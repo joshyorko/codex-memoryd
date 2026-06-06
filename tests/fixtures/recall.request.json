@@ -1,0 +1,17 @@
+{
+  "profile": "personal",
+  "workspace": "josh-personal",
+  "repo": {
+    "repo_id": "git:https://github.com/joshyorko/codex-memory-lab",
+    "root": "/workspaces/codex-memory-lab",
+    "remote": "https://github.com/joshyorko/codex-memory-lab",
+    "branch": "main",
+    "commit": null,
+    "is_git": true
+  },
+  "query": "Continue implementing provider-agnostic portable memory in Codex.",
+  "files": [
+    "codex-rs/ext/memories/src/runtime.rs"
+  ],
+  "max_tokens": 1200
+}

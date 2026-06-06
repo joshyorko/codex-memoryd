@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "data": {
+    "provider_name": "codex-memoryd",
+    "provider_version": "0.1.0",
+    "api_version": "v1",
+    "storage_schema_version": 1,
+    "status": "ok",
+    "storage": {
+      "kind": "sqlite",
+      "path": "/data/memory.db",
+      "writable": true
+    },
+    "active_profiles": ["personal"],
+    "active_workspaces": ["josh-personal"],
+    "last_sync": null,
+    "pending_writes": 0,
+    "local_import": {
+      "status": "unknown",
+      "last_preview_at": null,
+      "last_apply_at": null,
+      "unsynced_count": 0
+    },
+    "features": {
+      "fts5": true,
+      "search_mode": "fts5",
+      "recall": true,
+      "import_local": true,
+      "checkpoints": true,
+      "export": true,
+      "cross_profile_policy": "default_deny",
+      "max_recall_tokens": 1200
+    },
+    "degraded_reasons": []
+  },
+  "error": null,
+  "warnings": [],
+  "request_id": "req_example",
+  "provider": {
+    "name": "codex-memoryd",
+    "version": "0.1.0"
+  }
+}

@@ -156,21 +156,65 @@ image.
 
 The Codex fork has provider-agnostic portable memory (config,
 `PortableMemoryRuntime`, the `MemoryProvider` trait, selected
-local/provider/hybrid behavior, turn-input recall, turn-item writeback). To use
-`codex-memoryd` as the durable backend:
+local/provider/hybrid behavior, turn-input recall, turn-item writeback).
+
+### Final config contract
+
+This is the canonical `[memories]` shape that codex-memoryd targets:
 
 ```toml
 # Codex-side ~/.codex/config.toml
 [memories]
-backend = "provider"
-provider = "codex_memoryd"
+backend = "provider"              # local | provider | hybrid
+provider = "codex_memoryd"        # honcho | codex_memoryd  (when backend != local)
 provider_url = "http://127.0.0.1:8787"
 profile = "personal"
 workspace = "josh-personal"
-local_import_policy = "prompt"
+local_import_policy = "prompt"    # prompt | manual | startup_preview | startup_apply
+write_policy = "visible_turns"    # off | visible_turns
+sync_policy = "manual"            # manual | startup
+cross_profile_policy = "default_deny"
 ```
 
-Typical first-run switchover:
+`backend` stays a small stable enum; `provider` selects the implementation, so
+adding providers never grows the `backend` enum. `provider_url` points the
+runtime's HTTP client at this daemon's `/v1` API.
+
+### Compatibility matrix
+
+| `backend` | `provider` | Durable store | `provider_url` target | Local memory role |
+| --- | --- | --- | --- | --- |
+| `local` | — (ignored) | none (upstream local only) | — | source of truth |
+| `provider` | `honcho` | Honcho (cloud/self-host) | Honcho base URL | import source only |
+| `provider` | `codex_memoryd` | codex-memoryd SQLite | `http://127.0.0.1:8787` | import source only |
+| `hybrid` | `honcho` | Honcho + local cache | Honcho base URL | cache / debug / rebuild |
+| `hybrid` | `codex_memoryd` | codex-memoryd + local cache | `http://127.0.0.1:8787` | cache / debug / rebuild |
+
+In `local` mode, `provider`/`provider_url` are ignored and codex-memoryd is not
+contacted. In `provider`/`hybrid` mode the runtime fails open: if the daemon is
+unreachable, recall returns empty and writes are best-effort (in `hybrid`, local
+memory continues to serve).
+
+### ⚠️ Status vs. Codex PR #55
+
+The shape above is the **agreed target**. Codex **PR #55 as it currently
+stands** exposes a narrower contract and does not yet reach this daemon:
+
+| Field | Final shape | PR #55 today |
+| --- | --- | --- |
+| `backend` values | `local \| provider \| hybrid` | `local \| honcho \| hybrid` |
+| provider selector | `provider = "honcho" \| "codex_memoryd"` | none (backend doubles as selector) |
+| provider URL | `provider_url` | `honcho_base_url` |
+| first-run import | `local_import_policy` | not present |
+| wired HTTP client | Honcho v3 **and** codex-memoryd `/v1` | Honcho v3 only (both `honcho` and `hybrid`) |
+
+So on unmodified PR #55, `backend = "provider"` fails to load (unknown enum
+value) and no setting makes Codex speak codex-memoryd's `/v1` protocol. The
+exact codex-side delta required to honor the final shape is tracked in
+[`docs/codex-integration.md`](./docs/codex-integration.md#codex-side-delta-for-pr-55).
+This repo does not modify `codex/`.
+
+Typical first-run switchover (once both sides ship the final shape):
 
 ```bash
 export CODEX_MEMORYD_URL=http://127.0.0.1:8787

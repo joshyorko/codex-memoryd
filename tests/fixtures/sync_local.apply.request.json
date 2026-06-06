@@ -1,0 +1,22 @@
+{
+  "profile": "personal",
+  "workspace": "josh-personal",
+  "repo": null,
+  "source_root": "/home/josh/.codex/memories",
+  "mode": "apply",
+  "files": [
+    {
+      "path": "memory_summary.md",
+      "kind": "memory_summary",
+      "content": "# Memory Summary\nJosh prefers repo-native commands and concise commit messages.",
+      "hash": "sha256:example",
+      "modified_at": "2026-06-06T12:00:00Z",
+      "idempotency_key": "codex-local-memory:example"
+    },
+    {
+      "path": "rollout_summaries/2026-06-05-session.md",
+      "content": "# Checkpoint\n- Implemented the SQLite store and FTS5 fallback\n- Next: wire the HTTP server",
+      "modified_at": "2026-06-05T18:30:00Z"
+    }
+  ]
+}

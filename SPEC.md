@@ -845,7 +845,7 @@ Rules:
 
 ### 7.3 First-Run Detection and Switchover Flow
 
-When `backend` is `codex_memoryd` or `hybrid`, the Codex runtime SHOULD perform deterministic, runtime-level detection before the first agent turn:
+When `backend` is `provider` or `hybrid` (regardless of the selected `provider`), the Codex runtime SHOULD perform deterministic, runtime-level detection before the first agent turn:
 
 1. Detect that a provider-backed backend is active.
 2. Check provider status (`GET /v1/status`).

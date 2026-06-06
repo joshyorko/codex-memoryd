@@ -7,7 +7,15 @@ provider-agnostic portable memory runtime uses it. It complements
 `codex-memoryd` does **not** modify the Codex fork. Codex talks to it over HTTP
 JSON on loopback. The Codex side already has the `MemoryProvider` trait, the
 `PortableMemoryRuntime`, and selected `local | provider | hybrid` backend
-behavior; this provider is selected when `provider = "codex_memoryd"`.
+behavior; codex-memoryd is selected when `backend = "provider"` (or `"hybrid"`)
+and `provider = "codex_memoryd"`.
+
+> **Contract status.** The config shape and wire payloads in this document are
+> the agreed target. Codex **PR #55** currently exposes a narrower config
+> (`backend = local | honcho | hybrid`, no `provider`/`provider_url`, provider
+> URL carried by `honcho_base_url`) and only wires the Honcho v3 client. See
+> [Codex-side delta for PR #55](#codex-side-delta-for-pr-55) for exactly what
+> must change on the codex side. This repo does not modify `codex/`.
 
 ## Response envelope
 
@@ -241,3 +249,82 @@ model tokens:
 and `unavailable` when storage is not writable. The runtime uses
 `local_import.status` to decide whether to show the "local memories unsynced"
 banner.
+
+## Config contract & compatibility matrix
+
+Final `[memories]` shape (canonical target):
+
+```toml
+[memories]
+backend = "provider"              # local | provider | hybrid
+provider = "codex_memoryd"        # honcho | codex_memoryd  (when backend != local)
+provider_url = "http://127.0.0.1:8787"
+profile = "personal"
+workspace = "josh-personal"
+local_import_policy = "prompt"    # prompt | manual | startup_preview | startup_apply
+write_policy = "visible_turns"    # off | visible_turns
+sync_policy = "manual"            # manual | startup
+cross_profile_policy = "default_deny"
+```
+
+| `backend` | `provider` | Durable store | Provider HTTP target | Local memory role |
+| --- | --- | --- | --- | --- |
+| `local` | — (ignored) | none (upstream local only) | — | source of truth |
+| `provider` | `honcho` | Honcho | Honcho v3 base URL | import source only |
+| `provider` | `codex_memoryd` | codex-memoryd SQLite | `provider_url` → `/v1` | import source only |
+| `hybrid` | `honcho` | Honcho + local cache | Honcho v3 base URL | cache / debug / rebuild |
+| `hybrid` | `codex_memoryd` | codex-memoryd SQLite + local cache | `provider_url` → `/v1` | cache / debug / rebuild |
+
+Field defaults and meanings are normative in [`../SPEC.md` §11.1](../SPEC.md).
+
+## Codex-side delta for PR #55
+
+PR #55 is the foundation (config struct, `PortableMemoryRuntime`,
+`MemoryProvider` trait, `local | honcho | hybrid` selection, turn-input recall,
+turn-item writeback, the `/v1/sync/local-codex-memory` endpoint constant). To
+honor the final shape above, the following codex-side changes are required.
+**These are codex-side work items, tracked here for coordination; this repo does
+not implement them** (no edits to `codex/`).
+
+1. **`MemoryBackendKind`** (`config/src/types.rs`): change variants from
+   `Local | Honcho | Hybrid` to `Local | Provider | Hybrid`. Accept legacy
+   `honcho` as an alias that normalizes to `backend = "provider"`,
+   `provider = "honcho"` (SPEC §11.1.1 compatibility note) so existing configs
+   keep loading.
+2. **New `MemoryProvider` enum + `provider` field** on `MemoriesToml` /
+   `MemoriesConfig`: `honcho | codex_memoryd`, used to pick the concrete client
+   when `backend != local`.
+3. **`provider_url` field**: a general provider endpoint. Map the existing
+   `honcho_base_url` onto it when `provider = "honcho"` for back-compat.
+4. **`local_import_policy` field**: `prompt | manual | startup_preview |
+   startup_apply` (SPEC §7.4), driving first-run import behavior.
+5. **A `codex_memoryd` HTTP client** implementing the `MemoryProvider` trait
+   against this daemon's `/v1` API (envelope-aware), selected in `selected.rs`'s
+   `portable_provider_for_settings` when `provider = "codex_memoryd"`. Today both
+   `Honcho` and `Hybrid` route to the Honcho v3 client only.
+
+Until those land, on unmodified PR #55: `backend = "provider"` fails config load
+(unknown enum value), and there is no setting that routes durable memory to
+codex-memoryd's `/v1` API. The fixtures in [`../tests/fixtures`](../tests/fixtures)
+let the codex side build and test that client against this exact contract.
+
+### Request/response shapes the codex-side client must produce
+
+These match the daemon's protocol types (all request fields are optional /
+defaulted server-side; a minimal session is accepted):
+
+- **status**: `GET /v1/status` → envelope wrapping the status object above.
+- **recall**: `POST /v1/recall` with `{ profile, workspace, repo?, query,
+  files?, max_tokens? }` → envelope wrapping `{ summary, facts[], checkpoints[],
+  citations[], truncated, authority }`.
+- **turns**: `POST /v1/turns` with `{ profile, workspace, session{ id }, messages[
+  { actor, content } ] }` → envelope wrapping `{ accepted, rejected,
+  rejections[], source_ids[], derived_record_ids[] }`. The Codex
+  `VisibleMemoryMessage { actor, content, metadata }` maps directly onto a
+  message entry.
+- **sync**: `POST /v1/sync/local-codex-memory` with `{ profile, workspace, repo?,
+  source_root, mode, files[ { path, kind?, content, hash?, modified_at?,
+  idempotency_key? } ] }` → envelope wrapping the sync result. The Codex
+  `PortableMemoryFile { path, content, metadata, idempotency_key }` maps onto a
+  file entry (the daemon infers `kind` from `path` when omitted and computes its
+  own `source_hash`, so `hash`/`kind` are optional).

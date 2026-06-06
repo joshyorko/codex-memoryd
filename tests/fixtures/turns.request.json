@@ -1,0 +1,20 @@
+{
+  "profile": "personal",
+  "workspace": "josh-personal",
+  "repo": null,
+  "session": {
+    "id": "thread-123",
+    "source": "codex-cli"
+  },
+  "messages": [
+    {
+      "actor": "user",
+      "content": "Use repo-native commands like cargo test."
+    },
+    {
+      "actor": "assistant",
+      "content": "Understood; I'll prefer cargo test and avoid global installs."
+    }
+  ],
+  "write_policy": "visible_turns"
+}

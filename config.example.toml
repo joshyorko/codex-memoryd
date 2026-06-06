@@ -1,5 +1,10 @@
 # codex-memoryd provider configuration (example).
 #
+# This is the DAEMON's own config (~/.codex-memoryd/config.toml). It is NOT the
+# Codex-side [memories] block — that lives in ~/.codex/config.toml and selects
+# this daemon via `backend = "provider"` / `provider = "codex_memoryd"` /
+# `provider_url`. See README.md "How the Codex fork calls it" and SPEC.md §11.1.
+#
 # Resolution order (later wins):
 #   built-in defaults  ->  this file  ->  environment variables  ->  CLI flags
 #
