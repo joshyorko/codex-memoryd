@@ -1,0 +1,41 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Backtraces
+rustc-ice-*.txt
+
+# SQLite databases and runtime data (daemon storage)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+/data/
+/var/
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+*.local.toml
+config.local.*
+secrets/
+
+# Logs
+*.log
+logs/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,71 @@
+[package]
+name = "codex-memoryd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Codex-native portable memory provider daemon (recall, ingest, dedupe, safety, export)"
+license = "MIT"
+repository = "https://github.com/joshyorko/codex-memory-lab"
+default-run = "codex-memoryd"
+
+[[bin]]
+name = "codex-memoryd"
+path = "src/main.rs"
+
+[lib]
+name = "codex_memoryd"
+path = "src/lib.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.7", features = ["json", "tokio", "http1", "query"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Storage: bundled SQLite guarantees FTS5 is compiled in.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# IDs and hashing
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+
+# Secret / pattern detection
+regex = "1"
+
+# Time
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+
+# Misc
+dirs = "5"
+shellexpand = "3"
+once_cell = "1"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

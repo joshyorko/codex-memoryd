@@ -1,0 +1,9 @@
+target/
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+.git/
+docs/
+README.md
+SPEC.md

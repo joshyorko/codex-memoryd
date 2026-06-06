@@ -1,0 +1,42 @@
+# codex-memoryd provider configuration (example).
+#
+# Resolution order (later wins):
+#   built-in defaults  ->  this file  ->  environment variables  ->  CLI flags
+#
+# Default config path:   ~/.codex-memoryd/config.toml
+# Default storage path:  ~/.codex-memoryd/memory.db
+# Default bind:          127.0.0.1:8787
+#
+# Environment overrides:
+#   CODEX_MEMORYD_BIND, CODEX_MEMORYD_DB, CODEX_MEMORYD_PROFILE,
+#   CODEX_MEMORYD_WORKSPACE, CODEX_MEMORYD_LOG
+
+[server]
+# Loopback-only by default. For Docker, bind 0.0.0.0 and publish the port.
+bind = "127.0.0.1:8787"
+
+[storage]
+# Only "sqlite" is supported in the MVP. A `~` is expanded to the home dir.
+kind = "sqlite"
+path = "~/.codex-memoryd/memory.db"
+
+[policy]
+# Applied when a request omits the profile. Must be one of:
+# personal | work | oss | homelab
+default_profile = "personal"
+# Applied when a request omits the workspace.
+default_workspace = "default"
+# Cross-profile export posture. MVP is default_deny (work -> personal denied).
+cross_profile_policy = "default_deny"
+
+[recall]
+# Default token budget for /v1/recall when the request omits max_tokens.
+max_tokens = 1200
+# Maximum characters stored per memory record; longer content is truncated.
+max_record_chars = 8000
+
+[log]
+# error | warn | info | debug | trace
+level = "info"
+# text | json
+format = "text"
