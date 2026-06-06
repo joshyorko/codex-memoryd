@@ -567,6 +567,10 @@ Response data fields:
 - `checkpoints` (list)
 - `citations` (list)
 - `truncated` (boolean)
+- `authority` (string) — the reference implementation sets this to
+  `"recall_not_authority"` to satisfy the §8.2 requirement that recall output
+  MUST mark memory as contextual recall, not instruction. Implementations MAY
+  emit it; callers MUST NOT treat its absence as authority.
 
 Recall behavior:
 
@@ -622,6 +626,9 @@ Response data fields:
 - `rejected` (integer)
 - `rejections` (list)
 - `source_ids` (list)
+- `derived_record_ids` (list, OPTIONAL) — ids of memory records derived from
+  accepted messages. The reference implementation derives them synchronously and
+  returns them for caller feedback; implementations MAY omit this field.
 
 Rules:
 
@@ -647,6 +654,9 @@ Request fields:
 Response data fields:
 
 - `created` (list of conclusion IDs)
+- `record_ids` (list, OPTIONAL) — ids of the memory records created from the
+  conclusions (since conclusions SHOULD become memory records). The reference
+  implementation returns these for caller feedback; implementations MAY omit it.
 - `rejected` (list with reasons)
 
 Rules:
@@ -784,6 +794,18 @@ Query parameters:
 - `repo_id` (OPTIONAL)
 - `include_archived` (OPTIONAL)
 - `format` (OPTIONAL, default `jsonl`)
+- `target_profile` (OPTIONAL) — when set, the destination profile for the
+  export, so the provider can apply the profile-boundary matrix (§10.3). When
+  omitted, the export is treated as same-profile (no cross-profile filtering).
+  This makes the boundary check explicit at the API rather than relying on
+  out-of-band caller intent.
+
+Response:
+
+- The reference implementation streams records directly (JSONL/JSON), not
+  wrapped in the common envelope, so the response can be piped to a file. Export
+  metadata is returned in headers: `x-record-count`, `x-omitted-secret`,
+  `x-omitted-boundary`.
 
 Rules:
 

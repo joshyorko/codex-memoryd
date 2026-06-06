@@ -87,9 +87,11 @@ static SECRET_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b",
             "json web token",
         ),
-        // Generic credential assignments.
+        // Generic credential assignments. Includes a bare `token` keyword
+        // (and refresh/id token variants) — a common credential name in OAuth
+        // flows and secret managers that would otherwise slip through.
         (
-            r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|client[_-]?secret|bearer)\b\s*[:=]\s*[^\s]{6,}",
+            r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|bearer)\b\s*[:=]\s*[^\s]{6,}",
             "credential assignment",
         ),
         // Connection strings with inline credentials.
@@ -135,10 +137,14 @@ pub fn detect_secret(content: &str) -> Option<&'static str> {
         }
     }
 
-    // `.env` dump heuristic: an explicit .env reference plus assignments, or a
-    // dense block of UPPER_SNAKE=value lines.
+    // `.env` dump heuristic: an explicit `.env` reference plus assignments, or
+    // a dense block of UPPER_SNAKE=value lines. The bare threshold is 5 to avoid
+    // rejecting short configuration documentation (a handful of env-var examples
+    // like DATABASE_URL/RUST_LOG/WORKERS). Lines whose key is itself a credential
+    // keyword (API_KEY=, TOKEN=, …) are already caught by the credential regex
+    // above, so this heuristic only needs to catch dense non-keyword dumps.
     let env_assignment_lines = ENV_DUMP_LINE.find_iter(content).count();
-    if (lower.contains(".env") && env_assignment_lines >= 1) || env_assignment_lines >= 3 {
+    if (lower.contains(".env") && env_assignment_lines >= 2) || env_assignment_lines >= 5 {
         return Some("environment variable dump");
     }
 
@@ -572,14 +578,39 @@ mod tests {
 
     #[test]
     fn rejects_env_dumps() {
-        let env = "DATABASE_URL=postgres://x\nSECRET_TOKEN=abc\nAPI_HOST=h\n";
+        // Dense block of >=5 UPPER_SNAKE=value lines is treated as a dump.
+        let env =
+            "DATABASE_URL=postgres://x\nAPI_HOST=h\nAPP_PORT=8080\nLOG_LEVEL=info\nWORKERS=4\n";
         assert!(detect_secret(env).is_some());
+        // A `.env` reference plus a couple of assignments is also a dump.
+        let dotenv = "contents of .env:\nAPP_PORT=8080\nLOG_LEVEL=info\n";
+        assert!(detect_secret(dotenv).is_some());
+    }
+
+    #[test]
+    fn allows_short_config_documentation() {
+        // A few env-var examples in documentation must NOT be rejected.
+        let doc = "Configuration variables:\nRUST_LOG=debug\nWORKERS=4\n";
+        assert!(
+            detect_secret(doc).is_none(),
+            "short config docs should not trip the .env heuristic"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_token_assignment() {
+        // The bare `token=` keyword must be caught (OAuth/secret-manager style).
+        assert!(detect_secret("token = 0987654321fedcba0987654321fedcba").is_some());
+        assert!(detect_secret("TOKEN: abcdef123456").is_some());
+        assert!(detect_secret("refresh_token=zzzzzzyyyyyy123").is_some());
     }
 
     #[test]
     fn allows_ordinary_prose() {
         assert!(detect_secret("Josh prefers repo-native commands like cargo test.").is_none());
         assert!(detect_secret("Use axum for the HTTP server and rusqlite for storage.").is_none());
+        // "token" as a plain word (not an assignment) must not trip detection.
+        assert!(detect_secret("The recall response includes a token budget.").is_none());
     }
 
     #[test]

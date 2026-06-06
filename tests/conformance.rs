@@ -344,6 +344,110 @@ fn local_import_preview_then_apply_idempotent() {
 }
 
 #[test]
+fn forget_is_profile_scoped() {
+    let svc = service();
+    // Create a record under the work profile.
+    let created = svc
+        .conclusions(conclude_req(
+            "work",
+            "ws",
+            "Work-only decision about deploys",
+        ))
+        .unwrap();
+    let work_record = created.record_ids[0].clone();
+
+    // A forget request under the personal profile must NOT touch the work
+    // record — it should be reported as not_found, and the record must remain.
+    let resp = svc
+        .forget(ForgetRequest {
+            profile: Some("personal".to_string()),
+            workspace: None,
+            ids: Some(vec![work_record.clone()]),
+            mode: Some("delete".to_string()),
+            reason: None,
+        })
+        .unwrap();
+    assert!(resp.deleted.is_empty(), "must not delete across profiles");
+    assert_eq!(resp.not_found, vec![work_record.clone()]);
+
+    // The work record is still searchable under its own profile.
+    let search = svc
+        .search(SearchRequest {
+            profile: Some("work".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None,
+            query: Some("deploys".to_string()),
+            scope: None,
+            record_type: None,
+            limit: Some(10),
+            include_archived: false,
+            cursor: None,
+        })
+        .unwrap();
+    assert_eq!(
+        search.matches.len(),
+        1,
+        "record must survive cross-profile forget"
+    );
+}
+
+#[test]
+fn reimport_with_changed_content_supersedes_stale_records() {
+    let svc = service();
+    let mk = |content: &str| SyncRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        source_root: Some("/home/u/.codex/memories".to_string()),
+        mode: Some("apply".to_string()),
+        files: Some(vec![SyncFile {
+            path: "memory_summary.md".to_string(),
+            kind: Some("memory_summary".to_string()),
+            content: content.to_string(),
+            hash: None,
+            modified_at: None,
+            idempotency_key: None,
+            metadata: None,
+        }]),
+        metadata: None,
+    };
+
+    // First import.
+    svc.sync_local(mk("# Decision\n- We will use axum for the server\n"))
+        .unwrap();
+    // Changed content: the old fact is gone, a new one replaces it.
+    let second = svc
+        .sync_local(mk(
+            "# Decision\n- We will use hyper directly for the server\n",
+        ))
+        .unwrap();
+    assert!(second.updated >= 1, "stale chunk should be superseded");
+
+    // Default search must surface only the new fact, not the stale one.
+    let search = svc
+        .search(SearchRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None,
+            query: Some("server".to_string()),
+            scope: None,
+            record_type: None,
+            limit: Some(10),
+            include_archived: false,
+            cursor: None,
+        })
+        .unwrap();
+    assert!(
+        search.matches.iter().all(|m| !m.content.contains("axum")),
+        "stale 'axum' record must be archived after re-import"
+    );
+    assert!(
+        search.matches.iter().any(|m| m.content.contains("hyper")),
+        "new 'hyper' record must be present"
+    );
+}
+
+#[test]
 fn unknown_profile_is_rejected() {
     let svc = service();
     let err = svc

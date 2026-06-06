@@ -623,7 +623,16 @@ impl Service {
     // ------------------------------------------------------------------
 
     pub fn forget(&self, req: ForgetRequest) -> Result<ForgetResponse> {
-        let _profile = self.resolve_profile(&req.profile)?;
+        // Forget is profile-scoped: callers can only archive/delete records in
+        // their own profile (and workspace, when supplied). Out-of-scope ids are
+        // reported as not_found rather than touched (SPEC §4.1.2, §10.3).
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = req
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(sanitize_workspace);
         let ids_list = req
             .ids
             .ok_or_else(|| Error::invalid_request("ids is required"))?;
@@ -633,7 +642,9 @@ impl Service {
         let mode = req.mode.unwrap_or_else(|| "archive".to_string());
         match mode.trim().to_ascii_lowercase().as_str() {
             "delete" => {
-                let (deleted, not_found) = self.store.delete_records(&ids_list)?;
+                let (deleted, not_found) =
+                    self.store
+                        .delete_records(profile.as_str(), workspace.as_deref(), &ids_list)?;
                 Ok(ForgetResponse {
                     archived: vec![],
                     deleted,
@@ -642,7 +653,11 @@ impl Service {
                 })
             }
             "archive" => {
-                let (archived, not_found) = self.store.archive_records(&ids_list)?;
+                let (archived, not_found) = self.store.archive_records(
+                    profile.as_str(),
+                    workspace.as_deref(),
+                    &ids_list,
+                )?;
                 Ok(ForgetResponse {
                     archived,
                     deleted: vec![],

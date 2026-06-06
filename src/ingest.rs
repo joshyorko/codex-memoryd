@@ -147,7 +147,7 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
     let mut files_scanned = 0usize;
     let mut proposed = 0usize;
     let mut created = 0usize;
-    let updated = 0usize; // reserved: supersede-based updates land in a later phase
+    let mut updated = 0usize; // count of stale records superseded on re-import
     let mut skipped = 0usize;
     let mut rejected = 0usize;
     let mut rejections: Vec<SyncRejection> = Vec::new();
@@ -297,6 +297,15 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             continue;
         }
 
+        // If this path already had records, its content changed (different
+        // source hash). Track the fresh content hashes so stale chunks can be
+        // superseded after writing (SPEC §4.1.7).
+        let path_had_records = store
+            .count_active_records_for_path(profile_str, params.workspace, &file.path)
+            .unwrap_or(0)
+            > 0;
+        let mut fresh_hashes: Vec<String> = Vec::new();
+
         for chunk in chunks {
             let decision = policy::screen_content(&chunk.content, params.max_record_chars);
             let content = match decision {
@@ -320,6 +329,7 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 class.scope.as_str(),
                 &content,
             );
+            fresh_hashes.push(content_hash.clone());
             let metadata = json!({
                 "origin": "codex-local-memory",
                 "artifact_kind": kind.as_str(),
@@ -346,6 +356,19 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 crate::store::UpsertOutcome::Created(_) => created += 1,
                 crate::store::UpsertOutcome::Skipped(_) => skipped += 1,
             }
+        }
+
+        // Supersede stale chunks: if the file previously produced records that
+        // are no longer present in the fresh import, archive them.
+        if path_had_records {
+            updated += store
+                .archive_stale_path_records(
+                    profile_str,
+                    params.workspace,
+                    &file.path,
+                    &fresh_hashes,
+                )
+                .unwrap_or(0);
         }
     }
 

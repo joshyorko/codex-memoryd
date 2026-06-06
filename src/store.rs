@@ -105,7 +105,8 @@ impl Store {
     /// FTS5. An in-memory store is created when `path` is `:memory:`.
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
         let path = path.as_ref().to_path_buf();
-        let manager = if path.as_os_str() == ":memory:" {
+        let is_memory = path.as_os_str() == ":memory:";
+        let manager = if is_memory {
             SqliteConnectionManager::memory()
         } else {
             if let Some(parent) = path.parent() {
@@ -115,16 +116,22 @@ impl Store {
                     })?;
                 }
             }
+            // Enable WAL once, up front, on a single connection. WAL is a
+            // persistent property of the database file, so pooled connections
+            // inherit it without each having to switch journal mode — which
+            // would otherwise race to "database is locked" on a fresh file.
+            let bootstrap = rusqlite::Connection::open(&path)
+                .map_err(|e| Error::storage(format!("open {}: {e}", path.display())))?;
+            bootstrap
+                .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
+                .map_err(|e| Error::storage(format!("enable WAL: {e}")))?;
             SqliteConnectionManager::file(&path)
         };
-        // Apply pragmas on every checkout for durability + concurrency.
+        // Per-connection pragmas. journal_mode is intentionally NOT set here: it
+        // is already persisted on the file (or irrelevant for in-memory).
         let manager = manager.with_init(|conn| {
-            // busy_timeout MUST be set before journal_mode: switching to WAL
-            // takes a write lock, and concurrent pool connections opening a
-            // fresh database would otherwise race to "database is locked".
             conn.execute_batch(
                 "PRAGMA busy_timeout = 5000;
-                 PRAGMA journal_mode = WAL;
                  PRAGMA foreign_keys = ON;
                  PRAGMA synchronous = NORMAL;",
             )?;
@@ -133,7 +140,7 @@ impl Store {
 
         // In-memory pools must use a single connection or each checkout gets a
         // fresh empty database. Use max_size = 1 for memory.
-        let max_size = if path.as_os_str() == ":memory:" { 1 } else { 8 };
+        let max_size = if is_memory { 1 } else { 8 };
         let pool = Pool::builder()
             .max_size(max_size)
             .build(manager)
@@ -459,9 +466,17 @@ impl Store {
         Ok(())
     }
 
-    /// Archive records by id (soft delete). Returns the ids that were archived
-    /// vs not found.
-    pub fn archive_records(&self, ids_to_archive: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    /// Archive records by id (soft delete), scoped to a profile (and optionally
+    /// a workspace) so callers cannot touch records outside their boundary
+    /// (SPEC §4.1.2, §10.3). Records that exist but fall outside the scope are
+    /// reported as `not_found` to avoid leaking cross-profile existence.
+    /// Returns (archived, not_found).
+    pub fn archive_records(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_archive: &[String],
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let now = ids::now_rfc3339();
         let mut archived = Vec::new();
         let mut not_found = Vec::new();
@@ -471,10 +486,8 @@ impl Store {
             let mut stmt = tx.prepare(
                 "UPDATE memory_records SET archived = 1, updated_at = ?1 WHERE id = ?2 AND archived = 0",
             )?;
-            let mut exists_stmt = tx.prepare("SELECT 1 FROM memory_records WHERE id = ?1")?;
             for id in ids_to_archive {
-                let exists = exists_stmt.exists(params![id])?;
-                if !exists {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
                     not_found.push(id.clone());
                     continue;
                 }
@@ -486,17 +499,22 @@ impl Store {
         Ok((archived, not_found))
     }
 
-    /// Hard delete records by id. Returns (deleted, not_found).
-    pub fn delete_records(&self, ids_to_delete: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    /// Hard delete records by id, scoped to a profile (and optionally a
+    /// workspace). Returns (deleted, not_found).
+    pub fn delete_records(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_delete: &[String],
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let mut deleted = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         {
-            let mut exists_stmt = tx.prepare("SELECT 1 FROM memory_records WHERE id = ?1")?;
             let mut del_stmt = tx.prepare("DELETE FROM memory_records WHERE id = ?1")?;
             for id in ids_to_delete {
-                if !exists_stmt.exists(params![id])? {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
                     not_found.push(id.clone());
                     continue;
                 }
@@ -506,6 +524,87 @@ impl Store {
         }
         tx.commit()?;
         Ok((deleted, not_found))
+    }
+
+    /// Does a record with `id` exist within the given profile/workspace scope?
+    fn scoped_record_exists(
+        &self,
+        tx: &rusqlite::Transaction,
+        id: &str,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<bool> {
+        let exists = match workspace_id {
+            Some(ws) => tx.prepare(
+                "SELECT 1 FROM memory_records WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+            )?
+            .exists(params![id, profile_id, ws])?,
+            None => tx
+                .prepare("SELECT 1 FROM memory_records WHERE id = ?1 AND profile_id = ?2")?
+                .exists(params![id, profile_id])?,
+        };
+        Ok(exists)
+    }
+
+    /// Count active (non-archived) records derived from a given local import
+    /// path within a profile/workspace.
+    pub fn count_active_records_for_path(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        local_path: &str,
+    ) -> Result<i64> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_records
+             WHERE profile_id = ?1 AND workspace_id = ?2 AND archived = 0
+               AND json_extract(metadata, '$.local_path') = ?3",
+            params![profile_id, workspace_id, local_path],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Archive active records derived from `local_path` whose content_hash is
+    /// NOT in `keep_hashes`. Used when a local file's content changed on
+    /// re-import: prior chunks that no longer exist in the file are superseded
+    /// (archived) rather than left to contradict the fresh import (SPEC §4.1.7
+    /// "prefer updating or superseding old memories over duplicating").
+    /// Returns the number of records archived.
+    pub fn archive_stale_path_records(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        local_path: &str,
+        keep_hashes: &[String],
+    ) -> Result<usize> {
+        let now = ids::now_rfc3339();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut archived = 0usize;
+        {
+            // Gather candidate ids first (can't easily bind a NOT IN list).
+            let mut select = tx.prepare(
+                "SELECT id, content_hash FROM memory_records
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND archived = 0
+                   AND json_extract(metadata, '$.local_path') = ?3",
+            )?;
+            let rows = select
+                .query_map(params![profile_id, workspace_id, local_path], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut update = tx
+                .prepare("UPDATE memory_records SET archived = 1, updated_at = ?1 WHERE id = ?2")?;
+            for (id, hash) in rows {
+                if !keep_hashes.iter().any(|h| h == &hash) {
+                    update.execute(params![now, id])?;
+                    archived += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(archived)
     }
 
     /// Filtered listing without text search (used by export and recall
@@ -1105,7 +1204,9 @@ mod tests {
             .upsert_record(&sample_record("ephemeral note"))
             .unwrap();
         let id = outcome.id().to_string();
-        let (archived, not_found) = store.archive_records(std::slice::from_ref(&id)).unwrap();
+        let (archived, not_found) = store
+            .archive_records("personal", Some("ws"), std::slice::from_ref(&id))
+            .unwrap();
         assert_eq!(archived, vec![id]);
         assert!(not_found.is_empty());
         let filters = RecordQuery {
