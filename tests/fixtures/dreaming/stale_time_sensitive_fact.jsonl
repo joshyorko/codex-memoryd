@@ -1,0 +1,2 @@
+{"kind": "conclusion", "content": "We are currently blocked on the storage migration; will deploy the fix this week.", "created_at": "2026-01-10T08:00:00Z"}
+{"kind": "visible_turn", "actor": "user", "content": "Right now the daemon is failing on startup, planning to patch it tomorrow.", "created_at": "2026-01-10T08:05:00Z"}

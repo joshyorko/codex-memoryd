@@ -227,6 +227,20 @@ codex
 See [`docs/codex-integration.md`](./docs/codex-integration.md) for the full
 endpoint map, the local-import wire format, and the fail-open contract.
 
+## Roadmap: Dreamer loop (research)
+
+A background/offline memory-synthesis pass — the **Dreamer loop** — is being
+designed to compress repeated safe evidence (visible turns, conclusions,
+checkpoints, imported memories) into durable, provenance-backed records, demote
+stale facts, and supersede outdated ones. It is **recall, not authority**, and
+the model only proposes — `codex-memoryd` validates and persists. ChatGPT
+"dreaming" is **not** open source; it is only public inspiration, and this repo
+makes no compatibility claim. See
+[`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md) (motivation,
+threat model, non-claims) and
+[`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md) (CLI/API,
+storage, staleness/supersession, eval fixtures).
+
 ## Safety & profile boundaries
 
 **Secret blocking** (rejected or redacted before any durable write): private
