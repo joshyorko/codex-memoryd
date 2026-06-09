@@ -21,6 +21,7 @@ use crate::domain::RepoIdentity;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
 use crate::domain::VisibleTurn;
+use crate::dream;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
@@ -191,6 +192,26 @@ impl Service {
             offset,
         };
         recall::search(&self.store, &params)
+    }
+
+    // ------------------------------------------------------------------
+    // Dream preview
+    // ------------------------------------------------------------------
+
+    pub fn dream(&self, req: DreamRequest) -> Result<dream::DreamReport> {
+        let mode = req.mode.unwrap_or_else(|| "preview".to_string());
+        if mode.trim().to_ascii_lowercase() != "preview" {
+            return Err(Error::invalid_request(
+                "only dream preview mode is supported",
+            ));
+        }
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        dream::preview(
+            &self.store,
+            dream::DreamParams { profile, workspace },
+            self.config.max_record_chars,
+        )
     }
 
     // ------------------------------------------------------------------

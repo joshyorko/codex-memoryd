@@ -1,0 +1,59 @@
+{
+  "mode": "preview",
+  "run_id": "dream_4dcf2be26e1f15a8",
+  "profile": "personal",
+  "workspace": "test",
+  "evidence_window": {
+    "start": null,
+    "end": "2026-01-01T00:01:00Z"
+  },
+  "evidence_scanned": {
+    "visible_turns": 1,
+    "conclusions": 0,
+    "checkpoints": 0,
+    "imported_memories": 0,
+    "active_records": 0
+  },
+  "evidence_counts": {
+    "visible_turns": 1,
+    "conclusions": 0,
+    "checkpoints": 0,
+    "imported_memories": 0,
+    "active_records": 0
+  },
+  "candidates": [
+    {
+      "subject_key": "preference:user:54854df82dc69b06",
+      "action": "create",
+      "proposed_type": "preference",
+      "proposed_scope": "user",
+      "content": "Prefer cargo test for validation",
+      "confidence": 0.75,
+      "evidence": [
+        {
+          "kind": "visible_turn",
+          "id": "turn_user_pref",
+          "strength": "strong"
+        }
+      ],
+      "evidence_counts": {
+        "visible_turns": 1
+      },
+      "promotion_reason": "user visible turn is primary evidence",
+      "drift_prone": false,
+      "policy": "accept",
+      "supersedes": []
+    }
+  ],
+  "rejected": [],
+  "quarantined": [],
+  "stale": [],
+  "impact": {
+    "records_added": 1,
+    "records_archived": 0,
+    "estimated_tokens": 8
+  },
+  "created": 0,
+  "archived": 0,
+  "authority": "recall_not_authority"
+}

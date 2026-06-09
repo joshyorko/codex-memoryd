@@ -787,6 +787,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Deterministic checkpoint listing for Dream preview evidence gathering.
+    pub fn dream_checkpoints(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Checkpoint>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, profile_id, workspace_id, repo_id, summary,
+                    changed_files, decisions, blockers, next_steps, tests_run,
+                    tests_not_run, branch, commit_sha, created_at
+             FROM checkpoints
+             WHERE profile_id = ?1 AND workspace_id = ?2
+             ORDER BY created_at DESC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![profile_id, workspace_id, limit as i64],
+                row_to_checkpoint,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ------------------------------------------------------------------
     // Conclusions
     // ------------------------------------------------------------------
@@ -811,6 +837,30 @@ impl Store {
         Ok(())
     }
 
+    /// Deterministic conclusion listing for Dream preview evidence gathering.
+    pub fn dream_conclusions(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Conclusion>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, repo_id, target, content, source_id, created_at, metadata
+             FROM conclusions
+             WHERE profile_id = ?1 AND workspace_id = ?2
+             ORDER BY created_at DESC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![profile_id, workspace_id, limit as i64],
+                row_to_conclusion,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ------------------------------------------------------------------
     // Visible turns
     // ------------------------------------------------------------------
@@ -830,6 +880,55 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Deterministic visible-turn listing for Dream preview evidence gathering.
+    pub fn dream_visible_turns(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<VisibleTurn>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.session_id, t.actor, t.content, t.created_at, t.metadata
+             FROM visible_turns t
+             JOIN sessions s ON s.id = t.session_id
+             WHERE s.profile_id = ?1 AND s.workspace_id = ?2
+             ORDER BY t.created_at DESC, t.id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![profile_id, workspace_id, limit as i64],
+                row_to_visible_turn,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deterministic imported-source listing for Dream preview evidence gathering.
+    pub fn dream_memory_sources(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemorySource>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, kind, source_path, source_hash, created_at, ingested_at, metadata
+             FROM memory_sources
+             WHERE profile_id = ?1 AND workspace_id = ?2
+             ORDER BY ingested_at DESC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![profile_id, workspace_id, limit as i64],
+                row_to_source,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn ensure_session(
@@ -1096,6 +1195,20 @@ fn row_to_source(row: &Row) -> rusqlite::Result<MemorySource> {
     })
 }
 
+fn row_to_conclusion(row: &Row) -> rusqlite::Result<Conclusion> {
+    Ok(Conclusion {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        repo_id: row.get(3)?,
+        target: row.get(4)?,
+        content: row.get(5)?,
+        source_id: row.get(6)?,
+        created_at: row.get(7)?,
+        metadata: json_value(&row.get::<_, String>(8)?),
+    })
+}
+
 fn row_to_checkpoint(row: &Row) -> rusqlite::Result<Checkpoint> {
     Ok(Checkpoint {
         id: row.get(0)?,
@@ -1113,6 +1226,17 @@ fn row_to_checkpoint(row: &Row) -> rusqlite::Result<Checkpoint> {
         branch: row.get(12)?,
         commit: row.get(13)?,
         created_at: row.get(14)?,
+    })
+}
+
+fn row_to_visible_turn(row: &Row) -> rusqlite::Result<VisibleTurn> {
+    Ok(VisibleTurn {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        actor: row.get(2)?,
+        content: row.get(3)?,
+        created_at: row.get(4)?,
+        metadata: json_value(&row.get::<_, String>(5)?),
     })
 }
 

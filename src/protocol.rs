@@ -221,6 +221,18 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Dream preview (Phase 1)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DreamRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Turns (SPEC §6.4)
 // ---------------------------------------------------------------------------
 

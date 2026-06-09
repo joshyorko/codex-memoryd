@@ -98,6 +98,9 @@ codex-memoryd search --profile personal --workspace josh-personal --query "axum"
 codex-memoryd conclude --profile personal --workspace josh-personal \
   --content "Decision: use rusqlite bundled for storage"
 
+# Preview deterministic Dreamer candidates (no durable writes)
+codex-memoryd dream --profile personal --workspace josh-personal --preview
+
 # Import local Codex memory (provider local-ingest mode reads the filesystem)
 codex-memoryd sync-local --preview ~/.codex/memories
 codex-memoryd sync-local --apply   ~/.codex/memories
