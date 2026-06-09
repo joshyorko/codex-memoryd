@@ -44,10 +44,20 @@ log() {
 }
 
 run() {
-  printf '\n$' | tee -a "$OUT"
-  printf ' %q' "$@" | tee -a "$OUT"
+  printf '\n> ' | tee -a "$OUT"
+  printf '%q ' "$@" | tee -a "$OUT"
   printf '\n' | tee -a "$OUT"
   "$@" 2>&1 | tee -a "$OUT"
+}
+
+json_get() {
+  local label="$1"
+  local path="$2"
+  log "$label"
+  printf 'GET %s%s\n' "$CODEX_MEMORYD_URL" "$path" | tee -a "$OUT"
+  curl -fsS "$CODEX_MEMORYD_URL$path" \
+    | python3 -m json.tool \
+    | tee -a "$OUT"
 }
 
 json_post() {
@@ -96,8 +106,7 @@ if ! curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null 2>&1; then
 fi
 echo "daemon pid=$MEMORYD_PID url=$CODEX_MEMORYD_URL db=$WORKDIR/memory.db" | tee -a "$OUT"
 
-log "Captured /v1/status output"
-curl -fsS "$CODEX_MEMORYD_URL/v1/status" | python3 -m json.tool | tee -a "$OUT"
+json_get "Captured /v1/status output" "/v1/status"
 
 json_post "Seed /v1/conclusions through the provider contract" "/v1/conclusions" '{
   "profile": "'"$PROFILE"'",

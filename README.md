@@ -199,7 +199,7 @@ memory continues to serve).
 
 The shape above is implemented by `joshyorko/codex@tap-release`, including the
 `provider = "codex_memoryd"` adapter, `provider_url`, manual local import, and
-`visible_turns` writeback over this daemon's `/v1` API. Older `codex` PR #55
+`visible_turns` writeback over this daemon's `/v1` API. Older Codex PR #55
 snapshots exposed only the Honcho-shaped subset; the historical delta is kept in
 [`docs/codex-integration.md`](./docs/codex-integration.md#historical-codex-side-delta-from-pr-55).
 This repo does not modify `codex/`.

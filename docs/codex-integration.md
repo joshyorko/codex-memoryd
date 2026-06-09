@@ -11,7 +11,7 @@ behavior; codex-memoryd is selected when `backend = "provider"` (or `"hybrid"`)
 and `provider = "codex_memoryd"`.
 
 > **Contract status.** The config shape and wire payloads in this document are
-> the contract implemented by `joshyorko/codex@tap-release`. Older `codex` PR #55
+> the contract implemented by `joshyorko/codex@tap-release`. Older Codex PR #55
 > snapshots only exposed the Honcho-shaped subset; see
 > [Historical Codex-side delta from PR #55](#historical-codex-side-delta-from-pr-55)
 > for the migration notes. This repo does not modify `codex/`.
