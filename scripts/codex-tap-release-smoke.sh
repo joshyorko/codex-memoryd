@@ -8,6 +8,9 @@ BIND="${CODEX_MEMORYD_URL#http://}"
 BIND="${BIND#https://}"
 WORKDIR="${WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/codex-memoryd-tap-smoke.XXXXXX")}"
 OUT="$WORKDIR/smoke-output.txt"
+PROFILE="${PROFILE:-personal}"
+WORKSPACE_ID="${WORKSPACE_ID:-codex-memoryd-live-smoke}"
+MEMORY_SUMMARY_CONTENT=$'# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.\n'
 
 if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
   cat >&2 <<'EOF'
@@ -31,6 +34,7 @@ need python3
 
 mkdir -p "$WORKDIR"
 : >"$OUT"
+MEMORY_SUMMARY_JSON="$(printf '%s' "$MEMORY_SUMMARY_CONTENT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 
 log() {
   printf '\n### %s\n' "$*" | tee -a "$OUT"
@@ -63,11 +67,7 @@ MEMORYD_BIN="$ROOT/target/debug/codex-memoryd"
 
 export CODEX_HOME="$WORKDIR/codex-home"
 mkdir -p "$CODEX_HOME/memories"
-cat >"$CODEX_HOME/memories/memory_summary.md" <<'EOF'
-# Memory Summary
-- Prefer repo-native commands when working in codex-memoryd.
-- Decision: use codex-memoryd provider mode for the tap-release smoke.
-EOF
+printf '%s' "$MEMORY_SUMMARY_CONTENT" >"$CODEX_HOME/memories/memory_summary.md"
 
 log "Start codex-memoryd on loopback"
 "$MEMORYD_BIN" --db "$WORKDIR/memory.db" serve --bind "$BIND" >"$WORKDIR/codex-memoryd.log" 2>&1 &
@@ -97,8 +97,8 @@ log "Captured /v1/status output"
 curl -fsS "$CODEX_MEMORYD_URL/v1/status" | python3 -m json.tool | tee -a "$OUT"
 
 json_post "Seed /v1/conclusions through the provider contract" "/v1/conclusions" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "target": "user",
   "conclusions": [
     "Decision: tap-release provider smoke talks to codex-memoryd on loopback."
@@ -107,15 +107,15 @@ json_post "Seed /v1/conclusions through the provider contract" "/v1/conclusions"
 }'
 
 json_post "Captured recall output; authority must be recall_not_authority" "/v1/recall" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "query": "tap-release provider smoke loopback",
   "max_tokens": 1200
 }'
 
 json_post "Captured /v1/turns writeback counts" "/v1/turns" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "session": { "id": "tap-release-smoke", "source": "codex-cli" },
   "write_policy": "visible_turns",
   "messages": [
@@ -125,43 +125,43 @@ json_post "Captured /v1/turns writeback counts" "/v1/turns" '{
 }'
 
 json_post "Captured local import preview" "/v1/sync/local-codex-memory" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "source_root": "'"$CODEX_HOME"'/memories",
   "mode": "preview",
   "files": [
     {
       "path": "memory_summary.md",
       "kind": "memory_summary",
-      "content": "# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.\n"
+      "content": '"$MEMORY_SUMMARY_JSON"'
     }
   ]
 }'
 
 json_post "Captured local import apply" "/v1/sync/local-codex-memory" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "source_root": "'"$CODEX_HOME"'/memories",
   "mode": "apply",
   "files": [
     {
       "path": "memory_summary.md",
       "kind": "memory_summary",
-      "content": "# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.\n"
+      "content": '"$MEMORY_SUMMARY_JSON"'
     }
   ]
 }'
 
 json_post "Captured local import apply idempotency" "/v1/sync/local-codex-memory" '{
-  "profile": "personal",
-  "workspace": "codex-memoryd-live-smoke",
+  "profile": "'"$PROFILE"'",
+  "workspace": "'"$WORKSPACE_ID"'",
   "source_root": "'"$CODEX_HOME"'/memories",
   "mode": "apply",
   "files": [
     {
       "path": "memory_summary.md",
       "kind": "memory_summary",
-      "content": "# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.\n"
+      "content": '"$MEMORY_SUMMARY_JSON"'
     }
   ]
 }'
@@ -171,8 +171,8 @@ run "$CODEX_BIN" memory setup \
   --provider codex-memoryd \
   --backend provider \
   --provider-url "$CODEX_MEMORYD_URL" \
-  --profile personal \
-  --workspace codex-memoryd-live-smoke
+  --profile "$PROFILE" \
+  --workspace "$WORKSPACE_ID"
 run "$CODEX_BIN" memory status
 run "$CODEX_BIN" debug prompt-input "Recall the tap-release provider smoke decision."
 run "$CODEX_BIN" memory import-local --preview
@@ -183,14 +183,22 @@ run "$CODEX_BIN" memory setup \
   --provider codex-memoryd \
   --backend hybrid \
   --provider-url "$CODEX_MEMORYD_URL" \
-  --profile personal \
-  --workspace codex-memoryd-live-smoke
+  --profile "$PROFILE" \
+  --workspace "$WORKSPACE_ID"
 run "$CODEX_BIN" memory status
 run "$CODEX_BIN" debug prompt-input "Recall the tap-release hybrid smoke decision."
 
 log "Daemon-down fail-open check"
 kill -TERM "$MEMORYD_PID"
-sleep 0.2
+for _ in {1..50}; do
+  if ! kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
+  kill -KILL "$MEMORYD_PID" >/dev/null 2>&1 || true
+fi
 wait "$MEMORYD_PID" >/dev/null 2>&1 || true
 if "$CODEX_BIN" debug prompt-input "Daemon is down; this prompt build must still succeed." >"$WORKDIR/fail-open.json" 2>"$WORKDIR/fail-open.err"; then
   echo "fail-open: codex debug prompt-input exited 0 with daemon down" | tee -a "$OUT"
