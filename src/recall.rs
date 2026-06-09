@@ -425,6 +425,7 @@ mod tests {
                     "repo",
                     content,
                 ),
+                supersedes: vec![],
                 metadata: serde_json::Value::Null,
             };
             s.upsert_record(&rec).unwrap();

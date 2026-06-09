@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod domain;
+pub mod dream;
 pub mod error;
 pub mod export;
 pub mod ids;

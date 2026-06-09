@@ -135,6 +135,21 @@ pub enum Command {
     },
     /// Run self-checks (storage writable, FTS5, schema).
     Doctor,
+    /// Run the Dreamer loop in preview or apply mode.
+    Dream {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long, conflicts_with = "apply")]
+        preview: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        now: Option<String>,
+    },
 }
 
 impl Cli {
@@ -193,6 +208,28 @@ fn dispatch(cli: Cli) -> Result<()> {
             let service = cli.open_service(None)?;
             let status = service.status()?;
             print_json(&status)?;
+            Ok(())
+        }
+        Command::Dream {
+            profile,
+            workspace,
+            repo,
+            preview: _,
+            apply,
+            now,
+        } => {
+            let service = cli.open_service(None)?;
+            let resp = service.dream(DreamRequest {
+                profile: profile.clone(),
+                workspace: workspace.clone(),
+                repo: repo.clone().map(|repo_id| domain::RepoIdentity {
+                    repo_id,
+                    ..Default::default()
+                }),
+                mode: Some(if *apply { "apply" } else { "preview" }.to_string()),
+                now: now.clone(),
+            })?;
+            print_json(&resp)?;
             Ok(())
         }
         Command::Recall {

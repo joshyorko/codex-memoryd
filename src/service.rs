@@ -24,6 +24,7 @@ use crate::domain::VisibleTurn;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
+use crate::dream;
 use crate::export;
 use crate::export::ExportFormat;
 use crate::export::ExportParams;
@@ -360,6 +361,7 @@ impl Service {
             confidence: class.confidence,
             source_ids: vec![source_id.to_string()],
             content_hash,
+            supersedes: vec![],
             metadata: json!({ "origin": "visible_turn", "source_id": source_id }),
         };
         match self.store.upsert_record(&new)? {
@@ -459,6 +461,7 @@ impl Service {
                 confidence: class.confidence,
                 source_ids: vec![],
                 content_hash,
+                supersedes: vec![],
                 metadata: json!({ "origin": "conclusion", "conclusion_id": conclusion.id, "target": target }),
             };
             if let crate::store::UpsertOutcome::Created(id) = self.store.upsert_record(&new)? {
@@ -571,6 +574,7 @@ impl Service {
             confidence: 0.7,
             source_ids: vec![],
             content_hash,
+            supersedes: vec![],
             metadata: json!({ "origin": "checkpoint", "checkpoint_id": checkpoint.id }),
         });
 
@@ -578,6 +582,31 @@ impl Service {
             id: checkpoint.id,
             created_at: checkpoint.created_at,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Dreamer
+    // ------------------------------------------------------------------
+
+    pub fn dream(&self, req: DreamRequest) -> Result<DreamResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let repo_id = self.register_repo(&req.repo)?;
+        let mode = req.mode.unwrap_or_else(|| "preview".to_string());
+        if mode != "preview" && mode != "apply" {
+            return Err(Error::invalid_request("dream mode must be preview or apply"));
+        }
+        let now = req.now.unwrap_or_else(ids::now_rfc3339);
+        dream::run(
+            &self.store,
+            &dream::DreamParams {
+                profile,
+                workspace: &workspace,
+                repo_id: repo_id.as_deref(),
+                mode: &mode,
+                now: &now,
+            },
+        )
     }
 
     // ------------------------------------------------------------------
