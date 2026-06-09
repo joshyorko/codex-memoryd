@@ -18,6 +18,7 @@ if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
   cat >&2 <<'EOF'
 Set CODEX_BIN to a codex executable built from joshyorko/codex@tap-release, for example:
   git clone --branch tap-release https://github.com/joshyorko/codex /tmp/codex-tap-release
+  # Debug build is sufficient; "tap-release" is the branch name.
   cargo build --manifest-path /tmp/codex-tap-release/codex-rs/Cargo.toml -p codex-cli --bin codex
   CODEX_BIN=/tmp/codex-tap-release/codex-rs/target/debug/codex scripts/codex-tap-release-smoke.sh
 EOF
@@ -191,6 +192,7 @@ run "$CODEX_BIN" memory status
 run "$CODEX_BIN" debug prompt-input "Recall the tap-release hybrid smoke decision."
 
 log "Daemon-down fail-open check"
+trap - EXIT
 kill -TERM "$MEMORYD_PID"
 for _ in $(seq 1 "$HEALTH_CHECK_ATTEMPTS"); do
   if ! kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
