@@ -1,0 +1,28 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "decision:storage-backend-rusqlite",
+        "record_type": "decision",
+        "promotion_reason": "newer_evidence_supersedes_stale_fact",
+        "evidence_count": 3,
+        "must_contain": ["rusqlite", "bundled SQLite"],
+        "must_not_contain": ["still TBD; evaluating options"]
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  },
+  "expect_apply": { "created": 1, "archived": 1, "idempotent_second_apply": true },
+  "expect_recall_before": {
+    "query": "What storage backend does this project use?",
+    "must_contain": ["Storage backend is still TBD"],
+    "must_not_contain": ["rusqlite with bundled SQLite"]
+  },
+  "expect_recall_after": {
+    "query": "What storage backend does this project use?",
+    "must_contain": ["rusqlite with bundled SQLite"],
+    "must_not_contain": ["Storage backend is still TBD"]
+  }
+}
