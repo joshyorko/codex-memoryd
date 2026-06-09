@@ -90,6 +90,16 @@ pub enum Command {
         #[arg(long)]
         content: String,
     },
+    /// Preview deterministic Dreamer evidence gathering (no writes).
+    Dream {
+        /// Preview only (no durable writes).
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Import local Codex memory from a directory (provider local-ingest mode).
     SyncLocal {
         /// Preview only (no durable writes).
@@ -263,6 +273,26 @@ fn dispatch(cli: Cli) -> Result<()> {
                 record_type: None,
             };
             let resp = service.conclusions(req)?;
+            print_json(&resp)?;
+            Ok(())
+        }
+        Command::Dream {
+            preview,
+            profile,
+            workspace,
+        } => {
+            if !preview {
+                return Err(error::Error::invalid_request(
+                    "dream requires --preview (apply mode is not implemented)",
+                ));
+            }
+            let service = cli.open_service(None)?;
+            let req = DreamRequest {
+                profile: profile.clone(),
+                workspace: workspace.clone(),
+                mode: Some("preview".to_string()),
+            };
+            let resp = service.dream(req)?;
             print_json(&resp)?;
             Ok(())
         }
