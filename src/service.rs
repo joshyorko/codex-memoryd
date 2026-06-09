@@ -21,10 +21,10 @@ use crate::domain::RepoIdentity;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
 use crate::domain::VisibleTurn;
+use crate::dream;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
-use crate::dream;
 use crate::export;
 use crate::export::ExportFormat;
 use crate::export::ExportParams;
@@ -594,7 +594,9 @@ impl Service {
         let repo_id = self.register_repo(&req.repo)?;
         let mode = req.mode.unwrap_or_else(|| "preview".to_string());
         if mode != "preview" && mode != "apply" {
-            return Err(Error::invalid_request("dream mode must be preview or apply"));
+            return Err(Error::invalid_request(
+                "dream mode must be preview or apply",
+            ));
         }
         let now = req.now.unwrap_or_else(ids::now_rfc3339);
         dream::run(

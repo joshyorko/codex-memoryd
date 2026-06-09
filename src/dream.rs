@@ -103,8 +103,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
             .map(|until| is_after(params.now, until))
             .unwrap_or(false);
         if drift_prone {
-            let historical_reason = expired
-                .then(|| "expired relative-time content".to_string());
+            let historical_reason = expired.then(|| "expired relative-time content".to_string());
             stale.push(DreamStaleRecord {
                 memory_id: record.id.clone(),
                 drift_prone,
@@ -119,7 +118,11 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
                 historical_reason: historical_reason.clone(),
             });
             if expired {
-                let content = format!("As of {}, {}", date_part(&record.created_at), record.content);
+                let content = format!(
+                    "As of {}, {}",
+                    date_part(&record.created_at),
+                    record.content
+                );
                 push_candidate(
                     &mut candidates,
                     &mut rejected,
@@ -139,7 +142,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     for newer in &records {
         let newer_state = state_for(&newer.content);
         for older in &records {
-            if newer.id == older.id || !same_boundary(newer, older) || newer.created_at <= older.created_at {
+            if newer.id == older.id
+                || !same_boundary(newer, older)
+                || newer.created_at <= older.created_at
+            {
                 continue;
             }
             if supersedes(newer, older, &newer_state) {
@@ -170,11 +176,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     let mut created = Vec::new();
     if params.mode == "apply" {
         for candidate in &candidates {
-            let class = policy::classify(
-                &candidate.content,
-                params.profile,
-                params.repo_id.is_some(),
-            );
+            let class =
+                policy::classify(&candidate.content, params.profile, params.repo_id.is_some());
             let content_hash = ids::content_hash(
                 params.profile.as_str(),
                 params.workspace,
@@ -274,7 +277,9 @@ fn push_candidate(
             supersedes,
             policy: "accept".to_string(),
         }),
-        PolicyDecision::Reject { reason, .. } => rejected.push(DreamRejection { reason, supersedes }),
+        PolicyDecision::Reject { reason, .. } => {
+            rejected.push(DreamRejection { reason, supersedes })
+        }
     }
 }
 
@@ -309,9 +314,22 @@ fn state_for(content: &str) -> String {
         "completed".to_string()
     } else if contains_any(&lower, &["blocked", "stuck", "waiting on", "failing"]) {
         "blocked".to_string()
-    } else if contains_any(&lower, &["planned", "planning to", "going to", "will ", "todo", "next step"]) {
+    } else if contains_any(
+        &lower,
+        &[
+            "planned",
+            "planning to",
+            "going to",
+            "will ",
+            "todo",
+            "next step",
+        ],
+    ) {
         "planned".to_string()
-    } else if contains_any(&lower, &["currently", "right now", "in progress", "working on"]) {
+    } else if contains_any(
+        &lower,
+        &["currently", "right now", "in progress", "working on"],
+    ) {
         "active".to_string()
     } else {
         "active".to_string()
@@ -329,11 +347,22 @@ fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> 
     let old_lower = older.content.to_ascii_lowercase();
     let new_lower = newer.content.to_ascii_lowercase();
     let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
-        || contains_any(&old_lower, &["tbd", "evaluating", "not decided", "will ", "planned"]);
+        || contains_any(
+            &old_lower,
+            &["tbd", "evaluating", "not decided", "will ", "planned"],
+        );
     let new_settled = newer_state == "completed"
         || contains_any(
             &new_lower,
-            &["uses ", "decided", "no longer", "implemented", "fixed", "merged", "deployed"],
+            &[
+                "uses ",
+                "decided",
+                "no longer",
+                "implemented",
+                "fixed",
+                "merged",
+                "deployed",
+            ],
         );
     old_unsettled && new_settled
 }
