@@ -1,0 +1,27 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "preference:repo-native-commands",
+        "record_type": "preference",
+        "promotion_reason": "repeated_user_preference",
+        "evidence_count": 3,
+        "must_contain": ["cargo test", "helper scripts"],
+        "must_not_contain": []
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  },
+  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true },
+  "expect_recall_before": {
+    "query": "How should I run tests in this repo?",
+    "must_not_contain": ["cargo test", "helper scripts"]
+  },
+  "expect_recall_after": {
+    "query": "How should I run tests in this repo?",
+    "must_contain": ["cargo test", "helper scripts"],
+    "must_not_contain": []
+  }
+}
