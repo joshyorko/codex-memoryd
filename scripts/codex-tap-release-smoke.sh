@@ -10,7 +10,9 @@ WORKDIR="${WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/codex-memoryd-tap-smoke.XXXXXX"
 OUT="$WORKDIR/smoke-output.txt"
 PROFILE="${PROFILE:-personal}"
 WORKSPACE_ID="${WORKSPACE_ID:-codex-memoryd-live-smoke}"
-MEMORY_SUMMARY_CONTENT=$'# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.\n'
+HEALTH_CHECK_ATTEMPTS="${HEALTH_CHECK_ATTEMPTS:-50}"
+HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-0.1}"
+MEMORY_SUMMARY_CONTENT=$'# Memory Summary\n- Prefer repo-native commands when working in codex-memoryd.\n- Decision: use codex-memoryd provider mode for the tap-release smoke.'
 
 if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
   cat >&2 <<'EOF'
@@ -80,11 +82,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in {1..50}; do
+for _ in $(seq 1 "$HEALTH_CHECK_ATTEMPTS"); do
   if curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null 2>&1; then
     break
   fi
-  sleep 0.1
+  sleep "$HEALTH_CHECK_INTERVAL"
 done
 if ! curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null 2>&1; then
   echo "codex-memoryd did not become healthy at $CODEX_MEMORYD_URL" >&2
@@ -190,11 +192,11 @@ run "$CODEX_BIN" debug prompt-input "Recall the tap-release hybrid smoke decisio
 
 log "Daemon-down fail-open check"
 kill -TERM "$MEMORYD_PID"
-for _ in {1..50}; do
+for _ in $(seq 1 "$HEALTH_CHECK_ATTEMPTS"); do
   if ! kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
     break
   fi
-  sleep 0.1
+  sleep "$HEALTH_CHECK_INTERVAL"
 done
 if kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
   kill -KILL "$MEMORYD_PID" >/dev/null 2>&1 || true
