@@ -27,7 +27,7 @@ use crate::store::Store;
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)\b(today|tomorrow|tonight|this week|next week|this weekend|currently|right now|soon|as of now|going to|planning to|will\s+[a-z][a-z-]+)\b",
+        r"(?i)\b(today|tomorrow|tonight|this week|next week|this weekend|currently|right now|soon|as of now|going to|planning to|will\s+(add|build|complete|deploy|fix|implement|merge|migrate|patch|release|remove|replace|resolve|run|ship|switch|test|update|write))\b",
     )
     .expect("relative-time regex")
 });
