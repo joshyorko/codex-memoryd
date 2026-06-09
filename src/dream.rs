@@ -172,6 +172,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
 
     dedupe_candidates(&mut candidates);
 
+    let run_id = ids::new_id("dream");
     let mut archived = Vec::new();
     let mut created = Vec::new();
     if params.mode == "apply" {
@@ -188,7 +189,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
             );
             let metadata = json!({
                 "origin": "dreamer",
-                "run_id": "",
+                "run_id": run_id.clone(),
                 "state": candidate.state,
                 "drift_prone": candidate.drift_prone,
                 "expires_at": candidate.expires_at,
@@ -237,7 +238,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     }
 
     Ok(DreamResponse {
-        run_id: ids::new_id("dream"),
+        run_id,
         mode: params.mode.to_string(),
         profile: params.profile.as_str().to_string(),
         workspace: params.workspace.to_string(),

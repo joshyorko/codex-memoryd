@@ -214,11 +214,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             profile,
             workspace,
             repo,
-            preview: _,
+            preview,
             apply,
             now,
         } => {
             let service = cli.open_service(None)?;
+            let mode = if *apply {
+                "apply"
+            } else if *preview {
+                "preview"
+            } else {
+                "preview"
+            };
             let resp = service.dream(DreamRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
@@ -226,7 +233,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     repo_id,
                     ..Default::default()
                 }),
-                mode: Some(if *apply { "apply" } else { "preview" }.to_string()),
+                mode: Some(mode.to_string()),
                 now: now.clone(),
             })?;
             print_json(&resp)?;

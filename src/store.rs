@@ -444,7 +444,9 @@ impl Store {
                     not_found.push(id.clone());
                     continue;
                 }
-                let raw: String = select.query_row(params![id], |r| r.get(0))?;
+                let raw: String = select.query_row(params![id], |r| r.get(0)).map_err(|e| {
+                    Error::storage(format!("load metadata for archived record {id}: {e}"))
+                })?;
                 let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
                 if !metadata.is_object() {
                     metadata = serde_json::json!({});
