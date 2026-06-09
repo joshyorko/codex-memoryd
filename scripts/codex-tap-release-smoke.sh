@@ -83,7 +83,9 @@ mkdir -p "$CODEX_HOME/memories"
 printf '%s' "$MEMORY_SUMMARY_CONTENT" >"$CODEX_HOME/memories/memory_summary.md"
 
 log "Start codex-memoryd on loopback"
-"$MEMORYD_BIN" --db "$WORKDIR/memory.db" serve --bind "$BIND" >"$WORKDIR/codex-memoryd.log" 2>&1 &
+"$MEMORYD_BIN" --db "$WORKDIR/memory.db" serve --bind "$BIND" \
+  >"$WORKDIR/codex-memoryd.out" \
+  2>"$WORKDIR/codex-memoryd.err" &
 MEMORYD_PID=$!
 cleanup() {
   if kill -0 "$MEMORYD_PID" >/dev/null 2>&1; then
@@ -101,7 +103,8 @@ for _ in $(seq 1 "$HEALTH_CHECK_ATTEMPTS"); do
 done
 if ! curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null 2>&1; then
   echo "codex-memoryd did not become healthy at $CODEX_MEMORYD_URL" >&2
-  cat "$WORKDIR/codex-memoryd.log" >&2 || true
+  cat "$WORKDIR/codex-memoryd.out" >&2 || true
+  cat "$WORKDIR/codex-memoryd.err" >&2 || true
   exit 1
 fi
 echo "daemon pid=$MEMORYD_PID url=$CODEX_MEMORYD_URL db=$WORKDIR/memory.db" | tee -a "$OUT"
@@ -215,7 +218,7 @@ fi
 wait "$MEMORYD_PID" >/dev/null 2>&1 || true
 if "$CODEX_BIN" debug prompt-input "Daemon is down; this prompt build must still succeed." >"$WORKDIR/fail-open.json" 2>"$WORKDIR/fail-open.err"; then
   echo "fail-open: codex debug prompt-input exited 0 with daemon down" | tee -a "$OUT"
-  cat "$WORKDIR/fail-open.json" | tee -a "$OUT"
+  tee -a "$OUT" <"$WORKDIR/fail-open.json"
 else
   cat "$WORKDIR/fail-open.err" >&2
   exit 1
