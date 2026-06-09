@@ -86,7 +86,11 @@ for _ in {1..50}; do
   fi
   sleep 0.1
 done
-curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null
+if ! curl -fsS "$CODEX_MEMORYD_URL/healthz" >/dev/null 2>&1; then
+  echo "codex-memoryd did not become healthy at $CODEX_MEMORYD_URL" >&2
+  cat "$WORKDIR/codex-memoryd.log" >&2 || true
+  exit 1
+fi
 echo "daemon pid=$MEMORYD_PID url=$CODEX_MEMORYD_URL db=$WORKDIR/memory.db" | tee -a "$OUT"
 
 log "Captured /v1/status output"
@@ -185,7 +189,8 @@ run "$CODEX_BIN" memory status
 run "$CODEX_BIN" debug prompt-input "Recall the tap-release hybrid smoke decision."
 
 log "Daemon-down fail-open check"
-kill "$MEMORYD_PID"
+kill -TERM "$MEMORYD_PID"
+sleep 0.2
 wait "$MEMORYD_PID" >/dev/null 2>&1 || true
 if "$CODEX_BIN" debug prompt-input "Daemon is down; this prompt build must still succeed." >"$WORKDIR/fail-open.json" 2>"$WORKDIR/fail-open.err"; then
   echo "fail-open: codex debug prompt-input exited 0 with daemon down" | tee -a "$OUT"
