@@ -531,7 +531,7 @@ impl Store {
         {
             let mut select = tx.prepare("SELECT metadata FROM memory_records WHERE id = ?1")?;
             let mut update = tx.prepare(
-                "UPDATE memory_records SET archived = 1, updated_at = ?1, metadata = ?2 WHERE id = ?3",
+                "UPDATE memory_records SET archived = 1, updated_at = ?1, metadata = ?2 WHERE id = ?3 AND archived = 0",
             )?;
             for id in ids_to_archive {
                 if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
@@ -553,8 +553,9 @@ impl Store {
                     );
                     obj.insert("archived_at".to_string(), Value::String(now.clone()));
                 }
-                update.execute(params![now, metadata.to_string(), id])?;
-                archived.push(id.clone());
+                if update.execute(params![now, metadata.to_string(), id])? > 0 {
+                    archived.push(id.clone());
+                }
             }
         }
         tx.commit()?;
@@ -635,8 +636,9 @@ impl Store {
                     not_found.push(id.clone());
                     continue;
                 }
-                stmt.execute(params![now, id])?;
-                archived.push(id.clone());
+                if stmt.execute(params![now, id])? > 0 {
+                    archived.push(id.clone());
+                }
             }
         }
         tx.commit()?;

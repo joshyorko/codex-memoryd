@@ -385,6 +385,24 @@ pub struct DreamCandidate {
     pub historical_reason: Option<String>,
     pub supersedes: Vec<String>,
     pub policy: String,
+    #[serde(skip_serializing)]
+    pub subject_key: String,
+    #[serde(skip_serializing)]
+    pub evidence_ids: Vec<String>,
+    #[serde(skip_serializing)]
+    pub evidence_count: usize,
+    #[serde(skip_serializing)]
+    pub user_evidence_count: usize,
+    #[serde(skip_serializing)]
+    pub assistant_evidence_count: usize,
+    #[serde(skip_serializing)]
+    pub first_seen_at: String,
+    #[serde(skip_serializing)]
+    pub last_seen_at: String,
+    #[serde(skip_serializing)]
+    pub promotion_reason: String,
+    #[serde(skip_serializing)]
+    pub apply_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

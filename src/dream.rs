@@ -24,6 +24,7 @@ use crate::protocol::DreamStaleRecord;
 use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
+use crate::store::UpsertOutcome;
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -98,8 +99,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     let mut rejected = Vec::new();
 
     for record in &records {
-        let drift_prone = is_drift_prone(&record.content);
-        let state = state_for(&record.content);
+        let state = state_for_record(record);
+        let drift_prone = state != "historical" && is_drift_prone(&record.content);
         let valid_until = valid_until_for(record);
         let expired = valid_until
             .as_deref()
@@ -143,7 +144,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     }
 
     for newer in &records {
-        let newer_state = state_for(&newer.content);
+        let newer_state = state_for_record(newer);
         for older in &records {
             if newer.id == older.id
                 || !same_boundary(newer, older)
@@ -183,26 +184,59 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     let mut created = Vec::new();
     if params.mode == "apply" {
         for candidate in &candidates {
-            let class =
-                policy::classify(&candidate.content, params.profile, params.repo_id.is_some());
+            if !candidate.apply_eligible {
+                continue;
+            }
+            let content = match policy::screen_content(&candidate.content, policy::MAX_RECORD_CHARS)
+            {
+                PolicyDecision::Accept(clean) => clean,
+                PolicyDecision::Reject { code, reason } => {
+                    let _ = store.record_policy_event(
+                        Some(params.profile.as_str()),
+                        Some(params.workspace),
+                        "rejected_dream_candidate",
+                        &code,
+                        &reason,
+                        "dream",
+                    );
+                    rejected.push(DreamRejection {
+                        reason,
+                        supersedes: candidate.supersedes.clone(),
+                    });
+                    continue;
+                }
+            };
+            let class = policy::classify(&content, params.profile, params.repo_id.is_some());
             let content_hash = ids::content_hash(
                 params.profile.as_str(),
                 params.workspace,
                 params.repo_id,
                 class.record_type.as_str(),
                 class.scope.as_str(),
-                &candidate.content,
+                &content,
             );
             let metadata = json!({
                 "origin": "dreamer",
+                "dream_run_id": run_id.clone(),
                 "run_id": run_id.clone(),
+                "subject_key": candidate.subject_key,
+                "evidence_ids": candidate.evidence_ids,
+                "evidence_count": candidate.evidence_count,
+                "user_evidence_count": candidate.user_evidence_count,
+                "assistant_evidence_count": candidate.assistant_evidence_count,
+                "first_seen_at": candidate.first_seen_at,
+                "last_seen_at": candidate.last_seen_at,
                 "state": candidate.state,
                 "drift_prone": candidate.drift_prone,
                 "expires_at": candidate.expires_at,
                 "valid_until": candidate.valid_until,
                 "historical_reason": candidate.historical_reason,
                 "supersedes": candidate.supersedes,
-                "subject_key": subject_key(&candidate.content),
+                "promotion_reason": candidate.promotion_reason,
+                "evidence_window": {
+                    "start": candidate.first_seen_at,
+                    "end": candidate.last_seen_at,
+                },
             });
             let outcome = store.upsert_record(&NewRecord {
                 profile_id: params.profile.as_str().to_string(),
@@ -210,18 +244,20 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
                 repo_id: params.repo_id.map(|s| s.to_string()),
                 scope: class.scope,
                 record_type: class.record_type,
-                content: candidate.content.clone(),
+                content,
                 related_files: class.related_files,
                 tags: class.tags,
                 sensitivity: class.sensitivity,
                 portability: class.portability,
                 confidence: candidate.confidence,
-                source_ids: vec![],
+                source_ids: candidate.evidence_ids.clone(),
                 content_hash,
                 supersedes: candidate.supersedes.clone(),
                 metadata,
             })?;
-            created.push(outcome.id().to_string());
+            if let UpsertOutcome::Created(id) = outcome {
+                created.push(id);
+            }
             if !candidate.supersedes.is_empty() {
                 let reason = candidate
                     .historical_reason
@@ -293,23 +329,88 @@ fn push_candidate(
     supersedes: Vec<String>,
 ) {
     match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
-        PolicyDecision::Accept(clean) => candidates.push(DreamCandidate {
-            action: action.to_string(),
-            proposed_type: evidence.record_type.as_str().to_string(),
-            content: clean,
-            confidence: (evidence.confidence + 0.05).min(0.95),
-            state: state.to_string(),
-            drift_prone,
-            expires_at: valid_until.clone(),
-            valid_until,
-            historical_reason,
-            supersedes,
-            policy: "accept".to_string(),
-        }),
+        PolicyDecision::Accept(clean) => {
+            let evidence_ids = evidence_ids(evidence);
+            let evidence_count = evidence_ids.len();
+            let (user_evidence_count, assistant_evidence_count) =
+                evidence_actor_counts(evidence, evidence_count);
+            let promotion_reason = promotion_reason(action, &historical_reason);
+            candidates.push(DreamCandidate {
+                action: action.to_string(),
+                proposed_type: evidence.record_type.as_str().to_string(),
+                content: clean,
+                confidence: (evidence.confidence + 0.05).min(0.95),
+                state: state.to_string(),
+                drift_prone,
+                expires_at: valid_until.clone(),
+                valid_until,
+                historical_reason,
+                supersedes,
+                policy: "accept".to_string(),
+                subject_key: subject_key(&evidence.content),
+                evidence_ids,
+                evidence_count,
+                user_evidence_count,
+                assistant_evidence_count,
+                first_seen_at: evidence.created_at.clone(),
+                last_seen_at: evidence.updated_at.clone(),
+                promotion_reason,
+                apply_eligible: apply_eligible(evidence, evidence_count, assistant_evidence_count),
+            })
+        }
         PolicyDecision::Reject { reason, .. } => {
             rejected.push(DreamRejection { reason, supersedes })
         }
     }
+}
+
+fn evidence_ids(evidence: &MemoryRecord) -> Vec<String> {
+    if evidence.source_ids.is_empty() {
+        vec![evidence.id.clone()]
+    } else {
+        evidence.source_ids.clone()
+    }
+}
+
+fn evidence_actor_counts(evidence: &MemoryRecord, evidence_count: usize) -> (usize, usize) {
+    let actor = evidence
+        .metadata
+        .get("actor")
+        .or_else(|| evidence.metadata.get("target"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
+    match actor.as_deref() {
+        Some("assistant") => (0, evidence_count),
+        Some("user") => (evidence_count, 0),
+        _ => (0, 0),
+    }
+}
+
+fn apply_eligible(
+    evidence: &MemoryRecord,
+    evidence_count: usize,
+    assistant_evidence_count: usize,
+) -> bool {
+    if evidence_count > 0 && assistant_evidence_count == evidence_count {
+        return false;
+    }
+    let origin = evidence.metadata.get("origin").and_then(|v| v.as_str());
+    let artifact_kind = evidence
+        .metadata
+        .get("artifact_kind")
+        .and_then(|v| v.as_str());
+    !(origin == Some("codex-local-memory") && artifact_kind == Some("memory_summary"))
+}
+
+fn promotion_reason(action: &str, historical_reason: &Option<String>) -> String {
+    historical_reason.clone().unwrap_or_else(|| {
+        match action {
+            "rewrite_historical" => "expired drift-prone memory rewritten as historical fact",
+            "supersede" => "newer evidence supersedes older active memory",
+            _ => "dreamer candidate accepted by deterministic policy",
+        }
+        .to_string()
+    })
 }
 
 fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
@@ -365,6 +466,15 @@ fn state_for(content: &str) -> String {
     }
 }
 
+fn state_for_record(record: &MemoryRecord) -> String {
+    record
+        .metadata
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| state_for(&record.content))
+}
+
 fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> bool {
     if subject_key(&newer.content) != subject_key(&older.content) {
         return false;
@@ -372,7 +482,7 @@ fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> 
     if lexical_overlap(&newer.content, &older.content) < 1 {
         return false;
     }
-    let old_state = state_for(&older.content);
+    let old_state = state_for_record(older);
     let old_lower = older.content.to_ascii_lowercase();
     let new_lower = newer.content.to_ascii_lowercase();
     let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
