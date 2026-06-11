@@ -15,6 +15,9 @@ use crate::API_VERSION;
 use crate::PROVIDER_NAME;
 use crate::PROVIDER_VERSION;
 
+const AUTH_MISSING_REASON: &str =
+    "non-loopback bind has no built-in auth; remote /v1 exposure is unsupported";
+
 /// Build the status response. `degraded_reasons` from the store (e.g. FTS5
 /// fallback) downgrade the status to `degraded`.
 pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result<StatusResponse> {
@@ -30,10 +33,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     if !writable {
         degraded_reasons.push("storage is not writable".to_string());
     } else if !loopback_only {
-        degraded_reasons.push(
-            "non-loopback bind has no built-in auth; remote /v1 exposure is unsupported"
-                .to_string(),
-        );
+        degraded_reasons.push(AUTH_MISSING_REASON.to_string());
     }
 
     let status = if !writable {

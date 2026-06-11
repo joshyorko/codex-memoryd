@@ -764,10 +764,7 @@ fn default_sensitivity(profile: Profile) -> Sensitivity {
 
 fn redact_for_echo(content: &str) -> String {
     // Never echo back possibly-secret content verbatim in a rejection.
-    format!(
-        "[redacted rejected content; {} chars]",
-        content.chars().count()
-    )
+    format!("[redacted rejected content; {} bytes]", content.len())
 }
 
 fn map_code(code: &str) -> ErrorCode {

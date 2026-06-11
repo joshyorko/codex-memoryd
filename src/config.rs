@@ -275,9 +275,9 @@ fn bind_host(bind: &str) -> Option<String> {
     }
     if bind.starts_with('[') {
         return bind
-            .split(']')
-            .next()
-            .map(|s| s.trim_start_matches('[').to_string());
+            .find(']')
+            .map(|end| bind[1..end].to_string())
+            .filter(|host| !host.is_empty());
     }
     bind.rsplit_once(':')
         .map(|(host, _)| host.trim().to_string())
@@ -319,6 +319,9 @@ mod tests {
         assert!(cfg.bind_is_loopback());
 
         cfg.bind = "0.0.0.0:8787".to_string();
+        assert!(!cfg.bind_is_loopback());
+
+        cfg.bind = "[::1:8787".to_string();
         assert!(!cfg.bind_is_loopback());
     }
 }
