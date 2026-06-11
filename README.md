@@ -298,7 +298,7 @@ repository files, and verified current state.
 ## Testing
 
 ```bash
-cargo test          # 52 tests: unit + conformance + HTTP smoke + CLI smoke
+cargo test          # unit + conformance + HTTP smoke + CLI smoke
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
