@@ -322,12 +322,27 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
     let conn = Connection::open(&db).unwrap();
     let audit_text: String = conn
         .query_row(
-            "SELECT id || ' ' || profile_id || ' ' || workspace_id || ' ' ||
-                    mode || ' ' || status || ' ' || implementation_version || ' ' ||
-                    config_hash || ' ' || ruleset_version || ' ' ||
-                    COALESCE(source_counts, '') || ' ' ||
-                    COALESCE(candidate_counts, '') || ' ' ||
-                    COALESCE(error_summary, '')
+            "SELECT json_object(
+                    'id', id,
+                    'profile_id', profile_id,
+                    'workspace_id', workspace_id,
+                    'repo_id', repo_id,
+                    'mode', mode,
+                    'status', status,
+                    'started_at', started_at,
+                    'completed_at', completed_at,
+                    'implementation_version', implementation_version,
+                    'config_hash', config_hash,
+                    'ruleset_version', ruleset_version,
+                    'fixture_schema_version', fixture_schema_version,
+                    'source_window_start', source_window_start,
+                    'source_window_end', source_window_end,
+                    'source_counts', source_counts,
+                    'candidate_counts', candidate_counts,
+                    'created_count', created_count,
+                    'archived_count', archived_count,
+                    'rejected_count', rejected_count,
+                    'error_summary', error_summary)
              FROM dream_runs
              LIMIT 1",
             [],

@@ -659,7 +659,7 @@ impl Service {
         let source_records = self.store.query_records(&RecordQuery {
             profile_id: Some(profile.as_str().to_string()),
             workspace_id: Some(workspace.clone()),
-            repo_id: None,
+            repo_id: repo_id.clone(),
             record_type: None,
             scope: None,
             include_archived: false,
@@ -667,10 +667,6 @@ impl Service {
             limit: 500,
             offset: 0,
         })?;
-        let source_records = source_records
-            .into_iter()
-            .filter(|r| r.repo_id.as_deref() == repo_id.as_deref() || repo_id.is_none())
-            .collect::<Vec<_>>();
         let result = dream::run(
             &self.store,
             &dream::DreamParams {

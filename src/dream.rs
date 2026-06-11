@@ -83,7 +83,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     let records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
-        repo_id: None,
+        repo_id: params.repo_id.map(str::to_string),
         record_type: None,
         scope: None,
         include_archived: false,
@@ -91,11 +91,6 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         limit: 500,
         offset: 0,
     })?;
-    let records = records
-        .into_iter()
-        .filter(|r| r.repo_id.as_deref() == params.repo_id || params.repo_id.is_none())
-        .collect::<Vec<_>>();
-
     let mut candidates = Vec::new();
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
