@@ -397,12 +397,14 @@ fn apply_eligible(
 }
 
 fn promotion_reason(action: &str, historical_reason: &Option<String>) -> String {
-    historical_reason.clone().unwrap_or_else(|| match action {
-        "rewrite_historical" => "expired drift-prone memory rewritten as historical fact",
-        "supersede" => "newer evidence supersedes older active memory",
-        _ => "dreamer candidate accepted by deterministic policy",
-    }
-    .to_string())
+    historical_reason.clone().unwrap_or_else(|| {
+        match action {
+            "rewrite_historical" => "expired drift-prone memory rewritten as historical fact",
+            "supersede" => "newer evidence supersedes older active memory",
+            _ => "dreamer candidate accepted by deterministic policy",
+        }
+        .to_string()
+    })
 }
 
 fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
