@@ -64,6 +64,26 @@ pub struct DreamRunAudit {
     pub error_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DreamRunRecord {
+    pub run_id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub mode: String,
+    pub kind: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub watermark_before: Option<String>,
+    pub watermark_after: Option<String>,
+    pub error: Option<String>,
+    pub candidates: usize,
+    pub created: usize,
+    pub archived: usize,
+    pub limits_hit: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DreamRunSummary {
     pub id: String,
@@ -80,6 +100,22 @@ pub struct DreamRunSummary {
     pub archived_count: i64,
     pub rejected_count: i64,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledDreamRunSummary {
+    pub run_id: String,
+    pub status: String,
+    pub completed_at: Option<String>,
+    pub watermark_after: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionActivity {
+    pub started_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub turn_count: usize,
 }
 
 /// Filters applied to a record query.
@@ -303,6 +339,42 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn dream_session_activity(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<SessionActivity> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT MIN(s.started_at), MAX(COALESCE(t.created_at, s.started_at)), COUNT(t.id)
+             FROM sessions s
+             LEFT JOIN visible_turns t ON t.session_id = s.id
+             WHERE s.profile_id = ?1 AND s.workspace_id = ?2",
+        );
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo) = repo_id {
+            sql.push_str(" AND s.repo_id = ?");
+            args.push(Box::new(repo.to_string()));
+        } else {
+            sql.push_str(" AND s.repo_id IS NULL");
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let row = stmt.query_row(params_ref.as_slice(), |row| {
+            Ok(SessionActivity {
+                started_at: row.get(0)?,
+                last_activity_at: row.get(1)?,
+                turn_count: row.get::<_, i64>(2)? as usize,
+            })
+        })?;
+        Ok(row)
     }
 
     // ------------------------------------------------------------------
@@ -1046,6 +1118,111 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // Dream run audit/watermarks
+    // ------------------------------------------------------------------
+
+    pub fn record_dream_run(&self, run: &DreamRunRecord) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO dream_runs(
+                run_id, profile_id, workspace_id, repo_id, mode, kind, status,
+                started_at, completed_at, watermark_before, watermark_after, error,
+                candidates, created, archived, limits_hit
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(run_id) DO UPDATE SET
+                status = excluded.status,
+                completed_at = excluded.completed_at,
+                watermark_after = excluded.watermark_after,
+                error = excluded.error,
+                candidates = excluded.candidates,
+                created = excluded.created,
+                archived = excluded.archived,
+                limits_hit = excluded.limits_hit",
+            params![
+                run.run_id,
+                run.profile_id,
+                run.workspace_id,
+                run.repo_id,
+                run.mode,
+                run.kind,
+                run.status,
+                run.started_at,
+                run.completed_at,
+                run.watermark_before,
+                run.watermark_after,
+                run.error,
+                run.candidates as i64,
+                run.created as i64,
+                run.archived as i64,
+                serde_json::to_string(&run.limits_hit).unwrap_or_else(|_| "[]".to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_scheduled_dream_run(&self) -> Result<Option<ScheduledDreamRunSummary>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                "SELECT run_id, status, completed_at, watermark_after, error
+                 FROM dream_runs
+                 WHERE kind = 'scheduled'
+                 ORDER BY started_at DESC, run_id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(ScheduledDreamRunSummary {
+                        run_id: row.get(0)?,
+                        status: row.get(1)?,
+                        completed_at: row.get(2)?,
+                        watermark_after: row.get(3)?,
+                        error: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn scheduled_dream_watermark(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let result = if let Some(repo_id) = repo_id {
+            conn.query_row(
+                "SELECT watermark_after
+                 FROM dream_runs
+                 WHERE kind = 'scheduled' AND status = 'ok'
+                   AND watermark_after IS NOT NULL
+                   AND profile_id = ?1 AND workspace_id = ?2 AND repo_id = ?3
+                 ORDER BY completed_at DESC, run_id DESC
+                 LIMIT 1",
+                params![profile_id, workspace_id, repo_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                "SELECT watermark_after
+                 FROM dream_runs
+                 WHERE kind = 'scheduled' AND status = 'ok'
+                   AND watermark_after IS NOT NULL
+                   AND profile_id = ?1 AND workspace_id = ?2 AND repo_id IS NULL
+                 ORDER BY completed_at DESC, run_id DESC
+                 LIMIT 1",
+                params![profile_id, workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        Ok(result)
+    }
+
+    // ------------------------------------------------------------------
     // Sync cursors
     // ------------------------------------------------------------------
 
@@ -1197,6 +1374,7 @@ impl Store {
                         source_window_end, created_count, archived_count,
                         rejected_count, error_summary
                  FROM dream_runs
+                 WHERE id IS NOT NULL
                  ORDER BY started_at DESC
                  LIMIT 1",
                 [],

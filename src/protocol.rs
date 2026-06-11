@@ -94,7 +94,7 @@ pub struct StatusResponse {
     pub provider_version: String,
     pub api_version: String,
     pub storage_schema_version: i64,
-    /// `ok` | `degraded` | `unavailable`
+    /// `ok` | `degraded` | `unavailable` | `local_only` | `auth_required` | `auth_missing`
     pub status: String,
     pub storage: StorageStatus,
     pub active_profiles: Vec<String>,
@@ -123,6 +123,18 @@ pub struct DreamRunStatus {
     pub archived: i64,
     pub rejected: i64,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDreamStatus {
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_watermark: Option<String>,
+    pub next_eligible_run: Option<String>,
+    pub degraded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +441,16 @@ pub struct DreamResponse {
     pub archived: Vec<String>,
     pub created: Vec<String>,
     pub authority: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDreamResponse {
+    pub status: String,
+    pub reason: Option<String>,
+    pub run: Option<DreamResponse>,
+    pub watermark_before: Option<String>,
+    pub watermark_after: Option<String>,
+    pub limits_hit: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

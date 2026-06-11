@@ -16,6 +16,22 @@ and `provider = "codex_memoryd"`.
 > [Historical Codex-side delta from PR #55](#historical-codex-side-delta-from-pr-55)
 > for the migration notes. This repo does not modify `codex/`.
 
+## Local-only transport and auth contract
+
+Supported direct daemon use is local-only:
+
+- default bind `127.0.0.1:8787` (or `[::1]`/`localhost`) for same-host Codex;
+- Docker Compose publishing `127.0.0.1:8787:8787` on the host while the daemon
+  binds `0.0.0.0:8787` inside the container;
+- `/healthz` stays a simple unauthenticated liveness endpoint.
+
+There is currently no bearer-token, tenant isolation, or production remote auth
+implementation for `codex-memoryd`. If `/v1/*` is reachable on a non-loopback
+interface, that deployment is unsupported unless an external authenticated tunnel
+or reverse proxy supplies the missing protection. In that case `/v1/status`
+reports `status = "auth_missing"` with a warning instead of implying remote
+production safety.
+
 ## Response envelope
 
 Every endpoint except `GET /v1/export` returns the common envelope (SPEC §5.5):
@@ -65,6 +81,14 @@ Stable error codes (SPEC §14): `invalid_request`, `missing_profile`,
 | `POST /v1/forget` | Archive / delete | memory management |
 | `GET /v1/export` | Safe record export | backup / migration |
 
+Dreamer integration is deliberately preview-first. `codex-memoryd dream
+--preview` is the current local trust boundary; a future `/v1/dream` endpoint may
+mirror it only after the same service, policy, provenance, and fail-open
+contracts are in place. Dreamer output is recall input, not authority: it
+proposes evidence-backed candidate memories from safe visible turns, conclusions,
+checkpoints, and imported local memories, then requires preview and policy-gated
+apply before durable records change.
+
 ## Recall (pre-turn)
 
 Request:
@@ -109,7 +133,8 @@ preferences → broad/old memory. Results are packed to `max_tokens`
 (default 1200). Archived and `secret_blocked` records are never returned.
 
 **Fail-open contract**: if the provider is down or returns an error, Codex must
-proceed with the turn as if recall returned empty. Recall is best-effort.
+proceed with the turn as if recall returned empty. Recall is best-effort and must
+not block the user path.
 
 ## Visible-turn writeback
 
@@ -128,10 +153,11 @@ proceed with the turn as if recall returned empty. Recall is best-effort.
 Response `data`: `{ "accepted": 2, "rejected": 0, "rejections": [], "source_ids": [...], "derived_record_ids": [...] }`.
 
 Rules: **hidden reasoning is never sent**. Each message is screened for secrets
-and injection; rejected messages appear in `rejections` with a code. Accepted
-messages are stored as `visible_turns` + `memory_sources`, and high-signal
-content (preferences/decisions/commands/gotchas/conventions) derives a memory
-record. Writeback errors must not fail the user's turn.
+and injection; rejected messages appear in `rejections` with a code and bounded
+reason, never with the raw rejected content. Accepted messages are stored as
+`visible_turns` + `memory_sources`, and high-signal content
+(preferences/decisions/commands/gotchas/conventions) derives a memory record.
+Writeback errors must not fail the user's turn.
 
 ## Local Codex memory import
 
@@ -234,20 +260,29 @@ model tokens:
 {
   "provider_name": "codex-memoryd", "provider_version": "0.1.0",
   "api_version": "v1", "storage_schema_version": 2,
-  "status": "ok",
+  "status": "local_only",
   "storage": { "kind": "sqlite", "path": "/data/memory.db", "writable": true },
   "active_profiles": ["personal"], "active_workspaces": ["josh-personal"],
   "last_sync": null, "pending_writes": 0,
   "local_import": { "status": "unknown", "last_preview_at": null, "last_apply_at": null, "unsynced_count": 0 },
-  "features": { "fts5": true, "search_mode": "fts5", "metrics": { "...": 0 } },
+  "features": { "fts5": true, "search_mode": "fts5", "exposure": "local_only", "auth": "none", "metrics": { "...": 0 } },
   "degraded_reasons": []
 }
 ```
 
-`status` is `degraded` when the store reports a fallback (e.g. FTS5 unavailable)
-and `unavailable` when storage is not writable. The runtime uses
-`local_import.status` to decide whether to show the "local memories unsynced"
-banner.
+`status` values are:
+
+- `local_only`: healthy storage and loopback-only exposure (the normal local
+  default);
+- `auth_missing`: non-loopback bind/exposure without built-in auth; unsupported
+  for production remote use;
+- `degraded`: usable storage with a fallback such as LIKE search instead of
+  FTS5;
+- `unavailable`: storage is not writable or the provider cannot serve memory;
+- `ok` / `auth_required`: reserved for a future authenticated remote mode.
+
+The runtime uses `local_import.status` to decide whether to show the "local
+memories unsynced" banner.
 
 ## Config contract & compatibility matrix
 

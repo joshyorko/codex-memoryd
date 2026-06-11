@@ -5,7 +5,7 @@
     "provider_version": "0.1.0",
     "api_version": "v1",
     "storage_schema_version": 2,
-    "status": "ok",
+    "status": "local_only",
     "storage": {
       "kind": "sqlite",
       "path": "/data/memory.db",
@@ -30,7 +30,9 @@
       "checkpoints": true,
       "export": true,
       "cross_profile_policy": "default_deny",
-      "max_recall_tokens": 1200
+      "max_recall_tokens": 1200,
+      "exposure": "local_only",
+      "auth": "none"
     },
     "degraded_reasons": []
   },

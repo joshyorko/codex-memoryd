@@ -89,8 +89,7 @@ async fn parse_body<T: serde::de::DeserializeOwned>(bytes: axum::body::Bytes) ->
         // Allow empty body to deserialize to default (all-optional structs).
         return serde_json::from_slice(b"{}").map_err(Error::from);
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| Error::invalid_request(format!("invalid JSON body: {e}")))
+    serde_json::from_slice(&bytes).map_err(|_| Error::invalid_request("invalid JSON body"))
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +259,9 @@ async fn export_handler(
 
 /// Bind and serve until shutdown signal.
 pub async fn serve(service: Service, bind: &str) -> anyhow::Result<()> {
+    if service.config.dream_scheduler.enabled {
+        spawn_dream_scheduler(service.clone());
+    }
     let app = router(service);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local = listener.local_addr()?;
@@ -268,6 +270,19 @@ pub async fn serve(service: Service, bind: &str) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn spawn_dream_scheduler(service: Service) {
+    let interval_seconds = service.config.dream_scheduler.interval_seconds;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        loop {
+            interval.tick().await;
+            if let Err(err) = service.scheduled_dream(None) {
+                tracing::warn!(error = %err, "scheduled Dreamer run failed");
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

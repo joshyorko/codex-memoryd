@@ -13,15 +13,18 @@ use serde_json::Value;
 
 /// Boot the server in a background tokio runtime thread and return its base URL.
 fn boot() -> (String, std::thread::JoinHandle<()>) {
+    boot_with_config(Config {
+        default_workspace: "josh-personal".to_string(),
+        ..Default::default()
+    })
+}
+
+fn boot_with_config(config: Config) -> (String, std::thread::JoinHandle<()>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async move {
             let store = Store::open(":memory:").expect("store");
-            let config = Config {
-                default_workspace: "josh-personal".to_string(),
-                ..Default::default()
-            };
             let service = Service::new(store, config);
             let app = router(service);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -58,6 +61,8 @@ fn http_status_recall_sync_roundtrip() {
     assert_eq!(status["ok"], json!(true));
     assert_eq!(status["data"]["provider_name"], json!("codex-memoryd"));
     assert_eq!(status["data"]["api_version"], json!("v1"));
+    assert_eq!(status["data"]["status"], json!("local_only"));
+    assert_eq!(status["data"]["features"]["exposure"], json!("local_only"));
     assert!(status["request_id"].as_str().unwrap().starts_with("req_"));
 
     // POST /v1/conclusions creates a record.
@@ -116,6 +121,68 @@ fn http_status_recall_sync_roundtrip() {
     assert_eq!(preview["ok"], json!(true));
     assert_eq!(preview["data"]["mode"], json!("preview"));
     assert_eq!(preview["data"]["created"], json!(0));
+}
+
+#[test]
+fn http_status_reports_auth_missing_for_non_loopback_config() {
+    let (base, _handle) = boot_with_config(Config {
+        bind: "0.0.0.0:8787".to_string(),
+        default_workspace: "josh-personal".to_string(),
+        ..Default::default()
+    });
+    let http = client();
+
+    let status: Value = http
+        .get(format!("{base}/v1/status"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(status["ok"], json!(true));
+    assert_eq!(status["data"]["status"], json!("auth_missing"));
+    assert_eq!(status["data"]["features"]["auth"], json!("none"));
+    assert!(status["warnings"].as_array().unwrap().iter().any(|w| w
+        .as_str()
+        .unwrap()
+        .contains("remote /v1 exposure is unsupported")));
+}
+
+#[test]
+fn http_error_bodies_are_bounded_and_do_not_echo_rejected_content() {
+    let (base, _handle) = boot();
+    let http = client();
+
+    let bad_json = "not-json raw-rejected-content";
+    let resp = http
+        .post(format!("{base}/v1/recall"))
+        .header("content-type", "application/json")
+        .body(bad_json)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.text().unwrap();
+    assert!(body.len() < 512);
+    assert!(!body.contains("raw-rejected-content"));
+    assert!(body.contains("invalid JSON body"));
+
+    let bad_actor = "raw-rejected-actor";
+    let invalid_actor: Value = http
+        .post(format!("{base}/v1/turns"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "session": { "id": "s1", "source": "test" },
+            "messages": [
+                { "actor": bad_actor, "content": "hello" }
+            ]
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(invalid_actor["ok"], json!(true));
+    assert_eq!(invalid_actor["data"]["rejected"], json!(1));
+    assert!(!invalid_actor.to_string().contains(bad_actor));
 }
 
 #[test]

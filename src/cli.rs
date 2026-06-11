@@ -147,6 +147,8 @@ pub enum Command {
         preview: bool,
         #[arg(long)]
         apply: bool,
+        #[arg(long, conflicts_with_all = ["preview", "apply"])]
+        scheduled: bool,
         #[arg(long)]
         now: Option<String>,
         #[arg(long)]
@@ -218,10 +220,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             repo,
             preview,
             apply,
+            scheduled,
             now,
             since,
         } => {
             let service = cli.open_service(None)?;
+            if *scheduled {
+                let resp = service.scheduled_dream(now.clone())?;
+                print_json(&resp)?;
+                return Ok(());
+            }
             let mode = if *apply {
                 "apply"
             } else if *preview {
@@ -389,6 +397,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 "storage_writable": status.storage.writable,
                 "storage_path": status.storage.path,
                 "fts5": status.features.get("fts5"),
+                "dream_scheduler": status.features.get("dream_scheduler"),
                 "schema_version": status.storage_schema_version,
                 "status": status.status,
                 "degraded_reasons": status.degraded_reasons,
