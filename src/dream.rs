@@ -261,14 +261,17 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
 
 fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
     let mut seed = format!(
-        "{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
         params.profile.as_str(),
         params.workspace,
         params.repo_id.unwrap_or(""),
         params.mode,
-        params.now,
-        params.source_window_start.unwrap_or("")
+        params.now
     );
+    if let Some(source_window_start) = params.source_window_start {
+        seed.push('\x1f');
+        seed.push_str(source_window_start);
+    }
     for record in records {
         seed.push('\x1f');
         seed.push_str(&record.id);
