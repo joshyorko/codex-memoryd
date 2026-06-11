@@ -45,13 +45,13 @@ fn conclude_req(profile: &str, workspace: &str, content: &str) -> ConclusionsReq
 }
 
 #[test]
-fn status_reports_ok_and_schema() {
+fn status_reports_local_only_and_schema() {
     let svc = service();
     let status = svc.status().expect("status");
     assert_eq!(status.provider_name, "codex-memoryd");
     assert_eq!(status.api_version, "v1");
     assert_eq!(status.storage_schema_version, 1);
-    assert!(matches!(status.status.as_str(), "ok" | "degraded"));
+    assert!(matches!(status.status.as_str(), "local_only" | "degraded"));
     assert!(status.storage.writable);
 }
 

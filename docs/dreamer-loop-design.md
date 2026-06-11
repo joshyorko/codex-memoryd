@@ -69,7 +69,10 @@ here so the contract is fixed before a daemon exists.
 ## 3. Dream report (preview and apply output)
 
 Both modes return the same shape; `preview` writes nothing, `apply` fills the
-`created`/`archived` counts.
+`created`/`archived` counts. Candidate state is report-local
+(`accepted`, `quarantined`, `rejected`). Memory state is the proposed record
+state (`planned`, `active`, `blocked`, `completed`, `historical`,
+`superseded`) carried in metadata on apply.
 
 ```json
 {
@@ -94,10 +97,17 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
       "proposed_scope": "profile",
       "content": "Prefers repo-native commands (cargo test over ad-hoc scripts).",
       "confidence": 0.82,
-      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "candidate_state": "accepted",
+      "threshold_reason": "strong user evidence weight 3.0 >= preference threshold",
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…", "class": "user_turn", "weight": 1.0 } ],
       "evidence_counts": {
         "visible_turns": 3, "conclusions": 0, "checkpoints": 0,
         "imported_memories": 0, "active_records": 0
+      },
+      "evidence_weights": {
+        "user_turns": 3.0, "assistant_turns": 0.0, "conclusions": 0.0,
+        "checkpoints": 0.0, "imported_memories": 0.0, "active_records": 0.0,
+        "total_primary": 3.0, "total_corrob": 0.0
       },
       "promotion_reason": "repeated user steering across 3 turns",
       "state": "active",
@@ -115,10 +125,17 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
       "proposed_scope": "workspace",
       "content": "Storage uses rusqlite bundled SQLite (replaces earlier 'TBD storage').",
       "confidence": 0.9,
-      "evidence": [ { "kind": "conclusion", "id": "concl_…" } ],
+      "candidate_state": "accepted",
+      "threshold_reason": "explicit conclusion plus active-record conflict on same subject_key",
+      "evidence": [ { "kind": "conclusion", "id": "concl_…", "class": "conclusion", "weight": 2.0 } ],
       "evidence_counts": {
         "visible_turns": 0, "conclusions": 1, "checkpoints": 0,
         "imported_memories": 0, "active_records": 1
+      },
+      "evidence_weights": {
+        "user_turns": 0.0, "assistant_turns": 0.0, "conclusions": 2.0,
+        "checkpoints": 0.0, "imported_memories": 0.0, "active_records": 0.0,
+        "total_primary": 2.0, "total_corrob": 0.0
       },
       "promotion_reason": "newer explicit conclusion supersedes stale active record",
       "state": "completed",
@@ -138,10 +155,17 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
       "proposed_scope": "workspace",
       "content": "[redacted rejected evidence]",
       "confidence": 0.0,
-      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "candidate_state": "rejected",
+      "threshold_reason": "policy rejected secret-like content before promotion",
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…", "class": "user_turn", "weight": 1.0 } ],
       "evidence_counts": {
         "visible_turns": 1, "conclusions": 0, "checkpoints": 0,
         "imported_memories": 0, "active_records": 0
+      },
+      "evidence_weights": {
+        "user_turns": 1.0, "assistant_turns": 0.0, "conclusions": 0.0,
+        "checkpoints": 0.0, "imported_memories": 0.0, "active_records": 0.0,
+        "total_primary": 1.0, "total_corrob": 0.0
       },
       "promotion_reason": "secret-like content detected",
       "drift_prone": false,
@@ -157,10 +181,17 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
       "proposed_scope": "workspace",
       "content": "Run `cargo test` before merging.",
       "confidence": 0.42,
-      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "candidate_state": "quarantined",
+      "threshold_reason": "assistant-only proposal has weak evidence without adoption",
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…", "class": "assistant_turn", "weight": 0.25 } ],
       "evidence_counts": {
         "visible_turns": 1, "conclusions": 0, "checkpoints": 0,
         "imported_memories": 0, "active_records": 0
+      },
+      "evidence_weights": {
+        "user_turns": 0.0, "assistant_turns": 0.25, "conclusions": 0.0,
+        "checkpoints": 0.0, "imported_memories": 0.0, "active_records": 0.0,
+        "total_primary": 0.0, "total_corrob": 0.0
       },
       "promotion_reason": "assistant-only proposal requires user adoption",
       "drift_prone": false,
@@ -194,6 +225,31 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
   evidence yields `created: 0, archived: 0`. Dedupe reuses the existing
   content-hash mechanism in [`src/store.rs`](../src/store.rs) /
   [`src/ingest.rs`](../src/ingest.rs).
+
+### 3.1 Deterministic evidence classes and thresholds
+
+`subject_key` is required on every candidate and is the deterministic anchor for
+grouping, thresholding, and supersession. The normalizer lowercases, removes
+volatile words, keeps the record family and scope, and includes repo identity
+when repo-scoped so unrelated workspaces do not collide.
+
+Initial evidence classes are weighted asymmetrically:
+
+| Class | Weight | Role |
+| --- | --- | --- |
+| `user_turn` | `1.0` | Strong primary evidence. |
+| `conclusion` | `2.0` | Strong explicit evidence. |
+| `checkpoint` | `1.5` | Strong for task/repo state, next steps, gotchas, and conventions. |
+| `assistant_turn` | `0.25` | Weak unless adopted by later user/checkpoint/conclusion evidence. |
+| `imported_memory` | `0.5` | Corroborating only; cannot create active memory alone. |
+| `active_record` | `0.0` | Conflict/supersession/expiry input only; never self-reinforcement. |
+
+Threshold rules are deterministic and family-specific. Examples: repeated user
+steering must cross the preference threshold across distinct evidence; durable
+project decisions may promote from explicit conclusions; checkpoints can promote
+task state; assistant-only proposals and imported-summary-only candidates are
+quarantined or rejected. Same-turn repetition does not boost, explicit user
+adoption boosts, and hedging language lowers confidence.
 
 ## 4. Synthesis backend boundary
 
@@ -271,9 +327,10 @@ When newer evidence contradicts an active record on the same subject:
   `/v1/forget` archival default);
 - record `promotion_reason` and `evidence_window` provenance.
 
-"Same subject" in the heuristic MVP = same `record_type` + high lexical overlap
-within the same profile/workspace (and repo, when scoped to repo). An LLM
-synthesizer can refine subject matching later.
+"Same subject" in the heuristic MVP = same deterministic `subject_key` within
+the same profile/workspace (and repo, when scoped to repo), with lexical overlap
+as a guardrail for early heuristics. An LLM synthesizer can refine wording later,
+but it must not bypass the `subject_key` grouping and supersession anchor.
 
 ### 5.4 Provenance metadata (no migration)
 
@@ -282,7 +339,14 @@ Every synthesized record carries, in the existing `metadata` JSON value:
 ```json
 {
   "origin": "dreamer",
-  "run_id": "dream_…",
+  "dream_run_id": "dream_…",
+  "subject_key": "decision:workspace:storage-backend-rusqlite",
+  "evidence_ids": ["concl_…", "ckpt_…"],
+  "evidence_count": 2,
+  "user_evidence_count": 0,
+  "assistant_evidence_count": 0,
+  "first_seen_at": "…",
+  "last_seen_at": "…",
   "evidence_window": { "start": "…", "end": "…" },
   "state": "completed",
   "drift_prone": false,
@@ -350,6 +414,22 @@ Event shape:
 { "kind": "memory_record", "type": "decision", "content": "…", "created_at": "…" }
 ```
 
+Each `scenario.jsonl` SHOULD have a `scenario.expected.json` sidecar. Sidecars
+make the proof explicit instead of relying on ad-hoc test prose:
+
+```json
+{
+  "expect_preview": { "accepted": [], "rejected": [], "quarantined": [], "stale": [] },
+  "expect_apply": { "created": 0, "archived": 0, "idempotent_second_apply": true },
+  "expect_recall_before": { "query": "…", "must_not_contain": [] },
+  "expect_recall_after": { "query": "…", "must_contain": [], "must_not_contain": [] }
+}
+```
+
+Recall-before/after assertions are the key proof metric: accepted memory must
+improve later coding-agent recall for the scenario query while forbidden content
+(secrets, stale active facts, boundary-crossing facts) remains absent.
+
 Seeded scenarios:
 
 | Fixture | What it proves |
@@ -380,20 +460,30 @@ For each scenario the harness checks the dream report:
   later conclusions/checkpoints say implemented/fixed/merged/deployed
   (`planned_vs_completed_transition`);
 - repo gotcha promoted with `scope = repo` (`repo_gotcha`);
-- provenance present on every candidate (`promotion_reason`, `evidence`,
+- provenance present on every candidate (`subject_key`, `promotion_reason`,
+  `threshold_reason`, `evidence`, `evidence_counts`, `evidence_weights`,
   `evidence_window`);
+- sidecar recall-before/after assertions show recall improves where expected and
+  does not leak forbidden content;
 - **apply is idempotent** — second apply over the same window yields
   `created: 0`.
 
-## 8. Phase boundaries
+## 8. Implementation order
 
-- **Phase 1 (preview skeleton):** `src/dream.rs`, `codex-memoryd dream
-  --preview`, deterministic evidence gathering, heuristic `DreamSynthesizer`,
-  report assembly, **no durable writes**. Tests: no-write behavior + policy
-  rejection over the seeded fixtures.
-- **Phase 2 (apply):** idempotent writes, supersession/archive, provenance
-  metadata, `dream_runs` migration, conformance tests. Reuse
-  [`src/policy.rs`](../src/policy.rs) and [`src/store.rs`](../src/store.rs);
-  add no parallel write path.
-- **Phase 3 (daemon)** and **Phase 4 (MCP/App)** are out of scope here; see the
-  research doc's phased plan.
+This design is implemented and hardened in the issue order below, so preview,
+thresholds, apply, audit, reliability, and portability do not collapse into an
+autonomous writer:
+
+1. #10 deterministic preview-only source gathering and report shape.
+2. #11 fixture sidecars with preview/apply and recall-before/after assertions.
+3. #19 asymmetric evidence weighting, `subject_key`, thresholds, and candidate
+   states.
+4. #13 staleness, memory state transitions, drift/expiry metadata, and
+   supersession.
+5. #12 idempotent, policy-gated apply with required provenance metadata.
+6. #20 safe dream-run audit rows and incremental watermarks.
+7. #14 live Codex provider/hybrid smoke and daemon-down fail-open proof.
+8. #15 loopback/auth/status/fail-open reliability contract.
+9. #17 one-command local install and first-run demo.
+10. #16 local-first coding-memory bakeoff with defensible public claims.
+11. #18 local MCP recall/search/conclude/checkpoint/dream-preview tools.

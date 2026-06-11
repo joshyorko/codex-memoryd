@@ -72,6 +72,9 @@ pub struct DreamParams<'a> {
     pub repo_id: Option<&'a str>,
     pub mode: &'a str,
     pub now: &'a str,
+    pub recency_cutoff: Option<&'a str>,
+    pub max_records: usize,
+    pub max_candidates: Option<usize>,
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
@@ -82,8 +85,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         record_type: None,
         scope: None,
         include_archived: false,
-        recency_cutoff: None,
-        limit: 500,
+        recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
+        limit: params.max_records,
         offset: 0,
     })?;
     let records = records
@@ -172,6 +175,9 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     }
 
     dedupe_candidates(&mut candidates);
+    if let Some(max) = params.max_candidates {
+        candidates.truncate(max);
+    }
 
     let run_id = stable_run_id(params, &records);
     let mut archived = Vec::new();
