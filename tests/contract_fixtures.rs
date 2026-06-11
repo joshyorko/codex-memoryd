@@ -9,9 +9,11 @@
 use std::path::PathBuf;
 
 use codex_memoryd::config::Config;
+use codex_memoryd::domain::VisibleTurn;
 use codex_memoryd::protocol::*;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
+use serde_json::json;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -122,4 +124,38 @@ fn status_response_fixture_matches_protocol_shape() {
     assert_eq!(live_json["provider_name"], "codex-memoryd");
     assert_eq!(live_json["api_version"], "v1");
     assert_eq!(live_json["storage_schema_version"], 1);
+}
+
+#[test]
+fn dream_preview_report_fixture_matches_stable_shape() {
+    let svc = service();
+    svc.store
+        .ensure_session("sess_fixture", "personal", "test", None, None, "test")
+        .unwrap();
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: "turn_user_pref".to_string(),
+            session_id: "sess_fixture".to_string(),
+            actor: "user".to_string(),
+            content: "Prefer cargo test for validation".to_string(),
+            created_at: "2026-01-01T00:01:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+
+    let report = svc
+        .dream(DreamRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("test".to_string()),
+            repo: None,
+            mode: Some("preview".to_string()),
+            now: Some("2026-01-02T00:00:00Z".to_string()),
+        })
+        .expect("dream preview runs");
+    let live = serde_json::to_value(report).expect("serialize report");
+    let fixture: serde_json::Value = serde_json::from_str(&read_fixture(
+        "dreaming/preview_user_preference.report.json",
+    ))
+    .expect("fixture JSON");
+    assert_eq!(live, fixture);
 }

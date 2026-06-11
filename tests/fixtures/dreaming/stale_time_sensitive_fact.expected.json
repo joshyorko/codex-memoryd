@@ -1,0 +1,17 @@
+{
+  "expect_preview": {
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [],
+    "stale": [
+      {
+        "subject_key": "stale:relative-time-storage-blocker",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "relative_time_status_stale",
+        "evidence_count": 2,
+        "must_contain": ["drift-prone"],
+        "must_not_contain": ["will deploy the fix this week", "patch it tomorrow"]
+      }
+    ]
+  }
+}

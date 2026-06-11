@@ -98,6 +98,9 @@ codex-memoryd search --profile personal --workspace josh-personal --query "axum"
 codex-memoryd conclude --profile personal --workspace josh-personal \
   --content "Decision: use rusqlite bundled for storage"
 
+# Preview deterministic Dreamer candidates (no durable writes)
+codex-memoryd dream --profile personal --workspace josh-personal --preview
+
 # Import local Codex memory (provider local-ingest mode reads the filesystem)
 codex-memoryd sync-local --preview ~/.codex/memories
 codex-memoryd sync-local --apply   ~/.codex/memories
@@ -195,23 +198,13 @@ contacted. In `provider`/`hybrid` mode the runtime fails open: if the daemon is
 unreachable, recall returns empty and writes are best-effort (in `hybrid`, local
 memory continues to serve).
 
-### ⚠️ Status vs. Codex PR #55
+### Status vs. Codex tap-release
 
-The shape above is the **agreed target**. Codex **PR #55 as it currently
-stands** exposes a narrower contract and does not yet reach this daemon:
-
-| Field | Final shape | PR #55 today |
-| --- | --- | --- |
-| `backend` values | `local \| provider \| hybrid` | `local \| honcho \| hybrid` |
-| provider selector | `provider = "honcho" \| "codex_memoryd"` | none (backend doubles as selector) |
-| provider URL | `provider_url` | `honcho_base_url` |
-| first-run import | `local_import_policy` | not present |
-| wired HTTP client | Honcho v3 **and** codex-memoryd `/v1` | Honcho v3 only (both `honcho` and `hybrid`) |
-
-So on unmodified PR #55, `backend = "provider"` fails to load (unknown enum
-value) and no setting makes Codex speak codex-memoryd's `/v1` protocol. The
-exact codex-side delta required to honor the final shape is tracked in
-[`docs/codex-integration.md`](./docs/codex-integration.md#codex-side-delta-for-pr-55).
+The shape above is implemented by `joshyorko/codex@tap-release`, including the
+`provider = "codex_memoryd"` adapter, `provider_url`, manual local import, and
+`visible_turns` writeback over this daemon's `/v1` API. Older Codex PR #55
+snapshots exposed only the Honcho-shaped subset; the historical delta is kept in
+[`docs/codex-integration.md`](./docs/codex-integration.md#historical-codex-side-delta-from-pr-55).
 This repo does not modify `codex/`.
 
 Typical first-run switchover (once both sides ship the final shape):
@@ -223,6 +216,19 @@ codex memory import-local --preview   # safe: writes nothing
 codex memory import-local --apply     # idempotent
 codex
 ```
+
+Live tap-release proof smoke:
+
+```bash
+# After building or otherwise obtaining a joshyorko/codex@tap-release binary:
+CODEX_BIN=/tmp/codex-tap-release/codex-rs/target/debug/codex \
+  scripts/codex-tap-release-smoke.sh
+```
+
+The smoke starts `codex-memoryd` on loopback, runs Codex in `provider` and
+`hybrid` modes, captures `/v1/status`, recall authority, turn writeback counts,
+local import preview/apply idempotency, and verifies daemon-down fail-open
+behavior.
 
 See [`docs/codex-integration.md`](./docs/codex-integration.md) for the full
 endpoint map, the local-import wire format, and the fail-open contract.

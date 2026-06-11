@@ -11,11 +11,10 @@ behavior; codex-memoryd is selected when `backend = "provider"` (or `"hybrid"`)
 and `provider = "codex_memoryd"`.
 
 > **Contract status.** The config shape and wire payloads in this document are
-> the agreed target. Codex **PR #55** currently exposes a narrower config
-> (`backend = local | honcho | hybrid`, no `provider`/`provider_url`, provider
-> URL carried by `honcho_base_url`) and only wires the Honcho v3 client. See
-> [Codex-side delta for PR #55](#codex-side-delta-for-pr-55) for exactly what
-> must change on the codex side. This repo does not modify `codex/`.
+> the contract implemented by `joshyorko/codex@tap-release`. Older Codex PR #55
+> snapshots only exposed the Honcho-shaped subset; see
+> [Historical Codex-side delta from PR #55](#historical-codex-side-delta-from-pr-55)
+> for the migration notes. This repo does not modify `codex/`.
 
 ## Response envelope
 
@@ -277,7 +276,53 @@ cross_profile_policy = "default_deny"
 
 Field defaults and meanings are normative in [`../SPEC.md` §11.1](../SPEC.md).
 
-## Codex-side delta for PR #55
+## Live tap-release smoke
+
+The live smoke script is proof tooling only; it is not part of normal
+`cargo test`, and it does not make this repository clone or build the Codex fork
+unless you choose to do that as part of preparing `CODEX_BIN`.
+
+```bash
+# One-time setup outside this repository, or use any existing tap-release binary.
+git clone --branch tap-release https://github.com/joshyorko/codex /tmp/codex-tap-release
+cargo build --manifest-path /tmp/codex-tap-release/codex-rs/Cargo.toml \
+  -p codex-cli --bin codex
+
+# From this repository:
+CODEX_BIN=/tmp/codex-tap-release/codex-rs/target/debug/codex \
+  scripts/codex-tap-release-smoke.sh
+```
+
+The script starts `codex-memoryd` on `http://127.0.0.1:8787`, isolates
+`CODEX_HOME` under a temporary directory, configures Codex with:
+
+```toml
+[memories]
+backend = "provider"              # then repeated with "hybrid"
+provider = "codex_memoryd"
+provider_url = "http://127.0.0.1:8787"
+write_policy = "visible_turns"
+local_import_policy = "manual"
+```
+
+It captures pasteable output for:
+
+- `/v1/status`;
+- `/v1/conclusions`;
+- `/v1/recall`, including `authority = "recall_not_authority"`;
+- `/v1/turns` accepted/rejected writeback counts;
+- `/v1/sync/local-codex-memory` preview, apply, and second apply
+  idempotency;
+- Codex `memory status`, `debug prompt-input`, and `memory import-local` in
+  `provider` mode;
+- Codex `memory status` and `debug prompt-input` in `hybrid` mode;
+- daemon-down fail-open behavior, where the hybrid prompt build must still exit
+  successfully.
+
+The final line prints the temporary `smoke-output.txt` path so it can be pasted
+into an OpenAI-facing demo or issue comment.
+
+## Historical Codex-side delta from PR #55
 
 PR #55 is the foundation (config struct, `PortableMemoryRuntime`,
 `MemoryProvider` trait, `local | honcho | hybrid` selection, turn-input recall,
@@ -303,10 +348,10 @@ not implement them** (no edits to `codex/`).
    `portable_provider_for_settings` when `provider = "codex_memoryd"`. Today both
    `Honcho` and `Hybrid` route to the Honcho v3 client only.
 
-Until those land, on unmodified PR #55: `backend = "provider"` fails config load
-(unknown enum value), and there is no setting that routes durable memory to
-codex-memoryd's `/v1` API. The fixtures in [`../tests/fixtures`](../tests/fixtures)
-let the codex side build and test that client against this exact contract.
+These items have landed on `joshyorko/codex@tap-release`; they remain here as
+historical migration notes for anyone comparing against old PR #55 checkouts.
+The fixtures in [`../tests/fixtures`](../tests/fixtures) let the Codex side
+build and test that client against this exact contract.
 
 ### Request/response shapes the codex-side client must produce
 

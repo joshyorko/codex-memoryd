@@ -82,28 +82,45 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
     "visible_turns": 42, "conclusions": 3, "checkpoints": 2,
     "imported_memories": 7, "active_records": 31
   },
+  "evidence_counts": {
+    "visible_turns": 42, "conclusions": 3, "checkpoints": 2,
+    "imported_memories": 7, "active_records": 31
+  },
   "candidates": [
     {
+      "subject_key": "preference:profile:…",
       "action": "create",
       "proposed_type": "preference",
       "proposed_scope": "profile",
       "content": "Prefers repo-native commands (cargo test over ad-hoc scripts).",
       "confidence": 0.82,
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "evidence_counts": {
+        "visible_turns": 3, "conclusions": 0, "checkpoints": 0,
+        "imported_memories": 0, "active_records": 0
+      },
+      "promotion_reason": "repeated user steering across 3 turns",
       "state": "active",
       "drift_prone": false,
       "expires_at": null,
       "valid_until": null,
       "historical_reason": null,
-      "promotion_reason": "repeated user steering across 3 turns",
-      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
       "supersedes": [],
       "policy": "accept"
     },
     {
+      "subject_key": "decision:workspace:…",
       "action": "supersede",
       "proposed_type": "decision",
+      "proposed_scope": "workspace",
       "content": "Storage uses rusqlite bundled SQLite (replaces earlier 'TBD storage').",
       "confidence": 0.9,
+      "evidence": [ { "kind": "conclusion", "id": "concl_…" } ],
+      "evidence_counts": {
+        "visible_turns": 0, "conclusions": 1, "checkpoints": 0,
+        "imported_memories": 0, "active_records": 1
+      },
+      "promotion_reason": "newer explicit conclusion supersedes stale active record",
       "state": "completed",
       "drift_prone": false,
       "expires_at": null,
@@ -114,7 +131,42 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
     }
   ],
   "rejected": [
-    { "reason": "secret_detected", "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ] }
+    {
+      "subject_key": "rejected:workspace:…",
+      "action": "reject",
+      "proposed_type": "other",
+      "proposed_scope": "workspace",
+      "content": "[redacted rejected evidence]",
+      "confidence": 0.0,
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "evidence_counts": {
+        "visible_turns": 1, "conclusions": 0, "checkpoints": 0,
+        "imported_memories": 0, "active_records": 0
+      },
+      "promotion_reason": "secret-like content detected",
+      "drift_prone": false,
+      "policy": "secret_detected",
+      "supersedes": []
+    }
+  ],
+  "quarantined": [
+    {
+      "subject_key": "command:workspace:…",
+      "action": "quarantine",
+      "proposed_type": "command",
+      "proposed_scope": "workspace",
+      "content": "Run `cargo test` before merging.",
+      "confidence": 0.42,
+      "evidence": [ { "kind": "visible_turn", "id": "turn_…" } ],
+      "evidence_counts": {
+        "visible_turns": 1, "conclusions": 0, "checkpoints": 0,
+        "imported_memories": 0, "active_records": 0
+      },
+      "promotion_reason": "assistant-only proposal requires user adoption",
+      "drift_prone": false,
+      "policy": "assistant_only",
+      "supersedes": []
+    }
   ],
   "stale": [
     {
@@ -134,8 +186,10 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
 }
 ```
 
-- **Preview** sets `created` / `archived` to `0` and persists nothing except,
-  optionally, the `dream_runs` audit row (see §6).
+- **Preview** sets `created` / `archived` to `0` and persists nothing: no memory
+  records, conclusions, checkpoints, visible turns, archives, or `dream_runs`
+  audit rows are written unless a later audit issue explicitly adds
+  preview-run audit rows.
 - **Apply** is idempotent: re-running over the same evidence window with no new
   evidence yields `created: 0, archived: 0`. Dedupe reuses the existing
   content-hash mechanism in [`src/store.rs`](../src/store.rs) /

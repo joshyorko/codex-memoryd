@@ -406,6 +406,7 @@ pub struct DreamResponse {
     pub rejected: Vec<DreamRejection>,
     pub archived: Vec<String>,
     pub created: Vec<String>,
+    pub authority: String,
 }
 
 // ---------------------------------------------------------------------------

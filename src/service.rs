@@ -598,7 +598,11 @@ impl Service {
                 "dream mode must be preview or apply",
             ));
         }
-        let now = req.now.unwrap_or_else(ids::now_rfc3339);
+        let now = req.now.unwrap_or_else(|| {
+            let current = ids::now_rfc3339();
+            let day = current.split('T').next().unwrap_or("1970-01-01");
+            format!("{day}T00:00:00Z")
+        });
         dream::run(
             &self.store,
             &dream::DreamParams {

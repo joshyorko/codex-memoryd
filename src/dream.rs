@@ -172,7 +172,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
 
     dedupe_candidates(&mut candidates);
 
-    let run_id = ids::new_id("dream");
+    let run_id = stable_run_id(params, &records);
     let mut archived = Vec::new();
     let mut created = Vec::new();
     if params.mode == "apply" {
@@ -249,7 +249,29 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         rejected,
         archived,
         created,
+        authority: "recall_not_authority".to_string(),
     })
+}
+
+fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
+    let mut seed = format!(
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id.unwrap_or(""),
+        params.mode,
+        params.now
+    );
+    for record in records {
+        seed.push('\x1f');
+        seed.push_str(&record.id);
+        seed.push('\x1f');
+        seed.push_str(&record.updated_at);
+        seed.push('\x1f');
+        seed.push_str(&record.content);
+    }
+    let hash = ids::sha256_hex(seed.as_bytes());
+    format!("dream_{}", &hash["sha256:".len()..39])
 }
 
 fn push_candidate(
