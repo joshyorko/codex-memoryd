@@ -350,6 +350,7 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 confidence: class.confidence,
                 source_ids: vec![source.id.clone()],
                 content_hash,
+                supersedes: vec![],
                 metadata,
             };
             match store.upsert_record(&new_record)? {

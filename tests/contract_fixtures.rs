@@ -147,7 +147,9 @@ fn dream_preview_report_fixture_matches_stable_shape() {
         .dream(DreamRequest {
             profile: Some("personal".to_string()),
             workspace: Some("test".to_string()),
+            repo: None,
             mode: Some("preview".to_string()),
+            now: Some("2026-01-02T00:00:00Z".to_string()),
         })
         .expect("dream preview runs");
     let live = serde_json::to_value(report).expect("serialize report");

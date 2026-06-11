@@ -70,6 +70,7 @@ pub struct NewRecord {
     pub confidence: f64,
     pub source_ids: Vec<String>,
     pub content_hash: String,
+    pub supersedes: Vec<String>,
     pub metadata: Value,
 }
 
@@ -394,7 +395,7 @@ impl Store {
                 related_files, tags, sensitivity, portability, confidence,
                 source_ids, content_hash, supersedes, created_at, updated_at,
                 last_used_at, archived, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'[]',?15,?15,NULL,0,?16)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16,NULL,0,?17)",
             params![
                 id,
                 new.profile_id,
@@ -410,11 +411,60 @@ impl Store {
                 new.confidence,
                 serde_json::to_string(&new.source_ids)?,
                 new.content_hash,
+                serde_json::to_string(&new.supersedes)?,
                 now,
                 new.metadata.to_string(),
             ],
         )?;
         Ok(UpsertOutcome::Created(id))
+    }
+
+    /// Archive records and annotate their metadata with historical/supersession
+    /// context. Records remain recoverable via include_archived queries.
+    pub fn archive_records_with_metadata(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_archive: &[String],
+        state: &str,
+        historical_reason: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let now = ids::now_rfc3339();
+        let mut archived = Vec::new();
+        let mut not_found = Vec::new();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut select = tx.prepare("SELECT metadata FROM memory_records WHERE id = ?1")?;
+            let mut update = tx.prepare(
+                "UPDATE memory_records SET archived = 1, updated_at = ?1, metadata = ?2 WHERE id = ?3",
+            )?;
+            for id in ids_to_archive {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                let raw: String = select.query_row(params![id], |r| r.get(0)).map_err(|e| {
+                    Error::storage(format!("load metadata for archived record {id}: {e}"))
+                })?;
+                let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+                if !metadata.is_object() {
+                    metadata = serde_json::json!({});
+                }
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("state".to_string(), Value::String(state.to_string()));
+                    obj.insert(
+                        "historical_reason".to_string(),
+                        Value::String(historical_reason.to_string()),
+                    );
+                    obj.insert("archived_at".to_string(), Value::String(now.clone()));
+                }
+                update.execute(params![now, metadata.to_string(), id])?;
+                archived.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        Ok((archived, not_found))
     }
 
     pub fn find_by_content_hash(&self, content_hash: &str) -> Result<Option<MemoryRecord>> {
@@ -1276,6 +1326,7 @@ mod tests {
                 "workspace",
                 content,
             ),
+            supersedes: vec![],
             metadata: Value::Null,
         }
     }

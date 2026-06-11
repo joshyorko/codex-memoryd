@@ -166,6 +166,7 @@ mod tests {
                 "workspace",
                 "exportable content",
             ),
+            supersedes: vec![],
             metadata: serde_json::Value::Null,
         };
         s.upsert_record(&rec).unwrap();

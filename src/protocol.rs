@@ -221,18 +221,6 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Dream preview (Phase 1)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DreamRequest {
-    pub profile: Option<String>,
-    pub workspace: Option<String>,
-    #[serde(default)]
-    pub mode: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Turns (SPEC §6.4)
 // ---------------------------------------------------------------------------
 
@@ -352,6 +340,73 @@ pub struct CheckpointRequest {
 pub struct CheckpointResponse {
     pub id: String,
     pub created_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Dreamer loop (preview/apply)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DreamRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub repo: Option<RepoIdentity>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Deterministic clock override for evals/tests.
+    #[serde(default)]
+    pub now: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamCandidate {
+    pub action: String,
+    #[serde(rename = "type")]
+    pub proposed_type: String,
+    pub content: String,
+    pub confidence: f64,
+    pub state: String,
+    pub drift_prone: bool,
+    pub expires_at: Option<String>,
+    pub valid_until: Option<String>,
+    pub historical_reason: Option<String>,
+    pub supersedes: Vec<String>,
+    pub policy: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamStaleRecord {
+    pub memory_id: String,
+    pub drift_prone: bool,
+    pub state: String,
+    pub expires_at: Option<String>,
+    pub valid_until: Option<String>,
+    pub suggested_action: String,
+    pub historical_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamRejection {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamResponse {
+    pub run_id: String,
+    pub mode: String,
+    pub profile: String,
+    pub workspace: String,
+    pub repo_id: Option<String>,
+    pub now: String,
+    pub candidates: Vec<DreamCandidate>,
+    pub stale: Vec<DreamStaleRecord>,
+    pub rejected: Vec<DreamRejection>,
+    pub archived: Vec<String>,
+    pub created: Vec<String>,
+    pub authority: String,
 }
 
 // ---------------------------------------------------------------------------

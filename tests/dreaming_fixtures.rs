@@ -261,6 +261,7 @@ fn validate_event(path: &Path, line: usize, event: &FixtureEvent) -> Result<(), 
                 ));
             }
         }
+        "dream_clock" => {}
         other => {
             return Err(format!(
                 "{}:{line}: unknown event kind `{other}`",
@@ -355,6 +356,7 @@ fn seed_store(fixture: &LoadedFixture) -> SeededFixture {
                 confidence: 0.7,
                 source_ids: vec![source.id],
                 content_hash,
+                supersedes: vec![],
                 metadata: json!({
                     "origin": "dream_fixture_seed",
                     "fixture": fixture.name,
@@ -406,6 +408,19 @@ fn preview_fixture(fixture: &LoadedFixture) -> DreamPreview {
             0.9,
             vec!["mem_storage_tbd".to_string()],
         )),
+        "planned_vs_completed_transition" => preview.accepted.push(candidate(
+            CandidateState::Accepted,
+            fixture,
+            &[1, 2],
+            "decision:oauth-sync-completed",
+            RecordType::Decision,
+            Scope::Workspace,
+            None,
+            "Decision: OAuth sync was implemented and merged, superseding the earlier planned state.",
+            "newer_evidence_supersedes_planned_fact",
+            0.9,
+            vec![],
+        )),
         "repo_gotcha" => preview.accepted.push(candidate(
             CandidateState::Accepted,
             fixture,
@@ -441,6 +456,19 @@ fn preview_fixture(fixture: &LoadedFixture) -> DreamPreview {
             Scope::Workspace,
             None,
             "Relative-time daemon/storage migration status is drift-prone and should not be promoted as durable memory.",
+            "relative_time_status_stale",
+            0.0,
+            vec![],
+        )),
+        "relative_time_expiry_tomorrow" => preview.stale.push(candidate(
+            CandidateState::Stale,
+            fixture,
+            &[1],
+            "stale:relative-time-expiry-tomorrow",
+            RecordType::TaskCheckpoint,
+            Scope::Workspace,
+            None,
+            "Relative-time startup failure status expired after the deterministic clock advanced.",
             "relative_time_status_stale",
             0.0,
             vec![],
@@ -528,6 +556,7 @@ fn apply_preview(seeded: &SeededFixture, preview: &DreamPreview) -> ApplyReport 
             confidence: cand.confidence,
             source_ids,
             content_hash,
+            supersedes: vec![],
             metadata: json!({
                 "origin": "dream_eval",
                 "subject_key": cand.subject_key,

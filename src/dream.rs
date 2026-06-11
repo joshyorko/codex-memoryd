@@ -1,634 +1,479 @@
-//! Deterministic Dreamer preview. Phase 1 is intentionally read-only: it
-//! gathers bounded evidence from existing tables and emits the exact candidate
-//! objects that a future apply mode would have to policy-gate before writing.
+//! Deterministic Dreamer heuristics for staleness, state transitions, and
+//! supersession. This module is intentionally policy/store-backed and does not
+//! call an LLM.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use serde::Serialize;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::json;
+use time::format_description::well_known::Rfc3339;
+use time::Duration;
+use time::OffsetDateTime;
 
 use crate::domain::MemoryRecord;
 use crate::domain::Profile;
-use crate::domain::RecordType;
 use crate::error::Result;
 use crate::ids;
 use crate::policy;
 use crate::policy::PolicyDecision;
+use crate::protocol::DreamCandidate;
+use crate::protocol::DreamRejection;
+use crate::protocol::DreamResponse;
+use crate::protocol::DreamStaleRecord;
+use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
 
-const EVIDENCE_LIMIT: usize = 100;
-const ACTIVE_RECORD_LIMIT: usize = 200;
+static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(today|tomorrow|tonight|this week|next week|this weekend|currently|right now|soon|as of now|going to|planning to|will\s+(add|build|complete|deploy|fix|implement|merge|migrate|patch|release|remove|replace|resolve|run|ship|switch|test|update|write))\b",
+    )
+    .expect("relative-time regex")
+});
 
-#[derive(Debug, Clone)]
-pub struct DreamParams {
+const STOPWORDS: &[&str] = &[
+    "about",
+    "after",
+    "again",
+    "backend",
+    "being",
+    "blocked",
+    "completed",
+    "currently",
+    "decision",
+    "deployed",
+    "done",
+    "evaluating",
+    "fixed",
+    "going",
+    "implemented",
+    "into",
+    "later",
+    "longer",
+    "merged",
+    "options",
+    "planned",
+    "planning",
+    "right",
+    "still",
+    "summary",
+    "that",
+    "this",
+    "uses",
+    "will",
+    "with",
+];
+
+pub struct DreamParams<'a> {
     pub profile: Profile,
-    pub workspace: String,
+    pub workspace: &'a str,
+    pub repo_id: Option<&'a str>,
+    pub mode: &'a str,
+    pub now: &'a str,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DreamReport {
-    pub mode: String,
-    pub run_id: String,
-    pub profile: String,
-    pub workspace: String,
-    pub evidence_window: EvidenceWindow,
-    pub evidence_scanned: EvidenceCounts,
-    pub evidence_counts: EvidenceCounts,
-    pub candidates: Vec<DreamCandidate>,
-    pub rejected: Vec<DreamCandidate>,
-    pub quarantined: Vec<DreamCandidate>,
-    pub stale: Vec<StaleCandidate>,
-    pub impact: ImpactEstimate,
-    pub created: usize,
-    pub archived: usize,
-    pub authority: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EvidenceWindow {
-    pub start: Option<String>,
-    pub end: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EvidenceCounts {
-    pub visible_turns: usize,
-    pub conclusions: usize,
-    pub checkpoints: usize,
-    pub imported_memories: usize,
-    pub active_records: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DreamCandidate {
-    pub subject_key: String,
-    pub action: String,
-    pub proposed_type: String,
-    pub proposed_scope: String,
-    pub content: String,
-    pub confidence: f64,
-    pub evidence: Vec<DreamEvidence>,
-    pub evidence_counts: BTreeMap<String, usize>,
-    pub promotion_reason: String,
-    pub drift_prone: bool,
-    pub policy: String,
-    pub supersedes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DreamEvidence {
-    pub kind: String,
-    pub id: String,
-    pub strength: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StaleCandidate {
-    pub memory_id: String,
-    pub subject_key: String,
-    pub drift_prone: bool,
-    pub suggested_action: String,
-    pub evidence: Vec<DreamEvidence>,
-    pub evidence_counts: BTreeMap<String, usize>,
-    pub policy: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ImpactEstimate {
-    pub records_added: usize,
-    pub records_archived: usize,
-    pub estimated_tokens: usize,
-}
-
-#[derive(Debug, Clone)]
-struct CandidateBuilder {
-    candidate: DreamCandidate,
-}
-
-/// Build a deterministic preview report. This function must not call any store
-/// write method; preview is the trust boundary.
-pub fn preview(store: &Store, params: DreamParams, max_record_chars: usize) -> Result<DreamReport> {
-    let profile = params.profile.as_str();
-    let workspace = params.workspace;
-
-    let visible_turns = store.dream_visible_turns(profile, &workspace, EVIDENCE_LIMIT)?;
-    let conclusions = store.dream_conclusions(profile, &workspace, EVIDENCE_LIMIT)?;
-    let checkpoints = store.dream_checkpoints(profile, &workspace, EVIDENCE_LIMIT)?;
-    let imported_sources = store.dream_memory_sources(profile, &workspace, EVIDENCE_LIMIT)?;
-    let mut active_records = store.query_records(&RecordQuery {
-        profile_id: Some(profile.to_string()),
-        workspace_id: Some(workspace.clone()),
-        limit: ACTIVE_RECORD_LIMIT,
-        ..RecordQuery::default()
+pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
+    let records = store.query_records(&RecordQuery {
+        profile_id: Some(params.profile.as_str().to_string()),
+        workspace_id: Some(params.workspace.to_string()),
+        repo_id: None,
+        record_type: None,
+        scope: None,
+        include_archived: false,
+        recency_cutoff: None,
+        limit: 500,
+        offset: 0,
     })?;
-    active_records.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-
-    let counts = EvidenceCounts {
-        visible_turns: visible_turns.len(),
-        conclusions: conclusions.len(),
-        checkpoints: checkpoints.len(),
-        imported_memories: imported_sources
-            .iter()
-            .filter(|s| s.kind != "visible_turn")
-            .count(),
-        active_records: active_records.len(),
-    };
-
-    let mut builders: BTreeMap<String, CandidateBuilder> = BTreeMap::new();
-    let mut rejected = Vec::new();
-    let mut quarantined = Vec::new();
-
-    for turn in visible_turns.iter().filter(|t| t.actor == "user") {
-        add_proposal(
-            &mut builders,
-            &mut rejected,
-            ProposalInput {
-                kind: "visible_turn",
-                id: &turn.id,
-                strength: "strong",
-                content: &turn.content,
-                profile: params.profile,
-                repo_present: false,
-                reason: "user visible turn is primary evidence",
-                max_record_chars,
-            },
-        );
-    }
-
-    for conclusion in &conclusions {
-        add_proposal(
-            &mut builders,
-            &mut rejected,
-            ProposalInput {
-                kind: "conclusion",
-                id: &conclusion.id,
-                strength: "strong",
-                content: &conclusion.content,
-                profile: params.profile,
-                repo_present: conclusion.repo_id.is_some(),
-                reason: "conclusion is explicit durable evidence",
-                max_record_chars,
-            },
-        );
-    }
-
-    for checkpoint in &checkpoints {
-        add_proposal(
-            &mut builders,
-            &mut rejected,
-            ProposalInput {
-                kind: "checkpoint",
-                id: &checkpoint.id,
-                strength: "strong",
-                content: &checkpoint.summary,
-                profile: params.profile,
-                repo_present: checkpoint.repo_id.is_some(),
-                reason: "checkpoint is strong task-state evidence",
-                max_record_chars,
-            },
-        );
-    }
-
-    for turn in visible_turns.iter().filter(|t| t.actor == "assistant") {
-        add_assistant_proposal(
-            &mut builders,
-            &mut quarantined,
-            &turn.id,
-            &turn.content,
-            params.profile,
-            max_record_chars,
-        );
-    }
-
-    let active_by_subject = active_records
-        .iter()
-        .map(|record| (record_subject_key(record), record))
-        .collect::<BTreeMap<_, _>>();
+    let records = records
+        .into_iter()
+        .filter(|r| r.repo_id.as_deref() == params.repo_id || params.repo_id.is_none())
+        .collect::<Vec<_>>();
 
     let mut candidates = Vec::new();
-    for (subject_key, mut builder) in builders {
-        if let Some(active) = active_by_subject.get(&subject_key) {
-            builder
-                .candidate
-                .evidence
-                .push(evidence("active_record", &active.id, "conflict"));
-            increment(&mut builder.candidate.evidence_counts, "active_records");
-            builder.candidate.action = "reject".to_string();
-            builder.candidate.policy = "duplicate_active_record".to_string();
-            builder.candidate.promotion_reason =
-                "already represented by an active memory record".to_string();
-            rejected.push(builder.candidate);
-        } else {
-            candidates.push(finalize_candidate(builder.candidate));
+    let mut stale = Vec::new();
+    let mut rejected = Vec::new();
+
+    for record in &records {
+        let drift_prone = is_drift_prone(&record.content);
+        let state = state_for(&record.content);
+        let valid_until = valid_until_for(record);
+        let expired = valid_until
+            .as_deref()
+            .map(|until| is_after(params.now, until))
+            .unwrap_or(false);
+        if drift_prone {
+            let historical_reason = expired.then(|| "expired relative-time content".to_string());
+            stale.push(DreamStaleRecord {
+                memory_id: record.id.clone(),
+                drift_prone,
+                state: state.clone(),
+                expires_at: valid_until.clone(),
+                valid_until: valid_until.clone(),
+                suggested_action: if expired {
+                    "rewrite_historical".to_string()
+                } else {
+                    "set_valid_until".to_string()
+                },
+                historical_reason: historical_reason.clone(),
+            });
+            if expired {
+                let content = format!(
+                    "As of {}, {}",
+                    date_part(&record.created_at),
+                    record.content
+                );
+                push_candidate(
+                    &mut candidates,
+                    &mut rejected,
+                    record,
+                    "rewrite_historical",
+                    &content,
+                    "historical",
+                    false,
+                    None,
+                    historical_reason,
+                    vec![record.id.clone()],
+                );
+            }
         }
     }
 
-    for source in imported_sources.iter().filter(|s| s.kind != "visible_turn") {
-        // Imported local memory is secondary/corroborating evidence only. With no
-        // adopted strong proposal to attach to, it is intentionally not promoted.
-        let mut counts = BTreeMap::new();
-        counts.insert("imported_memories".to_string(), 1);
-        let content = source
-            .source_path
-            .clone()
-            .unwrap_or_else(|| source.source_hash.clone());
-        quarantined.push(DreamCandidate {
-            subject_key: subject_key("imported_memory", "workspace", &content),
-            action: "quarantine".to_string(),
-            proposed_type: "other".to_string(),
-            proposed_scope: "workspace".to_string(),
-            content,
-            confidence: 0.2,
-            evidence: vec![evidence("imported_memory", &source.id, "secondary")],
-            evidence_counts: counts,
-            promotion_reason: "imported local memory requires primary evidence before promotion"
-                .to_string(),
-            drift_prone: false,
-            policy: "secondary_only".to_string(),
-            supersedes: vec![],
-        });
+    for newer in &records {
+        let newer_state = state_for(&newer.content);
+        for older in &records {
+            if newer.id == older.id
+                || !same_boundary(newer, older)
+                || newer.created_at <= older.created_at
+            {
+                continue;
+            }
+            if supersedes(newer, older, &newer_state) {
+                let reason = format!(
+                    "newer {} evidence supersedes older {} state",
+                    newer_state,
+                    state_for(&older.content)
+                );
+                push_candidate(
+                    &mut candidates,
+                    &mut rejected,
+                    newer,
+                    "supersede",
+                    &newer.content,
+                    &newer_state,
+                    is_drift_prone(&newer.content),
+                    valid_until_for(newer),
+                    Some(reason),
+                    vec![older.id.clone()],
+                );
+            }
+        }
     }
 
-    let stale = active_records
-        .iter()
-        .filter(|record| is_drift_prone(&record.content))
-        .map(stale_candidate)
-        .collect::<Vec<_>>();
+    dedupe_candidates(&mut candidates);
 
-    rejected.sort_by(|a, b| a.subject_key.cmp(&b.subject_key));
-    quarantined.sort_by(|a, b| a.subject_key.cmp(&b.subject_key));
-    candidates.sort_by(|a, b| a.subject_key.cmp(&b.subject_key));
+    let run_id = stable_run_id(params, &records);
+    let mut archived = Vec::new();
+    let mut created = Vec::new();
+    if params.mode == "apply" {
+        for candidate in &candidates {
+            let class =
+                policy::classify(&candidate.content, params.profile, params.repo_id.is_some());
+            let content_hash = ids::content_hash(
+                params.profile.as_str(),
+                params.workspace,
+                params.repo_id,
+                class.record_type.as_str(),
+                class.scope.as_str(),
+                &candidate.content,
+            );
+            let metadata = json!({
+                "origin": "dreamer",
+                "run_id": run_id.clone(),
+                "state": candidate.state,
+                "drift_prone": candidate.drift_prone,
+                "expires_at": candidate.expires_at,
+                "valid_until": candidate.valid_until,
+                "historical_reason": candidate.historical_reason,
+                "supersedes": candidate.supersedes,
+                "subject_key": subject_key(&candidate.content),
+            });
+            let outcome = store.upsert_record(&NewRecord {
+                profile_id: params.profile.as_str().to_string(),
+                workspace_id: params.workspace.to_string(),
+                repo_id: params.repo_id.map(|s| s.to_string()),
+                scope: class.scope,
+                record_type: class.record_type,
+                content: candidate.content.clone(),
+                related_files: class.related_files,
+                tags: class.tags,
+                sensitivity: class.sensitivity,
+                portability: class.portability,
+                confidence: candidate.confidence,
+                source_ids: vec![],
+                content_hash,
+                supersedes: candidate.supersedes.clone(),
+                metadata,
+            })?;
+            created.push(outcome.id().to_string());
+            if !candidate.supersedes.is_empty() {
+                let reason = candidate
+                    .historical_reason
+                    .as_deref()
+                    .unwrap_or("superseded by newer Dreamer evidence");
+                let (mut newly_archived, _) = store.archive_records_with_metadata(
+                    params.profile.as_str(),
+                    Some(params.workspace),
+                    &candidate.supersedes,
+                    "superseded",
+                    reason,
+                )?;
+                archived.append(&mut newly_archived);
+            }
+        }
+        archived.sort();
+        archived.dedup();
+        created.sort();
+        created.dedup();
+    }
 
-    let estimated_tokens = candidates
-        .iter()
-        .map(|c| c.content.chars().count().div_ceil(4))
-        .sum();
-    let impact = ImpactEstimate {
-        records_added: candidates.len(),
-        records_archived: stale.len(),
-        estimated_tokens,
-    };
-
-    let evidence_window = EvidenceWindow {
-        start: None,
-        end: max_timestamp(&visible_turns, &conclusions, &checkpoints, &active_records),
-    };
-    let run_id = stable_run_id(profile, &workspace, &counts, &evidence_window);
-
-    Ok(DreamReport {
-        mode: "preview".to_string(),
+    Ok(DreamResponse {
         run_id,
-        profile: profile.to_string(),
-        workspace,
-        evidence_window,
-        evidence_scanned: counts.clone(),
-        evidence_counts: counts,
+        mode: params.mode.to_string(),
+        profile: params.profile.as_str().to_string(),
+        workspace: params.workspace.to_string(),
+        repo_id: params.repo_id.map(|s| s.to_string()),
+        now: params.now.to_string(),
         candidates,
-        rejected,
-        quarantined,
         stale,
-        impact,
-        created: 0,
-        archived: 0,
+        rejected,
+        archived,
+        created,
         authority: "recall_not_authority".to_string(),
     })
 }
 
-struct ProposalInput<'a> {
-    kind: &'static str,
-    id: &'a str,
-    strength: &'static str,
-    content: &'a str,
-    profile: Profile,
-    repo_present: bool,
-    reason: &'static str,
-    max_record_chars: usize,
-}
-
-fn add_proposal(
-    builders: &mut BTreeMap<String, CandidateBuilder>,
-    rejected: &mut Vec<DreamCandidate>,
-    input: ProposalInput<'_>,
-) {
-    let content = match policy::screen_content(input.content, input.max_record_chars) {
-        PolicyDecision::Accept(content) => content,
-        PolicyDecision::Reject { code, reason } => {
-            rejected.push(rejected_candidate(input, &code, &reason));
-            return;
-        }
-    };
-    let class = policy::classify(&content, input.profile, input.repo_present);
-    if class.record_type == RecordType::Other {
-        return;
-    }
-    let key = subject_key(class.record_type.as_str(), class.scope.as_str(), &content);
-    let entry = builders.entry(key.clone()).or_insert_with(|| {
-        let mut counts = BTreeMap::new();
-        counts.insert(kind_count_key(input.kind).to_string(), 0);
-        CandidateBuilder {
-            candidate: DreamCandidate {
-                subject_key: key,
-                action: "create".to_string(),
-                proposed_type: class.record_type.as_str().to_string(),
-                proposed_scope: class.scope.as_str().to_string(),
-                content: content.clone(),
-                confidence: class.confidence,
-                evidence: vec![],
-                evidence_counts: counts,
-                promotion_reason: input.reason.to_string(),
-                drift_prone: is_drift_prone(&content),
-                policy: "accept".to_string(),
-                supersedes: vec![],
-            },
-        }
-    });
-    entry
-        .candidate
-        .evidence
-        .push(evidence(input.kind, input.id, input.strength));
-    increment(
-        &mut entry.candidate.evidence_counts,
-        kind_count_key(input.kind),
+fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
+    let mut seed = format!(
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id.unwrap_or(""),
+        params.mode,
+        params.now
     );
-    if input.kind == "conclusion" || input.kind == "checkpoint" {
-        entry.candidate.confidence += 0.05;
+    for record in records {
+        seed.push('\x1f');
+        seed.push_str(&record.id);
+        seed.push('\x1f');
+        seed.push_str(&record.updated_at);
+        seed.push('\x1f');
+        seed.push_str(&record.content);
     }
-}
-
-fn add_assistant_proposal(
-    builders: &mut BTreeMap<String, CandidateBuilder>,
-    quarantined: &mut Vec<DreamCandidate>,
-    id: &str,
-    content: &str,
-    profile: Profile,
-    max_record_chars: usize,
-) {
-    let content = match policy::screen_content(content, max_record_chars) {
-        PolicyDecision::Accept(content) => content,
-        PolicyDecision::Reject { .. } => return,
-    };
-    let class = policy::classify(&content, profile, false);
-    if class.record_type == RecordType::Other {
-        return;
-    }
-    let key = subject_key(class.record_type.as_str(), class.scope.as_str(), &content);
-    if let Some(builder) = builders.get_mut(&key) {
-        builder
-            .candidate
-            .evidence
-            .push(evidence("visible_turn", id, "weak"));
-        increment(&mut builder.candidate.evidence_counts, "visible_turns");
-        builder.candidate.confidence += 0.02;
-        return;
-    }
-
-    let mut counts = BTreeMap::new();
-    counts.insert("visible_turns".to_string(), 1);
-    quarantined.push(DreamCandidate {
-        subject_key: key,
-        action: "quarantine".to_string(),
-        proposed_type: class.record_type.as_str().to_string(),
-        proposed_scope: class.scope.as_str().to_string(),
-        content,
-        confidence: round_confidence(class.confidence * 0.5),
-        evidence: vec![evidence("visible_turn", id, "weak")],
-        evidence_counts: counts,
-        promotion_reason: "assistant-only proposal requires user adoption".to_string(),
-        drift_prone: false,
-        policy: "assistant_only".to_string(),
-        supersedes: vec![],
-    });
-}
-
-fn rejected_candidate(input: ProposalInput<'_>, code: &str, reason: &str) -> DreamCandidate {
-    let mut counts = BTreeMap::new();
-    counts.insert(kind_count_key(input.kind).to_string(), 1);
-    DreamCandidate {
-        subject_key: subject_key("rejected", "workspace", input.content),
-        action: "reject".to_string(),
-        proposed_type: "other".to_string(),
-        proposed_scope: "workspace".to_string(),
-        content: "[redacted rejected evidence]".to_string(),
-        confidence: 0.0,
-        evidence: vec![evidence(input.kind, input.id, input.strength)],
-        evidence_counts: counts,
-        promotion_reason: reason.to_string(),
-        drift_prone: false,
-        policy: code.to_string(),
-        supersedes: vec![],
-    }
-}
-
-fn stale_candidate(record: &MemoryRecord) -> StaleCandidate {
-    let mut counts = BTreeMap::new();
-    counts.insert("active_records".to_string(), 1);
-    StaleCandidate {
-        memory_id: record.id.clone(),
-        subject_key: record_subject_key(record),
-        drift_prone: true,
-        suggested_action: "rewrite_historical".to_string(),
-        evidence: vec![evidence("active_record", &record.id, "conflict")],
-        evidence_counts: counts,
-        policy: "stale_review".to_string(),
-    }
-}
-
-fn finalize_candidate(mut candidate: DreamCandidate) -> DreamCandidate {
-    let strong = candidate
-        .evidence
-        .iter()
-        .filter(|e| e.strength == "strong")
-        .count();
-    if strong > 1 {
-        candidate.confidence += 0.05;
-    }
-    candidate.confidence = round_confidence(candidate.confidence);
-    candidate
-}
-
-fn evidence(kind: &str, id: &str, strength: &str) -> DreamEvidence {
-    DreamEvidence {
-        kind: kind.to_string(),
-        id: id.to_string(),
-        strength: strength.to_string(),
-    }
-}
-
-fn increment(counts: &mut BTreeMap<String, usize>, key: &str) {
-    *counts.entry(key.to_string()).or_insert(0) += 1;
-}
-
-fn kind_count_key(kind: &str) -> &str {
-    match kind {
-        "conclusion" => "conclusions",
-        "checkpoint" => "checkpoints",
-        "imported_memory" => "imported_memories",
-        "active_record" => "active_records",
-        _ => "visible_turns",
-    }
-}
-
-fn record_subject_key(record: &MemoryRecord) -> String {
-    subject_key(
-        record.record_type.as_str(),
-        record.scope.as_str(),
-        &record.content,
-    )
-}
-
-fn subject_key(record_type: &str, scope: &str, content: &str) -> String {
-    let hash = ids::content_hash("dream", "preview", None, record_type, scope, content);
-    format!("{record_type}:{scope}:{}", &hash["sha256:".len()..23])
-}
-
-fn is_drift_prone(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
-    [
-        "currently",
-        "for now",
-        "temporary",
-        "temporarily",
-        "today",
-        "this week",
-        "deprecated",
-        "legacy",
-        "old ",
-        "tbd",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn round_confidence(value: f64) -> f64 {
-    (value.clamp(0.0, 0.99) * 100.0).round() / 100.0
-}
-
-fn max_timestamp(
-    turns: &[crate::domain::VisibleTurn],
-    conclusions: &[crate::domain::Conclusion],
-    checkpoints: &[crate::domain::Checkpoint],
-    records: &[MemoryRecord],
-) -> Option<String> {
-    let mut values = Vec::new();
-    values.extend(turns.iter().map(|t| t.created_at.clone()));
-    values.extend(conclusions.iter().map(|c| c.created_at.clone()));
-    values.extend(checkpoints.iter().map(|c| c.created_at.clone()));
-    values.extend(records.iter().map(|r| r.updated_at.clone()));
-    values.into_iter().max()
-}
-
-fn stable_run_id(
-    profile: &str,
-    workspace: &str,
-    counts: &EvidenceCounts,
-    window: &EvidenceWindow,
-) -> String {
-    let seed = format!(
-        "{profile}\x1f{workspace}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{:?}",
-        counts.visible_turns,
-        counts.conclusions,
-        counts.checkpoints,
-        counts.imported_memories,
-        counts.active_records,
-        window.end
-    );
     let hash = ids::sha256_hex(seed.as_bytes());
-    format!("dream_{}", &hash["sha256:".len()..23])
+    format!("dream_{}", &hash["sha256:".len()..39])
 }
 
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-    use crate::domain::Portability;
-    use crate::domain::Scope;
-    use crate::domain::Sensitivity;
-    use crate::domain::VisibleTurn;
-    use crate::store::NewRecord;
-
-    fn mem_store() -> Store {
-        Store::open(":memory:").expect("open in-memory store")
-    }
-
-    fn params() -> DreamParams {
-        DreamParams {
-            profile: Profile::Personal,
-            workspace: "ws".to_string(),
+fn push_candidate(
+    candidates: &mut Vec<DreamCandidate>,
+    rejected: &mut Vec<DreamRejection>,
+    evidence: &MemoryRecord,
+    action: &str,
+    content: &str,
+    state: &str,
+    drift_prone: bool,
+    valid_until: Option<String>,
+    historical_reason: Option<String>,
+    supersedes: Vec<String>,
+) {
+    match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+        PolicyDecision::Accept(clean) => candidates.push(DreamCandidate {
+            action: action.to_string(),
+            proposed_type: evidence.record_type.as_str().to_string(),
+            content: clean,
+            confidence: (evidence.confidence + 0.05).min(0.95),
+            state: state.to_string(),
+            drift_prone,
+            expires_at: valid_until.clone(),
+            valid_until,
+            historical_reason,
+            supersedes,
+            policy: "accept".to_string(),
+        }),
+        PolicyDecision::Reject { reason, .. } => {
+            rejected.push(DreamRejection { reason, supersedes })
         }
     }
+}
 
-    #[test]
-    fn empty_workspace_preview_is_empty() {
-        let store = mem_store();
-        let report = preview(&store, params(), policy::MAX_RECORD_CHARS).unwrap();
-        assert!(report.candidates.is_empty());
-        assert!(report.rejected.is_empty());
-        assert!(report.quarantined.is_empty());
-        assert_eq!(report.created, 0);
-        assert_eq!(report.archived, 0);
+fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
+    let mut seen = BTreeSet::new();
+    candidates.retain(|c| {
+        let key = format!("{}:{}:{:?}", c.action, normalize(&c.content), c.supersedes);
+        seen.insert(key)
+    });
+}
+
+pub fn is_drift_prone(content: &str) -> bool {
+    RELATIVE_TIME.is_match(content)
+}
+
+fn state_for(content: &str) -> String {
+    let lower = content.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "completed",
+            "done",
+            "fixed",
+            "implemented",
+            "merged",
+            "deployed",
+            "shipped",
+            "resolved",
+            "no longer",
+        ],
+    ) {
+        "completed".to_string()
+    } else if contains_any(&lower, &["blocked", "stuck", "waiting on", "failing"]) {
+        "blocked".to_string()
+    } else if contains_any(
+        &lower,
+        &[
+            "planned",
+            "planning to",
+            "going to",
+            "will ",
+            "todo",
+            "next step",
+        ],
+    ) {
+        "planned".to_string()
+    } else if contains_any(
+        &lower,
+        &["currently", "right now", "in progress", "working on"],
+    ) {
+        "active".to_string()
+    } else {
+        "active".to_string()
     }
+}
 
-    #[test]
-    fn active_records_alone_do_not_create_candidates() {
-        let store = mem_store();
-        store.ensure_workspace("personal", "ws").unwrap();
-        let new = NewRecord {
-            profile_id: "personal".to_string(),
-            workspace_id: "ws".to_string(),
-            repo_id: None,
-            scope: Scope::User,
-            record_type: RecordType::Preference,
-            content: "Prefer repo-native commands".to_string(),
-            related_files: vec![],
-            tags: vec![],
-            sensitivity: Sensitivity::Personal,
-            portability: Portability::Portable,
-            confidence: 0.75,
-            source_ids: vec![],
-            content_hash: ids::content_hash(
-                "personal",
-                "ws",
-                None,
-                "preference",
-                "user",
-                "Prefer repo-native commands",
-            ),
-            metadata: json!({}),
-        };
-        store.upsert_record(&new).unwrap();
-
-        let report = preview(&store, params(), policy::MAX_RECORD_CHARS).unwrap();
-        assert!(report.candidates.is_empty());
-        assert!(report.quarantined.is_empty());
-        assert!(report.rejected.is_empty());
+fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> bool {
+    if subject_key(&newer.content) != subject_key(&older.content) {
+        return false;
     }
-
-    #[test]
-    fn assistant_only_proposal_is_quarantined() {
-        let store = mem_store();
-        store
-            .ensure_session("sess1", "personal", "ws", None, None, "test")
-            .unwrap();
-        store
-            .insert_visible_turn(&VisibleTurn {
-                id: "turn_assistant".to_string(),
-                session_id: "sess1".to_string(),
-                actor: "assistant".to_string(),
-                content: "Prefer cargo test for validation".to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                metadata: json!({}),
-            })
-            .unwrap();
-
-        let report = preview(&store, params(), policy::MAX_RECORD_CHARS).unwrap();
-        assert!(report.candidates.is_empty());
-        assert_eq!(report.quarantined.len(), 1);
-        assert_eq!(report.quarantined[0].action, "quarantine");
-        assert_eq!(report.quarantined[0].policy, "assistant_only");
+    if lexical_overlap(&newer.content, &older.content) < 1 {
+        return false;
     }
+    let old_state = state_for(&older.content);
+    let old_lower = older.content.to_ascii_lowercase();
+    let new_lower = newer.content.to_ascii_lowercase();
+    let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
+        || contains_any(
+            &old_lower,
+            &["tbd", "evaluating", "not decided", "will ", "planned"],
+        );
+    let new_settled = newer_state == "completed"
+        || contains_any(
+            &new_lower,
+            &[
+                "uses ",
+                "decided",
+                "no longer",
+                "implemented",
+                "fixed",
+                "merged",
+                "deployed",
+            ],
+        );
+    old_unsettled && new_settled
+}
+
+fn same_boundary(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    a.profile_id == b.profile_id && a.workspace_id == b.workspace_id && a.repo_id == b.repo_id
+}
+
+fn valid_until_for(record: &MemoryRecord) -> Option<String> {
+    record
+        .metadata
+        .get("valid_until")
+        .or_else(|| record.metadata.get("expires_at"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| infer_valid_until(&record.content, &record.created_at))
+}
+
+fn infer_valid_until(content: &str, created_at: &str) -> Option<String> {
+    if !is_drift_prone(content) {
+        return None;
+    }
+    let lower = content.to_ascii_lowercase();
+    let base = parse_time(created_at)?;
+    let days = if lower.contains("tomorrow") || lower.contains("tonight") {
+        2
+    } else if lower.contains("this week") || lower.contains("this weekend") {
+        8
+    } else if lower.contains("next week") {
+        15
+    } else {
+        7
+    };
+    Some(format_time(base + Duration::days(days)))
+}
+
+fn subject_key(content: &str) -> String {
+    tokens(content)
+        .into_iter()
+        .find(|t| !STOPWORDS.contains(&t.as_str()))
+        .unwrap_or_else(|| normalize(content).chars().take(32).collect())
+}
+
+fn lexical_overlap(a: &str, b: &str) -> usize {
+    let a = tokens(a).into_iter().collect::<BTreeSet<_>>();
+    let b = tokens(b).into_iter().collect::<BTreeSet<_>>();
+    a.intersection(&b)
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .count()
+}
+
+fn tokens(content: &str) -> Vec<String> {
+    normalize(content)
+        .split_whitespace()
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn normalize(content: &str) -> String {
+    content
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn is_after(a: &str, b: &str) -> bool {
+    match (parse_time(a), parse_time(b)) {
+        (Some(a), Some(b)) => a > b,
+        _ => a > b,
+    }
+}
+
+fn parse_time(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
+fn format_time(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn date_part(value: &str) -> &str {
+    value.split('T').next().unwrap_or(value)
 }

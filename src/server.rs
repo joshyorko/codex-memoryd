@@ -52,6 +52,7 @@ pub fn router(service: Service) -> Router {
         .route("/v1/turns", post(turns_handler))
         .route("/v1/conclusions", post(conclusions_handler))
         .route("/v1/checkpoints", post(checkpoints_handler))
+        .route("/v1/dream", post(dream_handler))
         .route("/v1/sync/local-codex-memory", post(sync_handler))
         .route("/v1/forget", post(forget_handler))
         .route("/v1/export", get(export_handler))
@@ -183,6 +184,17 @@ async fn checkpoints_handler(
         Err(e) => return err_envelope(e),
     };
     match state.service.checkpoint(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn dream_handler(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.dream(req) {
         Ok(data) => ok_envelope(data, vec![]),
         Err(e) => err_envelope(e),
     }

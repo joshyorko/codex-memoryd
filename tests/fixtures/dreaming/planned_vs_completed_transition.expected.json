@@ -1,0 +1,17 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "decision:oauth-sync-completed",
+        "record_type": "decision",
+        "promotion_reason": "newer_evidence_supersedes_planned_fact",
+        "evidence_count": 2,
+        "must_contain": ["OAuth sync", "implemented", "merged"],
+        "must_not_contain": []
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  }
+}

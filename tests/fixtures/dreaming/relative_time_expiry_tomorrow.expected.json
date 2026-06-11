@@ -1,0 +1,17 @@
+{
+  "expect_preview": {
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [],
+    "stale": [
+      {
+        "subject_key": "stale:relative-time-expiry-tomorrow",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "relative_time_status_stale",
+        "evidence_count": 1,
+        "must_contain": ["Relative-time", "expired"],
+        "must_not_contain": ["patch it tomorrow"]
+      }
+    ]
+  }
+}

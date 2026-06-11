@@ -100,7 +100,11 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
         "imported_memories": 0, "active_records": 0
       },
       "promotion_reason": "repeated user steering across 3 turns",
+      "state": "active",
       "drift_prone": false,
+      "expires_at": null,
+      "valid_until": null,
+      "historical_reason": null,
       "supersedes": [],
       "policy": "accept"
     },
@@ -117,7 +121,11 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
         "imported_memories": 0, "active_records": 1
       },
       "promotion_reason": "newer explicit conclusion supersedes stale active record",
+      "state": "completed",
       "drift_prone": false,
+      "expires_at": null,
+      "valid_until": null,
+      "historical_reason": "newer completed evidence supersedes older active state",
       "supersedes": ["mem_old…"],
       "policy": "accept"
     }
@@ -161,7 +169,15 @@ Both modes return the same shape; `preview` writes nothing, `apply` fills the
     }
   ],
   "stale": [
-    { "memory_id": "mem_…", "drift_prone": true, "suggested_action": "rewrite_historical" }
+    {
+      "memory_id": "mem_…",
+      "drift_prone": true,
+      "state": "planned",
+      "expires_at": "2026-01-12T08:00:00Z",
+      "valid_until": "2026-01-12T08:00:00Z",
+      "suggested_action": "rewrite_historical",
+      "historical_reason": "expired relative-time content"
+    }
   ],
   "impact": { "records_added": 2, "records_archived": 1, "estimated_tokens": 180 },
   "created": 0,
@@ -238,9 +254,9 @@ and SHOULD carry `valid_until`; completed past-tense statements ("deployed",
 
 ### 5.2 Demotion / rewrite
 
-For an existing `drift_prone` record older than its `valid_until` (or older than
-the recall `STALE_DAYS` hint in [`src/recall.rs`](../src/recall.rs) when no
-`valid_until` is set), the loop SHOULD propose one of:
+For an existing `drift_prone` record older than its `valid_until`/`expires_at`
+(or older than the recall `STALE_DAYS` hint in [`src/recall.rs`](../src/recall.rs)
+when no `valid_until` is set), the loop SHOULD propose one of:
 
 - `rewrite_historical` — restate as a dated historical fact ("As of <date>, …");
 - `invalidate` — archive when superseded by newer contradicting evidence.
@@ -268,10 +284,13 @@ Every synthesized record carries, in the existing `metadata` JSON value:
   "origin": "dreamer",
   "run_id": "dream_…",
   "evidence_window": { "start": "…", "end": "…" },
+  "state": "completed",
   "drift_prone": false,
+  "expires_at": null,
   "valid_after": null,
   "valid_until": null,
   "supersedes": ["mem_…"],
+  "historical_reason": "newer completed evidence supersedes older planned state",
   "promotion_reason": "repeated user steering across 3 turns"
 }
 ```
@@ -338,6 +357,8 @@ Seeded scenarios:
 | `repeated_preference.jsonl` | Repeated user steering is promoted to one stable `preference`. |
 | `stale_time_sensitive_fact.jsonl` | Relative-time content is marked `drift_prone` and demoted/rewritten. |
 | `conflicting_newer_fact.jsonl` | Newer evidence supersedes an older contradicting record. |
+| `planned_vs_completed_transition.jsonl` | Planned work becomes historical/superseded after implemented/merged evidence. |
+| `relative_time_expiry_tomorrow.jsonl` | `tomorrow` content expires after the deterministic clock advances. |
 | `secret_rejection.jsonl` | A repeated secret is **never** synthesized (policy reject). |
 | `repo_gotcha.jsonl` | A recurring failure is promoted to a `gotcha` scoped to the repo. |
 
@@ -350,8 +371,14 @@ For each scenario the harness checks the dream report:
   `secret_detected` (`secret_rejection`);
 - stale fact flagged `drift_prone` with a demotion `suggested_action`
   (`stale_time_sensitive_fact`);
+- `tomorrow`/`this week` style facts carry `valid_until`/`expires_at` and become
+  `rewrite_historical` candidates after the clock advances
+  (`relative_time_expiry_tomorrow`);
 - newer evidence produces a `supersede` candidate referencing the old id
   (`conflicting_newer_fact`);
+- planned/blocked/active task facts transition to `completed` supersession when
+  later conclusions/checkpoints say implemented/fixed/merged/deployed
+  (`planned_vs_completed_transition`);
 - repo gotcha promoted with `scope = repo` (`repo_gotcha`);
 - provenance present on every candidate (`promotion_reason`, `evidence`,
   `evidence_window`);
