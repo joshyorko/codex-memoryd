@@ -49,6 +49,9 @@ use crate::store::DreamRunRecord;
 use crate::store::NewRecord;
 use crate::store::Store;
 
+const SCHEDULED_DREAM_KIND: &str = "scheduled";
+const SCHEDULED_DREAM_MODE: &str = "apply";
+
 /// The provider service. Cheaply cloneable (Arc inside).
 #[derive(Clone)]
 pub struct Service {
@@ -648,8 +651,8 @@ impl Service {
                 run_id: ids::new_id("dream"),
                 profile_id: profile.as_str().to_string(),
                 workspace_id: workspace,
-                mode: "apply".to_string(),
-                kind: "scheduled".to_string(),
+                mode: SCHEDULED_DREAM_MODE.to_string(),
+                kind: SCHEDULED_DREAM_KIND.to_string(),
                 status: "error".to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
@@ -711,7 +714,7 @@ impl Service {
                 profile,
                 workspace: &workspace,
                 repo_id: None,
-                mode: "apply",
+                mode: SCHEDULED_DREAM_MODE,
                 now: &now,
                 recency_cutoff: watermark_before.as_deref(),
                 max_records: cfg.max_batch_size,
@@ -735,7 +738,7 @@ impl Service {
                     workspace_id: run.workspace.clone(),
                     repo_id: run.repo_id.clone(),
                     mode: run.mode.clone(),
-                    kind: "scheduled".to_string(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
                     status: "ok".to_string(),
                     started_at: now.clone(),
                     completed_at: Some(now),
@@ -763,7 +766,7 @@ impl Service {
                     workspace_id: run.workspace.clone(),
                     repo_id: run.repo_id.clone(),
                     mode: run.mode.clone(),
-                    kind: "scheduled".to_string(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
                     status: "error".to_string(),
                     started_at: now.clone(),
                     completed_at: Some(now),
@@ -789,8 +792,8 @@ impl Service {
                     run_id: ids::new_id("dream"),
                     profile_id: profile.as_str().to_string(),
                     workspace_id: workspace,
-                    mode: "apply".to_string(),
-                    kind: "scheduled".to_string(),
+                    mode: SCHEDULED_DREAM_MODE.to_string(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
                     status: "error".to_string(),
                     started_at: now.clone(),
                     completed_at: Some(now),
