@@ -301,6 +301,7 @@ impl Service {
                 repo_id.as_deref(),
                 &content,
                 &src.id,
+                &actor,
             )? {
                 derived_record_ids.push(record_id);
             }
@@ -325,6 +326,7 @@ impl Service {
         repo_id: Option<&str>,
         content: &str,
         source_id: &str,
+        actor: &str,
     ) -> Result<Option<String>> {
         let class = policy::classify(content, profile, repo_id.is_some());
         // Only derive for high-signal types; skip generic chatter.
@@ -362,7 +364,7 @@ impl Service {
             source_ids: vec![source_id.to_string()],
             content_hash,
             supersedes: vec![],
-            metadata: json!({ "origin": "visible_turn", "source_id": source_id }),
+            metadata: json!({ "origin": "visible_turn", "source_id": source_id, "actor": actor }),
         };
         match self.store.upsert_record(&new)? {
             crate::store::UpsertOutcome::Created(id) => Ok(Some(id)),
