@@ -123,7 +123,7 @@ fn status_response_fixture_matches_protocol_shape() {
     // Spot-check stable identity fields.
     assert_eq!(live_json["provider_name"], "codex-memoryd");
     assert_eq!(live_json["api_version"], "v1");
-    assert_eq!(live_json["storage_schema_version"], 1);
+    assert_eq!(live_json["storage_schema_version"], 2);
 }
 
 #[test]
@@ -150,6 +150,7 @@ fn dream_preview_report_fixture_matches_stable_shape() {
             repo: None,
             mode: Some("preview".to_string()),
             now: Some("2026-01-02T00:00:00Z".to_string()),
+            since: None,
         })
         .expect("dream preview runs");
     let live = serde_json::to_value(report).expect("serialize report");

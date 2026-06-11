@@ -4,6 +4,8 @@ use codex_memoryd::config::Config;
 use codex_memoryd::protocol::*;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
+use rusqlite::Connection;
+use tempfile::TempDir;
 
 fn service() -> Service {
     let store = Store::open(":memory:").expect("open store");
@@ -30,14 +32,23 @@ fn conclude(svc: &Service, content: &str) -> String {
 }
 
 fn dream(svc: &Service, mode: &str, now: &str) -> DreamResponse {
+    dream_since(svc, mode, now, None).unwrap()
+}
+
+fn dream_since(
+    svc: &Service,
+    mode: &str,
+    now: &str,
+    since: Option<&str>,
+) -> codex_memoryd::error::Result<DreamResponse> {
     svc.dream(DreamRequest {
         profile: Some("personal".to_string()),
         workspace: Some("ws".to_string()),
         repo: None,
         mode: Some(mode.to_string()),
         now: Some(now.to_string()),
+        since: since.map(str::to_string),
     })
-    .unwrap()
 }
 
 #[test]
@@ -157,4 +168,171 @@ fn planned_fact_transitions_to_completed_supersession() {
             && candidate.state == "completed"
             && candidate.supersedes == vec![old_id.clone()]
     }));
+}
+
+#[test]
+fn successful_preview_records_safe_audit_without_memory_writes() {
+    let svc = service();
+    conclude(
+        &svc,
+        "Right now the preview audit test is planning to rewrite this tomorrow.",
+    );
+    let before = svc.store.count_records().unwrap();
+
+    let report = dream(&svc, "preview", "2030-01-01T00:00:00Z");
+
+    assert_eq!(svc.store.count_records().unwrap(), before);
+    assert!(!report.candidates.is_empty());
+    let last = svc
+        .store
+        .last_dream_run()
+        .unwrap()
+        .expect("preview audit row");
+    assert_eq!(last.id, report.run_id);
+    assert_eq!(last.mode, "preview");
+    assert_eq!(last.status, "ok");
+    assert_eq!(last.source_window_start, None);
+    assert_eq!(
+        last.source_window_end.as_deref(),
+        Some("2030-01-01T00:00:00Z")
+    );
+    assert_eq!(last.created_count, 0);
+    assert_eq!(last.archived_count, 0);
+}
+
+#[test]
+fn successful_apply_records_audit_and_advances_watermark() {
+    let svc = service();
+    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(
+        &svc,
+        "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
+    );
+
+    let applied = dream(&svc, "apply", "2030-01-01T00:00:00Z");
+
+    assert!(applied.archived.contains(&old_id));
+    let last = svc
+        .store
+        .last_dream_run()
+        .unwrap()
+        .expect("apply audit row");
+    assert_eq!(last.id, applied.run_id);
+    assert_eq!(last.mode, "apply");
+    assert_eq!(last.status, "ok");
+    assert_eq!(last.created_count, applied.created.len() as i64);
+    assert_eq!(last.archived_count, applied.archived.len() as i64);
+    assert_eq!(
+        svc.store.dream_watermark("personal", "ws", None).unwrap(),
+        Some("2030-01-01T00:00:00Z".to_string())
+    );
+}
+
+#[test]
+fn failed_run_records_error_without_advancing_watermark() {
+    let svc = service();
+    conclude(&svc, "Decision: Dreamer audit uses safe aggregate counts.");
+    dream(&svc, "apply", "2030-01-01T00:00:00Z");
+    assert_eq!(
+        svc.store.dream_watermark("personal", "ws", None).unwrap(),
+        Some("2030-01-01T00:00:00Z".to_string())
+    );
+
+    let err = dream_since(&svc, "preview", "2031-01-01T00:00:00Z", Some("not-rfc3339"))
+        .expect_err("invalid since fails");
+
+    assert_eq!(err.code.as_str(), "invalid_request");
+    assert_eq!(
+        svc.store.dream_watermark("personal", "ws", None).unwrap(),
+        Some("2030-01-01T00:00:00Z".to_string())
+    );
+    let last = svc
+        .store
+        .last_dream_run()
+        .unwrap()
+        .expect("error audit row");
+    assert_eq!(last.status, "error");
+    assert_eq!(last.error_summary.as_deref(), Some("dream since must be an RFC3339 timestamp"));
+    let status = svc.status().unwrap();
+    assert_eq!(status.status, "degraded");
+    assert!(status
+        .degraded_reasons
+        .iter()
+        .any(|reason| reason.contains("last Dreamer run failed")));
+}
+
+#[test]
+fn explicit_since_overrides_apply_watermark() {
+    let svc = service();
+    conclude(
+        &svc,
+        "Right now the watermark override test is planning to ship tomorrow.",
+    );
+    dream(&svc, "apply", "2030-01-01T00:00:00Z");
+
+    let bounded = dream(&svc, "preview", "2031-01-01T00:00:00Z");
+    assert!(
+        bounded.candidates.is_empty(),
+        "apply watermark should bound the incremental preview"
+    );
+
+    let override_run = dream_since(
+        &svc,
+        "preview",
+        "2031-01-01T00:00:00Z",
+        Some("2000-01-01T00:00:00Z"),
+    )
+    .unwrap();
+
+    assert!(
+        !override_run.candidates.is_empty(),
+        "explicit since should replay older evidence"
+    );
+    let last = svc.store.last_dream_run().unwrap().unwrap();
+    assert_eq!(
+        last.source_window_start.as_deref(),
+        Some("2000-01-01T00:00:00Z")
+    );
+}
+
+#[test]
+fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("memory.db");
+    let store = Store::open(&db).expect("open file store");
+    let svc = Service::new(
+        store,
+        Config {
+            default_workspace: "ws".to_string(),
+            ..Default::default()
+        },
+    );
+    let sentinel = "AUDIT_SENTINEL_VISIBLE_TEXT";
+    conclude(
+        &svc,
+        &format!("Right now {sentinel} is planning to ship tomorrow."),
+    );
+
+    dream(&svc, "preview", "2030-01-01T00:00:00Z");
+
+    let conn = Connection::open(&db).unwrap();
+    let audit_text: String = conn
+        .query_row(
+            "SELECT id || ' ' || profile_id || ' ' || workspace_id || ' ' ||
+                    mode || ' ' || status || ' ' || implementation_version || ' ' ||
+                    config_hash || ' ' || ruleset_version || ' ' ||
+                    COALESCE(source_counts, '') || ' ' ||
+                    COALESCE(candidate_counts, '') || ' ' ||
+                    COALESCE(error_summary, '')
+             FROM dream_runs
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !audit_text.contains(sentinel),
+        "dream_runs audit row must not store raw evidence or candidate text"
+    );
 }

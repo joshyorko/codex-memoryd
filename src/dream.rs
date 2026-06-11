@@ -2,6 +2,7 @@
 //! supersession. This module is intentionally policy/store-backed and does not
 //! call an LLM.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use once_cell::sync::Lazy;
@@ -24,6 +25,10 @@ use crate::protocol::DreamStaleRecord;
 use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
+
+pub const DREAM_IMPLEMENTATION_VERSION: &str = "heuristic-v1";
+pub const DREAM_RULESET_VERSION: &str = "dreamer-heuristics-v1";
+pub const DREAM_FIXTURE_SCHEMA_VERSION: Option<&str> = None;
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -71,6 +76,7 @@ pub struct DreamParams<'a> {
     pub repo_id: Option<&'a str>,
     pub mode: &'a str,
     pub now: &'a str,
+    pub source_window_start: Option<&'a str>,
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
@@ -81,7 +87,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         record_type: None,
         scope: None,
         include_archived: false,
-        recency_cutoff: None,
+        recency_cutoff: params.source_window_start.map(str::to_string),
         limit: 500,
         offset: 0,
     })?;
@@ -255,12 +261,13 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
 
 fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
     let mut seed = format!(
-        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
         params.profile.as_str(),
         params.workspace,
         params.repo_id.unwrap_or(""),
         params.mode,
-        params.now
+        params.now,
+        params.source_window_start.unwrap_or("")
     );
     for record in records {
         seed.push('\x1f');
@@ -272,6 +279,33 @@ fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
     }
     let hash = ids::sha256_hex(seed.as_bytes());
     format!("dream_{}", &hash["sha256:".len()..39])
+}
+
+pub fn config_hash() -> String {
+    ids::sha256_hex(format!("{DREAM_IMPLEMENTATION_VERSION}:{DREAM_RULESET_VERSION}").as_bytes())
+}
+
+pub fn source_counts(records: &[MemoryRecord]) -> serde_json::Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for record in records {
+        *counts
+            .entry(record.record_type.as_str().to_string())
+            .or_default() += 1;
+    }
+    json!(counts)
+}
+
+pub fn candidate_counts(response: &DreamResponse) -> serde_json::Value {
+    let mut by_action = BTreeMap::<String, usize>::new();
+    let mut by_policy = BTreeMap::<String, usize>::new();
+    for candidate in &response.candidates {
+        *by_action.entry(candidate.action.clone()).or_default() += 1;
+        *by_policy.entry(candidate.policy.clone()).or_default() += 1;
+    }
+    json!({
+        "by_action": by_action,
+        "by_policy": by_policy,
+    })
 }
 
 fn push_candidate(
