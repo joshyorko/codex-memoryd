@@ -311,10 +311,10 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
             ..Default::default()
         },
     );
-    let sentinel = "AUDIT_SENTINEL_VISIBLE_TEXT";
+    let text_to_exclude = "AUDIT_SENTINEL_VISIBLE_TEXT";
     conclude(
         &svc,
-        &format!("Right now {sentinel} is planning to ship tomorrow."),
+        &format!("Right now {text_to_exclude} is planning to ship tomorrow."),
     );
 
     dream(&svc, "preview", "2030-01-01T00:00:00Z");
@@ -335,7 +335,7 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
         )
         .unwrap();
     assert!(
-        !audit_text.contains(sentinel),
+        !audit_text.contains(text_to_exclude),
         "dream_runs audit row must not store raw evidence or candidate text"
     );
 }

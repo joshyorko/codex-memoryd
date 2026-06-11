@@ -710,7 +710,7 @@ impl Service {
                 Ok(resp)
             }
             Err(err) => {
-                let summary = safe_error_summary(&err.message);
+                let summary = sanitize_error_summary(&err.message);
                 let _ = self.store.insert_dream_run(&dream_error_audit(
                     profile.as_str(),
                     &workspace,
@@ -875,11 +875,11 @@ fn dream_error_audit(
         created_count: 0,
         archived_count: 0,
         rejected_count: 0,
-        error_summary: Some(safe_error_summary(error_summary)),
+        error_summary: Some(sanitize_error_summary(error_summary)),
     }
 }
 
-fn safe_error_summary(raw: &str) -> String {
+fn sanitize_error_summary(raw: &str) -> String {
     raw.chars()
         .map(|c| {
             if c.is_ascii_graphic() || c == ' ' {
