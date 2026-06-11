@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use codex_memoryd::config::Config;
+use codex_memoryd::config::DreamSchedulerConfig;
 use codex_memoryd::protocol::*;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
@@ -12,6 +13,29 @@ fn service() -> Service {
         ..Default::default()
     };
     Service::new(store, config)
+}
+
+fn scheduled_service(config: DreamSchedulerConfig) -> Service {
+    let store = Store::open(":memory:").expect("open store");
+    let config = Config {
+        default_workspace: "ws".to_string(),
+        dream_scheduler: config,
+        ..Default::default()
+    };
+    Service::new(store, config)
+}
+
+fn scheduler_config() -> DreamSchedulerConfig {
+    DreamSchedulerConfig {
+        enabled: true,
+        interval_seconds: 60,
+        idle_window_seconds: 900,
+        min_session_age_seconds: 300,
+        min_turn_count: 2,
+        max_batch_size: 500,
+        max_candidates: 50,
+        max_runtime_seconds: 30,
+    }
 }
 
 fn conclude(svc: &Service, content: &str) -> String {
@@ -38,6 +62,28 @@ fn dream(svc: &Service, mode: &str, now: &str) -> DreamResponse {
         now: Some(now.to_string()),
     })
     .unwrap()
+}
+
+fn turn(svc: &Service, session_id: &str, content: &str, created_at: &str) {
+    svc.turns(TurnsRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        session: Some(TurnSession {
+            id: Some(session_id.to_string()),
+            thread_id: Some("thread".to_string()),
+            source: Some("test".to_string()),
+            metadata: None,
+        }),
+        messages: Some(vec![TurnMessage {
+            actor: "user".to_string(),
+            content: content.to_string(),
+            created_at: Some(created_at.to_string()),
+            metadata: None,
+        }]),
+        write_policy: None,
+    })
+    .unwrap();
 }
 
 #[test]
@@ -157,4 +203,178 @@ fn planned_fact_transitions_to_completed_supersession() {
             && candidate.state == "completed"
             && candidate.supersedes == vec![old_id.clone()]
     }));
+}
+
+#[test]
+fn scheduled_dreamer_can_be_disabled() {
+    let svc = service();
+
+    let scheduled = svc
+        .scheduled_dream(Some("2026-06-09T00:00:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(scheduled.status, "skipped");
+    assert_eq!(scheduled.reason.as_deref(), Some("scheduler_disabled"));
+    let status = svc.status().unwrap();
+    let scheduler = status.features.get("dream_scheduler").unwrap();
+    assert_eq!(scheduler.get("enabled").unwrap(), false);
+}
+
+#[test]
+fn scheduled_dreamer_skips_recent_active_evidence() {
+    let svc = scheduled_service(scheduler_config());
+    turn(
+        &svc,
+        "session-active",
+        "Decision: active scheduler evidence uses idle guards.",
+        "2026-06-09T00:00:00Z",
+    );
+
+    let scheduled = svc
+        .scheduled_dream(Some("2026-06-09T00:05:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(scheduled.status, "skipped");
+    assert_eq!(scheduled.reason.as_deref(), Some("evidence_not_idle"));
+    assert!(scheduled.run.is_none());
+}
+
+#[test]
+fn scheduled_dreamer_skips_short_lived_sessions() {
+    let svc = scheduled_service(scheduler_config());
+    turn(
+        &svc,
+        "session-short",
+        "Decision: short scheduler evidence has only one turn.",
+        "2026-06-09T00:00:00Z",
+    );
+
+    let scheduled = svc
+        .scheduled_dream(Some("2030-06-09T00:00:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(scheduled.status, "skipped");
+    assert_eq!(scheduled.reason.as_deref(), Some("short_lived_session"));
+}
+
+#[test]
+fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
+    let svc = scheduled_service(scheduler_config());
+    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(
+        &svc,
+        "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
+    );
+
+    let first = svc
+        .scheduled_dream(Some("2026-06-09T00:00:00Z".to_string()))
+        .unwrap();
+    assert_eq!(first.status, "ok");
+    assert!(first.run.as_ref().unwrap().archived.contains(&old_id));
+    assert_eq!(
+        svc.store
+            .scheduled_dream_watermark("personal", "ws", None)
+            .unwrap(),
+        Some("2026-06-09T00:00:00Z".to_string())
+    );
+
+    let second = svc
+        .scheduled_dream(Some("2026-06-10T00:00:00Z".to_string()))
+        .unwrap();
+    assert_eq!(
+        second.watermark_before.as_deref(),
+        Some("2026-06-09T00:00:00Z")
+    );
+    assert!(second.run.unwrap().candidates.is_empty());
+}
+
+#[test]
+fn scheduled_dreamer_failed_run_does_not_advance_watermark() {
+    let svc = scheduled_service(scheduler_config());
+    conclude(
+        &svc,
+        "Right now scheduler watermark test will be patched tomorrow.",
+    );
+    svc.scheduled_dream(Some("2030-01-01T00:00:00Z".to_string()))
+        .unwrap();
+    assert_eq!(
+        svc.store
+            .scheduled_dream_watermark("personal", "ws", None)
+            .unwrap()
+            .as_deref(),
+        Some("2030-01-01T00:00:00Z")
+    );
+
+    let mut cfg = scheduler_config();
+    cfg.max_runtime_seconds = 0;
+    let failing = Service::new(
+        svc.store.clone(),
+        Config {
+            default_workspace: "ws".to_string(),
+            dream_scheduler: cfg,
+            ..Default::default()
+        },
+    );
+    let failed = failing
+        .scheduled_dream(Some("2030-01-02T00:00:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(failed.status, "error");
+    assert_eq!(
+        failing
+            .store
+            .scheduled_dream_watermark("personal", "ws", None)
+            .unwrap()
+            .as_deref(),
+        Some("2030-01-01T00:00:00Z")
+    );
+    let status = failing.status().unwrap();
+    assert_eq!(status.status, "ok");
+    assert_eq!(
+        status
+            .features
+            .get("dream_scheduler")
+            .unwrap()
+            .get("degraded")
+            .unwrap(),
+        true
+    );
+}
+
+#[test]
+fn scheduled_dreamer_enforces_candidate_limit() {
+    let mut cfg = scheduler_config();
+    cfg.max_candidates = 1;
+    let svc = scheduled_service(cfg);
+    conclude(
+        &svc,
+        "Right now the daemon is failing on startup, planning to patch it tomorrow.",
+    );
+    conclude(&svc, "OAuth sync is planned; will implement it next week.");
+    std::thread::sleep(Duration::from_millis(5));
+    svc.checkpoint(CheckpointRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        session: None,
+        summary: Some("Implemented OAuth sync and merged it.".to_string()),
+        changed_files: vec![],
+        decisions: vec![],
+        blockers: vec![],
+        next_steps: vec![],
+        tests_run: vec![],
+        tests_not_run: vec![],
+        branch: None,
+        commit: None,
+    })
+    .unwrap();
+
+    let scheduled = svc
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(scheduled.status, "ok");
+    assert!(scheduled.run.unwrap().candidates.len() <= 1);
+    assert!(scheduled.limits_hit.contains(&"max_candidates".to_string()));
 }
