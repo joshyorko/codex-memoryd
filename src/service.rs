@@ -961,7 +961,7 @@ fn is_after(a: Option<&str>, b: Option<&str>) -> bool {
             OffsetDateTime::parse(b, &Rfc3339),
         ) {
             (Ok(a), Ok(b)) => a > b,
-            _ => a > b,
+            _ => false,
         },
         _ => false,
     }
