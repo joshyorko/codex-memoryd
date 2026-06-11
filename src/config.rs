@@ -323,5 +323,8 @@ mod tests {
 
         cfg.bind = "[::1:8787".to_string();
         assert!(!cfg.bind_is_loopback());
+
+        cfg.bind = "not-a-bind".to_string();
+        assert!(!cfg.bind_is_loopback());
     }
 }
