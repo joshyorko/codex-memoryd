@@ -26,6 +26,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub recall: RecallSection,
     #[serde(default)]
+    pub dream: DreamSection,
+    #[serde(default)]
     pub log: LogSection,
 }
 
@@ -54,6 +56,30 @@ pub struct RecallSection {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct DreamSection {
+    pub scheduler_enabled: Option<bool>,
+    pub scheduler_interval_seconds: Option<u64>,
+    pub idle_window_seconds: Option<i64>,
+    pub min_session_age_seconds: Option<i64>,
+    pub min_turn_count: Option<usize>,
+    pub max_batch_size: Option<usize>,
+    pub max_candidates: Option<usize>,
+    pub max_runtime_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DreamSchedulerConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub idle_window_seconds: i64,
+    pub min_session_age_seconds: i64,
+    pub min_turn_count: usize,
+    pub max_batch_size: usize,
+    pub max_candidates: usize,
+    pub max_runtime_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LogSection {
     pub level: Option<String>,
     pub format: Option<String>,
@@ -70,6 +96,7 @@ pub struct Config {
     pub cross_profile_policy: String,
     pub max_recall_tokens: usize,
     pub max_record_chars: usize,
+    pub dream_scheduler: DreamSchedulerConfig,
     pub log_level: String,
     pub log_format: String,
 }
@@ -85,6 +112,16 @@ impl Default for Config {
             cross_profile_policy: "default_deny".to_string(),
             max_recall_tokens: DEFAULT_MAX_RECALL_TOKENS,
             max_record_chars: DEFAULT_MAX_RECORD_CHARS,
+            dream_scheduler: DreamSchedulerConfig {
+                enabled: false,
+                interval_seconds: 3600,
+                idle_window_seconds: 900,
+                min_session_age_seconds: 300,
+                min_turn_count: 2,
+                max_batch_size: 500,
+                max_candidates: 50,
+                max_runtime_seconds: 30,
+            },
             log_level: "info".to_string(),
             log_format: "text".to_string(),
         }
@@ -225,6 +262,30 @@ impl Config {
         if let Some(c) = file.recall.max_record_chars {
             self.max_record_chars = c;
         }
+        if let Some(enabled) = file.dream.scheduler_enabled {
+            self.dream_scheduler.enabled = enabled;
+        }
+        if let Some(seconds) = file.dream.scheduler_interval_seconds {
+            self.dream_scheduler.interval_seconds = seconds;
+        }
+        if let Some(seconds) = file.dream.idle_window_seconds {
+            self.dream_scheduler.idle_window_seconds = seconds;
+        }
+        if let Some(seconds) = file.dream.min_session_age_seconds {
+            self.dream_scheduler.min_session_age_seconds = seconds;
+        }
+        if let Some(count) = file.dream.min_turn_count {
+            self.dream_scheduler.min_turn_count = count;
+        }
+        if let Some(size) = file.dream.max_batch_size {
+            self.dream_scheduler.max_batch_size = size;
+        }
+        if let Some(count) = file.dream.max_candidates {
+            self.dream_scheduler.max_candidates = count;
+        }
+        if let Some(seconds) = file.dream.max_runtime_seconds {
+            self.dream_scheduler.max_runtime_seconds = seconds;
+        }
         if let Some(l) = file.log.level {
             self.log_level = l;
         }
@@ -248,6 +309,14 @@ impl Config {
         }
         if self.max_recall_tokens == 0 {
             return Err(Error::invalid_request("recall.max_tokens must be > 0"));
+        }
+        if self.dream_scheduler.interval_seconds == 0 {
+            return Err(Error::invalid_request(
+                "dream.scheduler_interval_seconds must be > 0",
+            ));
+        }
+        if self.dream_scheduler.max_batch_size == 0 {
+            return Err(Error::invalid_request("dream.max_batch_size must be > 0"));
         }
         Ok(())
     }

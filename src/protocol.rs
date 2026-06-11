@@ -106,6 +106,18 @@ pub struct StatusResponse {
     pub degraded_reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDreamStatus {
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_watermark: Option<String>,
+    pub next_eligible_run: Option<String>,
+    pub degraded: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Recall (SPEC §6.2)
 // ---------------------------------------------------------------------------
@@ -407,6 +419,16 @@ pub struct DreamResponse {
     pub archived: Vec<String>,
     pub created: Vec<String>,
     pub authority: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDreamResponse {
+    pub status: String,
+    pub reason: Option<String>,
+    pub run: Option<DreamResponse>,
+    pub watermark_before: Option<String>,
+    pub watermark_after: Option<String>,
+    pub limits_hit: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

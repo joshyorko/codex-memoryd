@@ -7,9 +7,13 @@
 //! exact same code paths as HTTP.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::json;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::Duration;
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::domain::Checkpoint;
@@ -41,8 +45,12 @@ use crate::recall;
 use crate::recall::RecallParams;
 use crate::recall::SearchParams;
 use crate::status;
+use crate::store::DreamRunRecord;
 use crate::store::NewRecord;
 use crate::store::Store;
+
+const SCHEDULED_DREAM_KIND: &str = "scheduled";
+const SCHEDULED_DREAM_MODE: &str = "apply";
 
 /// The provider service. Cheaply cloneable (Arc inside).
 #[derive(Clone)]
@@ -611,8 +619,193 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: &mode,
                 now: &now,
+                recency_cutoff: None,
+                max_records: 500,
+                max_candidates: None,
             },
         )
+    }
+
+    pub fn scheduled_dream(&self, now: Option<String>) -> Result<ScheduledDreamResponse> {
+        let cfg = self.config.dream_scheduler;
+        let profile = self.resolve_profile(&Some(self.config.default_profile.clone()))?;
+        let workspace = self.config.default_workspace.clone();
+        let now = now.unwrap_or_else(ids::now_rfc3339);
+        if !cfg.enabled {
+            return Ok(ScheduledDreamResponse {
+                status: "skipped".to_string(),
+                reason: Some("scheduler_disabled".to_string()),
+                run: None,
+                watermark_before: None,
+                watermark_after: None,
+                limits_hit: vec![],
+            });
+        }
+
+        let watermark_before =
+            self.store
+                .scheduled_dream_watermark(profile.as_str(), &workspace, None)?;
+        if cfg.max_runtime_seconds == 0 {
+            let limits_hit = vec!["max_runtime_seconds".to_string()];
+            self.store.record_dream_run(&DreamRunRecord {
+                run_id: ids::new_id("dream"),
+                profile_id: profile.as_str().to_string(),
+                workspace_id: workspace,
+                mode: SCHEDULED_DREAM_MODE.to_string(),
+                kind: SCHEDULED_DREAM_KIND.to_string(),
+                status: "error".to_string(),
+                started_at: now.clone(),
+                completed_at: Some(now),
+                watermark_before: watermark_before.clone(),
+                watermark_after: None,
+                error: Some("max runtime exceeded before run".to_string()),
+                limits_hit: limits_hit.clone(),
+                ..Default::default()
+            })?;
+            return Ok(ScheduledDreamResponse {
+                status: "error".to_string(),
+                reason: Some("max_runtime_seconds".to_string()),
+                run: None,
+                watermark_before,
+                watermark_after: None,
+                limits_hit,
+            });
+        }
+
+        let activity = self
+            .store
+            .dream_session_activity(profile.as_str(), &workspace, None)?;
+        if let Some(last) = &activity.last_activity_at {
+            if is_after(
+                add_seconds(last, cfg.idle_window_seconds).as_deref(),
+                Some(&now),
+            ) {
+                return Ok(ScheduledDreamResponse {
+                    status: "skipped".to_string(),
+                    reason: Some("evidence_not_idle".to_string()),
+                    run: None,
+                    watermark_before,
+                    watermark_after: None,
+                    limits_hit: vec![],
+                });
+            }
+        }
+        if let Some(started) = &activity.started_at {
+            if is_after(
+                add_seconds(started, cfg.min_session_age_seconds).as_deref(),
+                Some(&now),
+            ) || (activity.turn_count > 0 && activity.turn_count < cfg.min_turn_count)
+            {
+                return Ok(ScheduledDreamResponse {
+                    status: "skipped".to_string(),
+                    reason: Some("short_lived_session".to_string()),
+                    run: None,
+                    watermark_before,
+                    watermark_after: None,
+                    limits_hit: vec![],
+                });
+            }
+        }
+
+        let started = Instant::now();
+        let result = dream::run(
+            &self.store,
+            &dream::DreamParams {
+                profile,
+                workspace: &workspace,
+                repo_id: None,
+                mode: SCHEDULED_DREAM_MODE,
+                now: &now,
+                recency_cutoff: watermark_before.as_deref(),
+                max_records: cfg.max_batch_size,
+                max_candidates: Some(cfg.max_candidates),
+            },
+        );
+        let elapsed = started.elapsed();
+        let mut limits_hit = Vec::new();
+        if elapsed.as_secs() >= cfg.max_runtime_seconds {
+            limits_hit.push("max_runtime_seconds".to_string());
+        }
+        match result {
+            Ok(run) if limits_hit.is_empty() => {
+                if run.candidates.len() >= cfg.max_candidates {
+                    limits_hit.push("max_candidates".to_string());
+                }
+                let watermark_after = Some(now.clone());
+                self.store.record_dream_run(&DreamRunRecord {
+                    run_id: run.run_id.clone(),
+                    profile_id: run.profile.clone(),
+                    workspace_id: run.workspace.clone(),
+                    repo_id: run.repo_id.clone(),
+                    mode: run.mode.clone(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
+                    status: "ok".to_string(),
+                    started_at: now.clone(),
+                    completed_at: Some(now),
+                    watermark_before: watermark_before.clone(),
+                    watermark_after: watermark_after.clone(),
+                    candidates: run.candidates.len(),
+                    created: run.created.len(),
+                    archived: run.archived.len(),
+                    limits_hit: limits_hit.clone(),
+                    ..Default::default()
+                })?;
+                Ok(ScheduledDreamResponse {
+                    status: "ok".to_string(),
+                    reason: None,
+                    run: Some(run),
+                    watermark_before,
+                    watermark_after,
+                    limits_hit,
+                })
+            }
+            Ok(run) => {
+                self.store.record_dream_run(&DreamRunRecord {
+                    run_id: run.run_id.clone(),
+                    profile_id: run.profile.clone(),
+                    workspace_id: run.workspace.clone(),
+                    repo_id: run.repo_id.clone(),
+                    mode: run.mode.clone(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
+                    status: "error".to_string(),
+                    started_at: now.clone(),
+                    completed_at: Some(now),
+                    watermark_before: watermark_before.clone(),
+                    watermark_after: None,
+                    error: Some("max runtime exceeded".to_string()),
+                    candidates: run.candidates.len(),
+                    created: run.created.len(),
+                    archived: run.archived.len(),
+                    limits_hit: limits_hit.clone(),
+                })?;
+                Ok(ScheduledDreamResponse {
+                    status: "error".to_string(),
+                    reason: Some("max_runtime_seconds".to_string()),
+                    run: Some(run),
+                    watermark_before,
+                    watermark_after: None,
+                    limits_hit,
+                })
+            }
+            Err(err) => {
+                self.store.record_dream_run(&DreamRunRecord {
+                    run_id: ids::new_id("dream"),
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace,
+                    mode: SCHEDULED_DREAM_MODE.to_string(),
+                    kind: SCHEDULED_DREAM_KIND.to_string(),
+                    status: "error".to_string(),
+                    started_at: now.clone(),
+                    completed_at: Some(now),
+                    watermark_before: watermark_before.clone(),
+                    watermark_after: None,
+                    error: Some(err.to_string()),
+                    limits_hit: limits_hit.clone(),
+                    ..Default::default()
+                })?;
+                Err(err)
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -751,6 +944,24 @@ fn sanitize_workspace(raw: &str) -> String {
         "default".to_string()
     } else {
         trimmed
+    }
+}
+
+fn add_seconds(value: &str, seconds: i64) -> Option<String> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    (parsed + Duration::seconds(seconds)).format(&Rfc3339).ok()
+}
+
+fn is_after(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => match (
+            OffsetDateTime::parse(a, &Rfc3339),
+            OffsetDateTime::parse(b, &Rfc3339),
+        ) {
+            (Ok(a), Ok(b)) => a > b,
+            _ => a > b,
+        },
+        _ => false,
     }
 }
 

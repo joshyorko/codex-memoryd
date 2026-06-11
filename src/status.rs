@@ -2,11 +2,15 @@
 //! config, and metrics. Never exposes secrets.
 
 use serde_json::json;
+use time::format_description::well_known::Rfc3339;
+use time::Duration;
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::protocol::LocalImportStatus;
+use crate::protocol::ScheduledDreamStatus;
 use crate::protocol::StatusResponse;
 use crate::protocol::StorageStatus;
 use crate::store::Store;
@@ -25,6 +29,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     let active_workspaces = store.active_workspaces().unwrap_or_default();
     let last_sync = store.last_sync_completed().unwrap_or(None);
     let pending_writes = 0; // writes are synchronous in the MVP
+    let dream_scheduler = dream_scheduler_status(store, config)?;
 
     if !writable {
         degraded_reasons.push("storage is not writable".to_string());
@@ -58,6 +63,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         "checkpoints": true,
         "export": true,
         "metrics": metrics.snapshot(),
+        "dream_scheduler": dream_scheduler,
         "cross_profile_policy": config.cross_profile_policy,
         "max_recall_tokens": config.max_recall_tokens,
     });
@@ -81,4 +87,41 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         features,
         degraded_reasons,
     })
+}
+
+fn dream_scheduler_status(store: &Store, config: &Config) -> Result<ScheduledDreamStatus> {
+    let last = store.last_scheduled_dream_run()?;
+    let (last_run_at, last_status, last_error, last_run_id, last_watermark) = match last {
+        Some(summary) => (
+            summary.completed_at.clone(),
+            Some(summary.status.clone()),
+            summary.error.clone(),
+            Some(summary.run_id.clone()),
+            summary.watermark_after.clone(),
+        ),
+        None => (None, None, None, None, None),
+    };
+    let next_eligible_run = if config.dream_scheduler.enabled {
+        last_run_at
+            .as_deref()
+            .and_then(|last| add_seconds(last, config.dream_scheduler.interval_seconds as i64))
+            .or_else(|| Some("now".to_string()))
+    } else {
+        None
+    };
+    Ok(ScheduledDreamStatus {
+        enabled: config.dream_scheduler.enabled,
+        last_run_at,
+        last_status: last_status.clone(),
+        last_error: last_error.clone(),
+        last_run_id,
+        last_watermark,
+        next_eligible_run,
+        degraded: matches!(last_status.as_deref(), Some("error")) || last_error.is_some(),
+    })
+}
+
+fn add_seconds(value: &str, seconds: i64) -> Option<String> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    (parsed + Duration::seconds(seconds)).format(&Rfc3339).ok()
 }
