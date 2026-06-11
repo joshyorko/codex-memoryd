@@ -1,13 +1,19 @@
 # codex-memoryd
 
-A Codex-native **portable memory provider**, written in Rust. It owns durable
-memory storage, recall, ingestion, dedupe, safety classification, and export for
-Codex runtimes across machines, devcontainers, and agent surfaces.
+`codex-memoryd` is a local-first portable memory provider for coding agents. It
+treats memory as recall, not authority. Dreamer proposes candidate memories
+from safe visible turns, checkpoints, conclusions, and imported local memories,
+then shows a preview before any policy-gated apply. Records stay scoped by
+profile, workspace, and repo, with provenance, supersession, and fail-open
+behavior when the provider is unavailable. Hidden reasoning, secrets, raw
+confidential logs, and credentials never become durable memory.
 
-`codex-memoryd` is purpose-built for [Codex](../codex) and implements the
-provider contract in [`SPEC.md`](./SPEC.md). It is local-first: an SQLite
-database, a loopback HTTP daemon, and a CLI. No embeddings, vector database,
-dashboard, or cloud hosting are required for the MVP.
+It is written in Rust and purpose-built for [Codex](../codex)'s provider
+contract in [`SPEC.md`](./SPEC.md): durable memory storage, recall, ingestion,
+dedupe, safety classification, and export across machines, devcontainers, and
+agent surfaces. It is local-first: an SQLite database, a loopback HTTP daemon,
+and a CLI. No embeddings, vector database, dashboard, or cloud hosting are
+required for the MVP.
 
 > **Memory is recall, not authority.** Retrieved memory informs the agent but
 > never overrides current user instructions, repository files, `AGENTS.md`,
@@ -235,17 +241,35 @@ endpoint map, the local-import wire format, and the fail-open contract.
 
 ## Roadmap: Dreamer loop (research)
 
-A background/offline memory-synthesis pass — the **Dreamer loop** — is being
-designed to compress repeated safe evidence (visible turns, conclusions,
-checkpoints, imported memories) into durable, provenance-backed records, demote
-stale facts, and supersede outdated ones. It is **recall, not authority**, and
-the model only proposes — `codex-memoryd` validates and persists. ChatGPT
-"dreaming" is **not** open source; it is only public inspiration, and this repo
-makes no compatibility claim. See
+A background/offline memory-synthesis pass — the **Dreamer loop** — consolidates
+repeated safe evidence into durable, provenance-backed records, marks
+drift-prone facts with validity metadata, and supersedes outdated records. It is
+**evidence-backed consolidation, not autonomous authority**: candidates are
+grouped by deterministic `subject_key`, previewed before writes, and accepted,
+quarantined, or rejected by policy and threshold gates.
+
+Dreamer treats evidence asymmetrically. User turns, explicit conclusions, and
+checkpoints are strong signals (with checkpoints strongest for task/repo state);
+assistant turns are weak unless adopted; imported memories are secondary
+corroboration only; active records are only conflict/supersession inputs, never
+primary evidence for creating a new active memory. Candidate apply records carry
+provenance (`origin`, run/window, evidence ids/counts, `subject_key`,
+`promotion_reason`), memory state (`planned`, `active`, `blocked`, `completed`,
+`historical`, or `superseded`), and drift/expiry fields (`drift_prone`,
+`expires_at`, `valid_until`) where applicable.
+
+Public writing about ChatGPT memory is inspiration only. This repository makes no
+claim about private OpenAI memory internals, compatibility, or architecture. See
 [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md) (motivation,
 threat model, non-claims) and
 [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md) (CLI/API,
 storage, staleness/supersession, eval fixtures).
+
+Implementation order is tracked by issues: #10 deterministic preview, #11
+fixture sidecars and recall-before/after evals, #19 evidence weighting and
+thresholds, #13 state/staleness/supersession, #12 policy-gated apply, #20
+dream-run audit/watermarks, #14 live Codex smoke, #15 reliability/auth/fail-open
+contracts, #17 first-run demo, #16 local-first bakeoff, and #18 local MCP tools.
 
 ## Safety & profile boundaries
 

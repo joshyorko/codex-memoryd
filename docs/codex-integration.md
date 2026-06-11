@@ -65,6 +65,14 @@ Stable error codes (SPEC §14): `invalid_request`, `missing_profile`,
 | `POST /v1/forget` | Archive / delete | memory management |
 | `GET /v1/export` | Safe record export | backup / migration |
 
+Dreamer integration is deliberately preview-first. `codex-memoryd dream
+--preview` is the current local trust boundary; a future `/v1/dream` endpoint may
+mirror it only after the same service, policy, provenance, and fail-open
+contracts are in place. Dreamer output is recall input, not authority: it
+proposes evidence-backed candidate memories from safe visible turns, conclusions,
+checkpoints, and imported local memories, then requires preview and policy-gated
+apply before durable records change.
+
 ## Recall (pre-turn)
 
 Request:
