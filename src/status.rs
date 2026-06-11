@@ -19,11 +19,15 @@ use crate::API_VERSION;
 use crate::PROVIDER_NAME;
 use crate::PROVIDER_VERSION;
 
+const AUTH_MISSING_REASON: &str =
+    "non-loopback bind has no built-in auth; remote /v1 exposure is unsupported";
+
 /// Build the status response. `degraded_reasons` from the store (e.g. FTS5
 /// fallback) downgrade the status to `degraded`.
 pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result<StatusResponse> {
     let writable = store.writable();
     let mut degraded_reasons: Vec<String> = store.degraded_reasons().to_vec();
+    let loopback_only = config.bind_is_loopback();
 
     let active_profiles = store.active_profiles().unwrap_or_default();
     let active_workspaces = store.active_workspaces().unwrap_or_default();
@@ -33,12 +37,16 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
 
     if !writable {
         degraded_reasons.push("storage is not writable".to_string());
+    } else if !loopback_only {
+        degraded_reasons.push(AUTH_MISSING_REASON.to_string());
     }
 
     let status = if !writable {
         "unavailable"
+    } else if !loopback_only {
+        "auth_missing"
     } else if degraded_reasons.is_empty() {
-        "ok"
+        "local_only"
     } else {
         "degraded"
     };
@@ -66,6 +74,8 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         "dream_scheduler": dream_scheduler,
         "cross_profile_policy": config.cross_profile_policy,
         "max_recall_tokens": config.max_recall_tokens,
+        "exposure": if loopback_only { "local_only" } else { "auth_missing" },
+        "auth": "none",
     });
 
     Ok(StatusResponse {

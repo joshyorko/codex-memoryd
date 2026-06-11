@@ -13,8 +13,8 @@ services:
       dockerfile: Dockerfile
     image: codex-memoryd:latest
     container_name: codex-memoryd
-    # Publish only on loopback by default. Change to "8787:8787" to expose on
-    # all interfaces (e.g. for devcontainers reaching the host gateway).
+    # Publish only on loopback by default. Do not change to "8787:8787" unless
+    # an external authenticated proxy/tunnel protects /v1/*.
     ports:
       - "127.0.0.1:8787:8787"
     environment:

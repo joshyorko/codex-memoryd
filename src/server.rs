@@ -89,8 +89,7 @@ async fn parse_body<T: serde::de::DeserializeOwned>(bytes: axum::body::Bytes) ->
         // Allow empty body to deserialize to default (all-optional structs).
         return serde_json::from_slice(b"{}").map_err(Error::from);
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| Error::invalid_request(format!("invalid JSON body: {e}")))
+    serde_json::from_slice(&bytes).map_err(|_| Error::invalid_request("invalid JSON body"))
 }
 
 // ---------------------------------------------------------------------------
