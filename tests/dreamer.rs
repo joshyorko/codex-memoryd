@@ -253,7 +253,10 @@ fn failed_run_records_error_without_advancing_watermark() {
         .unwrap()
         .expect("error audit row");
     assert_eq!(last.status, "error");
-    assert_eq!(last.error_summary.as_deref(), Some("dream since must be an RFC3339 timestamp"));
+    assert_eq!(
+        last.error_summary.as_deref(),
+        Some("dream since must be an RFC3339 timestamp")
+    );
     let status = svc.status().unwrap();
     assert_eq!(status.status, "degraded");
     assert!(status
