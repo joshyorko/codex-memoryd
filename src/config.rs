@@ -3,6 +3,8 @@
 //! variables → explicit CLI flags. Later sources win.
 
 use serde::Deserialize;
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -251,6 +253,34 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Whether the configured daemon bind is loopback-only. This intentionally
+    /// treats unresolved hostnames as non-loopback, except for `localhost`.
+    pub fn bind_is_loopback(&self) -> bool {
+        bind_host(&self.bind).is_some_and(|host| {
+            if host.eq_ignore_ascii_case("localhost") {
+                return true;
+            }
+            host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        })
+    }
+}
+
+fn bind_host(bind: &str) -> Option<String> {
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return Some(match addr {
+            SocketAddr::V4(addr) => addr.ip().to_string(),
+            SocketAddr::V6(addr) => addr.ip().to_string(),
+        });
+    }
+    if bind.starts_with('[') {
+        return bind
+            .split(']')
+            .next()
+            .map(|s| s.trim_start_matches('[').to_string());
+    }
+    bind.rsplit_once(':')
+        .map(|(host, _)| host.trim().to_string())
 }
 
 #[cfg(test)]
@@ -275,5 +305,20 @@ mod tests {
         let cfg = Config::load(None, &overrides).expect("load");
         assert_eq!(cfg.bind, "0.0.0.0:9999");
         assert_eq!(cfg.default_profile, "work");
+    }
+
+    #[test]
+    fn bind_loopback_detection_covers_supported_local_modes() {
+        let mut cfg = Config::default();
+        assert!(cfg.bind_is_loopback());
+
+        cfg.bind = "localhost:8787".to_string();
+        assert!(cfg.bind_is_loopback());
+
+        cfg.bind = "[::1]:8787".to_string();
+        assert!(cfg.bind_is_loopback());
+
+        cfg.bind = "0.0.0.0:8787".to_string();
+        assert!(!cfg.bind_is_loopback());
     }
 }

@@ -94,7 +94,7 @@ pub struct StatusResponse {
     pub provider_version: String,
     pub api_version: String,
     pub storage_schema_version: i64,
-    /// `ok` | `degraded` | `unavailable`
+    /// `ok` | `degraded` | `unavailable` | `local_only` | `auth_required` | `auth_missing`
     pub status: String,
     pub storage: StorageStatus,
     pub active_profiles: Vec<String>,

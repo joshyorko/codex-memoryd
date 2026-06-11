@@ -78,6 +78,22 @@ curl -s http://127.0.0.1:8787/v1/status | jq
 ```
 
 The daemon binds loopback by default and shuts down gracefully on SIGINT/SIGTERM.
+This is the supported direct-run mode: `/healthz` is unauthenticated liveness,
+and `/v1/*` is intended only for same-host Codex clients. There is no production
+remote bearer-token/auth implementation in this daemon yet.
+
+Supported bind/exposure modes:
+
+- `127.0.0.1:8787`, `[::1]:8787`, or `localhost:8787`: supported local-only
+  operation. `/v1/status` reports `status = "local_only"` when storage is
+  otherwise healthy.
+- Docker Compose default: the daemon binds `0.0.0.0:8787` inside the container,
+  but the host publishes `127.0.0.1:8787:8787`. This is still a local-only host
+  exposure.
+- Non-loopback host publishing (for example `8787:8787`, `0.0.0.0:8787`, or a
+  LAN address) is unsupported for production remote use until auth/isolation
+  lands. `/v1/status` reports `status = "auth_missing"` and an actionable warning
+  for this configuration; do not expose `/v1/*` to untrusted networks.
 
 ## CLI
 
@@ -152,8 +168,9 @@ docker compose down            # keeps the volume
 
 The image runs as a non-root user, stores data under the `/data` volume, binds
 `0.0.0.0:8787` inside the container (published to `127.0.0.1:8787` on the host),
-and ships a `HEALTHCHECK` hitting `/healthz`. No secrets are baked into the
-image.
+and ships a `HEALTHCHECK` hitting `/healthz`. Keep the host-side publish on
+`127.0.0.1`; changing it to all interfaces is unsupported without an external
+authenticating proxy. No secrets are baked into the image.
 
 ## How the Codex fork calls it
 
@@ -196,7 +213,8 @@ runtime's HTTP client at this daemon's `/v1` API.
 In `local` mode, `provider`/`provider_url` are ignored and codex-memoryd is not
 contacted. In `provider`/`hybrid` mode the runtime fails open: if the daemon is
 unreachable, recall returns empty and writes are best-effort (in `hybrid`, local
-memory continues to serve).
+memory continues to serve). Provider errors and daemon-down conditions must not
+block the Codex-side user path.
 
 ### Status vs. Codex tap-release
 

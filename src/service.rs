@@ -239,7 +239,7 @@ impl Service {
             if actor != "user" && actor != "assistant" {
                 rejections.push(Rejection {
                     index: Some(idx),
-                    reason: format!("invalid actor '{}': must be user or assistant", msg.actor),
+                    reason: "invalid actor: must be user or assistant".to_string(),
                     code: "invalid_request".to_string(),
                 });
                 Metrics::incr(&self.metrics.writeback_rejected);
@@ -764,12 +764,10 @@ fn default_sensitivity(profile: Profile) -> Sensitivity {
 
 fn redact_for_echo(content: &str) -> String {
     // Never echo back possibly-secret content verbatim in a rejection.
-    let preview: String = content.chars().take(48).collect();
-    if content.chars().count() > 48 {
-        format!("{preview}…")
-    } else {
-        preview
-    }
+    format!(
+        "[redacted rejected content; {} chars]",
+        content.chars().count()
+    )
 }
 
 fn map_code(code: &str) -> ErrorCode {

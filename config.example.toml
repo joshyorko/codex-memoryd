@@ -17,7 +17,9 @@
 #   CODEX_MEMORYD_WORKSPACE, CODEX_MEMORYD_LOG
 
 [server]
-# Loopback-only by default. For Docker, bind 0.0.0.0 and publish the port.
+# Loopback-only by default. For Docker, bind 0.0.0.0 inside the container only
+# when the host publishes 127.0.0.1:8787:8787. Non-loopback /v1 exposure has no
+# built-in auth yet and is unsupported for production remote use.
 bind = "127.0.0.1:8787"
 
 [storage]
