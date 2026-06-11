@@ -720,7 +720,7 @@ impl Service {
         );
         let elapsed = started.elapsed();
         let mut limits_hit = Vec::new();
-        if elapsed.as_secs() > cfg.max_runtime_seconds {
+        if elapsed.as_secs() >= cfg.max_runtime_seconds {
             limits_hit.push("max_runtime_seconds".to_string());
         }
         match result {
