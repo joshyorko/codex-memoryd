@@ -1,10 +1,13 @@
 # codex-memoryd
 
 `codex-memoryd` is a local-first portable memory provider for coding agents. It
-treats memory as recall, not authority. Dreamer proposes candidate memories
-from safe visible turns, checkpoints, conclusions, and imported local memories,
-then shows a preview before any policy-gated apply. Records stay scoped by
-profile, workspace, and repo, with provenance, supersession, and fail-open
+treats memory as recall, not authority. Records stay scoped by profile,
+workspace, and repo. Preview shows what would change before any policy-gated
+apply.
+
+Dreamer proposes candidate memories from safe visible turns, checkpoints,
+conclusions, and imported local memories, then shows a preview before any
+policy-gated apply. Records carry provenance, supersession, and fail-open
 behavior when the provider is unavailable. Hidden reasoning, secrets, raw
 confidential logs, and credentials never become durable memory.
 
@@ -34,6 +37,179 @@ assembly. `codex-memoryd` owns:
 
 It does **not** execute coding tasks, act as a general workflow engine, store
 secrets / hidden reasoning, or auto-merge work and personal memory.
+
+## Try it in 5 minutes
+
+This native path is Linux-first and works from a clean clone on
+Ubuntu/Bluefin-class systems with Rust installed. It keeps demo state under the
+repository's `.demo/` directory so it is easy to inspect and remove.
+
+```bash
+# Build and install a local native binary.
+# If you have not cloned yet:
+#   git clone https://github.com/joshyorko/codex-memoryd.git
+#   cd codex-memoryd
+cargo build --release
+install -Dm755 target/release/codex-memoryd "$HOME/.local/bin/codex-memoryd"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Start the daemon on loopback with an isolated demo database.
+mkdir -p .demo
+export CODEX_MEMORYD_DB="$PWD/.demo/memory.db"
+codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
+echo $! > .demo/codex-memoryd.pid
+
+# Verify the daemon and local storage.
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+codex-memoryd doctor | jq
+
+# Configure Codex to use this provider, replacing any existing [memories] block.
+python3 - <<'PY'
+from pathlib import Path
+p = Path.home() / ".codex" / "config.toml"
+p.parent.mkdir(parents=True, exist_ok=True)
+text = p.read_text() if p.exists() else ""
+out = []
+skip = False
+for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        skip = stripped == "[memories]"
+        if not skip:
+            out.append(line)
+    elif not skip:
+        out.append(line)
+memories = """[memories]
+backend = "provider"
+provider = "codex_memoryd"
+provider_url = "http://127.0.0.1:8787"
+profile = "personal"
+workspace = "codex-memoryd-demo"
+local_import_policy = "prompt"
+write_policy = "visible_turns"
+sync_policy = "manual"
+cross_profile_policy = "default_deny"
+"""
+p.write_text("\n".join(out).rstrip() + "\n\n" + memories)
+PY
+
+# Create a compact local Codex-memory fixture, then preview and apply import.
+mkdir -p .demo/codex-memories/rollout_summaries
+cat > .demo/codex-memories/memory_summary.md <<'MD'
+# Preferences
+- Prefer local-first memory providers for coding agents.
+MD
+codex-memoryd sync-local --preview --profile personal \
+  --workspace codex-memoryd-demo .demo/codex-memories | jq
+codex-memoryd sync-local --apply --profile personal \
+  --workspace codex-memoryd-demo .demo/codex-memories | jq
+
+# Write one conclusion, recall it, and export safe records.
+codex-memoryd conclude --profile personal --workspace codex-memoryd-demo \
+  --content "Decision: codex-memoryd first-run demo verifies status, recall, and export." | jq
+codex-memoryd recall --profile personal --workspace codex-memoryd-demo \
+  --query "first-run demo status recall export" | jq
+codex-memoryd export --profile personal --workspace codex-memoryd-demo \
+  > .demo/codex-memoryd-export.jsonl
+cat .demo/codex-memoryd-export.jsonl
+
+# Stop and restart the daemon.
+kill "$(cat .demo/codex-memoryd.pid)"
+codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
+echo $! > .demo/codex-memoryd.pid
+curl -fsS http://127.0.0.1:8787/v1/status | jq '.data.status'
+kill "$(cat .demo/codex-memoryd.pid)"
+```
+
+Expected status JSON shape:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "provider_name": "codex-memoryd",
+    "api_version": "v1",
+    "status": "local_only",
+    "storage": {
+      "kind": "sqlite",
+      "path": "/absolute/path/to/.demo/memory.db",
+      "writable": true
+    },
+    "features": {
+      "fts5": true,
+      "exposure": "local_only"
+    },
+    "degraded_reasons": []
+  },
+  "warnings": [],
+  "request_id": "req_...",
+  "provider": {
+    "name": "codex-memoryd",
+    "version": "0.1.0"
+  }
+}
+```
+
+Expected recall JSON shape (CLI output):
+
+```json
+{
+  "summary": "Decision: codex-memoryd first-run demo verifies status, recall, and export.",
+  "facts": [
+    {
+      "id": "mem_...",
+      "type": "decision",
+      "scope": "user",
+      "content": "Decision: codex-memoryd first-run demo verifies status, recall, and export.",
+      "confidence": 0.9,
+      "repo_id": null,
+      "related_files": [],
+      "updated_at": "2026-...",
+      "stale": false
+    }
+  ],
+  "checkpoints": [],
+  "citations": [
+    {
+      "memory_id": "mem_...",
+      "source_id": "src_...",
+      "source_path": null
+    }
+  ],
+  "truncated": false,
+  "authority": "recall_not_authority"
+}
+```
+
+Docker Compose path:
+
+```bash
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+docker compose logs -f codex-memoryd
+docker compose down
+```
+
+Native release binary path, once a GitHub Release asset is published:
+
+```bash
+install -Dm755 ./codex-memoryd-linux-x86_64 "$HOME/.local/bin/codex-memoryd"
+codex-memoryd --version
+```
+
+Troubleshooting first run:
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `bind ... failed to listen` | Port `8787` is already in use or the bind address is invalid. | Stop the other process or run `codex-memoryd serve --bind 127.0.0.1:8788` and update Codex `provider_url`. |
+| `storage_unavailable` with `create storage dir` or `open ...` | The `--db`/`CODEX_MEMORYD_DB` path is blocked by a file or lacks permissions. | Choose a writable path such as `CODEX_MEMORYD_DB=$PWD/.demo/memory.db` or fix directory ownership. |
+| `/v1/status` has `status: "auth_missing"` | The daemon is configured for non-loopback exposure without built-in auth. | Keep host exposure on `127.0.0.1` (Docker default) until a separate authenticated proxy/auth story exists. |
+| `curl: (7) Failed to connect` | The daemon is not running or was started with a different port. | Check `.demo/codex-memoryd.log`, restart `codex-memoryd serve`, and verify the configured `provider_url`. |
+| `jq: command not found` | `jq` is not installed. | Install it (`sudo apt install jq`) or omit `| jq`; responses are still JSON. |
+
+If the daemon is down, Codex-side provider/hybrid mode is designed to fail open:
+recall returns empty and writes are best-effort rather than blocking the coding
+path. See issues #14 and #16 for live smoke/bakeoff follow-ups.
 
 ## Architecture
 

@@ -149,7 +149,10 @@ impl Store {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        Error::storage(format!("create storage dir {}: {e}", parent.display()))
+                        Error::storage(format!(
+                            "create storage dir {}: {e}; check --db/CODEX_MEMORYD_DB path and directory permissions",
+                            parent.display()
+                        ))
                     })?;
                 }
             }
@@ -157,11 +160,20 @@ impl Store {
             // persistent property of the database file, so pooled connections
             // inherit it without each having to switch journal mode — which
             // would otherwise race to "database is locked" on a fresh file.
-            let bootstrap = rusqlite::Connection::open(&path)
-                .map_err(|e| Error::storage(format!("open {}: {e}", path.display())))?;
+            let bootstrap = rusqlite::Connection::open(&path).map_err(|e| {
+                Error::storage(format!(
+                    "open {}: {e}; check --db/CODEX_MEMORYD_DB path and file permissions",
+                    path.display()
+                ))
+            })?;
             bootstrap
                 .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
-                .map_err(|e| Error::storage(format!("enable WAL: {e}")))?;
+                .map_err(|e| {
+                    Error::storage(format!(
+                        "enable WAL for {}: {e}; check database write permissions",
+                        path.display()
+                    ))
+                })?;
             SqliteConnectionManager::file(&path)
         };
         // Per-connection pragmas. journal_mode is intentionally NOT set here: it

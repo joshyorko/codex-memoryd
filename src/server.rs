@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::header;
@@ -263,8 +264,14 @@ pub async fn serve(service: Service, bind: &str) -> anyhow::Result<()> {
         spawn_dream_scheduler(service.clone());
     }
     let app = router(service);
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    let local = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| {
+        format!(
+            "bind {bind}: failed to listen; choose an unused loopback address with --bind 127.0.0.1:<port> or stop the process using this port"
+        )
+    })?;
+    let local = listener
+        .local_addr()
+        .context("read listener local address after bind")?;
     tracing::info!(bind = %local, "codex-memoryd HTTP server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
