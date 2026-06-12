@@ -15,6 +15,7 @@ use codex_memoryd::domain;
 use codex_memoryd::error;
 use codex_memoryd::error::Result;
 use codex_memoryd::ingest::ArtifactKind;
+use codex_memoryd::mcp;
 use codex_memoryd::protocol::*;
 use codex_memoryd::server;
 use codex_memoryd::service::Service;
@@ -135,6 +136,11 @@ pub enum Command {
     },
     /// Run self-checks (storage writable, FTS5, schema).
     Doctor,
+    /// Run MCP transport entrypoints.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Run the Dreamer loop in preview or apply mode.
     Dream {
         #[arg(long)]
@@ -156,6 +162,12 @@ pub enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Run the MCP server over stdio.
+    Stdio,
+}
+
 impl Cli {
     fn overrides(&self, bind: Option<String>) -> CliOverrides {
         CliOverrides {
@@ -171,7 +183,7 @@ impl Cli {
         Config::load(self.config.as_deref(), &self.overrides(bind))
     }
 
-    fn open_service(&self, bind: Option<String>) -> Result<Service> {
+    pub(crate) fn open_service(&self, bind: Option<String>) -> Result<Service> {
         let config = self.load_config(bind)?;
         let store = Store::open(&config.storage_path)?;
         Ok(Service::new(store, config))
@@ -410,6 +422,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Mcp { command } => match command {
+            McpCommand::Stdio => {
+                let service = cli.open_service(None)?;
+                mcp::run_stdio(service)?;
+                Ok(())
+            }
+        },
     }
 }
 

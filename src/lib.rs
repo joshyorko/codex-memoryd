@@ -21,6 +21,7 @@ pub mod error;
 pub mod export;
 pub mod ids;
 pub mod ingest;
+pub mod mcp;
 pub mod metrics;
 pub mod policy;
 pub mod protocol;
