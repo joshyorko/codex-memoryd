@@ -259,7 +259,7 @@ model tokens:
 ```json
 {
   "provider_name": "codex-memoryd", "provider_version": "0.1.0",
-  "api_version": "v1", "storage_schema_version": 1,
+  "api_version": "v1", "storage_schema_version": 2,
   "status": "local_only",
   "storage": { "kind": "sqlite", "path": "/data/memory.db", "writable": true },
   "active_profiles": ["personal"], "active_workspaces": ["josh-personal"],

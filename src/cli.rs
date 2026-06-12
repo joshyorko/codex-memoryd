@@ -151,6 +151,8 @@ pub enum Command {
         scheduled: bool,
         #[arg(long)]
         now: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -220,6 +222,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             apply,
             scheduled,
             now,
+            since,
         } => {
             let service = cli.open_service(None)?;
             if *scheduled {
@@ -243,6 +246,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 }),
                 mode: Some(mode.to_string()),
                 now: now.clone(),
+                since: since.clone(),
             })?;
             print_json(&resp)?;
             Ok(())
@@ -397,6 +401,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 "schema_version": status.storage_schema_version,
                 "status": status.status,
                 "degraded_reasons": status.degraded_reasons,
+                "last_dream": status.last_dream,
                 "record_count": service.store.count_records().unwrap_or(-1),
             });
             print_json(&report)?;

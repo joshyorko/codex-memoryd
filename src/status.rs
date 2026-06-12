@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::error::Result;
 use crate::metrics::Metrics;
+use crate::protocol::DreamRunStatus;
 use crate::protocol::LocalImportStatus;
 use crate::protocol::ScheduledDreamStatus;
 use crate::protocol::StatusResponse;
@@ -32,6 +33,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     let active_profiles = store.active_profiles().unwrap_or_default();
     let active_workspaces = store.active_workspaces().unwrap_or_default();
     let last_sync = store.last_sync_completed().unwrap_or(None);
+    let last_dream = store.last_dream_run().unwrap_or(None);
     let pending_writes = 0; // writes are synchronous in the MVP
     let dream_scheduler = dream_scheduler_status(store, config)?;
 
@@ -39,6 +41,16 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         degraded_reasons.push("storage is not writable".to_string());
     } else if !loopback_only {
         degraded_reasons.push(AUTH_MISSING_REASON.to_string());
+    }
+    if let Some(run) = &last_dream {
+        if run.status == "error" {
+            degraded_reasons.push(match &run.error_summary {
+                Some(summary) if !summary.is_empty() => {
+                    format!("last Dreamer run failed: {summary}")
+                }
+                _ => "last Dreamer run failed".to_string(),
+            });
+        }
     }
 
     let status = if !writable {
@@ -92,6 +104,22 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         active_profiles,
         active_workspaces,
         last_sync,
+        last_dream: last_dream.map(|run| DreamRunStatus {
+            run_id: run.id,
+            profile: run.profile_id,
+            workspace: run.workspace_id,
+            repo_id: run.repo_id,
+            mode: run.mode,
+            status: run.status,
+            started_at: run.started_at,
+            completed_at: run.completed_at,
+            source_window_start: run.source_window_start,
+            source_window_end: run.source_window_end,
+            created: run.created_count,
+            archived: run.archived_count,
+            rejected: run.rejected_count,
+            error_summary: run.error_summary,
+        }),
         pending_writes,
         local_import,
         features,

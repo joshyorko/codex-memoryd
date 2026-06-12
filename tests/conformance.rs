@@ -50,7 +50,7 @@ fn status_reports_local_only_and_schema() {
     let status = svc.status().expect("status");
     assert_eq!(status.provider_name, "codex-memoryd");
     assert_eq!(status.api_version, "v1");
-    assert_eq!(status.storage_schema_version, 1);
+    assert_eq!(status.storage_schema_version, 2);
     assert!(matches!(status.status.as_str(), "local_only" | "degraded"));
     assert!(status.storage.writable);
 }
