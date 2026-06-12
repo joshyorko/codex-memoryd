@@ -288,6 +288,8 @@ fixture sidecars and recall-before/after evals, #19 evidence weighting and
 thresholds, #13 state/staleness/supersession, #12 policy-gated apply, #20
 dream-run audit/watermarks, #14 live Codex smoke, #15 reliability/auth/fail-open
 contracts, #17 first-run demo, #16 local-first bakeoff, and #18 local MCP tools.
+For #19, the fixture set now also includes user-adoption, non-promoted assistant-only,
+and imported-memory self-reinforcement edge cases in `tests/fixtures/dreaming`.
 
 ## Safety & profile boundaries
 

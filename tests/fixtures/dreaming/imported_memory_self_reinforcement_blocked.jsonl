@@ -1,0 +1,2 @@
+{"kind": "memory_record", "id": "imported_custom_script", "type": "decision", "content": "Decision: imported summary says the daemon should use custom scripts.", "created_at": "2026-06-01T10:00:00Z"}
+{"kind": "memory_record", "id": "active_custom_script", "type": "decision", "content": "Decision: active memory repeats the imported custom script summary.", "created_at": "2026-06-02T10:00:00Z"}

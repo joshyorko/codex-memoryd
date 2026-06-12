@@ -1,0 +1,18 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "command:cargo-test-repeated-steering",
+        "record_type": "command",
+        "promotion_reason": "repeated_user_steering",
+        "evidence_count": 2,
+        "must_contain": ["cargo test"],
+        "must_not_contain": []
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  },
+  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true }
+}

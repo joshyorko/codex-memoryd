@@ -441,6 +441,12 @@ Seeded scenarios:
 | `relative_time_expiry_tomorrow.jsonl` | `tomorrow` content expires after the deterministic clock advances. |
 | `secret_rejection.jsonl` | A repeated secret is **never** synthesized (policy reject). |
 | `repo_gotcha.jsonl` | A recurring failure is promoted to a `gotcha` scoped to the repo. |
+| `user_adopts_assistant_proposal.jsonl` | Assistant proposal plus explicit user adoption is promoted to a durable `command`. |
+| `assistant_proposal_without_adoption.jsonl` | Assistant-only proposal is quarantined until user validates/adopts it. |
+| `single_mention_preference_not_promoted.jsonl` | A single preference statement remains quarantined as unconfirmed. |
+| `imported_memory_self_reinforcement_blocked.jsonl` | Imported memory cannot self-reinforce into active candidates without fresh evidence. |
+| `explicit_conclusion_promotes.jsonl` | Explicit conclusion evidence promotes a `decision` when clear. |
+| `repeated_user_steering_promotes.jsonl` | Repeated user steering promotes to a durable `command` candidate. |
 
 ### Eval assertions
 

@@ -56,6 +56,12 @@ idempotent. Recall expectations compare the store before and after apply.
 | `relative_time_expiry_tomorrow.jsonl` | Expire `tomorrow`/relative-time content after the clock advances. |
 | `secret_rejection.jsonl` | Never synthesize a repeated secret; reject with `secret_detected`. |
 | `repo_gotcha.jsonl` | Promote a recurring failure into a `gotcha` scoped to the repo. |
+| `user_adopts_assistant_proposal.jsonl` | Assistant proposal plus explicit user adoption is promoted into `command`. |
+| `assistant_proposal_without_adoption.jsonl` | Assistant-only proposal is quarantined without user adoption. |
+| `single_mention_preference_not_promoted.jsonl` | Single user preference mention stays low-confidence and does not promote. |
+| `imported_memory_self_reinforcement_blocked.jsonl` | Imported/active memory self-reinforcement is blocked without fresh primary evidence. |
+| `explicit_conclusion_promotes.jsonl` | Explicit conclusion in evidence is accepted when it is clear and authoritative. |
+| `repeated_user_steering_promotes.jsonl` | Repeated user steering is promoted to one stable `command`. |
 
 See the design doc §7 for the per-scenario eval assertions, including
 sidecar-required provenance (`subject_key`, evidence counts, promotion/threshold

@@ -114,6 +114,10 @@ fn insert_direct_record(svc: &Service, content: &str, metadata: Value) -> String
 }
 
 fn turn(svc: &Service, session_id: &str, content: &str, created_at: &str) {
+    turn_as(svc, session_id, "user", content, created_at);
+}
+
+fn turn_as(svc: &Service, session_id: &str, actor: &str, content: &str, created_at: &str) {
     svc.turns(TurnsRequest {
         profile: Some("personal".to_string()),
         workspace: Some("ws".to_string()),
@@ -125,7 +129,7 @@ fn turn(svc: &Service, session_id: &str, content: &str, created_at: &str) {
             metadata: None,
         }),
         messages: Some(vec![TurnMessage {
-            actor: "user".to_string(),
+            actor: actor.to_string(),
             content: content.to_string(),
             created_at: Some(created_at.to_string()),
             metadata: None,
@@ -711,4 +715,140 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
         !audit_text.contains(text_to_exclude),
         "dream_runs audit row must not store raw evidence or candidate text"
     );
+}
+
+#[test]
+fn user_adopts_assistant_proposal() {
+    let svc = service();
+    turn_as(
+        &svc,
+        "adopt",
+        "assistant",
+        "Decision: use cargo test as the repo-native validation command.",
+        "2026-06-01T10:00:00Z",
+    );
+    turn(
+        &svc,
+        "adopt",
+        "Yes, use cargo test as the repo-native validation command.",
+        "2026-06-01T10:01:00Z",
+    );
+
+    let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "accepted"
+            && candidate.threshold_reason == "user_adopted_assistant_proposal"
+            && candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn assistant_proposal_without_adoption() {
+    let svc = service();
+    turn_as(
+        &svc,
+        "proposal",
+        "assistant",
+        "Decision: use custom helper scripts for validation.",
+        "2026-06-01T10:00:00Z",
+    );
+
+    let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "quarantined"
+            && candidate.threshold_reason == "assistant_only_proposal_quarantined"
+            && !candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn single_mention_preference_not_promoted() {
+    let svc = service();
+    turn(
+        &svc,
+        "single-pref",
+        "I prefer terse commit messages.",
+        "2026-06-01T10:00:00Z",
+    );
+
+    let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "quarantined"
+            && candidate.threshold_reason == "single_unconfirmed_preference"
+            && !candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn imported_memory_self_reinforcement_blocked() {
+    let svc = service();
+    insert_direct_record(
+        &svc,
+        "Decision: imported summary says the daemon should use custom scripts.",
+        json!({ "origin": "codex-local-memory", "artifact_kind": "memory_summary" }),
+    );
+    insert_direct_record(
+        &svc,
+        "Decision: active memory repeats the imported custom script summary.",
+        json!({ "origin": "dreamer" }),
+    );
+
+    let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "quarantined"
+            && candidate.threshold_reason
+                == "imported_or_active_memory_without_fresh_primary_evidence"
+            && !candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn explicit_conclusion_promotes() {
+    let svc = service();
+    conclude(
+        &svc,
+        "Decision: cargo test is the supported validation command.",
+    );
+
+    let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "accepted"
+            && candidate.threshold_reason == "explicit_conclusion"
+            && candidate
+                .evidence_classes
+                .contains(&"explicit_conclusion".to_string())
+            && candidate.evidence_weight >= 2.0
+            && candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn repeated_user_steering_promotes() {
+    let svc = service();
+    turn(
+        &svc,
+        "steering",
+        "Use cargo test for validation.",
+        "2026-06-01T10:00:00Z",
+    );
+    turn(
+        &svc,
+        "steering",
+        "Again, run cargo test before claiming done.",
+        "2026-06-08T10:00:00Z",
+    );
+
+    let report = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "accepted"
+            && candidate.threshold_reason == "repeated_user_steering"
+            && candidate.user_evidence_count >= 2
+            && candidate.apply_eligible
+    }));
 }

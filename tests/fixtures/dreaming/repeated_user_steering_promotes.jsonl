@@ -1,0 +1,2 @@
+{"kind": "visible_turn", "actor": "user", "content": "Use cargo test for validation.", "created_at": "2026-06-01T10:00:00Z"}
+{"kind": "visible_turn", "actor": "user", "content": "Again, run cargo test before claiming done.", "created_at": "2026-06-08T10:00:00Z"}
