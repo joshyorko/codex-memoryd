@@ -123,8 +123,10 @@ curl -fsS http://127.0.0.1:8787/v1/status | jq
 codex-memoryd status | jq
 codex-memoryd doctor | jq
 
-# 3) Configure this provider in ~/.codex/config.toml (replace existing [memories] block).
-cat > "$HOME/.codex/config.toml" <<'EOF'
+# 3) Configure this provider in ~/.codex/config.toml.
+# Add this [memories] block, or update only the existing one.
+#
+# [memories]
 [memories]
 backend = "provider"
 provider = "codex_memoryd"
@@ -135,7 +137,6 @@ local_import_policy = "prompt"
 write_policy = "visible_turns"
 sync_policy = "manual"
 cross_profile_policy = "default_deny"
-EOF
 
 # 4) Import local fixtures with a dry run, then apply.
 mkdir -p .demo/codex-memories/rollout_summaries
