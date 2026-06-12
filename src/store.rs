@@ -1009,23 +1009,38 @@ impl Store {
         &self,
         profile_id: &str,
         workspace_id: &str,
+        repo_id: Option<&str>,
+        since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Checkpoint>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, profile_id, workspace_id, repo_id, summary,
-                    changed_files, decisions, blockers, next_steps, tests_run,
-                    tests_not_run, branch, commit_sha, created_at
+        let mut sql = "SELECT id, session_id, profile_id, workspace_id, repo_id, summary,
+                changed_files, decisions, blockers, next_steps, tests_run,
+                tests_not_run, branch, commit_sha, created_at
              FROM checkpoints
-             WHERE profile_id = ?1 AND workspace_id = ?2
-             ORDER BY created_at DESC, id ASC
-             LIMIT ?3",
-        )?;
+             WHERE profile_id = ? AND workspace_id = ?"
+            .to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo_id) = repo_id {
+            sql.push_str(" AND repo_id = ?");
+            args.push(Box::new(repo_id.to_string()));
+        }
+        if let Some(since) = since {
+            sql.push_str(" AND created_at >= ?");
+            args.push(Box::new(since.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id ASC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(
-                params![profile_id, workspace_id, limit as i64],
-                row_to_checkpoint,
-            )?
+            .query_map(params_ref.as_slice(), row_to_checkpoint)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1059,21 +1074,37 @@ impl Store {
         &self,
         profile_id: &str,
         workspace_id: &str,
+        repo_id: Option<&str>,
+        since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Conclusion>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut sql =
             "SELECT id, profile_id, workspace_id, repo_id, target, content, source_id, created_at, metadata
              FROM conclusions
-             WHERE profile_id = ?1 AND workspace_id = ?2
-             ORDER BY created_at DESC, id ASC
-             LIMIT ?3",
-        )?;
+             WHERE profile_id = ? AND workspace_id = ?"
+                .to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo_id) = repo_id {
+            sql.push_str(" AND repo_id = ?");
+            args.push(Box::new(repo_id.to_string()));
+        }
+        if let Some(since) = since {
+            sql.push_str(" AND created_at >= ?");
+            args.push(Box::new(since.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id ASC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(
-                params![profile_id, workspace_id, limit as i64],
-                row_to_conclusion,
-            )?
+            .query_map(params_ref.as_slice(), row_to_conclusion)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1104,22 +1135,37 @@ impl Store {
         &self,
         profile_id: &str,
         workspace_id: &str,
+        repo_id: Option<&str>,
+        since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<VisibleTurn>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT t.id, t.session_id, t.actor, t.content, t.created_at, t.metadata
+        let mut sql = "SELECT t.id, t.session_id, t.actor, t.content, t.created_at, t.metadata
              FROM visible_turns t
              JOIN sessions s ON s.id = t.session_id
-             WHERE s.profile_id = ?1 AND s.workspace_id = ?2
-             ORDER BY t.created_at DESC, t.id ASC
-             LIMIT ?3",
-        )?;
+             WHERE s.profile_id = ? AND s.workspace_id = ?"
+            .to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo_id) = repo_id {
+            sql.push_str(" AND s.repo_id = ?");
+            args.push(Box::new(repo_id.to_string()));
+        }
+        if let Some(since) = since {
+            sql.push_str(" AND t.created_at >= ?");
+            args.push(Box::new(since.to_string()));
+        }
+        sql.push_str(" ORDER BY t.created_at DESC, t.id ASC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(
-                params![profile_id, workspace_id, limit as i64],
-                row_to_visible_turn,
-            )?
+            .query_map(params_ref.as_slice(), row_to_visible_turn)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1129,21 +1175,32 @@ impl Store {
         &self,
         profile_id: &str,
         workspace_id: &str,
+        since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemorySource>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut sql =
             "SELECT id, profile_id, workspace_id, kind, source_path, source_hash, created_at, ingested_at, metadata
              FROM memory_sources
-             WHERE profile_id = ?1 AND workspace_id = ?2
-             ORDER BY ingested_at DESC, id ASC
-             LIMIT ?3",
-        )?;
+             WHERE profile_id = ? AND workspace_id = ?"
+                .to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(since) = since {
+            sql.push_str(" AND ingested_at >= ?");
+            args.push(Box::new(since.to_string()));
+        }
+        sql.push_str(" ORDER BY ingested_at DESC, id ASC");
+        if limit > 0 {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(
-                params![profile_id, workspace_id, limit as i64],
-                row_to_source,
-            )?
+            .query_map(params_ref.as_slice(), row_to_source)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

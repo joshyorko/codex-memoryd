@@ -25,9 +25,9 @@ recall / store boundaries.
   - Test coverage includes promotion/rejection/supersession/stale-facts/secrets/user
     adoption/explicit conclusions/repeated steering/self-reinforcement blocking.
 - Remaining work:
-  - The loop is not fully productized; it is still memory-records-centric and
-    does not yet treat visible turns, conclusions, checkpoints, imports, and source
-    evidence as equally independent first-class streams.
+  - The loop is not fully productized; the report now exposes a first-class
+    evidence window with per-stream counts and safe source refs, but synthesis
+    is still record-centric and not yet a full product surface.
   - MCP Dreamer tooling is incomplete.
   - Upstream Codex native-memory parity is still missing in areas like idle/session
     eligibility, generated memory files, workspace-native semantics, and provider
@@ -103,14 +103,17 @@ state (`planned`, `active`, `blocked`, `completed`, `historical`,
   "run_id": "dream_…",
   "profile": "personal",
   "workspace": "josh-personal",
-  "evidence_window": { "start": "…", "end": "…" },
-  "evidence_scanned": {
-    "visible_turns": 42, "conclusions": 3, "checkpoints": 2,
-    "imported_memories": 7, "active_records": 31
-  },
-  "evidence_counts": {
-    "visible_turns": 42, "conclusions": 3, "checkpoints": 2,
-    "imported_memories": 7, "active_records": 31
+  "evidence_window": {
+    "start": null,
+    "end": "…",
+    "visible_turns": {
+      "count": 42,
+      "sources": [{ "id": "turn_…", "kind": "visible_turn" }]
+    },
+    "conclusions": { "count": 3, "sources": [] },
+    "checkpoints": { "count": 2, "sources": [] },
+    "imported_memories": { "count": 7, "sources": [] },
+    "active_memory_records": { "count": 31, "sources": [] }
   },
   "candidates": [
     {

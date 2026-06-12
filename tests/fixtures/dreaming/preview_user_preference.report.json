@@ -5,6 +5,39 @@
   "workspace": "test",
   "repo_id": null,
   "now": "2026-01-02T00:00:00Z",
+  "evidence_window": {
+    "start": null,
+    "end": "2026-01-02T00:00:00Z",
+    "visible_turns": {
+      "count": 1,
+      "sources": [
+        {
+          "id": "turn_user_pref",
+          "kind": "visible_turn",
+          "created_at": "2026-01-01T00:01:00Z",
+          "actor": "user",
+          "source_path": "turn:sess_fixture",
+          "summary": "visible_turn"
+        }
+      ]
+    },
+    "conclusions": {
+      "count": 0,
+      "sources": []
+    },
+    "checkpoints": {
+      "count": 0,
+      "sources": []
+    },
+    "imported_memories": {
+      "count": 0,
+      "sources": []
+    },
+    "active_memory_records": {
+      "count": 0,
+      "sources": []
+    }
+  },
   "candidates": [],
   "stale": [],
   "rejected": [],
