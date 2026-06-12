@@ -6,10 +6,14 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::body::Body;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::header;
+use axum::http::Request;
 use axum::http::StatusCode;
+use axum::middleware;
+use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
@@ -19,7 +23,7 @@ use axum::Router;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::ids;
 use crate::protocol::Envelope;
 use crate::protocol::ErrorBody;
@@ -44,10 +48,8 @@ fn provider_tag() -> ProviderTag {
 
 /// Build the axum router with all `/v1` routes.
 pub fn router(service: Service) -> Router {
-    let state = AppState { service };
-    Router::new()
-        .route("/v1/status", get(status_handler))
-        .route("/healthz", get(health_handler))
+    let state = Arc::new(AppState { service });
+    let protected_routes = Router::new()
         .route("/v1/recall", post(recall_handler))
         .route("/v1/search", post(search_handler))
         .route("/v1/turns", post(turns_handler))
@@ -57,7 +59,16 @@ pub fn router(service: Service) -> Router {
         .route("/v1/sync/local-codex-memory", post(sync_handler))
         .route("/v1/forget", post(forget_handler))
         .route("/v1/export", get(export_handler))
-        .with_state(Arc::new(state))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            v1_transport_gate,
+        ));
+
+    Router::new()
+        .route("/v1/status", get(status_handler))
+        .route("/healthz", get(health_handler))
+        .merge(protected_routes)
+        .with_state(state)
 }
 
 /// Wrap a successful value in the success envelope (HTTP 200).
@@ -255,6 +266,28 @@ async fn export_handler(
                 .into_response()
         }
         Err(e) => err_envelope(e),
+    }
+}
+
+async fn v1_transport_gate(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Err(err) = enforce_v1_transport_gate(&state) {
+        return err_envelope(err);
+    }
+    next.run(request).await
+}
+
+fn enforce_v1_transport_gate(state: &AppState) -> Result<(), Error> {
+    if state.service.config.bind_is_loopback() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::AuthMissing,
+            "remote /v1 access is disabled until transport auth is configured",
+        ))
     }
 }
 

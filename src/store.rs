@@ -833,6 +833,47 @@ impl Store {
         Ok(rows)
     }
 
+    /// Export rows and the matching `secret_blocked` count from one read
+    /// transaction so the omitted count matches the exported snapshot.
+    pub fn export_records(&self, query: &RecordQuery) -> Result<(Vec<MemoryRecord>, usize)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        let omitted_secret = {
+            let mut sql = "SELECT COUNT(*) FROM memory_records WHERE 1=1".to_string();
+            let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            append_export_scope_filters(&mut sql, &mut args, query);
+            sql.push_str(" AND sensitivity = 'secret_blocked'");
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                args.iter().map(|b| b.as_ref()).collect();
+            let count: i64 = tx.query_row(&sql, params_ref.as_slice(), |row| row.get(0))?;
+            count as usize
+        };
+
+        let rows = {
+            let mut sql = format!("SELECT {RECORD_COLS} FROM memory_records WHERE 1=1");
+            let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            append_export_scope_filters(&mut sql, &mut args, query);
+            sql.push_str(" AND sensitivity != 'secret_blocked'");
+            sql.push_str(" ORDER BY updated_at DESC");
+            if query.limit > 0 {
+                sql.push_str(&format!(" LIMIT {} OFFSET {}", query.limit, query.offset));
+            }
+
+            let mut stmt = tx.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                args.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(params_ref.as_slice(), row_to_record)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        tx.commit()?;
+        Ok((rows, omitted_secret))
+    }
+
     /// Full-text-ish search. Uses FTS5 when available, otherwise LIKE.
     /// Returns records ranked by relevance (FTS) or recency (LIKE).
     pub fn search_records(
@@ -1474,6 +1515,28 @@ fn append_record_filters(
     if let Some(cutoff) = &filters.recency_cutoff {
         sql.push_str(&format!(" AND {} >= ?", col("updated_at")));
         args.push(Box::new(cutoff.clone()));
+    }
+}
+
+fn append_export_scope_filters(
+    sql: &mut String,
+    args: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    query: &RecordQuery,
+) {
+    if let Some(p) = &query.profile_id {
+        sql.push_str(" AND profile_id = ?");
+        args.push(Box::new(p.clone()));
+    }
+    if let Some(w) = &query.workspace_id {
+        sql.push_str(" AND workspace_id = ?");
+        args.push(Box::new(w.clone()));
+    }
+    if let Some(r) = &query.repo_id {
+        sql.push_str(" AND repo_id = ?");
+        args.push(Box::new(r.clone()));
+    }
+    if !query.include_archived {
+        sql.push_str(" AND archived = 0");
     }
 }
 

@@ -20,6 +20,7 @@ pub enum ErrorCode {
     StorageUnavailable,
     PolicyDenied,
     SecretDetected,
+    AuthMissing,
     ProfileBoundaryDenied,
     SyncSourceInvalid,
     NotFound,
@@ -39,6 +40,7 @@ impl ErrorCode {
             ErrorCode::StorageUnavailable => "storage_unavailable",
             ErrorCode::PolicyDenied => "policy_denied",
             ErrorCode::SecretDetected => "secret_detected",
+            ErrorCode::AuthMissing => "auth_missing",
             ErrorCode::ProfileBoundaryDenied => "profile_boundary_denied",
             ErrorCode::SyncSourceInvalid => "sync_source_invalid",
             ErrorCode::NotFound => "not_found",
@@ -54,6 +56,7 @@ impl ErrorCode {
                 400
             }
             ErrorCode::UnknownProfile | ErrorCode::UnknownWorkspace | ErrorCode::NotFound => 404,
+            ErrorCode::AuthMissing => 401,
             ErrorCode::PolicyDenied
             | ErrorCode::SecretDetected
             | ErrorCode::ProfileBoundaryDenied => 422,
@@ -112,6 +115,10 @@ impl Error {
 
     pub fn profile_boundary(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::ProfileBoundaryDenied, message)
+    }
+
+    pub fn auth_missing(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::AuthMissing, message)
     }
 }
 

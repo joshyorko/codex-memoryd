@@ -227,6 +227,108 @@ fn cli_sync_local_preview_then_apply_idempotent() {
 }
 
 #[test]
+fn cli_sync_local_skips_external_symlinked_files_and_dirs() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let source_root = dir.path().join("source_root");
+    let in_root = source_root.join("keep");
+    let symlinked_file_target = dir.path().join("external").join("outside.md");
+    let symlinked_dir_target = dir.path().join("external_dir");
+
+    std::fs::create_dir_all(&in_root).unwrap();
+    std::fs::create_dir_all(symlinked_file_target.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(symlinked_dir_target.join("notes")).unwrap();
+    std::fs::write(
+        in_root.join("memory.md"),
+        "# Root\n- this file should be synced\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &symlinked_file_target,
+        "# Secret\n- external secret: aws_secret_access_key=EXTERNAL_TEST_SECRET_TOKEN\n",
+    )
+    .unwrap();
+    std::fs::write(
+        symlinked_dir_target.join("notes").join("nested.md"),
+        "# External nested\n- do-not-sync\n",
+    )
+    .unwrap();
+
+    let symlinked_file = source_root.join("outside.md");
+    let symlinked_dir = source_root.join("outside-dir");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&symlinked_file_target, &symlinked_file).unwrap();
+        std::os::unix::fs::symlink(&symlinked_dir_target, &symlinked_dir).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(&symlinked_file_target, &symlinked_file).unwrap();
+        std::os::windows::fs::symlink_dir(&symlinked_dir_target, &symlinked_dir).unwrap();
+    }
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "sync-local",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&source_root)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview_stdout.contains("\"mode\": \"preview\""));
+    assert!(preview_stdout.contains("\"files_scanned\": 1"));
+    assert!(preview_stdout.contains("\"created\": 0"));
+    assert!(!preview_stdout.contains("outside.md"));
+    assert!(!preview_stdout.contains("EXTERNAL_TEST_SECRET_TOKEN"));
+
+    let apply = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "sync-local",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&source_root)
+        .output()
+        .unwrap();
+    assert!(apply.status.success());
+    let apply_stdout = String::from_utf8_lossy(&apply.stdout);
+    assert!(apply_stdout.contains("\"mode\": \"apply\""));
+    assert!(apply_stdout.contains("\"files_scanned\": 1"));
+    assert!(apply_stdout.contains("\"created\": 1"));
+    assert!(!apply_stdout.contains("outside.md"));
+    assert!(!apply_stdout.contains("EXTERNAL_TEST_SECRET_TOKEN"));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "search",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--query",
+            "this file should be synced",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("this file should be synced"));
+}
+
+#[test]
 fn cli_dream_preview_empty_workspace_is_json() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

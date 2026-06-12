@@ -3,7 +3,6 @@
 
 use crate::domain::MemoryRecord;
 use crate::domain::Profile;
-use crate::domain::Sensitivity;
 use crate::error::Error;
 use crate::error::Result;
 use crate::policy;
@@ -83,18 +82,11 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
         offset: 0,
     };
 
-    // query_records already excludes secret_blocked at the SQL layer, but we
-    // count what we drop for transparency.
-    let all = store.query_records(&filters)?;
-    let mut omitted_secret = 0usize;
+    let (all, omitted_secret) = store.export_records(&filters)?;
     let mut omitted_boundary = 0usize;
     let mut exported: Vec<MemoryRecord> = Vec::new();
 
     for record in all {
-        if matches!(record.sensitivity, Sensitivity::SecretBlocked) {
-            omitted_secret += 1;
-            continue;
-        }
         // For personal->work, only generic operating preferences cross.
         if matches!(boundary, BoundaryDecision::AllowGenericPreferencesOnly)
             && !policy::is_generic_preference(record.record_type, record.sensitivity)
@@ -139,6 +131,7 @@ mod tests {
     use crate::domain::Portability;
     use crate::domain::RecordType;
     use crate::domain::Scope;
+    use crate::domain::Sensitivity;
     use crate::ids;
     use crate::store::NewRecord;
 
@@ -201,6 +194,7 @@ mod tests {
         };
         let result = export(&s, &params).unwrap();
         assert_eq!(result.record_count, 0);
+        assert_eq!(result.omitted_secret, 1);
         assert!(result.body.trim().is_empty());
     }
 
