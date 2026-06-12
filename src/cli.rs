@@ -439,11 +439,14 @@ fn read_local_memory_files(root: &PathBuf) -> Result<Vec<SyncFile>> {
             if name.starts_with('.') {
                 continue;
             }
-            let meta = match entry.metadata() {
+            let link_meta = match std::fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if meta.is_dir() {
+            if link_meta.file_type().is_symlink() {
+                continue;
+            }
+            if link_meta.is_dir() {
                 stack.push(path);
                 continue;
             }
