@@ -180,16 +180,14 @@ pub fn detect_injection(content: &str) -> bool {
 // Combined gate
 // ---------------------------------------------------------------------------
 
-/// Run the full safety gate on candidate durable content. Trims, then checks
-/// secrets, injection, emptiness, and size. On accept, returns cleaned content
-/// truncated to `max_chars`.
-pub fn screen_content(content: &str, max_chars: usize) -> PolicyDecision {
+/// Screen a string-ish value that may be persisted as metadata or auxiliary
+/// detail text. Empty strings are allowed, but secret/injection/raw-log checks
+/// match the durable content policy.
+pub fn screen_string_value(content: &str) -> PolicyDecision {
     let trimmed = content.trim();
+
     if trimmed.is_empty() {
-        return PolicyDecision::Reject {
-            code: "invalid_request".to_string(),
-            reason: "empty content".to_string(),
-        };
+        return PolicyDecision::Accept(String::new());
     }
 
     if let Some(label) = detect_secret(trimmed) {
@@ -206,8 +204,6 @@ pub fn screen_content(content: &str, max_chars: usize) -> PolicyDecision {
         };
     }
 
-    // Oversized raw text with no markdown/list structure is treated as a likely
-    // raw log dump that may hide secrets (SPEC §10.1 "large raw logs").
     if trimmed.chars().count() > MAX_RAW_LOG_CHARS && !looks_structured(trimmed) {
         return PolicyDecision::Reject {
             code: "policy_denied".to_string(),
@@ -215,7 +211,42 @@ pub fn screen_content(content: &str, max_chars: usize) -> PolicyDecision {
         };
     }
 
-    PolicyDecision::Accept(truncate_chars(trimmed, max_chars))
+    PolicyDecision::Accept(trimmed.to_string())
+}
+
+/// Reject HTTP(S) repository remotes with inline userinfo. Credential-bearing
+/// remotes should never become durable repo metadata.
+pub fn has_http_remote_credentials(remote: &str) -> bool {
+    let trimmed = remote.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    rest.split('/')
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+/// Run the full safety gate on candidate durable content. Trims, then checks
+/// secrets, injection, emptiness, and size. On accept, returns cleaned content
+/// truncated to `max_chars`.
+pub fn screen_content(content: &str, max_chars: usize) -> PolicyDecision {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return PolicyDecision::Reject {
+            code: "invalid_request".to_string(),
+            reason: "empty content".to_string(),
+        };
+    }
+
+    match screen_string_value(trimmed) {
+        PolicyDecision::Accept(cleaned) => {
+            PolicyDecision::Accept(truncate_chars(&cleaned, max_chars))
+        }
+        PolicyDecision::Reject { code, reason } => PolicyDecision::Reject { code, reason },
+    }
 }
 
 /// Heuristic: does the text have markdown/list structure (vs. a raw blob)?

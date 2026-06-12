@@ -104,15 +104,16 @@ impl Service {
     fn register_repo(&self, repo: &Option<RepoIdentity>) -> Result<Option<String>> {
         match repo {
             Some(r) if !r.repo_id.trim().is_empty() => {
+                let repo = screen_repo_identity(r)?;
                 self.store.ensure_repo(
-                    &r.repo_id,
-                    r.root.as_deref(),
-                    r.remote.as_deref(),
-                    r.branch.as_deref(),
-                    r.commit.as_deref(),
-                    r.is_git,
+                    &repo.repo_id,
+                    repo.root.as_deref(),
+                    repo.remote.as_deref(),
+                    repo.branch.as_deref(),
+                    repo.commit.as_deref(),
+                    repo.is_git,
                 )?;
-                Ok(Some(r.repo_id.clone()))
+                Ok(Some(repo.repo_id))
             }
             _ => Ok(None),
         }
@@ -223,19 +224,27 @@ impl Service {
 
         let session_id = session
             .id
-            .clone()
-            .filter(|s| !s.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| screen_persisted_string("session.id", s))
+            .transpose()?
             .unwrap_or_else(|| ids::new_id("session"));
+        let thread_id = screen_optional_persisted_string("session.thread_id", &session.thread_id)?;
         let source = session
             .source
-            .clone()
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| screen_persisted_string("session.source", s))
+            .transpose()?
             .unwrap_or_else(|| "codex".to_string());
         self.store.ensure_session(
             &session_id,
             profile.as_str(),
             &workspace,
             repo_id.as_deref(),
-            session.thread_id.as_deref(),
+            thread_id.as_deref(),
             &source,
         )?;
 
@@ -255,6 +264,30 @@ impl Service {
                 Metrics::incr(&self.metrics.writeback_rejected);
                 continue;
             }
+
+            let turn_metadata = match screen_optional_json_metadata(
+                &format!("messages[{idx}].metadata"),
+                &msg.metadata,
+            ) {
+                Ok(value) => value.unwrap_or(Value::Null),
+                Err(err) => {
+                    rejections.push(Rejection {
+                        index: Some(idx),
+                        reason: err.message.clone(),
+                        code: err.code.as_str().to_string(),
+                    });
+                    Metrics::incr(&self.metrics.writeback_rejected);
+                    let _ = self.store.record_policy_event(
+                        Some(profile.as_str()),
+                        Some(&workspace),
+                        "rejected_turn",
+                        err.code.as_str(),
+                        &err.message,
+                        "turns",
+                    );
+                    continue;
+                }
+            };
 
             let decision = policy::screen_content(&msg.content, self.config.max_record_chars);
             let content = match decision {
@@ -285,7 +318,7 @@ impl Service {
                 actor: actor.clone(),
                 content: content.clone(),
                 created_at: msg.created_at.clone().unwrap_or_else(ids::now_rfc3339),
-                metadata: msg.metadata.clone().unwrap_or(Value::Null),
+                metadata: turn_metadata,
             };
             self.store.insert_visible_turn(&turn)?;
 
@@ -393,6 +426,7 @@ impl Service {
         self.store.ensure_workspace(profile.as_str(), &workspace)?;
 
         let target = req.target.clone().unwrap_or_else(|| "user".to_string());
+        let metadata = screen_optional_json_metadata("conclusions.metadata", &req.metadata)?;
         let conclusions = req
             .conclusions
             .ok_or_else(|| Error::invalid_request("conclusions is required"))?;
@@ -441,7 +475,7 @@ impl Service {
                 content: content.clone(),
                 source_id: None,
                 created_at: ids::now_rfc3339(),
-                metadata: req.metadata.clone().unwrap_or(Value::Null),
+                metadata: metadata.clone().unwrap_or(Value::Null),
             };
             self.store.insert_conclusion(&conclusion)?;
             created.push(conclusion.id.clone());
@@ -526,15 +560,32 @@ impl Service {
         let session_id = req
             .session
             .as_ref()
-            .and_then(|s| s.id.clone())
-            .filter(|s| !s.trim().is_empty());
+            .and_then(|s| s.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| screen_persisted_string("checkpoint.session.id", s))
+            .transpose()?;
+        let thread_id = req
+            .session
+            .as_ref()
+            .map(|s| screen_optional_persisted_string("checkpoint.session.thread_id", &s.thread_id))
+            .transpose()?
+            .flatten();
+        let changed_files = screen_string_list("checkpoint.changed_files", req.changed_files)?;
+        let decisions = screen_string_list("checkpoint.decisions", req.decisions)?;
+        let blockers = screen_string_list("checkpoint.blockers", req.blockers)?;
+        let next_steps = screen_string_list("checkpoint.next_steps", req.next_steps)?;
+        let tests_run = screen_string_list("checkpoint.tests_run", req.tests_run)?;
+        let tests_not_run = screen_string_list("checkpoint.tests_not_run", req.tests_not_run)?;
+        let branch = screen_optional_persisted_string("checkpoint.branch", &req.branch)?;
+        let commit = screen_optional_persisted_string("checkpoint.commit", &req.commit)?;
         if let Some(sid) = &session_id {
             self.store.ensure_session(
                 sid,
                 profile.as_str(),
                 &workspace,
                 repo_id.as_deref(),
-                req.session.as_ref().and_then(|s| s.thread_id.as_deref()),
+                thread_id.as_deref(),
                 "checkpoint",
             )?;
         }
@@ -546,14 +597,14 @@ impl Service {
             workspace_id: workspace.clone(),
             repo_id: repo_id.clone(),
             summary: summary.clone(),
-            changed_files: req.changed_files,
-            decisions: req.decisions,
-            blockers: req.blockers,
-            next_steps: req.next_steps,
-            tests_run: req.tests_run,
-            tests_not_run: req.tests_not_run,
-            branch: req.branch,
-            commit: req.commit,
+            changed_files: changed_files.clone(),
+            decisions,
+            blockers,
+            next_steps,
+            tests_run,
+            tests_not_run,
+            branch,
+            commit,
             created_at: ids::now_rfc3339(),
         };
         self.store.insert_checkpoint(&checkpoint)?;
@@ -588,7 +639,7 @@ impl Service {
             content_hash,
             supersedes: vec![],
             metadata: json!({ "origin": "checkpoint", "checkpoint_id": checkpoint.id }),
-        });
+        })?;
 
         Ok(CheckpointResponse {
             id: checkpoint.id,
@@ -1106,6 +1157,86 @@ fn sanitize_workspace(raw: &str) -> String {
         "default".to_string()
     } else {
         trimmed
+    }
+}
+
+fn screen_repo_identity(repo: &RepoIdentity) -> Result<RepoIdentity> {
+    let repo_id = screen_persisted_string("repo.repo_id", &repo.repo_id)?;
+    let root = screen_optional_persisted_string("repo.root", &repo.root)?;
+    let remote = screen_optional_persisted_string("repo.remote", &repo.remote)?;
+    let branch = screen_optional_persisted_string("repo.branch", &repo.branch)?;
+    let commit = screen_optional_persisted_string("repo.commit", &repo.commit)?;
+    Ok(RepoIdentity {
+        repo_id,
+        root,
+        remote,
+        branch,
+        commit,
+        is_git: repo.is_git,
+    })
+}
+
+fn screen_persisted_string(field: &str, value: &str) -> Result<String> {
+    if field == "repo.remote" && policy::has_http_remote_credentials(value) {
+        return Err(Error::secret(format!(
+            "{field}: repository remote contains inline credentials"
+        )));
+    }
+
+    match policy::screen_string_value(value) {
+        PolicyDecision::Accept(cleaned) => Ok(cleaned),
+        PolicyDecision::Reject { code, reason } => {
+            Err(Error::new(map_code(&code), format!("{field}: {reason}")))
+        }
+    }
+}
+
+fn screen_optional_persisted_string(field: &str, value: &Option<String>) -> Result<Option<String>> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| screen_persisted_string(field, s))
+        .transpose()
+}
+
+fn screen_string_list(field: &str, values: Vec<String>) -> Result<Vec<String>> {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| screen_persisted_string(&format!("{field}[{idx}]"), &value))
+        .collect()
+}
+
+fn screen_optional_json_metadata(field: &str, value: &Option<Value>) -> Result<Option<Value>> {
+    match value {
+        Some(value) => {
+            screen_json_metadata(field, value)?;
+            Ok(Some(value.clone()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn screen_json_metadata(field: &str, value: &Value) -> Result<()> {
+    match value {
+        Value::String(raw) => {
+            screen_persisted_string(field, raw)?;
+            Ok(())
+        }
+        Value::Array(values) => {
+            for value in values {
+                screen_json_metadata(field, value)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                screen_json_metadata(field, value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
