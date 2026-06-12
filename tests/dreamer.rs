@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use codex_memoryd::config::{Config, DreamSchedulerConfig};
-use codex_memoryd::domain::{Portability, Profile, RecordType, Scope, Sensitivity};
+use codex_memoryd::domain::{
+    Checkpoint, Conclusion, Portability, Profile, RecordType, RepoIdentity, Scope, Sensitivity,
+    VisibleTurn,
+};
 use codex_memoryd::ids;
 use codex_memoryd::policy;
 use codex_memoryd::protocol::*;
@@ -79,11 +82,20 @@ fn dream_since(
 }
 
 fn insert_direct_record(svc: &Service, content: &str, metadata: Value) -> String {
+    insert_direct_record_for_repo(svc, content, metadata, None)
+}
+
+fn insert_direct_record_for_repo(
+    svc: &Service,
+    content: &str,
+    metadata: Value,
+    repo_id: Option<&str>,
+) -> String {
     let class = policy::classify(content, Profile::Personal, false);
     let content_hash = ids::content_hash(
         "personal",
         "ws",
-        None,
+        repo_id,
         class.record_type.as_str(),
         class.scope.as_str(),
         content,
@@ -93,7 +105,7 @@ fn insert_direct_record(svc: &Service, content: &str, metadata: Value) -> String
         .upsert_record(&NewRecord {
             profile_id: "personal".to_string(),
             workspace_id: "ws".to_string(),
-            repo_id: None,
+            repo_id: repo_id.map(str::to_string),
             scope: Scope::Session,
             record_type: RecordType::Decision,
             content: content.to_string(),
@@ -715,6 +727,217 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
         !audit_text.contains(text_to_exclude),
         "dream_runs audit row must not store raw evidence or candidate text"
     );
+}
+
+#[test]
+fn dream_preview_exposes_first_class_evidence_window_counts() {
+    let svc = service();
+    let session_id = "sess_evidence_window";
+    svc.store
+        .ensure_session(
+            session_id,
+            "personal",
+            "ws",
+            Some("repo-main"),
+            None,
+            "test",
+        )
+        .unwrap();
+    svc.store
+        .ensure_session(
+            "sess_evidence_old",
+            "personal",
+            "ws",
+            Some("repo-main"),
+            None,
+            "test",
+        )
+        .unwrap();
+    svc.store
+        .ensure_session(
+            "sess_evidence_other_repo",
+            "personal",
+            "ws",
+            Some("repo-other"),
+            None,
+            "test",
+        )
+        .unwrap();
+
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: "turn_visible".to_string(),
+            session_id: session_id.to_string(),
+            actor: "user".to_string(),
+            content: "Prefer repo-native commands.".to_string(),
+            created_at: "2026-01-01T00:01:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: "turn_old".to_string(),
+            session_id: "sess_evidence_old".to_string(),
+            actor: "user".to_string(),
+            content: "Old visible turn should not count.".to_string(),
+            created_at: "2025-01-01T00:01:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: "turn_other_repo".to_string(),
+            session_id: "sess_evidence_other_repo".to_string(),
+            actor: "user".to_string(),
+            content: "Other repo visible turn should not count.".to_string(),
+            created_at: "2026-01-01T00:01:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_conclusion(&Conclusion {
+            id: "concl_evidence".to_string(),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-main".to_string()),
+            target: "user".to_string(),
+            content: "Decision: use cargo test for validation.".to_string(),
+            source_id: None,
+            created_at: "2026-01-01T00:02:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_conclusion(&Conclusion {
+            id: "concl_old".to_string(),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-main".to_string()),
+            target: "user".to_string(),
+            content: "Old conclusion should not count.".to_string(),
+            source_id: None,
+            created_at: "2025-01-01T00:02:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_conclusion(&Conclusion {
+            id: "concl_other_repo".to_string(),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-other".to_string()),
+            target: "user".to_string(),
+            content: "Other repo conclusion should not count.".to_string(),
+            source_id: None,
+            created_at: "2026-01-01T00:02:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_checkpoint(&Checkpoint {
+            id: "ckpt_evidence".to_string(),
+            session_id: Some(session_id.to_string()),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-main".to_string()),
+            summary: "Keep using repo-native commands.".to_string(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2026-01-01T00:03:00Z".to_string(),
+        })
+        .unwrap();
+    svc.store
+        .insert_checkpoint(&Checkpoint {
+            id: "ckpt_old".to_string(),
+            session_id: Some("sess_evidence_old".to_string()),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-main".to_string()),
+            summary: "Old checkpoint should not count.".to_string(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2025-01-01T00:03:00Z".to_string(),
+        })
+        .unwrap();
+    svc.store
+        .insert_checkpoint(&Checkpoint {
+            id: "ckpt_other_repo".to_string(),
+            session_id: Some("sess_evidence_other_repo".to_string()),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: Some("repo-other".to_string()),
+            summary: "Other repo checkpoint should not count.".to_string(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2026-01-01T00:03:00Z".to_string(),
+        })
+        .unwrap();
+    svc.store
+        .upsert_source(
+            "personal",
+            "ws",
+            "memory_summary",
+            Some("memory_summary.md"),
+            &codex_memoryd::ids::source_hash(
+                "personal",
+                "ws",
+                "memory_summary.md",
+                "# Memory Summary\nPrefer repo-native commands.\n",
+            ),
+            &json!({ "origin": "codex-local-memory" }),
+        )
+        .unwrap();
+    insert_direct_record_for_repo(
+        &svc,
+        "Active memory record about repo-native commands.",
+        json!({ "origin": "manual" }),
+        Some("repo-main"),
+    );
+
+    let report = svc
+        .dream(DreamRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: Some(RepoIdentity {
+                repo_id: "repo-main".to_string(),
+                ..Default::default()
+            }),
+            mode: Some("preview".to_string()),
+            now: Some("2026-01-02T00:00:00Z".to_string()),
+            since: Some("2025-12-31T00:00:00Z".to_string()),
+        })
+        .unwrap();
+    let live = serde_json::to_value(report).unwrap();
+    let window = live
+        .get("evidence_window")
+        .and_then(Value::as_object)
+        .expect("evidence_window object");
+
+    assert_eq!(window["start"], "2025-12-31T00:00:00Z");
+    assert_eq!(window["end"], "2026-01-02T00:00:00Z");
+    assert_eq!(window["visible_turns"]["count"], 1);
+    assert_eq!(window["conclusions"]["count"], 1);
+    assert_eq!(window["checkpoints"]["count"], 1);
+    assert_eq!(window["imported_memories"]["count"], 1);
+    assert_eq!(window["active_memory_records"]["count"], 1);
 }
 
 #[test]

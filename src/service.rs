@@ -48,7 +48,6 @@ use crate::status;
 use crate::store::DreamRunAudit;
 use crate::store::DreamRunRecord;
 use crate::store::NewRecord;
-use crate::store::RecordQuery;
 use crate::store::Store;
 
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
@@ -716,17 +715,6 @@ impl Service {
                 .store
                 .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
         };
-        let source_records = self.store.query_records(&RecordQuery {
-            profile_id: Some(profile.as_str().to_string()),
-            workspace_id: Some(workspace.clone()),
-            repo_id: repo_id.clone(),
-            record_type: None,
-            scope: None,
-            include_archived: explicit_since,
-            recency_cutoff: source_window_start.clone(),
-            limit: 500,
-            offset: 0,
-        })?;
         let result = dream::run(
             &self.store,
             &dream::DreamParams {
@@ -759,7 +747,8 @@ impl Service {
                     fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
                     source_window_start,
                     source_window_end: Some(now),
-                    source_counts: dream::source_counts(&source_records),
+                    source_counts: serde_json::to_value(&resp.evidence_window)
+                        .unwrap_or_else(|_| json!({})),
                     candidate_counts: dream::candidate_counts(&resp),
                     created_count: resp.created.len() as i64,
                     archived_count: resp.archived.len() as i64,

@@ -394,6 +394,42 @@ pub struct DreamRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DreamEvidenceSource {
+    pub id: String,
+    pub kind: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamEvidenceStream {
+    pub count: usize,
+    pub sources: Vec<DreamEvidenceSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamEvidenceWindow {
+    pub start: Option<String>,
+    pub end: String,
+    pub visible_turns: DreamEvidenceStream,
+    pub conclusions: DreamEvidenceStream,
+    pub checkpoints: DreamEvidenceStream,
+    pub imported_memories: DreamEvidenceStream,
+    pub active_memory_records: DreamEvidenceStream,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DreamCandidate {
     pub action: String,
     #[serde(rename = "type")]
@@ -449,6 +485,7 @@ pub struct DreamResponse {
     pub workspace: String,
     pub repo_id: Option<String>,
     pub now: String,
+    pub evidence_window: DreamEvidenceWindow,
     pub candidates: Vec<DreamCandidate>,
     pub stale: Vec<DreamStaleRecord>,
     pub rejected: Vec<DreamRejection>,

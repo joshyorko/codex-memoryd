@@ -90,6 +90,10 @@ Dreamer integration is implemented for local use:
 - `src/dream.rs` contains the core pipeline.
 - Store durability now includes `dream_runs` audit rows and watermark tracking.
 - `/v1/status` includes the last Dreamer run result and scheduler state.
+- Dream reports now expose a first-class `evidence_window` with per-stream counts
+  and safe source refs for visible turns, conclusions, checkpoints, imported
+  memory sources, and active memory records. The audit row reuses that bundle via
+  the existing `source_counts` JSON column.
 
 Dreamer output is recall input, not authority: it proposes evidence-backed
 candidate memories from safe visible turns, conclusions, checkpoints, and imported

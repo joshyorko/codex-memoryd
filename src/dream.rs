@@ -12,13 +12,20 @@ use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
 
+use crate::domain::Checkpoint;
+use crate::domain::Conclusion;
 use crate::domain::MemoryRecord;
+use crate::domain::MemorySource;
 use crate::domain::Profile;
+use crate::domain::VisibleTurn;
 use crate::error::Result;
 use crate::ids;
 use crate::policy;
 use crate::policy::PolicyDecision;
 use crate::protocol::DreamCandidate;
+use crate::protocol::DreamEvidenceSource;
+use crate::protocol::DreamEvidenceStream;
+use crate::protocol::DreamEvidenceWindow;
 use crate::protocol::DreamRejection;
 use crate::protocol::DreamResponse;
 use crate::protocol::DreamStaleRecord;
@@ -146,6 +153,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         limit: params.max_records,
         offset: 0,
     })?;
+    let evidence_window =
+        build_evidence_window(store, params, params.recency_cutoff, params.now, &records)?;
     let mut candidates = Vec::new();
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
@@ -346,6 +355,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         workspace: params.workspace.to_string(),
         repo_id: params.repo_id.map(|s| s.to_string()),
         now: params.now.to_string(),
+        evidence_window,
         candidates,
         stale,
         rejected,
@@ -353,6 +363,159 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         created,
         authority: "recall_not_authority".to_string(),
     })
+}
+
+fn build_evidence_window(
+    store: &Store,
+    params: &DreamParams,
+    start: Option<&str>,
+    end: &str,
+    active_records: &[MemoryRecord],
+) -> Result<DreamEvidenceWindow> {
+    let visible_turns = store.dream_visible_turns(
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id,
+        start,
+        params.max_records,
+    )?;
+    let conclusions = store.dream_conclusions(
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id,
+        start,
+        params.max_records,
+    )?;
+    let checkpoints = store.dream_checkpoints(
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id,
+        start,
+        params.max_records,
+    )?;
+    let imported_memories = store.dream_memory_sources(
+        params.profile.as_str(),
+        params.workspace,
+        start,
+        params.max_records,
+    )?;
+
+    Ok(DreamEvidenceWindow {
+        start: start.map(str::to_string),
+        end: end.to_string(),
+        visible_turns: stream_from_visible_turns(&visible_turns),
+        conclusions: stream_from_conclusions(&conclusions),
+        checkpoints: stream_from_checkpoints(&checkpoints),
+        imported_memories: stream_from_sources(&imported_memories),
+        active_memory_records: stream_from_memory_records(active_records),
+    })
+}
+
+fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
+    DreamEvidenceStream {
+        count: records.len(),
+        sources: records
+            .iter()
+            .map(|record| DreamEvidenceSource {
+                id: record.id.clone(),
+                kind: "visible_turn".to_string(),
+                created_at: record.created_at.clone(),
+                updated_at: None,
+                actor: Some(record.actor.clone()),
+                record_type: None,
+                state: None,
+                source_path: Some(format!("turn:{}", record.session_id)),
+                summary: Some("visible_turn".to_string()),
+            })
+            .collect(),
+    }
+}
+
+fn stream_from_conclusions(records: &[Conclusion]) -> DreamEvidenceStream {
+    DreamEvidenceStream {
+        count: records.len(),
+        sources: records
+            .iter()
+            .map(|record| DreamEvidenceSource {
+                id: record.id.clone(),
+                kind: "conclusion".to_string(),
+                created_at: record.created_at.clone(),
+                updated_at: None,
+                actor: Some(record.target.clone()),
+                record_type: None,
+                state: None,
+                source_path: record.source_id.clone(),
+                summary: Some("conclusion".to_string()),
+            })
+            .collect(),
+    }
+}
+
+fn stream_from_checkpoints(records: &[Checkpoint]) -> DreamEvidenceStream {
+    DreamEvidenceStream {
+        count: records.len(),
+        sources: records
+            .iter()
+            .map(|record| DreamEvidenceSource {
+                id: record.id.clone(),
+                kind: "checkpoint".to_string(),
+                created_at: record.created_at.clone(),
+                updated_at: None,
+                actor: None,
+                record_type: Some("task_checkpoint".to_string()),
+                state: None,
+                source_path: record
+                    .session_id
+                    .as_ref()
+                    .map(|session_id| format!("session:{session_id}")),
+                summary: Some("checkpoint".to_string()),
+            })
+            .collect(),
+    }
+}
+
+fn stream_from_sources(records: &[MemorySource]) -> DreamEvidenceStream {
+    DreamEvidenceStream {
+        count: records.len(),
+        sources: records
+            .iter()
+            .map(|record| DreamEvidenceSource {
+                id: record.id.clone(),
+                kind: record.kind.clone(),
+                created_at: record.created_at.clone(),
+                updated_at: Some(record.ingested_at.clone()),
+                actor: None,
+                record_type: None,
+                state: None,
+                source_path: record.source_path.clone(),
+                summary: Some(record.kind.clone()),
+            })
+            .collect(),
+    }
+}
+
+fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
+    DreamEvidenceStream {
+        count: records.len(),
+        sources: records
+            .iter()
+            .map(|record| DreamEvidenceSource {
+                id: record.id.clone(),
+                kind: "memory_record".to_string(),
+                created_at: record.created_at.clone(),
+                updated_at: Some(record.updated_at.clone()),
+                actor: None,
+                record_type: Some(record.record_type.as_str().to_string()),
+                state: Some(state_for_record(record)),
+                source_path: None,
+                summary: Some(format!(
+                    "{}:{}",
+                    record.record_type.as_str(),
+                    state_for_record(record)
+                )),
+            })
+            .collect(),
+    }
 }
 
 fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
