@@ -192,7 +192,10 @@ impl Store {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        Error::storage(format!("create storage dir {}: {e}", parent.display()))
+                        Error::storage(format!(
+                            "create storage dir {}: {e}; check --db/CODEX_MEMORYD_DB path and directory permissions",
+                            parent.display()
+                        ))
                     })?;
                 }
             }
@@ -204,7 +207,12 @@ impl Store {
                 .map_err(|e| Error::storage(format!("open {}: {e}", path.display())))?;
             bootstrap
                 .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
-                .map_err(|e| Error::storage(format!("enable WAL: {e}")))?;
+                .map_err(|e| {
+                    Error::storage(format!(
+                        "enable WAL for {}: {e}; check database write permissions",
+                        path.display()
+                    ))
+                })?;
             SqliteConnectionManager::file(&path)
         };
         // Per-connection pragmas. journal_mode is intentionally NOT set here: it
