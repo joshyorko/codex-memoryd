@@ -1,16 +1,39 @@
-# Dreamer loop — design (Phases 1–2)
+# Dreamer loop — design (Phases 1–2 with service surface)
 
 Companion to [`dreamer-loop-research.md`](./dreamer-loop-research.md). This
 document specifies the **CLI/API contract, storage proposal, staleness and
 supersession rules, the synthesis backend boundary, and the eval fixture
-format** in enough detail to implement and test Phases 1 (preview) and 2
-(apply). It introduces **no schema migration**; everything fits the existing
+format** in enough detail to implement and run Phases 1 (preview) and 2 (apply).
+It introduces **no schema migration**; everything fits the existing
 [`MemoryRecord.metadata`](../src/domain.rs) JSON value and the existing policy /
 recall / store boundaries.
 
 > The model proposes; `codex-memoryd` validates and persists. Synthesized memory
 > is `recall_not_authority`. See [`dreamer-loop-research.md`](./dreamer-loop-research.md)
 > for motivation, non-claims, and threat model.
+
+## Implementation status (2026-06-12)
+
+- Implemented now:
+  - Dreamer core exists in `src/dream.rs`.
+  - CLI supports `dream --preview` and `dream --apply`.
+  - Service entrypoints `Service::dream` and `Service::scheduled_dream` in
+    `src/service.rs`.
+  - HTTP endpoint `/v1/dream` exists in `src/server.rs`.
+  - Durable dream run audit + watermark rows are persisted in the store.
+  - Status includes last Dreamer run and scheduler state.
+  - Test coverage includes promotion/rejection/supersession/stale-facts/secrets/user
+    adoption/explicit conclusions/repeated steering/self-reinforcement blocking.
+- Remaining work:
+  - The loop is not fully productized; it is still memory-records-centric and
+    does not yet treat visible turns, conclusions, checkpoints, imports, and source
+    evidence as equally independent first-class streams.
+  - MCP Dreamer tooling is incomplete.
+  - Upstream Codex native-memory parity is still missing in areas like idle/session
+    eligibility, generated memory files, workspace-native semantics, and provider
+    conformance.
+  - Hardening follow-ups remain: windowing/supersession edge cases and atomic
+    durable evidence writes.
 
 ## 1. CLI surface
 
@@ -39,7 +62,7 @@ Like the rest of the CLI ([`README.md`](../README.md)), `dream` opens the store
 directly and works without a running daemon. JSON goes to stdout, logs to
 stderr.
 
-## 2. HTTP surface (optional, Phase 2+)
+## 2. HTTP surface (implemented)
 
 A daemon-mode equivalent, envelope-aware like every other `/v1` endpoint
 ([`docs/codex-integration.md`](./codex-integration.md)):
@@ -63,8 +86,8 @@ Request:
 ```
 
 `mode` is `preview` or `apply`. The response `data` is the **dream report**
-(§3). The HTTP path is optional for Phase 1 (CLI is sufficient) and is listed
-here so the contract is fixed before a daemon exists.
+(§3). The HTTP path is now implemented alongside CLI paths; no separate daemon-only
+futures are required for local preview/apply.
 
 ## 3. Dream report (preview and apply output)
 

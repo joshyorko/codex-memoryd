@@ -77,17 +77,25 @@ Stable error codes (SPEC §14): `invalid_request`, `missing_profile`,
 | `POST /v1/turns` | Store safe visible turns | post-turn writeback |
 | `POST /v1/conclusions` | Durable facts | explicit "remember this" |
 | `POST /v1/checkpoints` | Resumable work summaries | after substantial work |
+| `POST /v1/dream` | Run Dreamer preview/apply | local scheduling and service callers |
 | `POST /v1/sync/local-codex-memory` | Import local Codex memory | `codex memory import-local` |
 | `POST /v1/forget` | Archive / delete | memory management |
 | `GET /v1/export` | Safe record export | backup / migration |
 
-Dreamer integration is deliberately preview-first. `codex-memoryd dream
---preview` is the current local trust boundary; a future `/v1/dream` endpoint may
-mirror it only after the same service, policy, provenance, and fail-open
-contracts are in place. Dreamer output is recall input, not authority: it
-proposes evidence-backed candidate memories from safe visible turns, conclusions,
-checkpoints, and imported local memories, then requires preview and policy-gated
-apply before durable records change.
+Dreamer integration is implemented for local use:
+- `codex-memoryd dream --preview` and `codex-memoryd dream --apply` are active.
+- Service entrypoints `Service::dream` and `Service::scheduled_dream` are wired from
+  `src/service.rs`.
+- `POST /v1/dream` is implemented in `src/server.rs`.
+- `src/dream.rs` contains the core pipeline.
+- Store durability now includes `dream_runs` audit rows and watermark tracking.
+- `/v1/status` includes the last Dreamer run result and scheduler state.
+
+Dreamer output is recall input, not authority: it proposes evidence-backed
+candidate memories from safe visible turns, conclusions, checkpoints, and imported
+local memories, then requires preview and policy-gated apply before durable records
+change. MCP Dreamer tooling remains unfinished, and the loop is not yet fully
+productized.
 
 ## Recall (pre-turn)
 

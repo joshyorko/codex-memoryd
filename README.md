@@ -194,7 +194,15 @@ codex-memoryd sync-local --apply   ~/.codex/memories
 codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
 codex-memoryd forget <record-id>            # archives by default
 codex-memoryd forget <record-id> --delete   # hard delete (secrets/PII)
+
+# MCP stdio (initialize, tools/list, tools/call)
+codex-memoryd mcp stdio
 ```
+
+The initial MCP tool surface is intentionally small: `memory_status`,
+`memory_recall`, `memory_search`, `memory_conclude`, and `memory_checkpoint`.
+Those tools route through the same `Service` and policy gates as the HTTP and
+CLI entrypoints.
 
 ## Configure storage
 
