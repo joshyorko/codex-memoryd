@@ -401,3 +401,7 @@ work→personal export denial, forget archiving, and secret omission on export.
 ## License
 
 MIT.
+
+## Memory bakeoff
+
+For a narrow comparison of local-only Codex memory, Honcho provider mode, and codex-memoryd provider mode (with explicit scope limits), see [`demos/memory-bakeoff/README.md`](./demos/memory-bakeoff/README.md).

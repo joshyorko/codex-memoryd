@@ -2,15 +2,15 @@
 # Local-first coding-memory bakeoff harness for codex-memoryd.
 #
 # Runs the codex-memoryd leg of demos/memory-bakeoff/README.md end to end on
-# loopback, with deterministic assertions for every claimed dimension:
+# loopback, with deterministic assertions for the codex-memoryd behavior this
+# project intends to prove:
 # recall-before/after correctness, secret + hidden-reasoning rejection,
-# workspace isolation, supersession, import preview/apply idempotency,
-# export/forget, provenance, and a kill-the-daemon fail-open step.
+# workspace isolation, supersession, import preview/apply idempotency, export,
+# local CLI behavior, and a kill-the-daemon fail-open step.
 #
-# No cloud services, no API keys, no Codex fork required. If CODEX_BIN points
-# at a joshyorko/codex@tap-release binary, the daemon-down step additionally
-# proves a Codex prompt build still exits 0 (otherwise that proof lives in
-# scripts/codex-tap-release-smoke.sh).
+# No cloud services, no API keys, no Honcho call, and no Codex fork required.
+# If CODEX_BIN points at a joshyorko/codex@tap-release binary, the daemon-down
+# step additionally proves Codex prompt construction still exits 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -77,13 +77,19 @@ json_post_assert() {
   curl -fsS -H 'content-type: application/json' -d "$body" \
     "$CODEX_MEMORYD_URL$path" >"$resp"
   python3 -m json.tool <"$resp" | tee -a "$OUT"
-  python3 -c "
-import json, sys
+  python3 - "$resp" "$expr" <<'PY' | tee -a "$OUT"
+import json
+import sys
+
 envelope = json.load(open(sys.argv[1]))
-data = envelope.get('data') or {}
-assert $expr, 'assertion failed: $expr -> ' + json.dumps(envelope)[:600]
-print('ASSERT OK: $expr')
-" "$resp" | tee -a "$OUT"
+data = envelope.get("data") or {}
+expr = sys.argv[2]
+
+if not eval(expr, {"data": data, "envelope": envelope, "json": __import__("json")}):
+    raise AssertionError("assertion failed: " + expr)
+
+print("ASSERT OK: " + expr)
+PY
 }
 
 # Build a /v1/sync/local-codex-memory body from the fixture directory.
@@ -350,4 +356,4 @@ print("ASSERT OK: provenance fields present (source_ids, content_hash, supersede
 ' "$WORKDIR/export.jsonl" | tee -a "$OUT"
 
 log "Bakeoff artifact"
-echo "Pasteable bakeoff output: $OUT" | tee -a "$OUT"
+echo "Pasteable codex-memoryd bakeoff output: $OUT" | tee -a "$OUT"

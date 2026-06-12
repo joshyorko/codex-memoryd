@@ -1,0 +1,42 @@
+### 1. Build codex-memoryd (debug build of this checkout)
+### 2. Local-first proof: /v1/status reports local_only on loopback
+{
+  "ok": true,
+  "data": {
+    "status": "local_only"
+  }
+}
+
+### 3. Recall-before on the coding fixture pack: must be empty
+ASSERT OK: len(data['facts']) == 0 and data['authority'] == 'recall_not_authority'
+
+### 4a. Import preview: counts only, no durable writes
+ASSERT OK: data['mode'] == 'preview' and data['created'] == 0 and data['proposed'] > 0 and data['rejected'] >= 1
+
+### 4c. Import apply: creates records, rejects the injection note
+ASSERT OK: data['mode'] == 'apply' and data['created'] > 0 and data['rejected'] >= 1
+
+### 6. Recall latency over loopback (25 warm samples)
+recall latency ms over 25 samples (machine-dependent): p50=7.4 p95=12.3 max=31.2
+
+### 7. Secret rejection: an API-key turn never becomes durable memory
+ASSERT OK: data['rejected'] == 1 and data['accepted'] == 0 and '<secret-prefix>' not in json.dumps(envelope)
+
+### 11. Kill the daemon: fail-open proof
+daemon (pid=<pid>) is down; http://127.0.0.1:8788/healthz no longer answers
+
+### 12. Local-first availability: the CLI keeps working with no daemon at all
+{
+  "ok": true,
+  "data": {
+    "profile": "personal",
+    "workspace": "bakeoff-ws-a",
+    "record_count": <record-count>
+  }
+}
+
+### 13a. Profile boundary: work -> personal export is denied (exit code 5)
+ASSERT OK: work -> personal export denied with exit code 5
+
+### 14. Inspectability/provenance: every exported record carries its evidence trail
+ASSERT OK: provenance fields present (source_ids, content_hash, supersedes, timestamps)
