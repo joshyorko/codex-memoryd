@@ -1,0 +1,17 @@
+{
+  "expect_preview": {
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [
+      {
+        "subject_key": "decision:custom-script-self-reinforcement",
+        "record_type": "decision",
+        "promotion_reason": "imported_or_active_memory_without_fresh_primary_evidence",
+        "evidence_count": 2,
+        "must_contain": ["custom script"],
+        "must_not_contain": []
+      }
+    ],
+    "stale": []
+  }
+}

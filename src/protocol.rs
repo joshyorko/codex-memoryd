@@ -100,10 +100,29 @@ pub struct StatusResponse {
     pub active_profiles: Vec<String>,
     pub active_workspaces: Vec<String>,
     pub last_sync: Option<String>,
+    pub last_dream: Option<DreamRunStatus>,
     pub pending_writes: i64,
     pub local_import: LocalImportStatus,
     pub features: Value,
     pub degraded_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamRunStatus {
+    pub run_id: String,
+    pub profile: String,
+    pub workspace: String,
+    pub repo_id: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub source_window_start: Option<String>,
+    pub source_window_end: Option<String>,
+    pub created: i64,
+    pub archived: i64,
+    pub rejected: i64,
+    pub error_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +388,9 @@ pub struct DreamRequest {
     /// Deterministic clock override for evals/tests.
     #[serde(default)]
     pub now: Option<String>,
+    /// Explicit incremental lower bound. Overrides the stored Dreamer watermark.
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -385,21 +407,17 @@ pub struct DreamCandidate {
     pub historical_reason: Option<String>,
     pub supersedes: Vec<String>,
     pub policy: String,
-    #[serde(skip_serializing)]
+    pub candidate_state: String,
     pub subject_key: String,
-    #[serde(skip_serializing)]
+    pub threshold_reason: String,
+    pub evidence_weight: f64,
+    pub evidence_classes: Vec<String>,
     pub evidence_ids: Vec<String>,
-    #[serde(skip_serializing)]
     pub evidence_count: usize,
-    #[serde(skip_serializing)]
     pub user_evidence_count: usize,
-    #[serde(skip_serializing)]
     pub assistant_evidence_count: usize,
-    #[serde(skip_serializing)]
     pub first_seen_at: String,
-    #[serde(skip_serializing)]
     pub last_seen_at: String,
-    #[serde(skip_serializing)]
     pub promotion_reason: String,
     #[serde(skip_serializing)]
     pub apply_eligible: bool,

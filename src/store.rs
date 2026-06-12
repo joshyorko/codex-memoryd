@@ -29,15 +29,40 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 1;
+pub const STORAGE_SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
+const MIGRATION_DREAM_RUNS: &str = include_str!("../migrations/0003_dream_runs.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
 /// Sync cursor timestamps: (last_started_at, last_completed_at, last_error).
 pub type SyncCursorTimes = (Option<String>, Option<String>, Option<String>);
+
+#[derive(Debug, Clone)]
+pub struct DreamRunAudit {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub implementation_version: String,
+    pub config_hash: String,
+    pub ruleset_version: String,
+    pub fixture_schema_version: Option<String>,
+    pub source_window_start: Option<String>,
+    pub source_window_end: Option<String>,
+    pub source_counts: Value,
+    pub candidate_counts: Value,
+    pub created_count: i64,
+    pub archived_count: i64,
+    pub rejected_count: i64,
+    pub error_summary: Option<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DreamRunRecord {
@@ -59,8 +84,26 @@ pub struct DreamRunRecord {
     pub limits_hit: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DreamRunSummary {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub source_window_start: Option<String>,
+    pub source_window_end: Option<String>,
+    pub created_count: i64,
+    pub archived_count: i64,
+    pub rejected_count: i64,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledDreamRunSummary {
     pub run_id: String,
     pub status: String,
     pub completed_at: Option<String>,
@@ -149,7 +192,10 @@ impl Store {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        Error::storage(format!("create storage dir {}: {e}", parent.display()))
+                        Error::storage(format!(
+                            "create storage dir {}: {e}; check --db/CODEX_MEMORYD_DB path and directory permissions",
+                            parent.display()
+                        ))
                     })?;
                 }
             }
@@ -161,7 +207,12 @@ impl Store {
                 .map_err(|e| Error::storage(format!("open {}: {e}", path.display())))?;
             bootstrap
                 .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
-                .map_err(|e| Error::storage(format!("enable WAL: {e}")))?;
+                .map_err(|e| {
+                    Error::storage(format!(
+                        "enable WAL for {}: {e}; check database write permissions",
+                        path.display()
+                    ))
+                })?;
             SqliteConnectionManager::file(&path)
         };
         // Per-connection pragmas. journal_mode is intentionally NOT set here: it
@@ -201,28 +252,6 @@ impl Store {
     fn migrate(&mut self) -> Result<()> {
         let conn = self.conn()?;
         conn.execute_batch(MIGRATION_INIT)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS dream_runs (
-                run_id TEXT PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                repo_id TEXT,
-                mode TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                completed_at TEXT,
-                watermark_before TEXT,
-                watermark_after TEXT,
-                error TEXT,
-                candidates INTEGER NOT NULL DEFAULT 0,
-                created INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0,
-                limits_hit TEXT NOT NULL DEFAULT '[]'
-            );
-            CREATE INDEX IF NOT EXISTS idx_dream_runs_scope
-                ON dream_runs(kind, profile_id, workspace_id, repo_id, completed_at);",
-        )?;
 
         // Record schema version in a tiny meta table.
         conn.execute_batch(
@@ -233,6 +262,7 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![STORAGE_SCHEMA_VERSION.to_string()],
         )?;
+        conn.execute_batch(MIGRATION_DREAM_RUNS)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -1104,21 +1134,12 @@ impl Store {
     pub fn record_dream_run(&self, run: &DreamRunRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO dream_runs(
+            "INSERT OR REPLACE INTO dream_runs(
                 run_id, profile_id, workspace_id, repo_id, mode, kind, status,
                 started_at, completed_at, watermark_before, watermark_after, error,
                 candidates, created, archived, limits_hit
              )
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-             ON CONFLICT(run_id) DO UPDATE SET
-                status = excluded.status,
-                completed_at = excluded.completed_at,
-                watermark_after = excluded.watermark_after,
-                error = excluded.error,
-                candidates = excluded.candidates,
-                created = excluded.created,
-                archived = excluded.archived,
-                limits_hit = excluded.limits_hit",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 run.run_id,
                 run.profile_id,
@@ -1141,7 +1162,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn last_scheduled_dream_run(&self) -> Result<Option<DreamRunSummary>> {
+    pub fn last_scheduled_dream_run(&self) -> Result<Option<ScheduledDreamRunSummary>> {
         let conn = self.conn()?;
         let result = conn
             .query_row(
@@ -1152,7 +1173,7 @@ impl Store {
                  LIMIT 1",
                 [],
                 |row| {
-                    Ok(DreamRunSummary {
+                    Ok(ScheduledDreamRunSummary {
                         run_id: row.get(0)?,
                         status: row.get(1)?,
                         completed_at: row.get(2)?,
@@ -1276,6 +1297,91 @@ impl Store {
             )
             .optional()?
             .flatten();
+        Ok(result)
+    }
+
+    // ------------------------------------------------------------------
+    // Dreamer audit runs
+    // ------------------------------------------------------------------
+
+    pub fn insert_dream_run(&self, run: &DreamRunAudit) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO dream_runs(
+                id, profile_id, workspace_id, repo_id, mode, status,
+                started_at, completed_at, implementation_version, config_hash,
+                ruleset_version, fixture_schema_version, source_window_start,
+                source_window_end, source_counts, candidate_counts,
+                created_count, archived_count, rejected_count, error_summary)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            params![
+                run.id,
+                run.profile_id,
+                run.workspace_id,
+                run.repo_id,
+                run.mode,
+                run.status,
+                run.started_at,
+                run.completed_at,
+                run.implementation_version,
+                run.config_hash,
+                run.ruleset_version,
+                run.fixture_schema_version,
+                run.source_window_start,
+                run.source_window_end,
+                run.source_counts.to_string(),
+                run.candidate_counts.to_string(),
+                run.created_count,
+                run.archived_count,
+                run.rejected_count,
+                run.error_summary,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn dream_watermark(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                "SELECT source_window_end FROM dream_runs
+                 WHERE profile_id = ?1
+                   AND workspace_id = ?2
+                   AND ((repo_id IS NULL AND ?3 IS NULL) OR repo_id = ?3)
+                   AND status = 'ok'
+                   AND mode = 'apply'
+                   AND completed_at IS NOT NULL
+                   AND source_window_end IS NOT NULL
+                 ORDER BY source_window_end DESC, completed_at DESC
+                 LIMIT 1",
+                params![profile_id, workspace_id, repo_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn last_dream_run(&self) -> Result<Option<DreamRunSummary>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                "SELECT id, profile_id, workspace_id, repo_id, mode, status,
+                        started_at, completed_at, source_window_start,
+                        source_window_end, created_count, archived_count,
+                        rejected_count, error_summary
+                 FROM dream_runs
+                 WHERE id IS NOT NULL
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                [],
+                row_to_dream_summary,
+            )
+            .optional()?;
         Ok(result)
     }
 
@@ -1443,6 +1549,25 @@ fn row_to_source(row: &Row) -> rusqlite::Result<MemorySource> {
         created_at: row.get(6)?,
         ingested_at: row.get(7)?,
         metadata: json_value(&row.get::<_, String>(8)?),
+    })
+}
+
+fn row_to_dream_summary(row: &Row) -> rusqlite::Result<DreamRunSummary> {
+    Ok(DreamRunSummary {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        repo_id: row.get(3)?,
+        mode: row.get(4)?,
+        status: row.get(5)?,
+        started_at: row.get(6)?,
+        completed_at: row.get(7)?,
+        source_window_start: row.get(8)?,
+        source_window_end: row.get(9)?,
+        created_count: row.get(10)?,
+        archived_count: row.get(11)?,
+        rejected_count: row.get(12)?,
+        error_summary: row.get(13)?,
     })
 }
 

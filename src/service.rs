@@ -45,8 +45,10 @@ use crate::recall;
 use crate::recall::RecallParams;
 use crate::recall::SearchParams;
 use crate::status;
+use crate::store::DreamRunAudit;
 use crate::store::DreamRunRecord;
 use crate::store::NewRecord;
+use crate::store::RecordQuery;
 use crate::store::Store;
 
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
@@ -603,7 +605,18 @@ impl Service {
         let workspace = self.resolve_workspace(&req.workspace);
         let repo_id = self.register_repo(&req.repo)?;
         let mode = req.mode.unwrap_or_else(|| "preview".to_string());
+        let started_at = ids::now_rfc3339();
         if mode != "preview" && mode != "apply" {
+            let _ = self.store.insert_dream_run(&dream_error_audit(
+                profile.as_str(),
+                &workspace,
+                repo_id.as_deref(),
+                &mode,
+                &started_at,
+                None,
+                None,
+                "dream mode must be preview or apply",
+            ));
             return Err(Error::invalid_request(
                 "dream mode must be preview or apply",
             ));
@@ -613,7 +626,57 @@ impl Service {
             let day = current.split('T').next().unwrap_or("1970-01-01");
             format!("{day}T00:00:00Z")
         });
-        dream::run(
+        if OffsetDateTime::parse(&now, &Rfc3339).is_err() {
+            let _ = self.store.insert_dream_run(&dream_error_audit(
+                profile.as_str(),
+                &workspace,
+                repo_id.as_deref(),
+                &mode,
+                &started_at,
+                None,
+                Some(&now),
+                "dream now must be an RFC3339 timestamp",
+            ));
+            return Err(Error::invalid_request(
+                "dream now must be an RFC3339 timestamp",
+            ));
+        }
+        if let Some(since) = req.since.as_deref() {
+            if OffsetDateTime::parse(since, &Rfc3339).is_err() {
+                let _ = self.store.insert_dream_run(&dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    &mode,
+                    &started_at,
+                    Some(since),
+                    Some(&now),
+                    "dream since must be an RFC3339 timestamp",
+                ));
+                return Err(Error::invalid_request(
+                    "dream since must be an RFC3339 timestamp",
+                ));
+            }
+        }
+        let explicit_since = req.since.is_some();
+        let source_window_start = match req.since {
+            Some(since) => Some(since),
+            None => self
+                .store
+                .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
+        };
+        let source_records = self.store.query_records(&RecordQuery {
+            profile_id: Some(profile.as_str().to_string()),
+            workspace_id: Some(workspace.clone()),
+            repo_id: repo_id.clone(),
+            record_type: None,
+            scope: None,
+            include_archived: explicit_since,
+            recency_cutoff: source_window_start.clone(),
+            limit: 500,
+            offset: 0,
+        })?;
+        let result = dream::run(
             &self.store,
             &dream::DreamParams {
                 profile,
@@ -621,11 +684,54 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: &mode,
                 now: &now,
-                recency_cutoff: None,
+                recency_cutoff: source_window_start.as_deref(),
+                include_archived_sources: explicit_since,
                 max_records: 500,
                 max_candidates: None,
             },
-        )
+        );
+        match result {
+            Ok(resp) => {
+                let completed_at = ids::now_rfc3339();
+                self.store.insert_dream_run(&DreamRunAudit {
+                    id: resp.run_id.clone(),
+                    profile_id: resp.profile.clone(),
+                    workspace_id: resp.workspace.clone(),
+                    repo_id: resp.repo_id.clone(),
+                    mode: resp.mode.clone(),
+                    status: "ok".to_string(),
+                    started_at,
+                    completed_at: Some(completed_at),
+                    implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+                    config_hash: dream::config_hash(),
+                    ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+                    fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
+                    source_window_start,
+                    source_window_end: Some(now),
+                    source_counts: dream::source_counts(&source_records),
+                    candidate_counts: dream::candidate_counts(&resp),
+                    created_count: resp.created.len() as i64,
+                    archived_count: resp.archived.len() as i64,
+                    rejected_count: resp.rejected.len() as i64,
+                    error_summary: None,
+                })?;
+                Ok(resp)
+            }
+            Err(err) => {
+                let summary = sanitize_error_summary(&err.message);
+                let _ = self.store.insert_dream_run(&dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    &mode,
+                    &started_at,
+                    source_window_start.as_deref(),
+                    Some(&now),
+                    &summary,
+                ));
+                Err(err)
+            }
+        }
     }
 
     pub fn scheduled_dream(&self, now: Option<String>) -> Result<ScheduledDreamResponse> {
@@ -719,6 +825,7 @@ impl Service {
                 mode: SCHEDULED_DREAM_MODE,
                 now: &now,
                 recency_cutoff: watermark_before.as_deref(),
+                include_archived_sources: false,
                 max_records: cfg.max_batch_size,
                 max_candidates: Some(cfg.max_candidates),
             },
@@ -926,6 +1033,59 @@ impl Service {
         };
         export::export(&self.store, &params)
     }
+}
+
+fn dream_error_audit(
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    mode: &str,
+    started_at: &str,
+    source_window_start: Option<&str>,
+    source_window_end: Option<&str>,
+    error_summary: &str,
+) -> DreamRunAudit {
+    let completed_at = ids::now_rfc3339();
+    DreamRunAudit {
+        id: ids::new_id("dream"),
+        profile_id: profile_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        repo_id: repo_id.map(str::to_string),
+        mode: mode.to_string(),
+        status: "error".to_string(),
+        started_at: started_at.to_string(),
+        completed_at: Some(completed_at),
+        implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+        config_hash: dream::config_hash(),
+        ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+        fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
+        source_window_start: source_window_start.map(str::to_string),
+        source_window_end: source_window_end.map(str::to_string),
+        source_counts: json!({}),
+        candidate_counts: json!({}),
+        created_count: 0,
+        archived_count: 0,
+        rejected_count: 0,
+        error_summary: Some(sanitize_error_summary(error_summary)),
+    }
+}
+
+fn sanitize_error_summary(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
 }
 
 fn parse_types(raw: &[String]) -> Vec<RecordType> {

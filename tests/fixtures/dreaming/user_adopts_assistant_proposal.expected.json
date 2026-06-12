@@ -1,0 +1,18 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "command:cargo-test-adopted",
+        "record_type": "command",
+        "promotion_reason": "user_adopted_assistant_proposal",
+        "evidence_count": 2,
+        "must_contain": ["cargo test", "repo-native"],
+        "must_not_contain": []
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  },
+  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true }
+}

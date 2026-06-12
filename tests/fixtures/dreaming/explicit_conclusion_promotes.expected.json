@@ -1,0 +1,18 @@
+{
+  "expect_preview": {
+    "accepted": [
+      {
+        "subject_key": "decision:cargo-test-validation",
+        "record_type": "decision",
+        "promotion_reason": "explicit_conclusion",
+        "evidence_count": 1,
+        "must_contain": ["cargo test", "validation command"],
+        "must_not_contain": []
+      }
+    ],
+    "rejected": [],
+    "quarantined": [],
+    "stale": []
+  },
+  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true }
+}

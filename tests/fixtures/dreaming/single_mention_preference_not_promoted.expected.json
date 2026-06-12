@@ -1,0 +1,17 @@
+{
+  "expect_preview": {
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [
+      {
+        "subject_key": "preference:terse-commit-messages",
+        "record_type": "preference",
+        "promotion_reason": "single_unconfirmed_preference",
+        "evidence_count": 1,
+        "must_contain": ["terse commit messages"],
+        "must_not_contain": []
+      }
+    ],
+    "stale": []
+  }
+}

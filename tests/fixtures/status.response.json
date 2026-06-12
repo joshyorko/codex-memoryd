@@ -4,7 +4,7 @@
     "provider_name": "codex-memoryd",
     "provider_version": "0.1.0",
     "api_version": "v1",
-    "storage_schema_version": 1,
+    "storage_schema_version": 2,
     "status": "local_only",
     "storage": {
       "kind": "sqlite",
@@ -14,6 +14,7 @@
     "active_profiles": ["personal"],
     "active_workspaces": ["josh-personal"],
     "last_sync": null,
+    "last_dream": null,
     "pending_writes": 0,
     "local_import": {
       "status": "unknown",

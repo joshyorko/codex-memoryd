@@ -64,6 +64,38 @@ fn cli_status_is_json() {
 }
 
 #[test]
+fn cli_status_storage_path_failure_is_actionable() {
+    let dir = TempDir::new().unwrap();
+    let not_a_dir = dir.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, "file blocks directory creation").unwrap();
+
+    bin()
+        .arg("--db")
+        .arg(not_a_dir.join("memory.db"))
+        .arg("status")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("check --db/CODEX_MEMORYD_DB"));
+}
+
+#[test]
+fn cli_serve_bind_conflict_is_actionable() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["serve", "--bind", &addr])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to listen"))
+        .stderr(predicate::str::contains("--bind 127.0.0.1:<port>"));
+}
+
+#[test]
 fn cli_conclude_then_search_roundtrip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
@@ -302,4 +334,22 @@ fn cli_help_lists_all_commands() {
         .stdout(predicate::str::contains("export"))
         .stdout(predicate::str::contains("forget"))
         .stdout(predicate::str::contains("doctor"));
+}
+
+#[test]
+fn readme_keeps_first_run_path_documented() {
+    let readme = include_str!("../README.md");
+    for required in [
+        "First-run path (source build)",
+        "CODEX_MEMORYD_DB",
+        "codex-memoryd doctor",
+        "curl -fsS http://127.0.0.1:8787/v1/status",
+        "codex-memoryd sync-local --preview",
+        "codex-memoryd sync-local --apply",
+        "codex-memoryd conclude --profile personal",
+        "codex-memoryd recall --profile personal",
+        "Fail-open note",
+    ] {
+        assert!(readme.contains(required), "README missing {required:?}");
+    }
 }

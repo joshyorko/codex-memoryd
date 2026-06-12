@@ -2,6 +2,7 @@
 //! supersession. This module is intentionally policy/store-backed and does not
 //! call an LLM.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use once_cell::sync::Lazy;
@@ -25,6 +26,10 @@ use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
 use crate::store::UpsertOutcome;
+
+pub const DREAM_IMPLEMENTATION_VERSION: &str = "heuristic-v1";
+pub const DREAM_RULESET_VERSION: &str = "dreamer-heuristics-v1";
+pub const DREAM_FIXTURE_SCHEMA_VERSION: Option<&str> = None;
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -56,15 +61,66 @@ const STOPWORDS: &[&str] = &[
     "options",
     "planned",
     "planning",
+    "please",
+    "proposal",
     "right",
+    "run",
     "still",
     "summary",
     "that",
     "this",
+    "use",
     "uses",
     "will",
     "with",
+    "yes",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceClass {
+    UserVisibleTurn,
+    AdoptedAssistantProposal,
+    AssistantVisibleTurn,
+    ExplicitConclusion,
+    Checkpoint,
+    ImportedMemory,
+    ActiveMemory,
+}
+
+impl EvidenceClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            EvidenceClass::UserVisibleTurn => "user_visible_turn",
+            EvidenceClass::AdoptedAssistantProposal => "adopted_assistant_proposal",
+            EvidenceClass::AssistantVisibleTurn => "assistant_visible_turn",
+            EvidenceClass::ExplicitConclusion => "explicit_conclusion",
+            EvidenceClass::Checkpoint => "checkpoint",
+            EvidenceClass::ImportedMemory => "imported_memory",
+            EvidenceClass::ActiveMemory => "active_memory",
+        }
+    }
+
+    fn weight(self) -> f64 {
+        match self {
+            EvidenceClass::UserVisibleTurn => 1.0,
+            EvidenceClass::AdoptedAssistantProposal => 1.25,
+            EvidenceClass::AssistantVisibleTurn => 0.25,
+            EvidenceClass::ExplicitConclusion => 2.0,
+            EvidenceClass::Checkpoint => 1.5,
+            EvidenceClass::ImportedMemory => 0.5,
+            EvidenceClass::ActiveMemory => 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceScore {
+    classes: Vec<EvidenceClass>,
+    weight: f64,
+    reason: String,
+    candidate_state: String,
+    apply_eligible: bool,
+}
 
 pub struct DreamParams<'a> {
     pub profile: Profile,
@@ -73,6 +129,7 @@ pub struct DreamParams<'a> {
     pub mode: &'a str,
     pub now: &'a str,
     pub recency_cutoff: Option<&'a str>,
+    pub include_archived_sources: bool,
     pub max_records: usize,
     pub max_candidates: Option<usize>,
 }
@@ -81,19 +138,14 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     let records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
-        repo_id: None,
+        repo_id: params.repo_id.map(str::to_string),
         record_type: None,
         scope: None,
-        include_archived: false,
+        include_archived: params.include_archived_sources,
         recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
         limit: params.max_records,
         offset: 0,
     })?;
-    let records = records
-        .into_iter()
-        .filter(|r| r.repo_id.as_deref() == params.repo_id || params.repo_id.is_none())
-        .collect::<Vec<_>>();
-
     let mut candidates = Vec::new();
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
@@ -174,6 +226,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         }
     }
 
+    if params.recency_cutoff.is_none() || params.include_archived_sources {
+        push_threshold_candidates(&records, &mut candidates, &mut rejected);
+    }
+
     dedupe_candidates(&mut candidates);
     if let Some(max) = params.max_candidates {
         candidates.truncate(max);
@@ -220,6 +276,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
                 "dream_run_id": run_id.clone(),
                 "run_id": run_id.clone(),
                 "subject_key": candidate.subject_key,
+                "candidate_state": candidate.candidate_state,
+                "threshold_reason": candidate.threshold_reason,
+                "evidence_weight": candidate.evidence_weight,
+                "evidence_classes": candidate.evidence_classes,
                 "evidence_ids": candidate.evidence_ids,
                 "evidence_count": candidate.evidence_count,
                 "user_evidence_count": candidate.user_evidence_count,
@@ -304,6 +364,10 @@ fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
         params.mode,
         params.now
     );
+    if let Some(source_window_start) = params.recency_cutoff {
+        seed.push('\x1f');
+        seed.push_str(source_window_start);
+    }
     for record in records {
         seed.push('\x1f');
         seed.push_str(&record.id);
@@ -314,6 +378,246 @@ fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
     }
     let hash = ids::sha256_hex(seed.as_bytes());
     format!("dream_{}", &hash["sha256:".len()..39])
+}
+
+pub fn config_hash() -> String {
+    ids::sha256_hex(format!("{DREAM_IMPLEMENTATION_VERSION}:{DREAM_RULESET_VERSION}").as_bytes())
+}
+
+pub fn source_counts(records: &[MemoryRecord]) -> serde_json::Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for record in records {
+        *counts
+            .entry(record.record_type.as_str().to_string())
+            .or_default() += 1;
+    }
+    json!(counts)
+}
+
+pub fn candidate_counts(response: &DreamResponse) -> serde_json::Value {
+    let mut by_action = BTreeMap::<String, usize>::new();
+    let mut by_policy = BTreeMap::<String, usize>::new();
+    for candidate in &response.candidates {
+        *by_action.entry(candidate.action.clone()).or_default() += 1;
+        *by_policy.entry(candidate.policy.clone()).or_default() += 1;
+    }
+    json!({
+        "by_action": by_action,
+        "by_policy": by_policy,
+    })
+}
+
+fn push_threshold_candidates(
+    records: &[MemoryRecord],
+    candidates: &mut Vec<DreamCandidate>,
+    rejected: &mut Vec<DreamRejection>,
+) {
+    let mut groups: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
+    for record in records {
+        groups
+            .entry(subject_key(&record.content))
+            .or_default()
+            .push(record);
+    }
+    for (subject, mut evidence) in groups {
+        evidence.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        let score = score_evidence(&evidence);
+        if score.candidate_state == "rejected" {
+            continue;
+        }
+        let Some(content) = threshold_content(&subject, &evidence, &score) else {
+            continue;
+        };
+        let state = if evidence
+            .iter()
+            .any(|record| state_for_record(record) == "completed")
+        {
+            "completed"
+        } else {
+            "active"
+        };
+        let Some(last) = evidence.last().copied() else {
+            continue;
+        };
+        push_candidate_with_score(
+            candidates,
+            rejected,
+            last,
+            "promote",
+            &content,
+            state,
+            is_drift_prone(&content),
+            None,
+            None,
+            vec![],
+            score,
+            &evidence,
+        );
+    }
+}
+
+fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
+    let mut classes = evidence
+        .iter()
+        .map(|r| evidence_class(r))
+        .collect::<Vec<_>>();
+    if has_assistant_adoption(evidence) {
+        for class in &mut classes {
+            if *class == EvidenceClass::AssistantVisibleTurn {
+                *class = EvidenceClass::AdoptedAssistantProposal;
+            }
+        }
+    }
+    let mut unique_classes = Vec::new();
+    for class in &classes {
+        if !unique_classes.contains(class) {
+            unique_classes.push(*class);
+        }
+    }
+    let weight = classes.iter().map(|class| class.weight()).sum::<f64>();
+    let user_turns = classes
+        .iter()
+        .filter(|class| **class == EvidenceClass::UserVisibleTurn)
+        .count();
+    let conclusions = classes
+        .iter()
+        .filter(|class| **class == EvidenceClass::ExplicitConclusion)
+        .count();
+    let checkpoints = classes
+        .iter()
+        .filter(|class| **class == EvidenceClass::Checkpoint)
+        .count();
+    let adopted = classes
+        .iter()
+        .filter(|class| **class == EvidenceClass::AdoptedAssistantProposal)
+        .count();
+    let assistant_only = !classes.is_empty()
+        && classes
+            .iter()
+            .all(|class| *class == EvidenceClass::AssistantVisibleTurn);
+    let active_only = !classes.is_empty()
+        && classes
+            .iter()
+            .all(|class| *class == EvidenceClass::ActiveMemory);
+    let self_reinforcing = !classes.is_empty()
+        && classes.iter().all(|class| {
+            matches!(
+                class,
+                EvidenceClass::ImportedMemory | EvidenceClass::ActiveMemory
+            )
+        });
+    let single_unconfirmed_preference =
+        evidence.len() == 1 && evidence[0].record_type == crate::domain::RecordType::Preference;
+
+    let (candidate_state, reason, apply_eligible) = if assistant_only {
+        ("quarantined", "assistant_only_proposal_quarantined", false)
+    } else if active_only {
+        ("rejected", "active_memory_only", false)
+    } else if self_reinforcing {
+        (
+            "quarantined",
+            "imported_or_active_memory_without_fresh_primary_evidence",
+            false,
+        )
+    } else if single_unconfirmed_preference {
+        ("quarantined", "single_unconfirmed_preference", false)
+    } else if conclusions > 0 {
+        ("accepted", "explicit_conclusion", true)
+    } else if checkpoints > 0 {
+        ("accepted", "checkpoint_backed_task_state", true)
+    } else if adopted > 0 {
+        ("accepted", "user_adopted_assistant_proposal", true)
+    } else if user_turns >= 2 || distinct_days(evidence) >= 2 {
+        ("accepted", "repeated_user_steering", true)
+    } else if weight >= 2.0 {
+        ("accepted", "weighted_primary_evidence_threshold", true)
+    } else {
+        ("quarantined", "insufficient_primary_evidence", false)
+    };
+
+    EvidenceScore {
+        classes: unique_classes,
+        weight,
+        reason: reason.to_string(),
+        candidate_state: candidate_state.to_string(),
+        apply_eligible,
+    }
+}
+
+fn evidence_class(record: &MemoryRecord) -> EvidenceClass {
+    let origin = record.metadata.get("origin").and_then(|v| v.as_str());
+    let actor = record
+        .metadata
+        .get("actor")
+        .or_else(|| record.metadata.get("target"))
+        .and_then(|v| v.as_str());
+    let artifact_kind = record
+        .metadata
+        .get("artifact_kind")
+        .and_then(|v| v.as_str());
+    if origin == Some("visible_turn") && actor == Some("user") {
+        EvidenceClass::UserVisibleTurn
+    } else if origin == Some("visible_turn") && actor == Some("assistant") {
+        EvidenceClass::AssistantVisibleTurn
+    } else if origin == Some("conclusion") {
+        EvidenceClass::ExplicitConclusion
+    } else if origin == Some("checkpoint") {
+        EvidenceClass::Checkpoint
+    } else if origin == Some("codex-local-memory") || artifact_kind == Some("memory_summary") {
+        EvidenceClass::ImportedMemory
+    } else {
+        EvidenceClass::ActiveMemory
+    }
+}
+
+fn has_assistant_adoption(evidence: &[&MemoryRecord]) -> bool {
+    let mut saw_assistant = false;
+    for record in evidence {
+        match evidence_class(record) {
+            EvidenceClass::AssistantVisibleTurn => saw_assistant = true,
+            EvidenceClass::UserVisibleTurn if saw_assistant => {
+                if contains_any(
+                    &record.content.to_ascii_lowercase(),
+                    &["yes", "do that", "use that", "adopt", "ship it", "go with"],
+                ) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn threshold_content(
+    subject: &str,
+    evidence: &[&MemoryRecord],
+    score: &EvidenceScore,
+) -> Option<String> {
+    if score.candidate_state == "accepted" {
+        return evidence.last().map(|record| record.content.clone());
+    }
+    let latest = evidence.last()?;
+    Some(format!(
+        "Quarantined Dreamer candidate for subject `{subject}`: {}",
+        summarize_for_threshold(&latest.content)
+    ))
+}
+
+fn summarize_for_threshold(content: &str) -> String {
+    content
+        .split_whitespace()
+        .take(18)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn distinct_days(evidence: &[&MemoryRecord]) -> usize {
+    evidence
+        .iter()
+        .filter_map(|record| record.created_at.split('T').next())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn push_candidate(
@@ -328,13 +632,76 @@ fn push_candidate(
     historical_reason: Option<String>,
     supersedes: Vec<String>,
 ) {
+    let evidence_refs = [evidence];
+    let score = score_evidence(&evidence_refs);
+    push_candidate_with_score(
+        candidates,
+        rejected,
+        evidence,
+        action,
+        content,
+        state,
+        drift_prone,
+        valid_until,
+        historical_reason,
+        supersedes,
+        score,
+        &evidence_refs,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_candidate_with_score(
+    candidates: &mut Vec<DreamCandidate>,
+    rejected: &mut Vec<DreamRejection>,
+    evidence: &MemoryRecord,
+    action: &str,
+    content: &str,
+    state: &str,
+    drift_prone: bool,
+    valid_until: Option<String>,
+    historical_reason: Option<String>,
+    supersedes: Vec<String>,
+    score: EvidenceScore,
+    evidence_records: &[&MemoryRecord],
+) {
     match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
         PolicyDecision::Accept(clean) => {
-            let evidence_ids = evidence_ids(evidence);
+            let evidence_ids = evidence_records
+                .iter()
+                .flat_map(|record| evidence_ids(record))
+                .collect::<Vec<_>>();
             let evidence_count = evidence_ids.len();
-            let (user_evidence_count, assistant_evidence_count) =
-                evidence_actor_counts(evidence, evidence_count);
-            let promotion_reason = promotion_reason(action, &historical_reason);
+            let user_evidence_count = evidence_records
+                .iter()
+                .filter(|record| {
+                    evidence_class(record) == EvidenceClass::UserVisibleTurn
+                        || record.metadata.get("target").and_then(|v| v.as_str()) == Some("user")
+                })
+                .count();
+            let assistant_evidence_count = evidence_records
+                .iter()
+                .filter(|record| {
+                    evidence_class(record) == EvidenceClass::AssistantVisibleTurn
+                        || record.metadata.get("target").and_then(|v| v.as_str())
+                            == Some("assistant")
+                })
+                .count();
+            let promotion_reason =
+                promotion_reason(action, &historical_reason, Some(score.reason.as_str()));
+            let evidence_classes = score
+                .classes
+                .iter()
+                .map(|class| class.as_str().to_string())
+                .collect::<Vec<_>>();
+            let first_seen_at = evidence_records
+                .first()
+                .map(|record| record.created_at.clone())
+                .unwrap_or_else(|| evidence.created_at.clone());
+            let last_seen_at = evidence_records
+                .last()
+                .map(|record| record.updated_at.clone())
+                .unwrap_or_else(|| evidence.updated_at.clone());
             candidates.push(DreamCandidate {
                 action: action.to_string(),
                 proposed_type: evidence.record_type.as_str().to_string(),
@@ -347,15 +714,20 @@ fn push_candidate(
                 historical_reason,
                 supersedes,
                 policy: "accept".to_string(),
+                candidate_state: score.candidate_state,
                 subject_key: subject_key(&evidence.content),
+                threshold_reason: score.reason,
+                evidence_weight: score.weight,
+                evidence_classes,
                 evidence_ids,
                 evidence_count,
                 user_evidence_count,
                 assistant_evidence_count,
-                first_seen_at: evidence.created_at.clone(),
-                last_seen_at: evidence.updated_at.clone(),
+                first_seen_at,
+                last_seen_at,
                 promotion_reason,
-                apply_eligible: apply_eligible(evidence, evidence_count, assistant_evidence_count),
+                apply_eligible: score.apply_eligible
+                    && apply_eligible(evidence, evidence_count, assistant_evidence_count),
             })
         }
         PolicyDecision::Reject { reason, .. } => {
@@ -369,20 +741,6 @@ fn evidence_ids(evidence: &MemoryRecord) -> Vec<String> {
         vec![evidence.id.clone()]
     } else {
         evidence.source_ids.clone()
-    }
-}
-
-fn evidence_actor_counts(evidence: &MemoryRecord, evidence_count: usize) -> (usize, usize) {
-    let actor = evidence
-        .metadata
-        .get("actor")
-        .or_else(|| evidence.metadata.get("target"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase());
-    match actor.as_deref() {
-        Some("assistant") => (0, evidence_count),
-        Some("user") => (evidence_count, 0),
-        _ => (0, 0),
     }
 }
 
@@ -402,12 +760,17 @@ fn apply_eligible(
     !(origin == Some("codex-local-memory") && artifact_kind == Some("memory_summary"))
 }
 
-fn promotion_reason(action: &str, historical_reason: &Option<String>) -> String {
+fn promotion_reason(
+    action: &str,
+    historical_reason: &Option<String>,
+    threshold_reason: Option<&str>,
+) -> String {
     historical_reason.clone().unwrap_or_else(|| {
         match action {
             "rewrite_historical" => "expired drift-prone memory rewritten as historical fact",
             "supersede" => "newer evidence supersedes older active memory",
-            _ => "dreamer candidate accepted by deterministic policy",
+            "promote" => threshold_reason.unwrap_or("deterministic promotion threshold met"),
+            _ => threshold_reason.unwrap_or("dreamer candidate accepted by deterministic policy"),
         }
         .to_string()
     })

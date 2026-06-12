@@ -101,6 +101,69 @@ Supported bind/exposure modes:
   lands. `/v1/status` reports `status = "auth_missing"` and an actionable warning
   for this configuration; do not expose `/v1/*` to untrusted networks.
 
+## First-run path (source build)
+
+This section stays intentionally small and uses the binary from a clean source
+checkout for a quick portability verification.
+
+```bash
+# 1) Build and install locally from source.
+git clone https://github.com/joshyorko/codex-memoryd.git
+cd codex-memoryd
+cargo build --release
+install -Dm755 target/release/codex-memoryd "$HOME/.local/bin/codex-memoryd"
+export PATH="$HOME/.local/bin:$PATH"
+
+# 2) Start the daemon on a repo-local demo database.
+mkdir -p .demo
+export CODEX_MEMORYD_DB="$PWD/.demo/memory.db"
+codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
+echo $! > .demo/codex-memoryd.pid
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+codex-memoryd status | jq
+codex-memoryd doctor | jq
+
+# 3) Configure this provider in ~/.codex/config.toml.
+# Add this [memories] block, or update only the existing one.
+#
+# [memories]
+[memories]
+backend = "provider"
+provider = "codex_memoryd"
+provider_url = "http://127.0.0.1:8787"
+profile = "personal"
+workspace = "codex-memoryd-demo"
+local_import_policy = "prompt"
+write_policy = "visible_turns"
+sync_policy = "manual"
+cross_profile_policy = "default_deny"
+
+# 4) Import local fixtures with a dry run, then apply.
+mkdir -p .demo/codex-memories/rollout_summaries
+cat > .demo/codex-memories/memory_summary.md <<'MD'
+# Preferences
+- Prefer local-first memory providers for coding agents.
+MD
+codex-memoryd sync-local --preview --profile personal --workspace codex-memoryd-demo .demo/codex-memories | jq
+codex-memoryd sync-local --apply --profile personal --workspace codex-memoryd-demo .demo/codex-memories | jq
+
+# 5) Write one conclusion and recall it.
+codex-memoryd conclude --profile personal --workspace codex-memoryd-demo \
+  --content "Decision: first run confirms source install, status checks, and import flow."
+codex-memoryd recall --profile personal --workspace codex-memoryd-demo \
+  --query "first run codex-memoryd" | jq
+
+# 6) Verify fail-open behavior by stopping the daemon and restarting Codex.
+kill "$(cat .demo/codex-memoryd.pid)"
+codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
+echo $! > .demo/codex-memoryd.pid
+codex-memoryd status | jq
+```
+
+Fail-open note: if the daemon is unavailable, provider/hybrid memory usage is
+designed to fail open (recall returns empty, writes are best-effort) rather than
+blocking your Codex turn path.
+
 ## CLI
 
 The CLI operates on the same code paths as the HTTP server (it opens the store
@@ -288,6 +351,8 @@ fixture sidecars and recall-before/after evals, #19 evidence weighting and
 thresholds, #13 state/staleness/supersession, #12 policy-gated apply, #20
 dream-run audit/watermarks, #14 live Codex smoke, #15 reliability/auth/fail-open
 contracts, #17 first-run demo, #16 local-first bakeoff, and #18 local MCP tools.
+For #19, the fixture set now also includes user-adoption, non-promoted assistant-only,
+and imported-memory self-reinforcement edge cases in `tests/fixtures/dreaming`.
 
 ## Safety & profile boundaries
 
@@ -336,3 +401,7 @@ work→personal export denial, forget archiving, and secret omission on export.
 ## License
 
 MIT.
+
+## Memory bakeoff
+
+For a narrow comparison of local-only Codex memory, Honcho provider mode, and codex-memoryd provider mode (with explicit scope limits), see [`demos/memory-bakeoff/README.md`](./demos/memory-bakeoff/README.md).
