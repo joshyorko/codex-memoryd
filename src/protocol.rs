@@ -209,8 +209,25 @@ pub struct RecallFactPolicy {
     pub rank: usize,
     pub freshness: RecallFreshness,
     pub provenance: RecallProvenance,
+    pub admission: RecallAdmission,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranking_signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallAdmission {
+    pub decision: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallWithheld {
+    pub reason: String,
+    pub count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +269,8 @@ pub struct RecallResponse {
     pub facts: Vec<RecallFact>,
     pub checkpoints: Vec<RecallCheckpoint>,
     pub citations: Vec<Citation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<RecallWithheld>,
     pub truncated: bool,
     /// Always true: provider context is recall, not authority (SPEC §10.4).
     pub authority: String,
