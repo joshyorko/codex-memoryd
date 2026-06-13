@@ -468,6 +468,197 @@ fn apply_persists_marker_provenance_for_created_records() {
 }
 
 #[test]
+fn single_generic_success_does_not_propose_comfort_path() {
+    let svc = service();
+    conclude(&svc, "Cargo test passed cleanly on the first run.");
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    assert!(
+        preview
+            .markers
+            .iter()
+            .all(|marker| marker.marker_kind.as_deref() != Some("comfort_path")),
+        "single smooth success should not propose comfort_path"
+    );
+}
+
+#[test]
+fn repeated_loose_success_does_not_propose_comfort_path() {
+    let svc = service();
+    conclude(&svc, "It worked on the first run.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "It worked again after the retry.");
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    assert!(
+        preview
+            .markers
+            .iter()
+            .all(|marker| marker.marker_kind.as_deref() != Some("comfort_path")),
+        "loose repeated success should not propose comfort_path"
+    );
+}
+
+#[test]
+fn repeated_strong_smooth_success_proposes_comfort_path() {
+    let svc = service();
+    conclude(&svc, "Cargo test passed cleanly on the first run.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "Cargo test passed cleanly again after the retry.");
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    let comfort_path = preview
+        .markers
+        .iter()
+        .find(|marker| marker.marker_kind.as_deref() == Some("comfort_path"))
+        .expect("comfort_path marker from repeated success");
+    assert!(comfort_path
+        .content
+        .contains("Cargo test passed cleanly again after the retry."));
+    assert!(!comfort_path.evidence_refs.is_empty());
+    assert!(comfort_path
+        .evidence_refs
+        .iter()
+        .any(|reference| reference.kind == "conclusion"));
+}
+
+#[test]
+fn affect_only_terms_do_not_produce_operational_markers() {
+    let svc = service();
+    conclude(
+        &svc,
+        "I am happy, excited, and frustrated about the result.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    assert!(
+        preview.markers.is_empty(),
+        "affect-only terms should not produce operational markers"
+    );
+}
+
+#[test]
+fn surprising_correction_proposes_surprise_marker() {
+    let svc = service();
+    conclude(&svc, "The fallback path was the fastest route.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(
+        &svc,
+        "Correction: actually, the fallback path was the fastest route and that was unexpected.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    let surprise = preview
+        .markers
+        .iter()
+        .find(|marker| marker.marker_kind.as_deref() == Some("surprise"))
+        .expect("surprise marker from correction");
+    assert!(surprise.content.contains("unexpected"));
+    assert!(!surprise.evidence_refs.is_empty());
+    assert!(surprise
+        .evidence_refs
+        .iter()
+        .any(|reference| reference.kind == "conclusion"));
+}
+
+#[test]
+fn ordinary_correction_without_surprise_language_does_not_propose_surprise_marker() {
+    let svc = service();
+    conclude(&svc, "The fallback path was the fastest route.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(
+        &svc,
+        "Actually, the fallback path was the fastest route after the change.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    assert!(
+        preview
+            .markers
+            .iter()
+            .all(|marker| marker.marker_kind.as_deref() != Some("surprise")),
+        "plain correction language should not propose surprise"
+    );
+}
+
+#[test]
+fn repeated_failure_and_recovery_proposes_battle_scar_even_with_affect_terms() {
+    let svc = service();
+    conclude(
+        &svc,
+        "I was frustrated because the cache failed on the first pass.",
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(
+        &svc,
+        "I was still frustrated, but the cache failed again before recovering on the fallback path.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    let battle_scar = preview
+        .markers
+        .iter()
+        .find(|marker| marker.marker_kind.as_deref() == Some("battle_scar"))
+        .expect("battle_scar marker from failure and recovery");
+    assert!(battle_scar.content.contains("failed again"));
+    assert!(battle_scar.content.contains("recovering"));
+    assert!(!battle_scar.evidence_refs.is_empty());
+    assert!(battle_scar
+        .evidence_refs
+        .iter()
+        .any(|reference| reference.kind == "conclusion"));
+}
+
+#[test]
 fn planned_fact_transitions_to_completed_supersession() {
     let svc = service();
     let old_id = conclude(&svc, "OAuth sync is planned; will implement it next week.");
