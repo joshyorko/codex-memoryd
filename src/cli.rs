@@ -130,6 +130,9 @@ pub enum Command {
         /// Apply (write subject episodes, idempotent).
         #[arg(long)]
         apply: bool,
+        /// Import a JSON or JSONL exported refs fixture instead of commit trailers.
+        #[arg(long, value_name = "FILE")]
+        refs_fixture: Option<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -799,6 +802,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             profile,
             workspace,
             max_count,
+            refs_fixture,
             repo,
         } => {
             let service = cli.open_service(None)?;
@@ -812,6 +816,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &service,
                 GitImportParams {
                     repo_path: repo,
+                    refs_fixture: refs_fixture.as_deref(),
                     profile: profile.clone(),
                     workspace: workspace.clone(),
                     mode,

@@ -267,6 +267,8 @@ codex-memoryd sync-local --apply ~/.codex/memories
 # Local Git evidence import
 codex-memoryd git-import --preview /path/to/repo
 codex-memoryd git-import --apply /path/to/repo
+codex-memoryd git-import --preview --refs-fixture /path/to/refs.jsonl /path/to/repo
+codex-memoryd git-import --apply --refs-fixture /path/to/refs.json /path/to/repo
 
 # Export and forget
 codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
@@ -280,6 +282,10 @@ codex-memoryd forget <record-id> --delete
 `Memory-Decision`, `Memory-Verify`, and `Memory-Gotcha`. Apply mode writes safe
 subject episodes and evidence ledger rows only; it does not promote Git evidence
 to active memory records.
+
+`--refs-fixture` accepts a JSON or JSONL export of PR, issue, or review comment
+evidence and runs the same preview/apply/idempotency flow without calling the
+GitHub API.
 
 ## Config and Compatibility
 
