@@ -39,6 +39,23 @@ fn estimate_tokens(text: &str) -> usize {
 /// Records older than this many days are considered stale for display hints.
 const STALE_DAYS: i64 = 120;
 
+#[derive(Clone, Copy)]
+struct PackTemplate {
+    mode: &'static str,
+    budget_tokens: usize,
+}
+
+const PACK_TEMPLATES: &[PackTemplate] = &[
+    PackTemplate {
+        mode: "default",
+        budget_tokens: 1200,
+    },
+    PackTemplate {
+        mode: "debugging",
+        budget_tokens: 1000,
+    },
+];
+
 /// Parameters resolved for a recall request.
 pub struct RecallParams<'a> {
     pub profile: Profile,
@@ -69,6 +86,24 @@ fn dedupe_ordered_signals(signals: Vec<String>) -> Vec<String> {
         }
     }
     deduped
+}
+
+fn pack_template(mode: &str) -> Result<&'static PackTemplate> {
+    PACK_TEMPLATES
+        .iter()
+        .find(|template| template.mode == mode)
+        .ok_or_else(|| {
+            crate::error::Error::invalid_request(format!(
+                "unknown pack_mode '{mode}'; use default or debugging"
+            ))
+        })
+}
+
+fn pack_template_signals(template: &PackTemplate) -> Vec<String> {
+    vec![
+        format!("pack_template:{}", template.mode),
+        format!("pack_budget:{}", template.budget_tokens),
+    ]
 }
 
 fn build_withheld(
@@ -111,6 +146,8 @@ fn build_withheld(
 
 /// Execute recall: gather, rank, pack, attach checkpoints + citations.
 pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
+    let template = pack_template(params.pack_mode)?;
+    let effective_max_tokens = params.max_tokens.min(template.budget_tokens);
     let recency_cutoff = params.recency_days.and_then(rfc3339_cutoff);
 
     let filters = RecordQuery {
@@ -153,20 +190,9 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
                 type_filtered += 1;
                 return None;
             }
-            let score = score_record(
-                &record,
-                repo_id,
-                params.files,
-                params.query,
-                params.pack_mode,
-            );
-            let ranking_signals = ranking_signals(
-                &record,
-                repo_id,
-                params.files,
-                params.query,
-                params.pack_mode,
-            );
+            let score = score_record(&record, repo_id, params.files, params.query, template);
+            let ranking_signals =
+                ranking_signals(&record, repo_id, params.files, params.query, template);
             Some(Scored {
                 record,
                 score,
@@ -203,7 +229,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     for entry in &scored {
         let r = &entry.record;
         let cost = estimate_tokens(&r.content);
-        if used_tokens + cost > params.max_tokens && !facts.is_empty() {
+        if used_tokens + cost > effective_max_tokens && !facts.is_empty() {
             truncated = true;
             break;
         }
@@ -275,6 +301,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         top_level_ranking_signals.push("query_match".to_string());
     }
     top_level_ranking_signals.push(format!("pack_mode:{}", params.pack_mode));
+    top_level_ranking_signals.extend(pack_template_signals(template));
     if scored.len() > facts.len() {
         truncated = true;
         if pack_withheld == 0 {
@@ -324,7 +351,9 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         },
         pack: RecallPack {
             mode: params.pack_mode.to_string(),
-            max_tokens: params.max_tokens,
+            template: template.mode.to_string(),
+            template_budget_tokens: template.budget_tokens,
+            max_tokens: effective_max_tokens,
             truncated,
         },
     })
@@ -346,7 +375,7 @@ fn score_record(
     repo_id: Option<&str>,
     files: &[String],
     query: &str,
-    pack_mode: &str,
+    pack_template: &PackTemplate,
 ) -> f64 {
     let mut score = 0.0;
 
@@ -389,7 +418,7 @@ fn score_record(
         score += 0.5;
     }
 
-    score += pack_mode_boost(record, pack_mode);
+    score += pack_mode_boost(record, pack_template);
 
     score
 }
@@ -399,7 +428,7 @@ fn ranking_signals(
     repo_id: Option<&str>,
     files: &[String],
     query: &str,
-    pack_mode: &str,
+    pack_template: &PackTemplate,
 ) -> Vec<String> {
     let mut signals = Vec::new();
 
@@ -445,13 +474,13 @@ fn ranking_signals(
         signals.push("stale_deprioritized".to_string());
     }
 
-    signals.extend(pack_mode_signals(record, pack_mode));
+    signals.extend(pack_mode_signals(record, pack_template));
 
     signals
 }
 
-fn pack_mode_boost(record: &MemoryRecord, pack_mode: &str) -> f64 {
-    if pack_mode != "debugging" {
+fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
+    if pack_template.mode != "debugging" {
         return 0.0;
     }
     let mut boost = match record.record_type {
@@ -473,8 +502,8 @@ fn pack_mode_boost(record: &MemoryRecord, pack_mode: &str) -> f64 {
     boost
 }
 
-fn pack_mode_signals(record: &MemoryRecord, pack_mode: &str) -> Vec<String> {
-    if pack_mode != "debugging" {
+fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec<String> {
+    if pack_template.mode != "debugging" {
         return vec!["pack_mode:default".to_string()];
     }
     let mut signals = vec!["pack_mode:debugging".to_string()];

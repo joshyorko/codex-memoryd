@@ -242,6 +242,8 @@ pub struct RecallPolicy {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallPack {
     pub mode: String,
+    pub template: String,
+    pub template_budget_tokens: usize,
     pub max_tokens: usize,
     pub truncated: bool,
 }

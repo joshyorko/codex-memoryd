@@ -49,7 +49,7 @@ fn recall_req(profile: &str, workspace: &str, query: &str) -> RecallRequest {
         session: None,
         query: Some(query.to_string()),
         files: vec![],
-        max_tokens: Some(1000),
+        max_tokens: None,
         pack_mode: None,
         include_types: vec![],
         exclude_types: vec![],
@@ -607,6 +607,39 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
 }
 
 #[test]
+fn recall_default_pack_mode_reports_template_budget() {
+    let svc = service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: default pack mode should stay balanced",
+        Sensitivity::Personal,
+    );
+
+    let mut req = recall_req("personal", "ws", "balanced");
+    req.pack_mode = Some("default".to_string());
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "default");
+    assert_eq!(recall.pack.template, "default");
+    assert_eq!(recall.pack.template_budget_tokens, 1200);
+    assert_eq!(recall.pack.max_tokens, 1200);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:default".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:default".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:1200".to_string()));
+}
+
+#[test]
 fn recall_debugging_pack_mode_reports_and_prioritizes_gotchas() {
     let svc = service();
     svc.store.ensure_workspace("personal", "ws").unwrap();
@@ -654,12 +687,22 @@ fn recall_debugging_pack_mode_reports_and_prioritizes_gotchas() {
     let recall = svc.recall(req).unwrap();
 
     assert_eq!(recall.pack.mode, "debugging");
+    assert_eq!(recall.pack.template, "debugging");
+    assert_eq!(recall.pack.template_budget_tokens, 1000);
     assert_eq!(recall.pack.max_tokens, 1000);
     assert_eq!(recall.pack.truncated, recall.truncated);
     assert!(recall
         .policy
         .ranking_signals
         .contains(&"pack_mode:debugging".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:debugging".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:1000".to_string()));
     assert_eq!(recall.facts[0].record_type, "gotcha");
     assert!(recall.facts[0]
         .policy
