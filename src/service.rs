@@ -66,6 +66,7 @@ const ADAPTER_TARGETS: &[&str] = &[
     "claude-code",
     "copilot",
     "github-instructions",
+    "mcp-pack",
     "markdown",
 ];
 
@@ -75,6 +76,7 @@ enum AdapterTarget {
     ClaudeCode,
     Copilot,
     GitHubInstructions,
+    McpPack,
     Markdown,
 }
 
@@ -86,6 +88,7 @@ impl AdapterTarget {
             "claude-code" => Ok(Self::ClaudeCode),
             "copilot" => Ok(Self::Copilot),
             "github-instructions" => Ok(Self::GitHubInstructions),
+            "mcp-pack" => Ok(Self::McpPack),
             "markdown" => Ok(Self::Markdown),
             _ => Err(Error::invalid_request(format!(
                 "unknown adapter target '{target}'; use {}",
@@ -100,6 +103,7 @@ impl AdapterTarget {
             Self::ClaudeCode => "claude-code",
             Self::Copilot => "copilot",
             Self::GitHubInstructions => "github-instructions",
+            Self::McpPack => "mcp-pack",
             Self::Markdown => "markdown",
         }
     }
@@ -405,10 +409,23 @@ impl Service {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let markdown = render_adapter_view(target, &card);
-        let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
-        let rendered_bytes = markdown.len();
-        let digest_target = serde_json::json!({
+        let context_pack;
+        let (markdown, rendered_bytes, truncated) = if target == AdapterTarget::McpPack {
+            let rendered = render_mcp_pack_adapter_view(target, &card, &source_ids, req.max_bytes)?;
+            context_pack = Some(rendered.context_pack);
+            (
+                rendered.markdown,
+                rendered.rendered_bytes,
+                rendered.truncated,
+            )
+        } else {
+            let markdown = render_adapter_view(target, &card)?;
+            let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
+            let rendered_bytes = markdown.len();
+            context_pack = None;
+            (markdown, rendered_bytes, truncated)
+        };
+        let mut digest_target = serde_json::json!({
             "target": target.as_str(),
             "adapter_version": ADAPTER_VIEW_VERSION,
             "profile": card.profile,
@@ -418,6 +435,15 @@ impl Service {
             "source_ids": source_ids,
             "markdown": markdown,
         });
+        if let Some(context_pack) = &context_pack {
+            let context_pack = serde_json::to_value(context_pack).map_err(|err| {
+                Error::internal(format!("failed to serialize MCP context pack: {err}"))
+            })?;
+            digest_target
+                .as_object_mut()
+                .expect("adapter digest target is an object")
+                .insert("context_pack".to_string(), context_pack);
+        }
         let digest_bytes = serde_json::to_vec(&digest_target)
             .map_err(|err| Error::internal(format!("failed to serialize adapter digest: {err}")))?;
 
@@ -437,6 +463,7 @@ impl Service {
                 rendered_bytes,
                 truncated,
             },
+            context_pack,
             markdown,
         })
     }
@@ -2204,8 +2231,15 @@ fn normalize_adapter_target(raw: &str) -> String {
     raw.trim().to_ascii_lowercase().replace('_', "-")
 }
 
-fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> String {
-    match target {
+struct RenderedMcpPack {
+    markdown: String,
+    rendered_bytes: usize,
+    truncated: bool,
+    context_pack: AdapterContextPack,
+}
+
+fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> Result<String> {
+    let markdown = match target {
         AdapterTarget::AgentsMd => {
             render_memory_markdown_view("AGENTS.md Memory View", "agents-md", card)
         }
@@ -2220,10 +2254,119 @@ fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> String
             "github-instructions",
             card,
         ),
+        AdapterTarget::McpPack => unreachable!("mcp-pack uses render_mcp_pack_adapter_view"),
         AdapterTarget::Markdown => {
             render_memory_markdown_view("Markdown Memory View", "markdown", card)
         }
+    };
+    Ok(markdown)
+}
+
+fn render_mcp_pack_adapter_view(
+    target: AdapterTarget,
+    card: &CardShowResponse,
+    source_ids: &[String],
+    max_bytes: Option<usize>,
+) -> Result<RenderedMcpPack> {
+    let records = adapter_context_pack_records(card);
+    let rendered =
+        render_mcp_pack_with_records(target, card, source_ids, records, max_bytes, false)?;
+    if !rendered.truncated {
+        return Ok(rendered);
     }
+
+    render_mcp_pack_with_records(target, card, &[], Vec::new(), max_bytes, true)
+}
+
+fn render_mcp_pack_with_records(
+    target: AdapterTarget,
+    card: &CardShowResponse,
+    source_ids: &[String],
+    records: Vec<AdapterContextPackRecord>,
+    max_bytes: Option<usize>,
+    force_truncated: bool,
+) -> Result<RenderedMcpPack> {
+    let mut budget = AdapterContextPackBudget {
+        max_bytes,
+        rendered_bytes: 0,
+        truncated: force_truncated,
+    };
+    let mut rendered = String::new();
+
+    for _ in 0..5 {
+        let pack = build_adapter_context_pack(target, card, source_ids, budget.clone(), &records);
+        let raw = render_mcp_pack_markdown(&pack)?;
+        let (limited, truncated) = apply_byte_budget(raw, max_bytes);
+        let next_budget = AdapterContextPackBudget {
+            max_bytes,
+            rendered_bytes: limited.len(),
+            truncated: truncated || force_truncated,
+        };
+        rendered = limited;
+        let stable = next_budget.rendered_bytes == budget.rendered_bytes
+            && next_budget.truncated == budget.truncated;
+        budget = next_budget;
+        if stable {
+            let context_pack =
+                build_adapter_context_pack(target, card, source_ids, budget, &records);
+            return Ok(RenderedMcpPack {
+                markdown: rendered,
+                rendered_bytes: context_pack.budget.rendered_bytes,
+                truncated: context_pack.budget.truncated,
+                context_pack,
+            });
+        }
+    }
+
+    let context_pack = build_adapter_context_pack(target, card, source_ids, budget, &records);
+    Ok(RenderedMcpPack {
+        markdown: rendered,
+        rendered_bytes: context_pack.budget.rendered_bytes,
+        truncated: context_pack.budget.truncated,
+        context_pack,
+    })
+}
+
+fn adapter_context_pack_records(card: &CardShowResponse) -> Vec<AdapterContextPackRecord> {
+    card.records
+        .iter()
+        .map(|record| AdapterContextPackRecord {
+            record_type: record.record_type.clone(),
+            scope: record.scope.clone(),
+            content: record.content.clone(),
+            confidence: record.confidence,
+            updated_at: record.updated_at.clone(),
+        })
+        .collect()
+}
+
+fn build_adapter_context_pack(
+    target: AdapterTarget,
+    card: &CardShowResponse,
+    source_ids: &[String],
+    budget: AdapterContextPackBudget,
+    records: &[AdapterContextPackRecord],
+) -> AdapterContextPack {
+    AdapterContextPack {
+        target: target.as_str().to_string(),
+        adapter_version: ADAPTER_VIEW_VERSION.to_string(),
+        authority: "recall_not_authority".to_string(),
+        profile: card.profile.clone(),
+        workspace: card.workspace.clone(),
+        subject_id: card.subject_id.clone(),
+        card_type: card.card_type.clone(),
+        generated_at: card.generated_at.clone(),
+        freshness: card.freshness.clone(),
+        budget,
+        source_ids: source_ids.to_vec(),
+        records: records.to_vec(),
+    }
+}
+
+fn render_mcp_pack_markdown(pack: &AdapterContextPack) -> Result<String> {
+    let json = serde_json::to_string_pretty(pack)
+        .map_err(|err| Error::internal(format!("failed to serialize MCP context pack: {err}")))?;
+    Ok(format!("# MCP JSON Context Pack\n\n```json\n{json}\n```\n"))
 }
 
 fn render_memory_markdown_view(title: &str, target: &str, card: &CardShowResponse) -> String {

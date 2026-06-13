@@ -1654,6 +1654,160 @@ fn cli_adapter_markdown_export_is_deterministic() {
 }
 
 #[test]
+fn cli_adapter_mcp_pack_export_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: mcp-pack adapter exports deterministic JSON context",
+        ])
+        .assert()
+        .success();
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "mcp-pack",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "mcp-pack",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["target"], "mcp-pack");
+    assert_eq!(first["adapter_version"], "adapter-view-v1");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["source_card_type"], "workspace_summary");
+    assert_eq!(first["budget"]["truncated"], false);
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+
+    let context_pack = &first["context_pack"];
+    assert_eq!(context_pack["target"], "mcp-pack");
+    assert_eq!(context_pack["adapter_version"], "adapter-view-v1");
+    assert_eq!(context_pack["authority"], "recall_not_authority");
+    assert_eq!(context_pack["profile"], "personal");
+    assert_eq!(context_pack["workspace"], "josh-personal");
+    assert_eq!(context_pack["card_type"], "workspace_summary");
+    assert_eq!(context_pack["budget"]["truncated"], false);
+    assert_eq!(context_pack["records"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        context_pack["records"][0]["content"],
+        "Decision: mcp-pack adapter exports deterministic JSON context"
+    );
+
+    let markdown = first["markdown"].as_str().unwrap();
+    assert!(markdown.contains("# MCP JSON Context Pack"));
+    assert!(markdown.contains("```json"));
+    assert!(markdown.contains("\"target\": \"mcp-pack\""));
+    assert!(markdown.contains("\"authority\": \"recall_not_authority\""));
+
+    let legacy = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "agents-md",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(legacy.status.success());
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert!(legacy.get("context_pack").is_none());
+
+    let budgeted = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "mcp-pack",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--max-bytes",
+            "160",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(budgeted.status.success());
+    let budgeted: Value = serde_json::from_slice(&budgeted.stdout).unwrap();
+    let markdown = budgeted["markdown"].as_str().unwrap();
+    assert_eq!(budgeted["budget"]["max_bytes"], 160);
+    assert_eq!(budgeted["budget"]["truncated"], true);
+    assert!(budgeted["budget"]["rendered_bytes"].as_u64().unwrap() <= 160);
+    assert_eq!(budgeted["context_pack"]["budget"]["max_bytes"], 160);
+    assert_eq!(budgeted["context_pack"]["budget"]["truncated"], true);
+    assert_eq!(
+        budgeted["context_pack"]["budget"]["rendered_bytes"],
+        budgeted["budget"]["rendered_bytes"]
+    );
+    assert!(budgeted["context_pack"]["source_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(budgeted["context_pack"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        markdown.len() as u64,
+        budgeted["budget"]["rendered_bytes"].as_u64().unwrap()
+    );
+}
+
+#[test]
 fn cli_adapter_agents_md_budget_and_target_validation() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
