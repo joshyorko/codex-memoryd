@@ -307,9 +307,10 @@ impl Service {
                 query.record_type = Some(RecordType::Preference);
                 ("workspace", None)
             }
+            "open_questions" => ("workspace", None),
             _ => {
                 return Err(Error::invalid_request(format!(
-                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, or active_preferences"
+                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, active_preferences, or open_questions"
                 )))
             }
         };
@@ -317,6 +318,9 @@ impl Service {
         let mut records = self.store.query_records(&query)?;
         if let Some(subject_id) = subject_id.as_deref() {
             records.retain(|record| record.subject_id.as_deref() == Some(subject_id));
+        }
+        if card_type == "open_questions" {
+            records.retain(is_open_question_record);
         }
         records.sort_by(|a, b| {
             b.updated_at
@@ -2210,6 +2214,18 @@ fn sanitize_error_summary(raw: &str) -> String {
 
 fn parse_types(raw: &[String]) -> Vec<RecordType> {
     raw.iter().filter_map(|t| RecordType::parse(t)).collect()
+}
+
+fn is_open_question_record(record: &MemoryRecord) -> bool {
+    if record.record_type != RecordType::Other {
+        return false;
+    }
+    let content = record.content.trim();
+    if content.is_empty() {
+        return false;
+    }
+    let lower = content.to_ascii_lowercase();
+    lower.starts_with("question:") || lower.starts_with("open question:")
 }
 
 fn resolve_pack_mode(raw: Option<&str>) -> Result<String> {

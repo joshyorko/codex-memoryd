@@ -93,6 +93,55 @@ fn seed_preference_record(
     id
 }
 
+fn seed_record(
+    db: &PathBuf,
+    profile: &str,
+    workspace: &str,
+    record_type: RecordType,
+    content: &str,
+    updated_at: &str,
+    archived: bool,
+    source_ids: Vec<String>,
+) -> String {
+    let store = Store::open(db).unwrap();
+    let record = NewRecord {
+        profile_id: profile.to_string(),
+        workspace_id: workspace.to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type,
+        content: content.to_string(),
+        related_files: vec![],
+        tags: vec![record_type.as_str().to_string()],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.9,
+        source_ids,
+        content_hash: ids::content_hash(
+            profile,
+            workspace,
+            None,
+            record_type.as_str(),
+            Scope::Workspace.as_str(),
+            content,
+        ),
+        supersedes: vec![],
+        metadata: serde_json::json!({"origin": "cli_smoke"}),
+    };
+    let id = match store.upsert_record(&record).unwrap() {
+        UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+    };
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE memory_records SET created_at = ?1, updated_at = ?1, archived = ?3 WHERE id = ?2",
+        params![updated_at, id, archived as i64],
+    )
+    .unwrap();
+    id
+}
+
 fn git(repo: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -975,6 +1024,193 @@ fn cli_card_workspace_summary_markdown_renders() {
     assert!(stdout.contains("Profile: personal"));
     assert!(stdout.contains("Authority: recall_not_authority"));
     assert!(stdout.contains("Content hash: "));
+}
+
+#[test]
+fn cli_card_open_questions_json_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Question: should we keep the workspace scope explicit?",
+        "2026-06-01T09:00:00Z",
+        false,
+        vec!["src_q1".to_string()],
+    );
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Open question: what is the final sync boundary?",
+        "2026-06-01T10:00:00Z",
+        false,
+        vec!["src_q2".to_string()],
+    );
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Note: this contains a question mark but is not an explicit question?",
+        "2026-06-01T11:00:00Z",
+        false,
+        vec!["src_ignore".to_string()],
+    );
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::TaskCheckpoint,
+        "Open question: task checkpoint wording should not opt in",
+        "2026-06-01T11:30:00Z",
+        false,
+        vec!["src_checkpoint".to_string()],
+    );
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Question: archived questions stay out of the card",
+        "2026-06-01T12:00:00Z",
+        true,
+        vec!["src_archived".to_string()],
+    );
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "open_questions",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "open_questions",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "open_questions");
+    assert_eq!(first["scope"], "workspace");
+    assert_eq!(first["profile"], "work");
+    assert_eq!(first["workspace"], "team-workspace");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["build_spec_version"], "card-summary-v1");
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    assert_eq!(first["records"].as_array().unwrap().len(), 2);
+    assert_eq!(first["records"][0]["type"], "other");
+    assert_eq!(
+        first["records"][0]["source_ids"],
+        serde_json::json!(["src_q2"])
+    );
+    assert_eq!(first["records"][1]["type"], "other");
+    assert_eq!(
+        first["records"][1]["source_ids"],
+        serde_json::json!(["src_q1"])
+    );
+    assert!(first["records"].as_array().unwrap().iter().all(|record| {
+        record["content"]
+            .as_str()
+            .map(|content| {
+                content.starts_with("Question:") || content.starts_with("Open question:")
+            })
+            .unwrap_or(false)
+    }));
+    assert!(!first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |record| record["source_ids"] == serde_json::json!(["src_ignore"])
+                || record["source_ids"] == serde_json::json!(["src_checkpoint"])
+        ));
+}
+
+#[test]
+fn cli_card_open_questions_markdown_renders() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Question: which workspace boundary should we use?",
+        "2026-06-01T09:00:00Z",
+        false,
+        vec!["src_q1".to_string()],
+    );
+    seed_record(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Open question: how should we treat hidden writes?",
+        "2026-06-01T10:00:00Z",
+        false,
+        vec!["src_q2".to_string()],
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "open_questions",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Card summary: open_questions"));
+    assert!(stdout.contains("Authority: recall_not_authority"));
+    assert!(stdout.contains("Content hash: "));
+    assert!(stdout.contains("Question: which workspace boundary should we use?"));
+    assert!(stdout.contains("Open question: how should we treat hidden writes?"));
+    assert!(stdout.contains("source_ids: src_q1"));
+    assert!(stdout.contains("source_ids: src_q2"));
 }
 
 #[test]
