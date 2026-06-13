@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "are",
+        "subject_key": "are-migration-storage",
         "action": "promote",
         "record_type": "other",
         "promotion_reason": "explicit_conclusion",
@@ -14,7 +14,7 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "now",
+        "subject_key": "daemon-failing-patch",
         "action": "promote",
         "record_type": "other",
         "promotion_reason": "insufficient_primary_evidence",

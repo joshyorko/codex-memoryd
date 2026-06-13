@@ -2,10 +2,10 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "oauth"
+        "subject_key": "oauth-sync"
       },
       {
-        "subject_key": "oauth"
+        "subject_key": "oauth-sync"
       }
     ],
     "rejected": [],

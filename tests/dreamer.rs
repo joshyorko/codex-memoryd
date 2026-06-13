@@ -335,7 +335,7 @@ fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
         })
         .expect("superseding observation");
     assert_eq!(observation.key, observation.id);
-    assert_eq!(observation.subject_key, "storage");
+    assert_eq!(observation.subject_key, "backend-bundled-rusqlite");
     assert_eq!(observation.authority, "recall_not_authority");
     assert!(observation.apply_eligible);
     assert!(observation.content.contains("rusqlite"));
@@ -495,6 +495,92 @@ fn planned_fact_transitions_to_completed_supersession() {
             && candidate.state == "completed"
             && candidate.supersedes == vec![old_id.clone()]
     }));
+}
+
+#[test]
+fn same_subject_matches_even_when_state_words_and_word_order_change() {
+    let svc = service();
+    let old_id = conclude(&svc, "OAuth sync is planned; will implement it next week.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "Sync OAuth is implemented and merged.");
+
+    let report = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.action == "supersede" && candidate.supersedes == vec![old_id.clone()]
+    }));
+}
+
+#[test]
+fn metadata_subject_key_is_used_for_matching_and_candidate_subject_key() {
+    let svc = service();
+    let old_id = insert_direct_record(
+        &svc,
+        "Storage options were still under review.",
+        json!({
+            "subject_key": "oauth-sync",
+            "state": "planned",
+            "origin": "conclusion",
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    insert_direct_record(
+        &svc,
+        "Different wording for the same migration step.",
+        json!({
+            "subject_key": "oauth-sync",
+            "state": "completed",
+            "origin": "conclusion",
+        }),
+    );
+
+    let report = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.action == "supersede" && candidate.supersedes == vec![old_id.clone()]
+        })
+        .expect("metadata subject key should enable explicit supersession");
+    assert_eq!(candidate.subject_key, "oauth-sync");
+
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    assert!(applied.archived.contains(&old_id));
+}
+
+#[test]
+fn shared_generic_words_do_not_create_false_positive_supersession() {
+    let svc = service();
+    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "Storage cache is implemented for fast lookups.");
+
+    let report = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(!report.candidates.iter().any(|candidate| {
+        candidate.action == "supersede" && candidate.supersedes == vec![old_id.clone()]
+    }));
+}
+
+#[test]
+fn non_transitive_bridge_matches_do_not_create_one_promotion_group() {
+    let svc = service();
+    conclude(&svc, "Decision: storage sync alpha.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "Decision: storage sync backend beta.");
+    std::thread::sleep(Duration::from_millis(5));
+    conclude(&svc, "Decision: storage oauth gamma.");
+
+    let report = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let promotions = report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.action == "promote")
+        .collect::<Vec<_>>();
+    assert_eq!(promotions.len(), 3);
+    assert!(promotions
+        .iter()
+        .all(|candidate| candidate.evidence_count == 1));
 }
 
 #[test]
@@ -1412,13 +1498,13 @@ fn repeated_user_steering_promotes() {
     turn(
         &svc,
         "steering",
-        "Use cargo test for validation.",
+        "Use cargo test now.",
         "2026-06-01T10:00:00Z",
     );
     turn(
         &svc,
         "steering",
-        "Again, run cargo test before claiming done.",
+        "Run cargo test again.",
         "2026-06-08T10:00:00Z",
     );
 

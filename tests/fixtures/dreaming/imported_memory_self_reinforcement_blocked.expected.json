@@ -4,12 +4,12 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "imported",
+        "subject_key": "active-custom-imported",
         "action": "promote",
         "record_type": "decision",
         "promotion_reason": "imported_or_active_memory_without_fresh_primary_evidence",
-        "evidence_count": 1,
-        "must_contain": ["Decision: imported summary says the daemon should use custom scripts"],
+        "evidence_count": 2,
+        "must_contain": ["Decision: active memory repeats the imported custom script summary"],
         "must_not_contain": []
       }
     ],
