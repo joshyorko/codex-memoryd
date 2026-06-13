@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "cargo",
+        "subject_key": "before-cargo-claiming",
         "action": "promote",
         "record_type": "command",
         "promotion_reason": "repeated_user_steering",
@@ -14,7 +14,7 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "cargo",
+        "subject_key": "before-cargo-claiming",
         "action": "supersede",
         "record_type": "command",
         "promotion_reason": "newer completed evidence supersedes older active state",
