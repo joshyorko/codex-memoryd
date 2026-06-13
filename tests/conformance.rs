@@ -594,6 +594,14 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
     assert_eq!(recall.facts[0].policy.provenance.profile_id, "personal");
     assert_eq!(recall.facts[0].policy.provenance.workspace_id, "ws");
     assert!(!recall.facts[0].policy.provenance.evidence_refs.is_empty());
+    assert_eq!(
+        recall.facts[0].policy.provenance.source_risk.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        recall.facts[0].policy.provenance.trust_level.as_deref(),
+        Some("medium")
+    );
     assert!(!recall.facts[0].policy.ranking_signals.is_empty());
     assert!(recall.facts[1].policy.freshness.stale);
     assert_eq!(
@@ -764,6 +772,14 @@ fn recall_reports_withheld_policy_diagnostics_without_leaking_content() {
         .admission
         .gates
         .contains(&"profile_workspace".to_string()));
+    assert_eq!(
+        recall.facts[0].policy.provenance.source_risk.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        recall.facts[0].policy.provenance.trust_level.as_deref(),
+        Some("medium")
+    );
     assert!(recall
         .withheld
         .iter()

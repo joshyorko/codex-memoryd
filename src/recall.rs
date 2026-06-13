@@ -259,14 +259,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             policy: RecallFactPolicy {
                 rank,
                 freshness,
-                provenance: RecallProvenance {
-                    profile_id: r.profile_id.clone(),
-                    workspace_id: r.workspace_id.clone(),
-                    repo_id: r.repo_id.clone(),
-                    evidence_refs: r.source_ids.clone(),
-                    subject_id: r.subject_id.clone(),
-                    episode_id: r.episode_id.clone(),
-                },
+                provenance: recall_provenance(r),
                 admission: RecallAdmission {
                     decision: "admitted".to_string(),
                     reason: admission_reason.to_string(),
@@ -357,6 +350,46 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             truncated,
         },
     })
+}
+
+fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
+    let (source_risk, trust_level) = recall_source_diagnostics(record);
+    RecallProvenance {
+        profile_id: record.profile_id.clone(),
+        workspace_id: record.workspace_id.clone(),
+        repo_id: record.repo_id.clone(),
+        evidence_refs: record.source_ids.clone(),
+        subject_id: record.subject_id.clone(),
+        episode_id: record.episode_id.clone(),
+        source_risk,
+        trust_level,
+    }
+}
+
+fn recall_source_diagnostics(record: &MemoryRecord) -> (Option<String>, Option<String>) {
+    let source_risk = Some(
+        match record.sensitivity {
+            crate::domain::Sensitivity::Public => "low",
+            crate::domain::Sensitivity::Personal => "medium",
+            crate::domain::Sensitivity::WorkConfidential => "high",
+            crate::domain::Sensitivity::SecretBlocked => "blocked",
+        }
+        .to_string(),
+    );
+
+    let trust_level = match record
+        .metadata
+        .get("origin")
+        .and_then(|value| value.as_str())
+    {
+        Some("conclusion") | Some("checkpoint") | Some("git_import") | Some("sync_local") => {
+            Some("high".to_string())
+        }
+        _ if !record.source_ids.is_empty() => Some("medium".to_string()),
+        _ => Some("low".to_string()),
+    };
+
+    (source_risk, trust_level)
 }
 
 fn type_allowed(t: RecordType, include: &[RecordType], exclude: &[RecordType]) -> bool {
