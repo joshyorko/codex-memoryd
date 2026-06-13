@@ -111,6 +111,41 @@ fn episode_req(
     }
 }
 
+fn insert_test_record(
+    svc: &Service,
+    record_type: RecordType,
+    content: &str,
+    sensitivity: Sensitivity,
+) -> String {
+    let record = NewRecord {
+        profile_id: "personal".to_string(),
+        workspace_id: "ws".to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type,
+        content: content.to_string(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity,
+        portability: Portability::ProfileOnly,
+        confidence: 0.8,
+        source_ids: vec!["src_test".to_string()],
+        content_hash: ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            record_type.as_str(),
+            "workspace",
+            content,
+        ),
+        supersedes: vec![],
+        metadata: serde_json::Value::Null,
+    };
+    svc.store.upsert_record(&record).unwrap().id().to_string()
+}
+
 #[test]
 fn status_reports_local_only_and_schema() {
     let svc = service();
@@ -554,11 +589,21 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
     assert_eq!(recall.facts[0].id, fresh_id);
     assert_eq!(recall.facts[0].policy.rank, 1);
     assert!(!recall.facts[0].policy.freshness.stale);
+    assert_eq!(recall.facts[0].policy.admission.decision, "admitted");
+    assert_eq!(recall.facts[0].policy.admission.reason, "admitted_ranked");
     assert_eq!(recall.facts[0].policy.provenance.profile_id, "personal");
     assert_eq!(recall.facts[0].policy.provenance.workspace_id, "ws");
     assert!(!recall.facts[0].policy.provenance.evidence_refs.is_empty());
     assert!(!recall.facts[0].policy.ranking_signals.is_empty());
     assert!(recall.facts[1].policy.freshness.stale);
+    assert_eq!(
+        recall.facts[1].policy.admission.reason,
+        "admitted_stale_deprioritized"
+    );
+    assert!(recall.facts[1]
+        .policy
+        .ranking_signals
+        .contains(&"stale_deprioritized".to_string()));
 }
 
 #[test]
@@ -620,6 +665,83 @@ fn recall_debugging_pack_mode_reports_and_prioritizes_gotchas() {
         .policy
         .ranking_signals
         .contains(&"debugging_gotcha".to_string()));
+}
+
+#[test]
+fn recall_reports_withheld_policy_diagnostics_without_leaking_content() {
+    let svc = service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: visible server recall memo",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: second visible server recall memo",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Preference,
+        "Preference: filtered server recall memo",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: secret server recall memo must not leak",
+        Sensitivity::SecretBlocked,
+    );
+    let archived_id = insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: archived server recall memo must not leak",
+        Sensitivity::Personal,
+    );
+    let (archived, not_found) = svc
+        .store
+        .archive_records("personal", Some("ws"), std::slice::from_ref(&archived_id))
+        .unwrap();
+    assert_eq!(archived, vec![archived_id]);
+    assert!(not_found.is_empty());
+
+    let mut req = recall_req("personal", "ws", "server recall memo");
+    req.include_types = vec!["decision".to_string()];
+    req.max_tokens = Some(1);
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.facts.len(), 1);
+    assert!(recall.truncated);
+    assert_eq!(recall.facts[0].policy.admission.decision, "admitted");
+    assert!(recall.facts[0]
+        .policy
+        .admission
+        .gates
+        .contains(&"profile_workspace".to_string()));
+    assert!(recall
+        .withheld
+        .iter()
+        .any(|entry| entry.reason == "secret_blocked" && entry.count == 1));
+    assert!(recall
+        .withheld
+        .iter()
+        .any(|entry| entry.reason == "archived" && entry.count == 1));
+    assert!(recall
+        .withheld
+        .iter()
+        .any(|entry| entry.reason == "type_filtered" && entry.count == 1));
+    assert!(recall
+        .withheld
+        .iter()
+        .any(|entry| entry.reason == "pack_truncated" && entry.count == 1));
+
+    let serialized = serde_json::to_string(&recall).unwrap();
+    assert!(!serialized.contains("secret server recall memo"));
+    assert!(!serialized.contains("archived server recall memo"));
+    assert!(!serialized.contains("filtered server recall memo"));
 }
 
 #[test]

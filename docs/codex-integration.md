@@ -161,6 +161,11 @@ Response `data`:
           "subject_id": null,
           "episode_id": null
         },
+        "admission": {
+          "decision": "admitted",
+          "reason": "admitted_ranked",
+          "gates": ["profile_workspace"]
+        },
         "ranking_signals": ["repo_match", "query_match"]
       }
     }
@@ -169,11 +174,18 @@ Response `data`:
     { "id": "ckpt_…", "summary": "…", "branch": "main", "commit": null, "next_steps": ["…"], "created_at": "…" }
   ],
   "citations": [ { "memory_id": "mem_…", "source_id": "src_…", "source_path": "memory_summary.md" } ],
+  "withheld": [
+    { "reason": "secret_blocked", "count": 1, "gates": ["secret_blocked"] },
+    { "reason": "pack_truncated", "count": 2, "gates": ["max_tokens", "result_limit"] }
+  ],
   "truncated": false
 }
 ```
 
 For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy`, `pack`, and per-fact `policy` objects are additive metadata used for diagnostics, pack selection, and ranking auditability.
+`facts[].policy.admission` explains why an emitted item was admitted. `withheld`
+is optional and reports deterministic counts by gate only; it never includes raw
+withheld content.
 
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable

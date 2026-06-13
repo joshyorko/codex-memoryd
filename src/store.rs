@@ -173,6 +173,13 @@ pub struct RecordQuery {
     pub offset: usize,
 }
 
+/// Counts of records omitted before recall ranking for deterministic storage reasons.
+#[derive(Debug, Clone, Default)]
+pub struct RecallOmissionCounts {
+    pub archived: usize,
+    pub secret_blocked: usize,
+}
+
 /// A new memory record to upsert. The store computes nothing here except
 /// applying defaults; ids/hashes come from the caller.
 #[derive(Debug, Clone)]
@@ -1246,6 +1253,20 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn recall_omission_counts(
+        &self,
+        query: &RecordQuery,
+        query_text: &str,
+    ) -> Result<RecallOmissionCounts> {
+        let conn = self.conn()?;
+        let archived = count_recall_omission(&conn, query, query_text, "archived")?;
+        let secret_blocked = count_recall_omission(&conn, query, query_text, "secret_blocked")?;
+        Ok(RecallOmissionCounts {
+            archived,
+            secret_blocked,
+        })
+    }
+
     /// Export rows and the matching `secret_blocked` count from one read
     /// transaction so the omitted count matches the exported snapshot.
     pub fn export_records(&self, query: &RecordQuery) -> Result<(Vec<MemoryRecord>, usize)> {
@@ -2064,6 +2085,60 @@ fn append_record_filters(
         sql.push_str(&format!(" AND {} >= ?", col("updated_at")));
         args.push(Box::new(cutoff.clone()));
     }
+}
+
+fn count_recall_omission(
+    conn: &rusqlite::Connection,
+    filters: &RecordQuery,
+    query_text: &str,
+    reason: &str,
+) -> Result<usize> {
+    let mut sql = "SELECT COUNT(*) FROM memory_records WHERE 1=1".to_string();
+    let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(p) = &filters.profile_id {
+        sql.push_str(" AND profile_id = ?");
+        args.push(Box::new(p.clone()));
+    }
+    if let Some(w) = &filters.workspace_id {
+        sql.push_str(" AND workspace_id = ?");
+        args.push(Box::new(w.clone()));
+    }
+    if let Some(r) = &filters.repo_id {
+        sql.push_str(" AND repo_id = ?");
+        args.push(Box::new(r.clone()));
+    }
+    if let Some(t) = &filters.record_type {
+        sql.push_str(" AND type = ?");
+        args.push(Box::new(t.as_str().to_string()));
+    }
+    if let Some(s) = &filters.scope {
+        sql.push_str(" AND scope = ?");
+        args.push(Box::new(s.as_str().to_string()));
+    }
+    if let Some(cutoff) = &filters.recency_cutoff {
+        sql.push_str(" AND updated_at >= ?");
+        args.push(Box::new(cutoff.clone()));
+    }
+
+    match reason {
+        "archived" => sql.push_str(" AND archived = 1 AND sensitivity != 'secret_blocked'"),
+        "secret_blocked" => sql.push_str(" AND sensitivity = 'secret_blocked'"),
+        _ => return Ok(0),
+    }
+
+    let trimmed = query_text.trim();
+    if !trimmed.is_empty() {
+        sql.push_str(" AND (content LIKE ? OR tags LIKE ? OR related_files LIKE ?)");
+        let like = format!("%{}%", escape_like(trimmed));
+        args.push(Box::new(like.clone()));
+        args.push(Box::new(like.clone()));
+        args.push(Box::new(like));
+    }
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let count: i64 = conn.query_row(&sql, params_ref.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
 }
 
 fn append_export_scope_filters(

@@ -16,6 +16,7 @@ use crate::domain::RecordType;
 use crate::domain::RepoIdentity;
 use crate::error::Result;
 use crate::protocol::Citation;
+use crate::protocol::RecallAdmission;
 use crate::protocol::RecallCheckpoint;
 use crate::protocol::RecallFact;
 use crate::protocol::RecallFactPolicy;
@@ -24,6 +25,7 @@ use crate::protocol::RecallPack;
 use crate::protocol::RecallPolicy;
 use crate::protocol::RecallProvenance;
 use crate::protocol::RecallResponse;
+use crate::protocol::RecallWithheld;
 use crate::protocol::SearchMatch;
 use crate::protocol::SearchResponse;
 use crate::store::RecordQuery;
@@ -69,6 +71,44 @@ fn dedupe_ordered_signals(signals: Vec<String>) -> Vec<String> {
     deduped
 }
 
+fn build_withheld(
+    archived: usize,
+    secret_blocked: usize,
+    type_filtered: usize,
+    pack_withheld: usize,
+) -> Vec<RecallWithheld> {
+    let mut withheld = Vec::new();
+    if archived > 0 {
+        withheld.push(RecallWithheld {
+            reason: "archived".to_string(),
+            count: archived,
+            gates: vec!["active_records".to_string()],
+        });
+    }
+    if secret_blocked > 0 {
+        withheld.push(RecallWithheld {
+            reason: "secret_blocked".to_string(),
+            count: secret_blocked,
+            gates: vec!["secret_blocked".to_string()],
+        });
+    }
+    if type_filtered > 0 {
+        withheld.push(RecallWithheld {
+            reason: "type_filtered".to_string(),
+            count: type_filtered,
+            gates: vec!["include_exclude_types".to_string()],
+        });
+    }
+    if pack_withheld > 0 {
+        withheld.push(RecallWithheld {
+            reason: "pack_truncated".to_string(),
+            count: pack_withheld,
+            gates: vec!["max_tokens".to_string(), "result_limit".to_string()],
+        });
+    }
+    withheld
+}
+
 /// Execute recall: gather, rank, pack, attach checkpoints + citations.
 pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     let recency_cutoff = params.recency_days.and_then(rfc3339_cutoff);
@@ -85,6 +125,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         limit: 200,
         offset: 0,
     };
+    let recall_omissions = store.recall_omission_counts(&filters, params.query)?;
 
     // Use search when a query is present; otherwise list candidates.
     let candidates = if params.query.trim().is_empty() {
@@ -100,10 +141,18 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     };
 
     let repo_id = params.repo.map(|r| r.repo_id.as_str());
+    let mut type_filtered = 0usize;
     let mut scored: Vec<Scored> = candidates
         .into_iter()
-        .filter(|r| type_allowed(r.record_type, params.include_types, params.exclude_types))
-        .map(|record| {
+        .filter_map(|record| {
+            if !type_allowed(
+                record.record_type,
+                params.include_types,
+                params.exclude_types,
+            ) {
+                type_filtered += 1;
+                return None;
+            }
             let score = score_record(
                 &record,
                 repo_id,
@@ -118,11 +167,11 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
                 params.query,
                 params.pack_mode,
             );
-            Scored {
+            Some(Scored {
                 record,
                 score,
                 ranking_signals,
-            }
+            })
         })
         .collect();
 
@@ -147,11 +196,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     let mut touched: Vec<String> = Vec::new();
     let mut used_tokens = 0usize;
     let mut truncated = false;
+    let mut pack_withheld = 0usize;
     let mut top_level_ranking_signals = Vec::new();
     let admission_gates = vec!["profile_workspace".to_string()];
 
-    for scored in &scored {
-        let r = &scored.record;
+    for entry in &scored {
+        let r = &entry.record;
         let cost = estimate_tokens(&r.content);
         if used_tokens + cost > params.max_tokens && !facts.is_empty() {
             truncated = true;
@@ -162,7 +212,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         let age_days = days_since(&r.updated_at);
         let freshness = RecallFreshness { stale, age_days };
         let rank = facts.len() + 1;
-        for signal in &scored.ranking_signals {
+        let admission_reason = if stale {
+            "admitted_stale_deprioritized"
+        } else {
+            "admitted_ranked"
+        };
+        for signal in &entry.ranking_signals {
             top_level_ranking_signals.push(signal.clone());
         }
         facts.push(RecallFact {
@@ -186,7 +241,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
                     subject_id: r.subject_id.clone(),
                     episode_id: r.episode_id.clone(),
                 },
-                ranking_signals: scored.ranking_signals.clone(),
+                admission: RecallAdmission {
+                    decision: "admitted".to_string(),
+                    reason: admission_reason.to_string(),
+                    gates: admission_gates.clone(),
+                },
+                ranking_signals: entry.ranking_signals.clone(),
             },
         });
         citations.push(Citation {
@@ -200,7 +260,8 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         });
         touched.push(r.id.clone());
         if facts.len() >= 40 {
-            truncated = truncated || scored.score > 0.0;
+            truncated = truncated || entry.score > 0.0;
+            pack_withheld = scored.len().saturating_sub(facts.len());
             break;
         }
     }
@@ -216,8 +277,17 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     top_level_ranking_signals.push(format!("pack_mode:{}", params.pack_mode));
     if scored.len() > facts.len() {
         truncated = true;
+        if pack_withheld == 0 {
+            pack_withheld = scored.len().saturating_sub(facts.len());
+        }
     }
     let top_level_ranking_signals = dedupe_ordered_signals(top_level_ranking_signals);
+    let withheld = build_withheld(
+        recall_omissions.archived,
+        recall_omissions.secret_blocked,
+        type_filtered,
+        pack_withheld,
+    );
 
     // Recent checkpoints (repo-scoped first).
     let checkpoints = store
@@ -244,6 +314,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         facts,
         checkpoints,
         citations,
+        withheld,
         truncated,
         authority: "recall_not_authority".to_string(),
         policy: RecallPolicy {
@@ -368,6 +439,10 @@ fn ranking_signals(
 
     if recency_boost(&record.updated_at) > 0.0 && query.is_empty() {
         signals.push("recent_implicit".to_string());
+    }
+
+    if is_stale(&record.updated_at) {
+        signals.push("stale_deprioritized".to_string());
     }
 
     signals.extend(pack_mode_signals(record, pack_mode));
