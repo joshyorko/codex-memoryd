@@ -26,6 +26,7 @@ use crate::protocol::DreamCandidate;
 use crate::protocol::DreamEvidenceSource;
 use crate::protocol::DreamEvidenceStream;
 use crate::protocol::DreamEvidenceWindow;
+use crate::protocol::DreamObservation;
 use crate::protocol::DreamRejection;
 use crate::protocol::DreamResponse;
 use crate::protocol::DreamStaleRecord;
@@ -352,6 +353,16 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 class.scope.as_str(),
                 &content,
             );
+            let observation = observation_from_candidate(candidate);
+            let observation_id = observation.id.clone();
+            let observation_refs = observation.evidence_refs.clone();
+            let observation_summary = observation.summary.clone();
+            let observation_kind = observation.kind.clone();
+            let observation_category = observation.category.clone();
+            let observation_subject_key = observation.subject_key.clone();
+            let observation_state = observation.state.clone();
+            let observation_authority = observation.authority.clone();
+            let observation_policy = observation.policy.clone();
             let safe_summary = ledger_safe_summary(&candidate.content);
             let source_id = candidate.evidence_ids.first().cloned();
             let metadata = json!({
@@ -364,6 +375,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 "evidence_weight": candidate.evidence_weight,
                 "evidence_classes": candidate.evidence_classes,
                 "evidence_ids": candidate.evidence_ids,
+                "evidence_refs": candidate.evidence_refs,
+                "retires": candidate.retires,
                 "evidence_count": candidate.evidence_count,
                 "user_evidence_count": candidate.user_evidence_count,
                 "assistant_evidence_count": candidate.assistant_evidence_count,
@@ -379,6 +392,21 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 "evidence_window": {
                     "start": candidate.first_seen_at,
                     "end": candidate.last_seen_at,
+                },
+                "observation_id": observation_id,
+                "observation_refs": observation_refs,
+                "observation": {
+                    "id": observation_id,
+                    "key": observation.key,
+                    "kind": observation_kind,
+                    "category": observation_category,
+                    "subject_key": observation_subject_key,
+                    "summary": observation_summary,
+                    "confidence": observation.confidence,
+                    "state": observation_state,
+                    "authority": observation_authority,
+                    "policy": observation_policy,
+                    "apply_eligible": observation.apply_eligible,
                 },
             });
             let outcome = store.upsert_record(&NewRecord {
@@ -441,6 +469,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         created.sort();
         created.dedup();
     }
+    let observations = observations_from_candidates(&candidates);
 
     Ok((
         DreamResponse {
@@ -452,6 +481,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             now: params.now.to_string(),
             evidence_window,
             candidates,
+            observations,
             stale,
             rejected,
             archived,
@@ -1019,6 +1049,10 @@ fn push_candidate_with_score(
                 .iter()
                 .flat_map(|record| evidence_ids(record))
                 .collect::<Vec<_>>();
+            let evidence_refs = evidence_records
+                .iter()
+                .map(|record| evidence_ref(record))
+                .collect::<Vec<_>>();
             let evidence_count = evidence_ids.len();
             let user_evidence_count = evidence_records
                 .iter()
@@ -1042,6 +1076,8 @@ fn push_candidate_with_score(
                 .iter()
                 .map(|class| class.as_str().to_string())
                 .collect::<Vec<_>>();
+            let candidate_supersedes = supersedes.clone();
+            let retires = supersedes;
             let first_seen_at = evidence_records
                 .first()
                 .map(|record| record.created_at.clone())
@@ -1060,7 +1096,7 @@ fn push_candidate_with_score(
                 expires_at: valid_until.clone(),
                 valid_until,
                 historical_reason,
-                supersedes,
+                supersedes: candidate_supersedes,
                 policy: "accept".to_string(),
                 candidate_state: score.candidate_state,
                 subject_key: subject_key_for_record(evidence),
@@ -1068,6 +1104,8 @@ fn push_candidate_with_score(
                 evidence_weight: score.weight,
                 evidence_classes,
                 evidence_ids,
+                evidence_refs,
+                retires,
                 evidence_count,
                 user_evidence_count,
                 assistant_evidence_count,
@@ -1090,6 +1128,87 @@ fn evidence_ids(evidence: &MemoryRecord) -> Vec<String> {
     } else {
         evidence.source_ids.clone()
     }
+}
+
+fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
+    let kind = record
+        .metadata
+        .get("origin")
+        .and_then(|value| value.as_str())
+        .map(|origin| match origin {
+            "visible_turn" => "visible_turn",
+            "conclusion" => "conclusion",
+            "checkpoint" => "checkpoint",
+            "codex-local-memory" => "imported_memory",
+            _ => "memory_record",
+        })
+        .unwrap_or("memory_record")
+        .to_string();
+    DreamEvidenceSource {
+        id: record.id.clone(),
+        kind,
+        created_at: record.created_at.clone(),
+        updated_at: Some(record.updated_at.clone()),
+        actor: record
+            .metadata
+            .get("actor")
+            .or_else(|| record.metadata.get("target"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        record_type: Some(record.record_type.as_str().to_string()),
+        state: Some(state_for_record(record)),
+        source_path: record
+            .metadata
+            .get("source_path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        summary: Some(format!(
+            "{}:{}",
+            record.record_type.as_str(),
+            state_for_record(record)
+        )),
+    }
+}
+
+fn observations_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObservation> {
+    candidates.iter().map(observation_from_candidate).collect()
+}
+
+fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
+    let id = stable_observation_id(candidate);
+    DreamObservation {
+        id: id.clone(),
+        key: id,
+        kind: "dream_observation".to_string(),
+        category: candidate.candidate_state.clone(),
+        subject_key: candidate.subject_key.clone(),
+        summary: ledger_safe_summary(&candidate.content),
+        content: candidate.content.clone(),
+        confidence: candidate.confidence,
+        state: candidate.state.clone(),
+        evidence_refs: candidate.evidence_refs.clone(),
+        retires: candidate.supersedes.clone(),
+        first_seen_at: candidate.first_seen_at.clone(),
+        last_seen_at: candidate.last_seen_at.clone(),
+        authority: "recall_not_authority".to_string(),
+        policy: candidate.policy.clone(),
+        apply_eligible: candidate.apply_eligible,
+    }
+}
+
+fn stable_observation_id(candidate: &DreamCandidate) -> String {
+    ids::sha256_hex(
+        format!(
+            "dream_observation:{}:{}:{}:{}:{}:{}",
+            candidate.subject_key,
+            candidate.action,
+            candidate.proposed_type,
+            candidate.first_seen_at,
+            candidate.last_seen_at,
+            candidate.evidence_ids.join(",")
+        )
+        .as_bytes(),
+    )
 }
 
 fn apply_eligible(

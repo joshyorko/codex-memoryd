@@ -449,6 +449,10 @@ pub struct DreamCandidate {
     pub evidence_weight: f64,
     pub evidence_classes: Vec<String>,
     pub evidence_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<DreamEvidenceSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retires: Vec<String>,
     pub evidence_count: usize,
     pub user_evidence_count: usize,
     pub assistant_evidence_count: usize,
@@ -456,6 +460,28 @@ pub struct DreamCandidate {
     pub last_seen_at: String,
     pub promotion_reason: String,
     #[serde(skip_serializing)]
+    pub apply_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamObservation {
+    pub id: String,
+    pub key: String,
+    pub kind: String,
+    pub category: String,
+    pub subject_key: String,
+    pub summary: String,
+    pub content: String,
+    pub confidence: f64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<DreamEvidenceSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retires: Vec<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub authority: String,
+    pub policy: String,
     pub apply_eligible: bool,
 }
 
@@ -487,6 +513,8 @@ pub struct DreamResponse {
     pub now: String,
     pub evidence_window: DreamEvidenceWindow,
     pub candidates: Vec<DreamCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<DreamObservation>,
     pub stale: Vec<DreamStaleRecord>,
     pub rejected: Vec<DreamRejection>,
     pub archived: Vec<String>,

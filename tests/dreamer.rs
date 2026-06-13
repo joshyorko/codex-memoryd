@@ -303,6 +303,55 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
 }
 
 #[test]
+fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
+    let svc = service();
+    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    std::thread::sleep(Duration::from_millis(5));
+    let new_id = conclude(
+        &svc,
+        "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
+    );
+
+    let before_preview = svc.store.count_records().unwrap();
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    assert_eq!(svc.store.count_records().unwrap(), before_preview);
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(preview.authority, "recall_not_authority");
+    assert_eq!(applied.authority, "recall_not_authority");
+    assert_eq!(
+        serde_json::to_value(&preview.observations).unwrap(),
+        serde_json::to_value(&applied.observations).unwrap()
+    );
+
+    let observation = preview
+        .observations
+        .iter()
+        .find(|candidate| {
+            candidate.kind == "dream_observation"
+                && candidate.category == "accepted"
+                && candidate.retires == vec![old_id.clone()]
+        })
+        .expect("superseding observation");
+    assert_eq!(observation.key, observation.id);
+    assert_eq!(observation.subject_key, "backend-bundled-rusqlite");
+    assert_eq!(observation.authority, "recall_not_authority");
+    assert!(observation.apply_eligible);
+    assert!(observation.content.contains("rusqlite"));
+    assert!(observation.summary.contains("rusqlite"));
+    assert!(!observation.evidence_refs.is_empty());
+    assert!(observation
+        .evidence_refs
+        .iter()
+        .any(|reference| reference.id == new_id));
+    assert!(observation
+        .evidence_refs
+        .iter()
+        .all(|reference| reference.kind == "conclusion"));
+    assert!(applied.archived.contains(&old_id));
+}
+
+#[test]
 fn planned_fact_transitions_to_completed_supersession() {
     let svc = service();
     let old_id = conclude(&svc, "OAuth sync is planned; will implement it next week.");
@@ -444,7 +493,37 @@ fn apply_is_idempotent_and_records_required_dreamer_metadata() {
     assert_eq!(created.metadata["state"], "historical");
     assert_eq!(created.metadata["drift_prone"], false);
     assert_eq!(created.metadata["supersedes"], json!([old_id]));
+    assert_eq!(created.metadata["retires"], json!([old_id]));
     assert!(created.metadata["evidence_ids"].as_array().unwrap().len() == 1);
+    assert_eq!(
+        created.metadata["evidence_refs"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(created.metadata["evidence_refs"][0]["id"], json!(old_id));
+    assert_eq!(
+        created.metadata["observation_id"].as_str().unwrap().len(),
+        71
+    );
+    assert_eq!(
+        created.metadata["observation"]["authority"],
+        json!("recall_not_authority")
+    );
+    assert_eq!(
+        created.metadata["observation"]["apply_eligible"],
+        json!(true)
+    );
+    assert_eq!(
+        created.metadata["observation"]["subject_key"],
+        created.metadata["subject_key"]
+    );
+    assert_eq!(
+        created.metadata["observation_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(created.metadata["observation_refs"][0]["id"], json!(old_id));
     assert!(created.metadata["first_seen_at"].as_str().is_some());
     assert!(created.metadata["last_seen_at"].as_str().is_some());
     assert!(created.metadata["promotion_reason"].as_str().is_some());
