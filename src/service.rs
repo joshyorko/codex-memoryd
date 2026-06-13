@@ -62,6 +62,7 @@ const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
 const AGENTS_MD_CONTEXT_PACK_TEMPLATE: &str = "agents-md-v1";
+const CLAUDE_CODE_CONTEXT_PACK_TEMPLATE: &str = "claude-code-v1";
 const MCP_CONTEXT_PACK_TEMPLATE: &str = "mcp-json-v1";
 const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
@@ -429,7 +430,7 @@ impl Service {
                 rendered.truncated,
                 Some(rendered.context_pack),
             )
-        } else if target == AdapterTarget::AgentsMd {
+        } else if matches!(target, AdapterTarget::AgentsMd | AdapterTarget::ClaudeCode) {
             let markdown = render_adapter_view(target, &card)?;
             let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
             let rendered_bytes = markdown.len();
@@ -448,13 +449,18 @@ impl Service {
             } else {
                 adapter_context_pack_records(&card)
             };
+            let template = match target {
+                AdapterTarget::AgentsMd => AGENTS_MD_CONTEXT_PACK_TEMPLATE,
+                AdapterTarget::ClaudeCode => CLAUDE_CODE_CONTEXT_PACK_TEMPLATE,
+                _ => unreachable!("only markdown adapter targets reach this branch"),
+            };
             (
                 markdown,
                 rendered_bytes,
                 truncated,
                 Some(build_adapter_context_pack(
                     target,
-                    AGENTS_MD_CONTEXT_PACK_TEMPLATE,
+                    template,
                     &card,
                     &source_ids,
                     budget,
@@ -477,7 +483,7 @@ impl Service {
             "source_ids": source_ids,
             "markdown": markdown,
         });
-        // `agents-md` context packs are additive metadata; keep the legacy
+        // Markdown adapter context packs are additive metadata; keep the legacy
         // markdown/source digest stable for existing adapter consumers.
         if target == AdapterTarget::McpPack {
             let context_pack = context_pack
