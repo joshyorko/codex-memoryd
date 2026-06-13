@@ -17,24 +17,28 @@ use serde_json::Value;
 
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
+use crate::domain::Episode;
 use crate::domain::MemoryRecord;
 use crate::domain::MemorySource;
 use crate::domain::Portability;
 use crate::domain::RecordType;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
+use crate::domain::Subject;
+use crate::domain::SubjectKind;
 use crate::domain::VisibleTurn;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 3;
+pub const STORAGE_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
 const MIGRATION_DREAM_RUNS: &str = include_str!("../migrations/0003_dream_runs.sql");
 const MIGRATION_EVIDENCE_LEDGER: &str = include_str!("../migrations/0004_evidence_ledger.sql");
+const MIGRATION_SUBJECTS_EPISODES: &str = include_str!("../migrations/0005_subjects_episodes.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -176,6 +180,8 @@ pub struct NewRecord {
     pub profile_id: String,
     pub workspace_id: String,
     pub repo_id: Option<String>,
+    pub subject_id: Option<String>,
+    pub episode_id: Option<String>,
     pub scope: Scope,
     pub record_type: RecordType,
     pub content: String,
@@ -289,6 +295,7 @@ impl Store {
     fn migrate(&mut self) -> Result<()> {
         let conn = self.conn()?;
         conn.execute_batch(MIGRATION_INIT)?;
+        ensure_memory_record_ref_columns(&conn)?;
 
         // Record schema version in a tiny meta table.
         conn.execute_batch(
@@ -301,6 +308,7 @@ impl Store {
         )?;
         conn.execute_batch(MIGRATION_DREAM_RUNS)?;
         conn.execute_batch(MIGRATION_EVIDENCE_LEDGER)?;
+        conn.execute_batch(MIGRATION_SUBJECTS_EPISODES)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -451,6 +459,225 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // Subjects & episodes
+    // ------------------------------------------------------------------
+
+    pub fn insert_or_get_subject(&self, subject: &Subject) -> Result<(Subject, bool)> {
+        let conn = self.conn()?;
+        let inserted = conn.execute(
+            "INSERT INTO subjects(
+                id, profile_id, workspace_id, subject_key, kind, display_name,
+                created_at, updated_at, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(profile_id, workspace_id, subject_key) DO NOTHING",
+            params![
+                subject.id,
+                subject.profile_id,
+                subject.workspace_id,
+                subject.subject_key,
+                subject.kind.as_str(),
+                subject.display_name,
+                subject.created_at,
+                subject.updated_at,
+                subject.metadata.to_string(),
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok((subject.clone(), true));
+        }
+
+        let existing = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_COLS} FROM subjects
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND subject_key = ?3"
+                ),
+                params![
+                    subject.profile_id,
+                    subject.workspace_id,
+                    subject.subject_key
+                ],
+                row_to_subject,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::storage(format!(
+                    "subject conflict for {}/{}/{} but no existing row was visible",
+                    subject.profile_id, subject.workspace_id, subject.subject_key
+                ))
+            })?;
+        Ok((existing, false))
+    }
+
+    pub fn find_subject_by_key(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        subject_key: &str,
+    ) -> Result<Option<Subject>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_COLS} FROM subjects
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND subject_key = ?3"
+                ),
+                params![profile_id, workspace_id, subject_key],
+                row_to_subject,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn get_subject(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+    ) -> Result<Option<Subject>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_COLS} FROM subjects
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3"
+                ),
+                params![profile_id, workspace_id, id],
+                row_to_subject,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn list_subjects(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        kind: Option<SubjectKind>,
+    ) -> Result<Vec<Subject>> {
+        let conn = self.conn()?;
+        let mut sql = format!(
+            "SELECT {SUBJECT_COLS} FROM subjects WHERE profile_id = ?1 AND workspace_id = ?2"
+        );
+        let rows = if let Some(kind) = kind {
+            sql.push_str(" AND kind = ?3 ORDER BY updated_at DESC, subject_key ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    params![profile_id, workspace_id, kind.as_str()],
+                    row_to_subject,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        } else {
+            sql.push_str(" ORDER BY updated_at DESC, subject_key ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![profile_id, workspace_id], row_to_subject)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(rows)
+    }
+
+    pub fn subject_exists_in_scope(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists = conn
+            .prepare(
+                "SELECT 1 FROM subjects WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+            )?
+            .exists(params![profile_id, workspace_id, id])?;
+        Ok(exists)
+    }
+
+    pub fn insert_episode(&self, episode: &Episode) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO episodes(
+                id, profile_id, workspace_id, subject_id, source_kind, source_ref,
+                started_at, ended_at, status, summary, trust_level, source_metadata,
+                created_at, updated_at, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                episode.id,
+                episode.profile_id,
+                episode.workspace_id,
+                episode.subject_id,
+                episode.source_kind,
+                episode.source_ref,
+                episode.started_at,
+                episode.ended_at,
+                episode.status,
+                episode.summary,
+                episode.trust_level,
+                episode.source_metadata.to_string(),
+                episode.created_at,
+                episode.updated_at,
+                episode.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_episode(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+    ) -> Result<Option<Episode>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {EPISODE_COLS} FROM episodes
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3"
+                ),
+                params![profile_id, workspace_id, id],
+                row_to_episode,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn list_episodes(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        subject_id: Option<&str>,
+    ) -> Result<Vec<Episode>> {
+        let conn = self.conn()?;
+        let mut sql = format!(
+            "SELECT {EPISODE_COLS} FROM episodes WHERE profile_id = ?1 AND workspace_id = ?2"
+        );
+        let rows = if let Some(subject_id) = subject_id {
+            sql.push_str(" AND subject_id = ?3 ORDER BY created_at DESC, id ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    params![profile_id, workspace_id, subject_id],
+                    row_to_episode,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        } else {
+            sql.push_str(" ORDER BY created_at DESC, id ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![profile_id, workspace_id], row_to_episode)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(rows)
+    }
+
+    // ------------------------------------------------------------------
     // Memory sources
     // ------------------------------------------------------------------
 
@@ -553,16 +780,18 @@ impl Store {
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO memory_records(
-                id, profile_id, workspace_id, repo_id, scope, type, content,
-                related_files, tags, sensitivity, portability, confidence,
-                source_ids, content_hash, supersedes, created_at, updated_at,
-                last_used_at, archived, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16,NULL,0,?17)",
+                id, profile_id, workspace_id, repo_id, subject_id, episode_id,
+                scope, type, content, related_files, tags, sensitivity,
+                portability, confidence, source_ids, content_hash, supersedes,
+                created_at, updated_at, last_used_at, archived, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,NULL,0,?19)",
             params![
                 id,
                 new.profile_id,
                 new.workspace_id,
                 new.repo_id,
+                new.subject_id,
+                new.episode_id,
                 new.scope.as_str(),
                 new.record_type.as_str(),
                 new.content,
@@ -1752,11 +1981,39 @@ fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
     )
 }
 
+fn ensure_memory_record_ref_columns(conn: &rusqlite::Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memory_records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|name| name == "subject_id") {
+        conn.execute("ALTER TABLE memory_records ADD COLUMN subject_id TEXT", [])?;
+    }
+    if !columns.iter().any(|name| name == "episode_id") {
+        conn.execute("ALTER TABLE memory_records ADD COLUMN episode_id TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_subject
+         ON memory_records(subject_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_episode
+         ON memory_records(episode_id)",
+        [],
+    )?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------------
 // Row mappers and SQL helpers
 // ----------------------------------------------------------------------
 
-const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, metadata";
+const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, metadata";
+const SUBJECT_COLS: &str =
+    "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
+const EPISODE_COLS: &str =
+    "id, profile_id, workspace_id, subject_id, source_kind, source_ref, started_at, ended_at, status, summary, trust_level, source_metadata, created_at, updated_at, metadata";
 
 fn record_cols_prefixed(prefix: &str) -> String {
     RECORD_COLS
@@ -1872,23 +2129,60 @@ fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
         profile_id: row.get(1)?,
         workspace_id: row.get(2)?,
         repo_id: row.get(3)?,
-        scope: Scope::parse(&row.get::<_, String>(4)?).unwrap_or(Scope::Workspace),
-        record_type: RecordType::parse(&row.get::<_, String>(5)?).unwrap_or(RecordType::Other),
-        content: row.get(6)?,
-        related_files: json_str_list(&row.get::<_, String>(7)?),
-        tags: json_str_list(&row.get::<_, String>(8)?),
-        sensitivity: Sensitivity::parse(&row.get::<_, String>(9)?).unwrap_or(Sensitivity::Personal),
-        portability: Portability::parse(&row.get::<_, String>(10)?)
+        subject_id: row.get(4)?,
+        episode_id: row.get(5)?,
+        scope: Scope::parse(&row.get::<_, String>(6)?).unwrap_or(Scope::Workspace),
+        record_type: RecordType::parse(&row.get::<_, String>(7)?).unwrap_or(RecordType::Other),
+        content: row.get(8)?,
+        related_files: json_str_list(&row.get::<_, String>(9)?),
+        tags: json_str_list(&row.get::<_, String>(10)?),
+        sensitivity: Sensitivity::parse(&row.get::<_, String>(11)?)
+            .unwrap_or(Sensitivity::Personal),
+        portability: Portability::parse(&row.get::<_, String>(12)?)
             .unwrap_or(Portability::ProfileOnly),
-        confidence: row.get(11)?,
-        source_ids: json_str_list(&row.get::<_, String>(12)?),
-        content_hash: row.get(13)?,
-        supersedes: json_str_list(&row.get::<_, String>(14)?),
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
-        last_used_at: row.get(17)?,
-        archived: row.get::<_, i64>(18)? != 0,
-        metadata: json_value(&row.get::<_, String>(19)?),
+        confidence: row.get(13)?,
+        source_ids: json_str_list(&row.get::<_, String>(14)?),
+        content_hash: row.get(15)?,
+        supersedes: json_str_list(&row.get::<_, String>(16)?),
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        last_used_at: row.get(19)?,
+        archived: row.get::<_, i64>(20)? != 0,
+        metadata: json_value(&row.get::<_, String>(21)?),
+    })
+}
+
+fn row_to_subject(row: &Row) -> rusqlite::Result<Subject> {
+    Ok(Subject {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        subject_key: row.get(3)?,
+        kind: SubjectKind::parse(&row.get::<_, String>(4)?).unwrap_or(SubjectKind::Other),
+        display_name: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        metadata: json_value(&row.get::<_, String>(8)?),
+    })
+}
+
+fn row_to_episode(row: &Row) -> rusqlite::Result<Episode> {
+    Ok(Episode {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        subject_id: row.get(3)?,
+        source_kind: row.get(4)?,
+        source_ref: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        status: row.get(8)?,
+        summary: row.get(9)?,
+        trust_level: row.get(10)?,
+        source_metadata: json_value(&row.get::<_, String>(11)?),
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        metadata: json_value(&row.get::<_, String>(14)?),
     })
 }
 
@@ -1989,6 +2283,8 @@ mod tests {
             profile_id: "personal".to_string(),
             workspace_id: "ws".to_string(),
             repo_id: None,
+            subject_id: None,
+            episode_id: None,
             scope: Scope::Workspace,
             record_type: RecordType::Decision,
             content: content.to_string(),

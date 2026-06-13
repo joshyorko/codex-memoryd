@@ -158,6 +158,117 @@ fn http_status_recall_sync_roundtrip() {
 }
 
 #[test]
+fn http_subject_episode_roundtrip() {
+    let (base, _handle) = boot();
+    let http = client();
+
+    let subject: Value = http
+        .post(format!("{base}/v1/subjects"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "subject_key": "repo:codex-memoryd",
+            "kind": "repo",
+            "display_name": "codex-memoryd"
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(subject["ok"], json!(true));
+    assert_eq!(subject["data"]["created"], json!(true));
+    let subject_id = subject["data"]["subject"]["id"].as_str().unwrap();
+
+    let duplicate: Value = http
+        .post(format!("{base}/v1/subjects"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "subject_key": "repo:codex-memoryd",
+            "kind": "repo",
+            "display_name": "ignored duplicate"
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(duplicate["ok"], json!(true));
+    assert_eq!(duplicate["data"]["created"], json!(false));
+    assert_eq!(
+        duplicate["data"]["subject"]["id"],
+        subject["data"]["subject"]["id"]
+    );
+
+    let subjects: Value = http
+        .get(format!(
+            "{base}/v1/subjects?profile=personal&workspace=josh-personal&kind=repo"
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(subjects["ok"], json!(true));
+    assert_eq!(subjects["data"]["subjects"].as_array().unwrap().len(), 1);
+
+    let fetched_subject: Value = http
+        .get(format!(
+            "{base}/v1/subjects/get?profile=personal&workspace=josh-personal&id={subject_id}"
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(fetched_subject["ok"], json!(true));
+    assert_eq!(
+        fetched_subject["data"]["subject"]["subject_key"],
+        json!("repo:codex-memoryd")
+    );
+
+    let episode: Value = http
+        .post(format!("{base}/v1/episodes"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "subject_id": subject_id,
+            "source_kind": "github_issue",
+            "source_ref": "joshyorko/codex-memoryd#65",
+            "summary": "Subject and episode storage MVP",
+            "status": "open"
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(episode["ok"], json!(true));
+    let episode_id = episode["data"]["episode"]["id"].as_str().unwrap();
+
+    let episodes: Value = http
+        .get(format!(
+            "{base}/v1/episodes?profile=personal&workspace=josh-personal&subject_id={subject_id}"
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(episodes["ok"], json!(true));
+    assert_eq!(episodes["data"]["episodes"].as_array().unwrap().len(), 1);
+
+    let fetched_episode: Value = http
+        .get(format!(
+            "{base}/v1/episodes/get?profile=personal&workspace=josh-personal&id={episode_id}"
+        ))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(fetched_episode["ok"], json!(true));
+    assert_eq!(
+        fetched_episode["data"]["episode"]["subject_id"],
+        json!(subject_id)
+    );
+}
+
+#[test]
 fn http_status_reports_auth_missing_for_non_loopback_config() {
     let (base, _handle) = boot_with_config(Config {
         bind: "0.0.0.0:0".to_string(),

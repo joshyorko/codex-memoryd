@@ -44,6 +44,8 @@ fn insert_scoped_record(
         profile_id: profile_id.to_string(),
         workspace_id: workspace_id.to_string(),
         repo_id: repo_id.map(|repo| repo.to_string()),
+        subject_id: None,
+        episode_id: None,
         scope: Scope::Workspace,
         record_type: RecordType::Other,
         content: content.to_string(),

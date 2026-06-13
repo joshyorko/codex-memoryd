@@ -8,6 +8,7 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use rusqlite::Connection;
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn bin() -> Command {
@@ -131,6 +132,157 @@ fn cli_conclude_then_search_roundtrip() {
         .assert()
         .success()
         .stdout(predicate::str::contains("rusqlite"));
+}
+
+#[test]
+fn cli_subject_episode_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let subject_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--key",
+            "workflow:dogfood-import",
+            "--kind",
+            "workflow",
+            "--display-name",
+            "Dogfood import",
+        ])
+        .output()
+        .unwrap();
+    assert!(subject_output.status.success());
+    let subject: Value = serde_json::from_slice(&subject_output.stdout).unwrap();
+    assert_eq!(subject["created"], true);
+    let subject_id = subject["subject"]["id"].as_str().unwrap().to_string();
+
+    let duplicate_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--key",
+            "workflow:dogfood-import",
+            "--kind",
+            "workflow",
+            "--display-name",
+            "Ignored duplicate",
+        ])
+        .output()
+        .unwrap();
+    assert!(duplicate_output.status.success());
+    let duplicate: Value = serde_json::from_slice(&duplicate_output.stdout).unwrap();
+    assert_eq!(duplicate["created"], false);
+    assert_eq!(duplicate["subject"]["id"], subject["subject"]["id"]);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "list",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--kind",
+            "workflow",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workflow:dogfood-import"));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "get",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            &subject_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dogfood import"));
+
+    let episode_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "episode",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--subject-id",
+            &subject_id,
+            "--source-kind",
+            "fizzy_card",
+            "--source-ref",
+            "491",
+            "--summary",
+            "Container/import/MCP gate verified",
+            "--status",
+            "completed",
+        ])
+        .output()
+        .unwrap();
+    assert!(episode_output.status.success());
+    let episode: Value = serde_json::from_slice(&episode_output.stdout).unwrap();
+    assert_eq!(episode["created"], true);
+    assert_eq!(episode["episode"]["subject_id"], subject_id);
+    let episode_id = episode["episode"]["id"].as_str().unwrap().to_string();
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "episode",
+            "list",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--subject-id",
+            &subject_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Container/import/MCP gate verified",
+        ));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "episode",
+            "get",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            &episode_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fizzy_card"));
 }
 
 #[test]
