@@ -134,6 +134,45 @@ fn cli_conclude_then_search_roundtrip() {
 }
 
 #[test]
+fn cli_patch_preview_renders_markdown() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: use rusqlite with bundled SQLite",
+        ])
+        .assert()
+        .success();
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "patch",
+            "preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Memory patch preview"))
+        .stdout(predicate::str::contains("+ decision"));
+}
+
+#[test]
 fn cli_conclude_rejects_secret() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

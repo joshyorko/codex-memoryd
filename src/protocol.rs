@@ -393,7 +393,128 @@ pub struct DreamRequest {
     pub since: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPatchApplyRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub repo: Option<RepoIdentity>,
+    pub run_id: String,
+    #[serde(default)]
+    pub now: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPatchExplainRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub repo: Option<RepoIdentity>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub memory_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPatchRollbackRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub repo: Option<RepoIdentity>,
+    pub run_id: String,
+    #[serde(default)]
+    pub preview: bool,
+    #[serde(default)]
+    pub now: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchAction {
+    pub op: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub subject_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<String>,
+    pub content: String,
+    pub policy_outcome: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<DreamEvidenceSource>,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchPreviewResponse {
+    pub run_id: String,
+    pub profile: String,
+    pub workspace: String,
+    pub repo_id: Option<String>,
+    pub now: String,
+    pub dream: DreamResponse,
+    pub actions: Vec<MemoryPatchAction>,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchApplyResponse {
+    pub requested_run_id: String,
+    pub preview_run_id: String,
+    pub preview: MemoryPatchPreviewResponse,
+    pub applied: DreamResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchExplainItem {
+    pub memory_id: String,
+    pub run_id: Option<String>,
+    pub patch_run_id: Option<String>,
+    pub policy_outcome: String,
+    pub state: String,
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<DreamEvidenceSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchExplainResponse {
+    pub profile: String,
+    pub workspace: String,
+    pub repo_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<String>,
+    pub items: Vec<MemoryPatchExplainItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPatchRollbackResponse {
+    pub run_id: String,
+    pub mode: String,
+    pub profile: String,
+    pub workspace: String,
+    pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restored: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<MemoryPatchAction>,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamEvidenceSource {
     pub id: String,
     pub kind: String,
