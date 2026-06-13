@@ -232,6 +232,39 @@ fn cli_recall_accepts_pack_mode_and_rejects_unknown_pack() {
         .assert()
         .success();
 
+    let default_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "sqlite",
+            "--pack-mode",
+            "default",
+        ])
+        .output()
+        .unwrap();
+    assert!(default_output.status.success());
+    let default_recall: Value = serde_json::from_slice(&default_output.stdout).unwrap();
+    assert_eq!(default_recall["pack"]["mode"], "default");
+    assert_eq!(default_recall["pack"]["template"], "default");
+    assert_eq!(default_recall["pack"]["template_budget_tokens"], 1200);
+    assert_eq!(default_recall["pack"]["max_tokens"], 1200);
+    assert!(default_recall["policy"]["ranking_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal == "pack_template:default"));
+    assert!(default_recall["policy"]["ranking_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal == "pack_budget:1200"));
+
     let output = bin()
         .arg("--db")
         .arg(&db)
@@ -251,11 +284,24 @@ fn cli_recall_accepts_pack_mode_and_rejects_unknown_pack() {
     assert!(output.status.success());
     let recall: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(recall["pack"]["mode"], "debugging");
+    assert_eq!(recall["pack"]["template"], "debugging");
+    assert_eq!(recall["pack"]["template_budget_tokens"], 1000);
+    assert_eq!(recall["pack"]["max_tokens"], 1000);
     assert!(recall["policy"]["ranking_signals"]
         .as_array()
         .unwrap()
         .iter()
         .any(|signal| signal == "pack_mode:debugging"));
+    assert!(recall["policy"]["ranking_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal == "pack_template:debugging"));
+    assert!(recall["policy"]["ranking_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal == "pack_budget:1000"));
 
     bin()
         .arg("--db")

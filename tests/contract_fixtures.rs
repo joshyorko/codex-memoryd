@@ -47,6 +47,8 @@ fn recall_fixture_deserializes_and_runs() {
     let resp = svc.recall(req).expect("recall runs");
     assert_eq!(resp.authority, "recall_not_authority");
     assert_eq!(resp.pack.mode, "default");
+    assert_eq!(resp.pack.template, "default");
+    assert_eq!(resp.pack.template_budget_tokens, 1200);
     assert_eq!(resp.pack.max_tokens, 1200);
     assert_eq!(resp.policy.authority, "recall_not_authority");
     assert!(resp
@@ -57,6 +59,14 @@ fn recall_fixture_deserializes_and_runs() {
         .policy
         .ranking_signals
         .contains(&"repo_match".to_string()));
+    assert!(resp
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:default".to_string()));
+    assert!(resp
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:1200".to_string()));
 }
 
 #[test]
