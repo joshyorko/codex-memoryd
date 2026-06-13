@@ -54,6 +54,7 @@ use crate::store::DreamRunAudit;
 use crate::store::DreamRunRecord;
 use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
+use crate::store::RecordQuery;
 use crate::store::Store;
 
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
@@ -227,6 +228,12 @@ impl Service {
             .to_ascii_lowercase()
             .trim_matches('_')
             .replace("__", "_");
+        let mut query = RecordQuery {
+            profile_id: Some(profile.as_str().to_string()),
+            workspace_id: Some(workspace.clone()),
+            ..Default::default()
+        };
+
         let (scope_label, subject_id) = match card_type.as_str() {
             "subject_summary" => {
                 let subject_id = screen_persisted_string(
@@ -249,18 +256,18 @@ impl Service {
                 ("subject", Some(subject_id))
             }
             "workspace_summary" => ("workspace", None),
+            "active_preferences" => {
+                query.record_type = Some(RecordType::Preference);
+                ("workspace", None)
+            }
             _ => {
                 return Err(Error::invalid_request(format!(
-                    "unknown card type '{card_type}'; use subject_summary or workspace_summary"
+                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, or active_preferences"
                 )))
             }
         };
 
-        let mut records = self.store.query_records(&crate::store::RecordQuery {
-            profile_id: Some(profile.as_str().to_string()),
-            workspace_id: Some(workspace.clone()),
-            ..Default::default()
-        })?;
+        let mut records = self.store.query_records(&query)?;
         if let Some(subject_id) = subject_id.as_deref() {
             records.retain(|record| record.subject_id.as_deref() == Some(subject_id));
         }

@@ -332,7 +332,7 @@ pub struct CardShowRequest {
     pub profile: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
-    /// `subject_summary` | `workspace_summary`.
+    /// `subject_summary` | `workspace_summary` | `active_preferences`.
     #[serde(rename = "type")]
     pub r#type: String,
     /// Optional for workspace summaries.

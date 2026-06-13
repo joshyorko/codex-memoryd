@@ -6,7 +6,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use codex_memoryd::domain::Portability;
+use codex_memoryd::domain::RecordType;
+use codex_memoryd::domain::Scope;
+use codex_memoryd::domain::Sensitivity;
+use codex_memoryd::ids;
+use codex_memoryd::store::NewRecord;
+use codex_memoryd::store::Store;
+use codex_memoryd::store::UpsertOutcome;
 use predicates::prelude::*;
+use rusqlite::params;
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -35,6 +44,53 @@ fn count_archived(db: &PathBuf) -> i64 {
         |row| row.get(0),
     )
     .unwrap()
+}
+
+fn seed_preference_record(
+    db: &PathBuf,
+    profile: &str,
+    workspace: &str,
+    content: &str,
+    updated_at: &str,
+    archived: bool,
+) -> String {
+    let store = Store::open(db).unwrap();
+    let record = NewRecord {
+        profile_id: profile.to_string(),
+        workspace_id: workspace.to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type: RecordType::Preference,
+        content: content.to_string(),
+        related_files: vec![],
+        tags: vec!["preference".to_string()],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.9,
+        source_ids: vec!["src_test".to_string()],
+        content_hash: ids::content_hash(
+            profile,
+            workspace,
+            None,
+            RecordType::Preference.as_str(),
+            Scope::Workspace.as_str(),
+            content,
+        ),
+        supersedes: vec![],
+        metadata: serde_json::json!({"origin": "cli_smoke"}),
+    };
+    let id = match store.upsert_record(&record).unwrap() {
+        UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+    };
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE memory_records SET created_at = ?1, updated_at = ?1, archived = ?3 WHERE id = ?2",
+        params![updated_at, id, archived as i64],
+    )
+    .unwrap();
+    id
 }
 
 fn git(repo: &std::path::Path, args: &[&str]) {
@@ -873,6 +929,161 @@ fn cli_card_workspace_summary_markdown_renders() {
     assert!(stdout.contains("Profile: personal"));
     assert!(stdout.contains("Authority: recall_not_authority"));
     assert!(stdout.contains("Content hash: "));
+}
+
+#[test]
+fn cli_card_active_preferences_json_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_preference_record(
+        &db,
+        "personal",
+        "josh-personal",
+        "Preference: use repo-native commands",
+        "2026-06-13T12:00:00Z",
+        false,
+    );
+    seed_preference_record(
+        &db,
+        "personal",
+        "josh-personal",
+        "Preference: prefer markdown card output",
+        "2026-06-13T13:00:00Z",
+        false,
+    );
+    seed_preference_record(
+        &db,
+        "personal",
+        "josh-personal",
+        "Preference: archived preference should not show",
+        "2026-06-13T14:00:00Z",
+        true,
+    );
+    seed_preference_record(
+        &db,
+        "personal",
+        "other-workspace",
+        "Preference: other workspace should not show",
+        "2026-06-13T15:00:00Z",
+        false,
+    );
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "active_preferences",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "active_preferences",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "active_preferences");
+    assert_eq!(first["scope"], "workspace");
+    assert_eq!(first["profile"], "personal");
+    assert_eq!(first["workspace"], "josh-personal");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["records"].as_array().unwrap().len(), 2);
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    let contents = first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["content"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contents,
+        vec![
+            "Preference: prefer markdown card output",
+            "Preference: use repo-native commands",
+        ]
+    );
+    assert!(!first
+        .to_string()
+        .contains("Preference: archived preference should not show"));
+    assert!(!first
+        .to_string()
+        .contains("Preference: other workspace should not show"));
+}
+
+#[test]
+fn cli_card_active_preferences_markdown_renders() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_preference_record(
+        &db,
+        "personal",
+        "josh-personal",
+        "Preference: render active preferences as markdown",
+        "2026-06-13T12:00:00Z",
+        false,
+    );
+    seed_preference_record(
+        &db,
+        "personal",
+        "josh-personal",
+        "Preference: archived markdown preference should not show",
+        "2026-06-13T13:00:00Z",
+        true,
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "active_preferences",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Card summary: active_preferences"));
+    assert!(stdout.contains("Profile: personal"));
+    assert!(stdout.contains("Workspace: josh-personal"));
+    assert!(stdout.contains("Preference: render active preferences as markdown"));
+    assert!(!stdout.contains("Preference: archived markdown preference should not show"));
 }
 
 #[test]
