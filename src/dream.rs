@@ -29,6 +29,8 @@ use crate::protocol::DreamEvidenceWindow;
 use crate::protocol::DreamRejection;
 use crate::protocol::DreamResponse;
 use crate::protocol::DreamStaleRecord;
+use crate::store::ledger_safe_summary;
+use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
@@ -265,6 +267,38 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             {
                 PolicyDecision::Accept(clean) => clean,
                 PolicyDecision::Reject { code, reason } => {
+                    let source_hash = ids::sha256_hex(
+                        format!(
+                            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                            params.profile.as_str(),
+                            params.workspace,
+                            candidate.subject_key,
+                            code,
+                            ids::sha256_hex(candidate.content.as_bytes())
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = store.record_evidence_ledger(&EvidenceLedgerEntry {
+                        profile_id: params.profile.as_str().to_string(),
+                        workspace_id: params.workspace.to_string(),
+                        repo_id: params.repo_id.map(|s| s.to_string()),
+                        subject_key: Some(candidate.subject_key.clone()),
+                        source_kind: "dream_apply".to_string(),
+                        source_id: candidate.evidence_ids.first().cloned(),
+                        source_path: Some(format!("dream:{}", candidate.subject_key)),
+                        source_hash,
+                        safe_summary: ledger_safe_summary(&format!(
+                            "rejected dream candidate {} for {}: {}",
+                            candidate.action, candidate.subject_key, reason
+                        )),
+                        policy_state: code.clone(),
+                        metadata: json!({
+                            "dream_run_id": run_id.clone(),
+                            "action": candidate.action,
+                            "subject_key": candidate.subject_key,
+                            "reason": reason,
+                        }),
+                    });
                     let _ = store.record_policy_event(
                         Some(params.profile.as_str()),
                         Some(params.workspace),
@@ -289,6 +323,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 class.scope.as_str(),
                 &content,
             );
+            let safe_summary = ledger_safe_summary(&candidate.content);
+            let source_id = candidate.evidence_ids.first().cloned();
             let metadata = json!({
                 "origin": "dreamer",
                 "dream_run_id": run_id.clone(),
@@ -329,9 +365,29 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 portability: class.portability,
                 confidence: candidate.confidence,
                 source_ids: candidate.evidence_ids.clone(),
-                content_hash,
+                content_hash: content_hash.clone(),
                 supersedes: candidate.supersedes.clone(),
                 metadata,
+            })?;
+            store.record_evidence_ledger(&EvidenceLedgerEntry {
+                profile_id: params.profile.as_str().to_string(),
+                workspace_id: params.workspace.to_string(),
+                repo_id: params.repo_id.map(|s| s.to_string()),
+                subject_key: Some(candidate.subject_key.clone()),
+                source_kind: "dream_apply".to_string(),
+                source_id,
+                source_path: Some(format!("dream:{}", candidate.subject_key)),
+                source_hash: content_hash,
+                safe_summary,
+                policy_state: "accepted".to_string(),
+                metadata: json!({
+                    "dream_run_id": run_id.clone(),
+                    "action": candidate.action,
+                    "subject_key": candidate.subject_key,
+                    "promotion_reason": candidate.promotion_reason,
+                    "candidate_state": candidate.candidate_state,
+                    "evidence_count": candidate.evidence_count,
+                }),
             })?;
             if let UpsertOutcome::Created(id) = outcome {
                 created.push(id);

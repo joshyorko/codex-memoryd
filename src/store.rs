@@ -29,16 +29,33 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 2;
+pub const STORAGE_SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
 const MIGRATION_DREAM_RUNS: &str = include_str!("../migrations/0003_dream_runs.sql");
+const MIGRATION_EVIDENCE_LEDGER: &str = include_str!("../migrations/0004_evidence_ledger.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
 /// Sync cursor timestamps: (last_started_at, last_completed_at, last_error).
 pub type SyncCursorTimes = (Option<String>, Option<String>, Option<String>);
+
+/// Append-only evidence ledger row.
+#[derive(Debug, Clone)]
+pub struct EvidenceLedgerEntry {
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub subject_key: Option<String>,
+    pub source_kind: String,
+    pub source_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_hash: String,
+    pub safe_summary: String,
+    pub policy_state: String,
+    pub metadata: Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct DreamRunAudit {
@@ -116,6 +133,26 @@ pub struct SessionActivity {
     pub started_at: Option<String>,
     pub last_activity_at: Option<String>,
     pub turn_count: usize,
+}
+
+/// Normalize and cap a ledger summary so callers can safely pass content
+/// excerpts, policy reasons, or operation summaries without raw blobs.
+pub fn ledger_safe_summary(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 /// Filters applied to a record query.
@@ -263,6 +300,7 @@ impl Store {
             params![STORAGE_SCHEMA_VERSION.to_string()],
         )?;
         conn.execute_batch(MIGRATION_DREAM_RUNS)?;
+        conn.execute_batch(MIGRATION_EVIDENCE_LEDGER)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -1507,6 +1545,38 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_evidence_ledger(&self, entry: &EvidenceLedgerEntry) -> Result<()> {
+        let now = ids::now_rfc3339();
+        let id = ids::new_id("led");
+        let event_key = evidence_ledger_event_key(entry);
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO evidence_ledger(
+                id, event_key, profile_id, workspace_id, repo_id, subject_key,
+                source_kind, source_id, source_path, source_hash, safe_summary,
+                policy_state, created_at, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                id,
+                event_key,
+                &entry.profile_id,
+                &entry.workspace_id,
+                &entry.repo_id,
+                &entry.subject_key,
+                &entry.source_kind,
+                &entry.source_id,
+                &entry.source_path,
+                &entry.source_hash,
+                &entry.safe_summary,
+                &entry.policy_state,
+                now,
+                entry.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn count_policy_denials(&self) -> Result<i64> {
         let conn = self.conn()?;
         let n: i64 = conn.query_row(
@@ -1516,6 +1586,24 @@ impl Store {
         )?;
         Ok(n)
     }
+}
+
+fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
+    ids::sha256_hex(
+        format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            entry.profile_id,
+            entry.workspace_id,
+            entry.repo_id.as_deref().unwrap_or(""),
+            entry.subject_key.as_deref().unwrap_or(""),
+            entry.source_kind,
+            entry.source_id.as_deref().unwrap_or(""),
+            entry.source_path.as_deref().unwrap_or(""),
+            entry.source_hash,
+            entry.policy_state,
+        )
+        .as_bytes(),
+    )
 }
 
 // ----------------------------------------------------------------------

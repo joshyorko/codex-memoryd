@@ -53,6 +53,11 @@ A single Rust crate with strict module boundaries (SPEC §3.2):
 | `cli` | clap command-line interface |
 | `export` / `status` / `metrics` | Export, status assembly, counters |
 
+Write provenance is tracked in an append-only
+[evidence ledger](./docs/evidence-ledger.md). The ledger is for audit and
+adapter diagnostics only; it is not a recall source and never stores raw
+rejected secret content, hidden reasoning, or raw logs.
+
 Stack: **axum** (HTTP), **clap** (CLI), **rusqlite** with bundled SQLite +
 **r2d2** pool (storage), **serde** (types), **tracing** (logs), **regex**
 (secret detection), **sha2** (hashing), **uuid** (ids).
