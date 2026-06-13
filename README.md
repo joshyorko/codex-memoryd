@@ -413,3 +413,6 @@ MIT.
 ## Memory bakeoff
 
 For a narrow comparison of local-only Codex memory, Honcho provider mode, and codex-memoryd provider mode (with explicit scope limits), see [`demos/memory-bakeoff/README.md`](./demos/memory-bakeoff/README.md).
+
+For the next substrate slice behind issues #43, #44, and #45, see
+[`docs/agent-agnostic-memory-substrate.md`](./docs/agent-agnostic-memory-substrate.md).
