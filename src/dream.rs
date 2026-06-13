@@ -1281,18 +1281,33 @@ fn stable_marker_id(candidate: &DreamCandidate, kind: MarkerKind) -> String {
 
 fn marker_kind_for_candidate(candidate: &DreamCandidate) -> Option<MarkerKind> {
     let content = candidate.content.to_ascii_lowercase();
-    if contains_any(
+    if has_explicit_surprise_language(&content) || has_correction_with_surprise_language(&content) {
+        Some(MarkerKind::Surprise)
+    } else if contains_any(
         &content,
         &[
-            "surprise",
-            "surprising",
-            "unexpected",
-            "counterintuitive",
-            "turns out",
-            "didn't expect",
+            "battle scar",
+            "battle_scar",
+            "failed",
+            "failure",
+            "broken",
+            "broke",
+        ],
+    ) && contains_any(
+        &content,
+        &[
+            "recover",
+            "recovered",
+            "recovery",
+            "retry",
+            "fallback",
+            "resume",
+            "backoff",
+            "unblock",
+            "switching",
         ],
     ) {
-        Some(MarkerKind::Surprise)
+        Some(MarkerKind::BattleScar)
     } else if contains_any(
         &content,
         &[
@@ -1302,43 +1317,9 @@ fn marker_kind_for_candidate(candidate: &DreamCandidate) -> Option<MarkerKind> {
             "less confident",
             "confidence increased",
             "confidence dropped",
-            "confidence",
         ],
     ) {
         Some(MarkerKind::ConfidenceDelta)
-    } else if candidate.state == "completed"
-        && contains_any(
-            &content,
-            &[
-                "recovery pattern",
-                "recovery_pattern",
-                "recover",
-                "recovered",
-                "retry",
-                "fallback",
-                "resume",
-                "backoff",
-                "unblock",
-            ],
-        )
-    {
-        Some(MarkerKind::RecoveryPattern)
-    } else if contains_any(
-        &content,
-        &[
-            "battle scar",
-            "battle_scar",
-            "blocked",
-            "stuck",
-            "failed",
-            "failure",
-            "broken",
-            "broke",
-            "incident",
-            "outage",
-        ],
-    ) {
-        Some(MarkerKind::BattleScar)
     } else if contains_any(
         &content,
         &[
@@ -1354,7 +1335,8 @@ fn marker_kind_for_candidate(candidate: &DreamCandidate) -> Option<MarkerKind> {
     ) || matches!(
         candidate.promotion_reason.as_str(),
         "repeated_user_steering" | "user_adopted_assistant_proposal"
-    ) {
+    ) || repeated_smooth_success(candidate, &content)
+    {
         Some(MarkerKind::ComfortPath)
     } else if contains_any(
         &content,
@@ -1374,6 +1356,52 @@ fn marker_kind_for_candidate(candidate: &DreamCandidate) -> Option<MarkerKind> {
     } else {
         None
     }
+}
+
+fn repeated_smooth_success(candidate: &DreamCandidate, content: &str) -> bool {
+    candidate.evidence_count >= 2
+        && contains_any(
+            content,
+            &[
+                "passed cleanly",
+                "worked smoothly",
+                "stable path",
+                "repeatable success",
+                "smooth success",
+                "green twice",
+            ],
+        )
+}
+
+fn has_explicit_surprise_language(content: &str) -> bool {
+    contains_any(
+        content,
+        &[
+            "surprise",
+            "surprising",
+            "unexpected",
+            "counterintuitive",
+            "turns out",
+            "didn't expect",
+            "unexpectedly",
+        ],
+    )
+}
+
+fn has_correction_with_surprise_language(content: &str) -> bool {
+    contains_any(content, &["actually", "correction", "corrected", "instead"])
+        && contains_any(
+            content,
+            &[
+                "surprise",
+                "surprising",
+                "unexpected",
+                "counterintuitive",
+                "turns out",
+                "didn't expect",
+                "unexpectedly",
+            ],
+        )
 }
 
 fn marker_details(
