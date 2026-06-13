@@ -406,6 +406,41 @@ pub struct AdapterBudget {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AdapterContextPackBudget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    pub rendered_bytes: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterContextPackRecord {
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub scope: String,
+    pub content: String,
+    pub confidence: f64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterContextPack {
+    pub target: String,
+    pub adapter_version: String,
+    pub authority: String,
+    pub profile: String,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    pub card_type: String,
+    pub generated_at: String,
+    pub freshness: String,
+    pub budget: AdapterContextPackBudget,
+    pub source_ids: Vec<String>,
+    pub records: Vec<AdapterContextPackRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AdapterExportResponse {
     pub target: String,
     pub adapter_version: String,
@@ -420,6 +455,8 @@ pub struct AdapterExportResponse {
     pub source_ids: Vec<String>,
     pub content_hash: String,
     pub budget: AdapterBudget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pack: Option<AdapterContextPack>,
     pub markdown: String,
 }
 
