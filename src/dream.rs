@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
@@ -148,6 +149,27 @@ impl EvidenceClass {
             EvidenceClass::Checkpoint => 1.5,
             EvidenceClass::ImportedMemory => 0.5,
             EvidenceClass::ActiveMemory => 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerKind {
+    BattleScar,
+    ComfortPath,
+    Surprise,
+    RecoveryPattern,
+    ConfidenceDelta,
+}
+
+impl MarkerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MarkerKind::BattleScar => "battle_scar",
+            MarkerKind::ComfortPath => "comfort_path",
+            MarkerKind::Surprise => "surprise",
+            MarkerKind::RecoveryPattern => "recovery_pattern",
+            MarkerKind::ConfidenceDelta => "confidence_delta",
         }
     }
 }
@@ -293,6 +315,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             if !candidate.apply_eligible {
                 continue;
             }
+            let marker = marker_from_candidate(candidate);
             let content = match policy::screen_content(&candidate.content, policy::MAX_RECORD_CHARS)
             {
                 PolicyDecision::Accept(clean) => clean,
@@ -356,16 +379,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             let observation = observation_from_candidate(candidate);
             let observation_id = observation.id.clone();
             let observation_refs = observation.evidence_refs.clone();
-            let observation_summary = observation.summary.clone();
-            let observation_kind = observation.kind.clone();
-            let observation_category = observation.category.clone();
-            let observation_subject_key = observation.subject_key.clone();
-            let observation_state = observation.state.clone();
-            let observation_authority = observation.authority.clone();
-            let observation_policy = observation.policy.clone();
+            let observation_metadata = observation_metadata_json(&observation, marker.as_ref());
             let safe_summary = ledger_safe_summary(&candidate.content);
             let source_id = candidate.evidence_ids.first().cloned();
-            let metadata = json!({
+            let mut metadata = json!({
                 "origin": "dreamer",
                 "dream_run_id": run_id.clone(),
                 "run_id": run_id.clone(),
@@ -395,20 +412,11 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 },
                 "observation_id": observation_id,
                 "observation_refs": observation_refs,
-                "observation": {
-                    "id": observation_id,
-                    "key": observation.key,
-                    "kind": observation_kind,
-                    "category": observation_category,
-                    "subject_key": observation_subject_key,
-                    "summary": observation_summary,
-                    "confidence": observation.confidence,
-                    "state": observation_state,
-                    "authority": observation_authority,
-                    "policy": observation_policy,
-                    "apply_eligible": observation.apply_eligible,
-                },
+                "observation": observation_metadata,
             });
+            if let Some(marker) = &marker {
+                metadata["marker"] = json!(marker);
+            }
             let outcome = store.upsert_record(&NewRecord {
                 profile_id: params.profile.as_str().to_string(),
                 workspace_id: params.workspace.to_string(),
@@ -444,6 +452,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                     "promotion_reason": candidate.promotion_reason,
                     "candidate_state": candidate.candidate_state,
                     "evidence_count": candidate.evidence_count,
+                    "marker": marker,
                 }),
             })?;
             if let UpsertOutcome::Created(id) = outcome {
@@ -470,6 +479,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         created.dedup();
     }
     let observations = observations_from_candidates(&candidates);
+    let markers = markers_from_candidates(&candidates);
 
     Ok((
         DreamResponse {
@@ -482,6 +492,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             evidence_window,
             candidates,
             observations,
+            markers,
             stale,
             rejected,
             archived,
@@ -1174,18 +1185,30 @@ fn observations_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObser
     candidates.iter().map(observation_from_candidate).collect()
 }
 
+fn markers_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObservation> {
+    candidates
+        .iter()
+        .filter_map(marker_from_candidate)
+        .collect()
+}
+
 fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
     let id = stable_observation_id(candidate);
     DreamObservation {
         id: id.clone(),
         key: id,
         kind: "dream_observation".to_string(),
+        marker_kind: None,
         category: candidate.candidate_state.clone(),
         subject_key: candidate.subject_key.clone(),
         summary: ledger_safe_summary(&candidate.content),
         content: candidate.content.clone(),
         confidence: candidate.confidence,
         state: candidate.state.clone(),
+        trigger: None,
+        outcome: None,
+        recovery: None,
+        future_guidance: None,
         evidence_refs: candidate.evidence_refs.clone(),
         retires: candidate.supersedes.clone(),
         first_seen_at: candidate.first_seen_at.clone(),
@@ -1194,6 +1217,35 @@ fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
         policy: candidate.policy.clone(),
         apply_eligible: candidate.apply_eligible,
     }
+}
+
+fn marker_from_candidate(candidate: &DreamCandidate) -> Option<DreamObservation> {
+    let marker_kind = marker_kind_for_candidate(candidate)?;
+    let id = stable_marker_id(candidate, marker_kind);
+    let (trigger, outcome, recovery, future_guidance) = marker_details(marker_kind, candidate);
+    Some(DreamObservation {
+        id: id.clone(),
+        key: id,
+        kind: "dream_observation".to_string(),
+        marker_kind: Some(marker_kind.as_str().to_string()),
+        category: candidate.candidate_state.clone(),
+        subject_key: candidate.subject_key.clone(),
+        summary: ledger_safe_summary(&trigger),
+        content: candidate.content.clone(),
+        confidence: candidate.confidence,
+        state: candidate.state.clone(),
+        trigger: Some(trigger),
+        outcome: Some(outcome),
+        recovery: Some(recovery),
+        future_guidance: Some(future_guidance),
+        evidence_refs: candidate.evidence_refs.clone(),
+        retires: candidate.retires.clone(),
+        first_seen_at: candidate.first_seen_at.clone(),
+        last_seen_at: candidate.last_seen_at.clone(),
+        authority: "recall_not_authority".to_string(),
+        policy: candidate.policy.clone(),
+        apply_eligible: candidate.apply_eligible,
+    })
 }
 
 fn stable_observation_id(candidate: &DreamCandidate) -> String {
@@ -1209,6 +1261,194 @@ fn stable_observation_id(candidate: &DreamCandidate) -> String {
         )
         .as_bytes(),
     )
+}
+
+fn stable_marker_id(candidate: &DreamCandidate, kind: MarkerKind) -> String {
+    ids::sha256_hex(
+        format!(
+            "dream_marker:{}:{}:{}:{}:{}:{}:{}",
+            kind.as_str(),
+            candidate.subject_key,
+            candidate.action,
+            candidate.proposed_type,
+            candidate.first_seen_at,
+            candidate.last_seen_at,
+            candidate.evidence_ids.join(","),
+        )
+        .as_bytes(),
+    )
+}
+
+fn marker_kind_for_candidate(candidate: &DreamCandidate) -> Option<MarkerKind> {
+    let content = candidate.content.to_ascii_lowercase();
+    if contains_any(
+        &content,
+        &[
+            "surprise",
+            "surprising",
+            "unexpected",
+            "counterintuitive",
+            "turns out",
+            "didn't expect",
+        ],
+    ) {
+        Some(MarkerKind::Surprise)
+    } else if contains_any(
+        &content,
+        &[
+            "confidence delta",
+            "confidence_delta",
+            "more confident",
+            "less confident",
+            "confidence increased",
+            "confidence dropped",
+            "confidence",
+        ],
+    ) {
+        Some(MarkerKind::ConfidenceDelta)
+    } else if candidate.state == "completed"
+        && contains_any(
+            &content,
+            &[
+                "recovery pattern",
+                "recovery_pattern",
+                "recover",
+                "recovered",
+                "retry",
+                "fallback",
+                "resume",
+                "backoff",
+                "unblock",
+            ],
+        )
+    {
+        Some(MarkerKind::RecoveryPattern)
+    } else if contains_any(
+        &content,
+        &[
+            "battle scar",
+            "battle_scar",
+            "blocked",
+            "stuck",
+            "failed",
+            "failure",
+            "broken",
+            "broke",
+            "incident",
+            "outage",
+        ],
+    ) {
+        Some(MarkerKind::BattleScar)
+    } else if contains_any(
+        &content,
+        &[
+            "comfort path",
+            "comfort_path",
+            "known good",
+            "known-good",
+            "default path",
+            "preferred path",
+            "go-to",
+            "repeatable",
+        ],
+    ) || matches!(
+        candidate.promotion_reason.as_str(),
+        "repeated_user_steering" | "user_adopted_assistant_proposal"
+    ) {
+        Some(MarkerKind::ComfortPath)
+    } else if contains_any(
+        &content,
+        &[
+            "recovery pattern",
+            "recovery_pattern",
+            "recover",
+            "recovered",
+            "retry",
+            "fallback",
+            "resume",
+            "backoff",
+            "unblock",
+        ],
+    ) {
+        Some(MarkerKind::RecoveryPattern)
+    } else {
+        None
+    }
+}
+
+fn marker_details(
+    kind: MarkerKind,
+    candidate: &DreamCandidate,
+) -> (String, String, String, String) {
+    let trigger = ledger_safe_summary(&candidate.content);
+    match kind {
+        MarkerKind::BattleScar => (
+            format!("Battle scar trigger: {trigger}"),
+            "This records the failure path that left a scar.".to_string(),
+            candidate.historical_reason.clone().unwrap_or_else(|| {
+                "Recovered by the fallback path recorded in the ledger.".to_string()
+            }),
+            "Keep the fallback path handy and document the failure mode.".to_string(),
+        ),
+        MarkerKind::ComfortPath => (
+            format!("Comfort path: {trigger}"),
+            "This is the known-good path that keeps working.".to_string(),
+            "No special recovery required.".to_string(),
+            "Use this path by default unless fresher evidence says otherwise.".to_string(),
+        ),
+        MarkerKind::Surprise => (
+            format!("Surprise: {trigger}"),
+            "The unexpected result was useful enough to keep.".to_string(),
+            "Recheck if the surprise repeats under new conditions.".to_string(),
+            "Treat this as a caveat and validate before depending on it.".to_string(),
+        ),
+        MarkerKind::RecoveryPattern => (
+            format!("Recovery pattern: {trigger}"),
+            "The recovery sequence restored progress.".to_string(),
+            candidate
+                .historical_reason
+                .clone()
+                .unwrap_or_else(|| "Retry or fallback got the work unstuck.".to_string()),
+            "Run the recovery sequence first when the same failure returns.".to_string(),
+        ),
+        MarkerKind::ConfidenceDelta => (
+            format!("Confidence delta: {trigger}"),
+            format!("Confidence moved to {:.2}.", candidate.confidence),
+            format!(
+                "The evidence mix now includes {} refs.",
+                candidate.evidence_refs.len()
+            ),
+            "Look for the same evidence mix before changing confidence again.".to_string(),
+        ),
+    }
+}
+
+fn observation_metadata_json(
+    observation: &DreamObservation,
+    marker: Option<&DreamObservation>,
+) -> Value {
+    let mut value = json!({
+        "id": observation.id,
+        "key": observation.key,
+        "kind": observation.kind,
+        "category": observation.category,
+        "subject_key": observation.subject_key,
+        "summary": observation.summary,
+        "content": observation.content,
+        "confidence": observation.confidence,
+        "state": observation.state,
+        "authority": observation.authority,
+        "policy": observation.policy,
+        "apply_eligible": observation.apply_eligible,
+    });
+    if let Some(marker) = marker {
+        value["marker_kind"] = json!(marker.marker_kind);
+        value["trigger"] = json!(marker.trigger);
+        value["outcome"] = json!(marker.outcome);
+        value["recovery"] = json!(marker.recovery);
+        value["future_guidance"] = json!(marker.future_guidance);
+    }
+    value
 }
 
 fn apply_eligible(

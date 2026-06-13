@@ -468,12 +468,22 @@ pub struct DreamObservation {
     pub id: String,
     pub key: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_kind: Option<String>,
     pub category: String,
     pub subject_key: String,
     pub summary: String,
     pub content: String,
     pub confidence: f64,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub future_guidance: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<DreamEvidenceSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -515,6 +525,8 @@ pub struct DreamResponse {
     pub candidates: Vec<DreamCandidate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<DreamObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<DreamObservation>,
     pub stale: Vec<DreamStaleRecord>,
     pub rejected: Vec<DreamRejection>,
     pub archived: Vec<String>,
