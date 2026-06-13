@@ -148,7 +148,8 @@ fn mcp_stdio_conclude_roundtrip_surfaces_in_recall() {
                     "arguments": {
                         "profile": "personal",
                         "workspace": "mcp-smoke",
-                        "query": "bundled sqlite"
+                        "query": "bundled sqlite",
+                        "packMode": "debugging"
                     }
                 }
             }),
@@ -170,6 +171,10 @@ fn mcp_stdio_conclude_roundtrip_surfaces_in_recall() {
             .as_str()
             .expect("fact content")
             .contains("bundled sqlite")));
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["pack"]["mode"],
+        "debugging"
+    );
 }
 
 #[test]

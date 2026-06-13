@@ -13,5 +13,6 @@
   "files": [
     "codex-rs/ext/memories/src/runtime.rs"
   ],
-  "max_tokens": 1200
+  "max_tokens": 1200,
+  "pack_mode": "default"
 }

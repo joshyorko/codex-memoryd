@@ -41,10 +41,13 @@ fn recall_fixture_deserializes_and_runs() {
     assert_eq!(req.profile.as_deref(), Some("personal"));
     assert_eq!(req.workspace.as_deref(), Some("josh-personal"));
     assert_eq!(req.max_tokens, Some(1200));
+    assert_eq!(req.pack_mode.as_deref(), Some("default"));
     // It must drive the service without error (empty store → empty facts).
     let svc = service();
     let resp = svc.recall(req).expect("recall runs");
     assert_eq!(resp.authority, "recall_not_authority");
+    assert_eq!(resp.pack.mode, "default");
+    assert_eq!(resp.pack.max_tokens, 1200);
     assert_eq!(resp.policy.authority, "recall_not_authority");
     assert!(resp
         .policy

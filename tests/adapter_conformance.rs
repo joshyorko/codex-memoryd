@@ -161,6 +161,7 @@ fn recall_is_advisory_budgeted_and_cited() {
             query: Some("portable adapter preferences".to_string()),
             files: vec![],
             max_tokens: Some(10),
+            pack_mode: None,
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,

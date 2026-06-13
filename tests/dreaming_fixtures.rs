@@ -537,6 +537,7 @@ fn recall_text(service: &Service, expectation: &RecallExpectation) -> String {
             query: Some(expectation.query.clone()),
             files: vec![],
             max_tokens: Some(1000),
+            pack_mode: None,
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,

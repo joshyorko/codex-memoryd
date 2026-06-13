@@ -135,6 +135,70 @@ fn cli_conclude_then_search_roundtrip() {
 }
 
 #[test]
+fn cli_recall_accepts_pack_mode_and_rejects_unknown_pack() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Gotcha: sqlite debugging failed until rollback path was checked",
+        ])
+        .assert()
+        .success();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "sqlite",
+            "--pack-mode",
+            "debugging",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let recall: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(recall["pack"]["mode"], "debugging");
+    assert!(recall["policy"]["ranking_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|signal| signal == "pack_mode:debugging"));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "sqlite",
+            "--pack-mode",
+            "everything",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown pack_mode"));
+}
+
+#[test]
 fn cli_subject_episode_roundtrip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

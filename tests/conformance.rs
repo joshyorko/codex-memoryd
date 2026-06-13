@@ -50,6 +50,7 @@ fn recall_req(profile: &str, workspace: &str, query: &str) -> RecallRequest {
         query: Some(query.to_string()),
         files: vec![],
         max_tokens: Some(1000),
+        pack_mode: None,
         include_types: vec![],
         exclude_types: vec![],
         recency_days: None,
@@ -558,6 +559,78 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
     assert!(!recall.facts[0].policy.provenance.evidence_refs.is_empty());
     assert!(!recall.facts[0].policy.ranking_signals.is_empty());
     assert!(recall.facts[1].policy.freshness.stale);
+}
+
+#[test]
+fn recall_debugging_pack_mode_reports_and_prioritizes_gotchas() {
+    let svc = service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    for (content, record_type) in [
+        (
+            "Decision: server planning should stay boring and stable",
+            RecordType::Decision,
+        ),
+        (
+            "Gotcha: server failure required rollback and recovery steps",
+            RecordType::Gotcha,
+        ),
+    ] {
+        let record = NewRecord {
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Workspace,
+            record_type,
+            content: content.to_string(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: 0.8,
+            source_ids: vec!["test-source".to_string()],
+            content_hash: ids::content_hash(
+                "personal",
+                "ws",
+                None,
+                record_type.as_str(),
+                "workspace",
+                content,
+            ),
+            supersedes: vec![],
+            metadata: serde_json::Value::Null,
+        };
+        svc.store.upsert_record(&record).unwrap();
+    }
+
+    let mut req = recall_req("personal", "ws", "server");
+    req.pack_mode = Some("debugging".to_string());
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "debugging");
+    assert_eq!(recall.pack.max_tokens, 1000);
+    assert_eq!(recall.pack.truncated, recall.truncated);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:debugging".to_string()));
+    assert_eq!(recall.facts[0].record_type, "gotcha");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"debugging_gotcha".to_string()));
+}
+
+#[test]
+fn recall_unknown_pack_mode_is_rejected() {
+    let svc = service();
+    let mut req = recall_req("personal", "ws", "server");
+    req.pack_mode = Some("everything".to_string());
+
+    let err = svc.recall(req).expect_err("unknown pack mode must fail");
+    assert_eq!(err.code.as_str(), "invalid_request");
+    assert!(err.message.contains("unknown pack_mode"));
 }
 
 #[test]
