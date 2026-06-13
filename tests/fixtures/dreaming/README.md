@@ -22,11 +22,13 @@ recall for the scenario query while forbidden or stale content remains absent.
 { "kind": "conclusion", "content": "…", "created_at": "…" }
 { "kind": "checkpoint", "summary": "…", "created_at": "…" }
 { "kind": "memory_record", "type": "decision", "content": "…", "created_at": "…" }
+{ "kind": "dream_clock", "now": "…", "created_at": "…" }
 ```
 
 `kind` is one of `visible_turn`, `conclusion`, `checkpoint`, `memory_record`.
 Additional optional fields: `actor` (turns), `type` (records), `repo_id`,
-`id` (so supersession fixtures can reference an existing record).
+`id` (so supersession fixtures can reference an existing record), and `now`
+for the deterministic-clock fixture.
 
 ## Sidecar shape
 

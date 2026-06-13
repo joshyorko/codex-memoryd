@@ -730,7 +730,7 @@ impl Service {
             },
         );
         match result {
-            Ok(resp) => {
+            Ok((resp, _)) => {
                 let completed_at = ids::now_rfc3339();
                 self.store.insert_dream_run(&DreamRunAudit {
                     id: resp.run_id.clone(),
@@ -876,10 +876,15 @@ impl Service {
             limits_hit.push("max_runtime_seconds".to_string());
         }
         match result {
-            Ok(run) if limits_hit.is_empty() => {
-                if run.candidates.len() >= cfg.max_candidates {
+            Ok((run, max_candidates_hit)) => {
+                if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
+                let status = if limits_hit.is_empty() {
+                    "ok"
+                } else {
+                    "ok_with_limits"
+                };
                 let watermark_after = Some(now.clone());
                 self.store.record_dream_run(&DreamRunRecord {
                     run_id: run.run_id.clone(),
@@ -888,7 +893,7 @@ impl Service {
                     repo_id: run.repo_id.clone(),
                     mode: run.mode.clone(),
                     kind: SCHEDULED_DREAM_KIND.to_string(),
-                    status: "ok".to_string(),
+                    status: status.to_string(),
                     started_at: now.clone(),
                     completed_at: Some(now),
                     watermark_before: watermark_before.clone(),
@@ -900,39 +905,11 @@ impl Service {
                     ..Default::default()
                 })?;
                 Ok(ScheduledDreamResponse {
-                    status: "ok".to_string(),
-                    reason: None,
+                    status: status.to_string(),
+                    reason: (!limits_hit.is_empty()).then(|| limits_hit.join(",")),
                     run: Some(run),
                     watermark_before,
                     watermark_after,
-                    limits_hit,
-                })
-            }
-            Ok(run) => {
-                self.store.record_dream_run(&DreamRunRecord {
-                    run_id: run.run_id.clone(),
-                    profile_id: run.profile.clone(),
-                    workspace_id: run.workspace.clone(),
-                    repo_id: run.repo_id.clone(),
-                    mode: run.mode.clone(),
-                    kind: SCHEDULED_DREAM_KIND.to_string(),
-                    status: "error".to_string(),
-                    started_at: now.clone(),
-                    completed_at: Some(now),
-                    watermark_before: watermark_before.clone(),
-                    watermark_after: None,
-                    error: Some("max runtime exceeded".to_string()),
-                    candidates: run.candidates.len(),
-                    created: run.created.len(),
-                    archived: run.archived.len(),
-                    limits_hit: limits_hit.clone(),
-                })?;
-                Ok(ScheduledDreamResponse {
-                    status: "error".to_string(),
-                    reason: Some("max_runtime_seconds".to_string()),
-                    run: Some(run),
-                    watermark_before,
-                    watermark_after: None,
                     limits_hit,
                 })
             }

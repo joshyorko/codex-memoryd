@@ -170,7 +170,7 @@ pub struct DreamParams<'a> {
     pub max_candidates: Option<usize>,
 }
 
-pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
+pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     let records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
@@ -269,11 +269,20 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     }
 
     dedupe_candidates(&mut candidates);
+    let mut max_candidates_hit = false;
     if let Some(max) = params.max_candidates {
-        candidates.truncate(max);
+        if let Some(limit_for_processing) = max.checked_add(1) {
+            candidates.truncate(limit_for_processing);
+            max_candidates_hit = candidates.len() > max;
+            if max_candidates_hit {
+                candidates.truncate(max);
+            }
+        } else {
+            candidates.truncate(max);
+        }
     }
 
-    let run_id = stable_run_id(params, &records);
+    let run_id = stable_run_id(params, &evidence_window, &records);
     let mut archived = Vec::new();
     let mut created = Vec::new();
     if params.mode == "apply" {
@@ -377,21 +386,24 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         created.dedup();
     }
 
-    Ok(DreamResponse {
-        run_id,
-        mode: params.mode.to_string(),
-        profile: params.profile.as_str().to_string(),
-        workspace: params.workspace.to_string(),
-        repo_id: params.repo_id.map(|s| s.to_string()),
-        now: params.now.to_string(),
-        evidence_window,
-        candidates,
-        stale,
-        rejected,
-        archived,
-        created,
-        authority: "recall_not_authority".to_string(),
-    })
+    Ok((
+        DreamResponse {
+            run_id,
+            mode: params.mode.to_string(),
+            profile: params.profile.as_str().to_string(),
+            workspace: params.workspace.to_string(),
+            repo_id: params.repo_id.map(|s| s.to_string()),
+            now: params.now.to_string(),
+            evidence_window,
+            candidates,
+            stale,
+            rejected,
+            archived,
+            created,
+            authority: "recall_not_authority".to_string(),
+        },
+        max_candidates_hit,
+    ))
 }
 
 fn build_evidence_window(
@@ -547,29 +559,84 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
     }
 }
 
-fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
-    let mut seed = format!(
-        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id.unwrap_or(""),
-        params.mode,
-        params.now
+fn stable_run_id(
+    params: &DreamParams,
+    evidence_window: &DreamEvidenceWindow,
+    records: &[MemoryRecord],
+) -> String {
+    let mut seed = String::new();
+    push_seed_part(&mut seed, params.profile.as_str());
+    push_seed_part(&mut seed, params.workspace);
+    push_seed_part(&mut seed, params.repo_id.unwrap_or(""));
+    push_seed_part(&mut seed, params.mode);
+    push_seed_part(&mut seed, evidence_window.start.as_deref().unwrap_or(""));
+    push_seed_part(&mut seed, &evidence_window.end);
+    push_evidence_stream_seed(
+        &mut seed,
+        "visible_turns",
+        &evidence_window.visible_turns,
+        false,
     );
-    if let Some(source_window_start) = params.recency_cutoff {
-        seed.push('\x1f');
-        seed.push_str(source_window_start);
-    }
-    for record in records {
-        seed.push('\x1f');
-        seed.push_str(&record.id);
-        seed.push('\x1f');
-        seed.push_str(&record.updated_at);
-        seed.push('\x1f');
-        seed.push_str(&record.content);
+    push_evidence_stream_seed(
+        &mut seed,
+        "conclusions",
+        &evidence_window.conclusions,
+        false,
+    );
+    push_evidence_stream_seed(
+        &mut seed,
+        "checkpoints",
+        &evidence_window.checkpoints,
+        false,
+    );
+    push_evidence_stream_seed(
+        &mut seed,
+        "imported_memories",
+        &evidence_window.imported_memories,
+        true,
+    );
+    let mut ordered_records = records.iter().collect::<Vec<_>>();
+    ordered_records.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then(a.id.cmp(&b.id))
+            .then(a.content_hash.cmp(&b.content_hash))
+    });
+    for record in ordered_records {
+        push_seed_part(&mut seed, &record.id);
+        push_seed_part(&mut seed, &record.updated_at);
+        push_seed_part(&mut seed, &record.content_hash);
     }
     let hash = ids::sha256_hex(seed.as_bytes());
     format!("dream_{}", &hash["sha256:".len()..39])
+}
+
+fn push_seed_part(seed: &mut String, value: &str) {
+    seed.push('\x1f');
+    seed.push_str(value);
+}
+
+fn push_evidence_stream_seed(
+    seed: &mut String,
+    label: &str,
+    stream: &DreamEvidenceStream,
+    include_updated_at: bool,
+) {
+    push_seed_part(seed, label);
+    push_seed_part(seed, &stream.count.to_string());
+    let mut sources = stream.sources.iter().collect::<Vec<_>>();
+    sources.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then(a.created_at.cmp(&b.created_at))
+            .then(a.updated_at.cmp(&b.updated_at))
+    });
+    for source in sources {
+        push_seed_part(seed, &source.id);
+        push_seed_part(seed, &source.created_at);
+        if include_updated_at {
+            push_seed_part(seed, source.updated_at.as_deref().unwrap_or(""));
+        }
+    }
 }
 
 pub fn config_hash() -> String {
@@ -667,12 +734,18 @@ fn push_threshold_candidates(
 }
 
 fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryRecord>> {
-    let mut groups: BTreeMap<String, Vec<&'a MemoryRecord>> = BTreeMap::new();
+    let mut groups: Vec<Vec<&'a MemoryRecord>> = Vec::new();
     for record in records {
-        let subject_key = subject_key_for_record(record);
-        groups.entry(subject_key).or_default().push(*record);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| same_subject(group[0], record))
+        {
+            group.push(*record);
+        } else {
+            groups.push(vec![*record]);
+        }
     }
-    groups.into_values().collect()
+    groups
 }
 
 fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
@@ -1065,10 +1138,11 @@ fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> 
     let old_lower = older.content.to_ascii_lowercase();
     let new_lower = newer.content.to_ascii_lowercase();
     let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
-        || contains_any(
-            &old_lower,
-            &["tbd", "evaluating", "not decided", "will ", "planned"],
-        );
+        || (old_state != "completed"
+            && contains_any(
+                &old_lower,
+                &["tbd", "evaluating", "not decided", "will ", "planned"],
+            ));
     let new_settled = newer_state == "completed"
         || contains_any(
             &new_lower,
@@ -1165,13 +1239,28 @@ fn same_subject(a: &MemoryRecord, b: &MemoryRecord) -> bool {
     let a_terms = a_terms.into_iter().collect::<BTreeSet<_>>();
     let b_terms = b_terms.into_iter().collect::<BTreeSet<_>>();
     let shared = a_terms.intersection(&b_terms).collect::<Vec<_>>();
-    if shared.len() >= 2 {
+    let meaningful_shared = shared
+        .iter()
+        .filter(|term| !GENERIC_SHARED_TERMS.contains(&term.as_str()))
+        .count();
+    if meaningful_shared >= 2 {
         return true;
     }
-    if shared.len() == 1 && shared[0].as_str() == "storage" {
+    if shared.len() == 1 && shared[0].as_str() == "cargo" && command_phrase_bridge(a, b) {
+        return true;
+    }
+    if shared.iter().any(|term| term.as_str() == "storage") {
         return storage_bridge(&a_terms, &b_terms);
     }
     false
+}
+
+fn command_phrase_bridge(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    let a = normalize(&a.content);
+    let b = normalize(&b.content);
+    COMMAND_PHRASE_HINTS
+        .iter()
+        .any(|phrase| a.contains(phrase) && b.contains(phrase))
 }
 
 fn storage_bridge(a_terms: &BTreeSet<String>, b_terms: &BTreeSet<String>) -> bool {
@@ -1187,9 +1276,13 @@ fn contains_any_term(terms: &BTreeSet<String>, needles: &[&str]) -> bool {
 }
 
 const STORAGE_TECH_HINTS: &[&str] = &[
-    "api", "cargo", "command", "commands", "key", "oauth", "repo", "rusqlite", "script", "sqlite",
-    "sync", "test", "tests", "tool", "tools", "fts5", "sqlite3", "bundle", "bundled",
+    "api", "cargo", "command", "commands", "key", "repo", "rusqlite", "script", "sqlite", "test",
+    "tests", "tool", "tools", "fts5", "sqlite3", "bundle", "bundled",
 ];
+
+const GENERIC_SHARED_TERMS: &[&str] = &["storage", "sync"];
+
+const COMMAND_PHRASE_HINTS: &[&str] = &["cargo test"];
 
 fn tokens(content: &str) -> Vec<String> {
     normalize(content)

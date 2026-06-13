@@ -2,22 +2,28 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "gotcha:bundled-sqlite-fts5",
+        "subject_key": "always-bit-build",
+        "action": "promote",
         "record_type": "gotcha",
-        "promotion_reason": "repeated_repo_failure_pattern",
+        "promotion_reason": "checkpoint_backed_task_state",
         "evidence_count": 3,
-        "must_contain": ["FTS5", "bundled SQLite"],
+        "must_contain": [
+          "Same FTS5 build gotcha bit us again",
+          "bundled feature"
+        ],
         "must_not_contain": []
       }
     ],
-    "rejected": [],
     "quarantined": [],
-    "stale": []
+    "rejected": [],
+    "stale": [],
+    "rejected_items": []
   },
-  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true },
+  "expect_apply": { "created": 0, "archived": 0, "idempotent_second_apply": true },
   "expect_recall_before": {
     "query": "Why do cargo tests fail around FTS5?",
-    "must_not_contain": ["non-bundled SQLite", "bundled SQLite feature"]
+    "must_contain": ["non-bundled SQLite", "bundled SQLite feature"],
+    "must_not_contain": []
   },
   "expect_recall_after": {
     "query": "Why do cargo tests fail around FTS5?",

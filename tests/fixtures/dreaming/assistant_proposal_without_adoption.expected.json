@@ -4,14 +4,16 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "command:custom-helper-scripts",
-        "record_type": "command",
+        "subject_key": "custom-for-helper",
+        "action": "promote",
+        "record_type": "decision",
         "promotion_reason": "assistant_only_proposal_quarantined",
         "evidence_count": 1,
         "must_contain": ["custom helper scripts"],
         "must_not_contain": []
       }
     ],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   }
 }

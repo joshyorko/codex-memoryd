@@ -1295,7 +1295,7 @@ impl Store {
             conn.query_row(
                 "SELECT watermark_after
                  FROM dream_runs
-                 WHERE kind = 'scheduled' AND status = 'ok'
+                 WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id = ?3
                  ORDER BY completed_at DESC, run_id DESC
@@ -1308,7 +1308,7 @@ impl Store {
             conn.query_row(
                 "SELECT watermark_after
                  FROM dream_runs
-                 WHERE kind = 'scheduled' AND status = 'ok'
+                 WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id IS NULL
                  ORDER BY completed_at DESC, run_id DESC

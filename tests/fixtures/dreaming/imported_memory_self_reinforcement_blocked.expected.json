@@ -4,14 +4,16 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "decision:custom-script-self-reinforcement",
+        "subject_key": "active-custom-imported",
+        "action": "promote",
         "record_type": "decision",
         "promotion_reason": "imported_or_active_memory_without_fresh_primary_evidence",
         "evidence_count": 2,
-        "must_contain": ["custom script"],
+        "must_contain": ["Decision: active memory repeats the imported custom script summary"],
         "must_not_contain": []
       }
     ],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   }
 }
