@@ -20,6 +20,7 @@ use crate::PROVIDER_VERSION;
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const TOOL_TEXT_TYPE: &str = "text";
+const READ_ONLY_TOOL_NAMES: &[&str] = &["memory_status", "memory_recall", "memory_search"];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,7 +170,7 @@ struct ToolDefinition {
     input_schema: Value,
 }
 
-pub fn run_stdio(service: Service) -> Result<()> {
+pub fn run_stdio(service: Service, read_only: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -189,7 +190,7 @@ pub fn run_stdio(service: Service) -> Result<()> {
             continue;
         }
 
-        let response = handle_message(&service, &mut state, trimmed);
+        let response = handle_message(&service, &mut state, trimmed, read_only);
         if let Some(response) = response {
             let text = serde_json::to_string(&response)?;
             writeln!(writer, "{text}")?;
@@ -200,7 +201,12 @@ pub fn run_stdio(service: Service) -> Result<()> {
     Ok(())
 }
 
-fn handle_message(service: &Service, state: &mut ServerState, raw: &str) -> Option<RpcResponse> {
+fn handle_message(
+    service: &Service,
+    state: &mut ServerState,
+    raw: &str,
+    read_only: bool,
+) -> Option<RpcResponse> {
     let parsed = match serde_json::from_str::<RpcRequest>(raw) {
         Ok(request) => request,
         Err(_) => return Some(parse_error(Value::Null, "invalid JSON request")),
@@ -236,7 +242,7 @@ fn handle_message(service: &Service, state: &mut ServerState, raw: &str) -> Opti
         "initialized" => None,
         "tools/list" => Some(match ensure_initialized(state, id.clone()) {
             Some(error) => error,
-            None => ok(id, json!({ "tools": tool_definitions() })),
+            None => ok(id, json!({ "tools": tool_definitions(read_only) })),
         }),
         "tools/call" => Some(match ensure_initialized(state, id.clone()) {
             Some(error) => error,
@@ -244,7 +250,7 @@ fn handle_message(service: &Service, state: &mut ServerState, raw: &str) -> Opti
                 .params
                 .and_then(|params| serde_json::from_value::<ToolCallParams>(params).ok())
             {
-                Some(params) => handle_tool_call(service, id, params),
+                Some(params) => handle_tool_call(service, id, params, read_only),
                 None => invalid_params(id, "invalid tools/call params"),
             },
         }),
@@ -265,7 +271,16 @@ fn ensure_initialized(state: &ServerState, id: Value) -> Option<RpcResponse> {
     }
 }
 
-fn handle_tool_call(service: &Service, id: Value, params: ToolCallParams) -> RpcResponse {
+fn handle_tool_call(
+    service: &Service,
+    id: Value,
+    params: ToolCallParams,
+    read_only: bool,
+) -> RpcResponse {
+    if read_only && !READ_ONLY_TOOL_NAMES.contains(&params.name.as_str()) {
+        return read_only_tool_disabled(id, params.name);
+    }
+
     match params.name.as_str() {
         "memory_status" => {
             let args = parse_tool_args::<StatusArgs>(params.arguments).unwrap_or(StatusArgs {});
@@ -394,8 +409,8 @@ fn parse_tool_args<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(value).map_err(|err| err.to_string())
 }
 
-fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
+    let mut tools = vec![
         ToolDefinition {
             name: "memory_status",
             description: "Probe provider health and status.",
@@ -440,47 +455,54 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false,
             }),
         },
-        ToolDefinition {
-            name: "memory_conclude",
-            description: "Write a durable conclusion using the existing write policy.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "profile": { "type": "string" },
-                    "workspace": { "type": "string" },
-                    "repoId": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["content"],
-                "additionalProperties": false,
-            }),
-        },
-        ToolDefinition {
-            name: "memory_checkpoint",
-            description: "Write checkpoint-backed task state using the existing write policy.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "profile": { "type": "string" },
-                    "workspace": { "type": "string" },
-                    "repoId": { "type": "string" },
-                    "summary": { "type": "string" },
-                    "changedFiles": { "type": "array", "items": { "type": "string" } },
-                    "decisions": { "type": "array", "items": { "type": "string" } },
-                    "blockers": { "type": "array", "items": { "type": "string" } },
-                    "nextSteps": { "type": "array", "items": { "type": "string" } },
-                    "testsRun": { "type": "array", "items": { "type": "string" } },
-                    "testsNotRun": { "type": "array", "items": { "type": "string" } },
-                    "branch": { "type": "string" },
-                    "commit": { "type": "string" },
-                    "sessionId": { "type": "string" },
-                    "threadId": { "type": "string" }
-                },
-                "required": ["summary"],
-                "additionalProperties": false,
-            }),
-        },
-    ]
+    ];
+
+    if !read_only {
+        tools.extend([
+            ToolDefinition {
+                name: "memory_conclude",
+                description: "Write a durable conclusion using the existing write policy.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "profile": { "type": "string" },
+                        "workspace": { "type": "string" },
+                        "repoId": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["content"],
+                    "additionalProperties": false,
+                }),
+            },
+            ToolDefinition {
+                name: "memory_checkpoint",
+                description: "Write checkpoint-backed task state using the existing write policy.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "profile": { "type": "string" },
+                        "workspace": { "type": "string" },
+                        "repoId": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "changedFiles": { "type": "array", "items": { "type": "string" } },
+                        "decisions": { "type": "array", "items": { "type": "string" } },
+                        "blockers": { "type": "array", "items": { "type": "string" } },
+                        "nextSteps": { "type": "array", "items": { "type": "string" } },
+                        "testsRun": { "type": "array", "items": { "type": "string" } },
+                        "testsNotRun": { "type": "array", "items": { "type": "string" } },
+                        "branch": { "type": "string" },
+                        "commit": { "type": "string" },
+                        "sessionId": { "type": "string" },
+                        "threadId": { "type": "string" }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false,
+                }),
+            },
+        ]);
+    }
+
+    tools
 }
 
 fn ok(id: Value, result: Value) -> RpcResponse {
@@ -542,6 +564,19 @@ fn method_not_found(id: Value, method: impl Into<String>) -> RpcResponse {
         error: Some(RpcError {
             code: -32601,
             message: format!("unknown method '{}'", method.into()),
+            data: None,
+        }),
+    }
+}
+
+fn read_only_tool_disabled(id: Value, tool: impl Into<String>) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        id,
+        result: None,
+        error: Some(RpcError {
+            code: -32601,
+            message: format!("tool '{}' is disabled in read-only mode", tool.into()),
             data: None,
         }),
     }

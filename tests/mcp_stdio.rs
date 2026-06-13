@@ -13,7 +13,7 @@ fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("memory.db")
 }
 
-fn run_mcp(db: &PathBuf, requests: &[Value]) -> Vec<Value> {
+fn run_mcp(db: &PathBuf, extra_args: &[&str], requests: &[Value]) -> Vec<Value> {
     let stdin = requests
         .iter()
         .map(Value::to_string)
@@ -24,6 +24,7 @@ fn run_mcp(db: &PathBuf, requests: &[Value]) -> Vec<Value> {
         .arg("--db")
         .arg(db)
         .args(["mcp", "stdio"])
+        .args(extra_args)
         .write_stdin(stdin)
         .assert()
         .success()
@@ -45,6 +46,7 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
 
     let responses = run_mcp(
         &db,
+        &[],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -112,6 +114,7 @@ fn mcp_stdio_conclude_roundtrip_surfaces_in_recall() {
 
     let responses = run_mcp(
         &db,
+        &[],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -176,6 +179,7 @@ fn mcp_stdio_rejects_unknown_tool_args_field() {
 
     let responses = run_mcp(
         &db,
+        &[],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -215,6 +219,7 @@ fn mcp_stdio_accepts_tool_call_meta() {
 
     let responses = run_mcp(
         &db,
+        &[],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -244,4 +249,78 @@ fn mcp_stdio_accepts_tool_call_meta() {
         responses[1]["result"]["structuredContent"]["provider_name"],
         "codex-memoryd"
     );
+}
+
+#[test]
+fn mcp_stdio_read_only_lists_read_tools_and_rejects_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let responses = run_mcp(
+        &db,
+        &["--read-only"],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_status",
+                    "arguments": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_conclude",
+                    "arguments": {
+                        "profile": "personal",
+                        "workspace": "mcp-smoke",
+                        "content": "should be blocked"
+                    }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 4);
+
+    let tool_names: Vec<_> = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        tool_names,
+        vec!["memory_status", "memory_recall", "memory_search"]
+    );
+
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["provider_name"],
+        "codex-memoryd"
+    );
+    assert_eq!(responses[3]["error"]["code"], -32601);
+    assert!(responses[3]["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("read-only mode"));
 }
