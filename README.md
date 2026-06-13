@@ -95,6 +95,19 @@ curl -fsS http://127.0.0.1:8787/v1/status | jq
 docker compose down
 ```
 
+#### Compose runtime heartbeat
+
+Repo-local reproducible heartbeat:
+
+```bash
+scripts/dogfood-compose-heartbeat.sh
+```
+
+This rebuilds and restarts Compose, verifies container health and localhost-only
+publish on `127.0.0.1:8787`, runs import preview/apply/idempotent second apply
+against `/host-codex-memories`, refreshes `.dogfood/mcp-sandbox-memory.db`, and
+does a raw `--read-only` MCP stdio tool canary.
+
 ### MCP Dogfood
 
 The Codex-facing MCP runbook is intentionally read-only. It uses the sandbox DB

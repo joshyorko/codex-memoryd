@@ -43,6 +43,19 @@ Stop it with:
 kill "$(cat .dogfood/codex-memoryd.pid)"
 ```
 
+## Compose Runtime Heartbeat
+
+For repeatable Compose verification, run:
+
+```bash
+scripts/dogfood-compose-heartbeat.sh
+```
+
+This heartbeat rebuilds and relaunches Compose from current checkout, checks
+health/status/doctor, runs `sync-local` preview/apply/apply, refreshes
+`.dogfood/mcp-sandbox-memory.db` from `.dogfood/memory.db`, verifies localhost-only
+publish on `127.0.0.1:8787`, and runs a raw MCP stdio canary in `--read-only` mode.
+
 ## Manual Dogfood Flow
 
 Set the database path for all CLI commands:
