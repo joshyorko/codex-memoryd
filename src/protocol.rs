@@ -430,6 +430,7 @@ pub struct AdapterContextPackRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct AdapterContextPack {
     pub target: String,
+    pub template: String,
     pub adapter_version: String,
     pub authority: String,
     pub profile: String,

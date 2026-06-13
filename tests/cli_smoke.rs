@@ -1959,6 +1959,7 @@ fn cli_adapter_mcp_pack_export_is_deterministic() {
 
     let context_pack = &first["context_pack"];
     assert_eq!(context_pack["target"], "mcp-pack");
+    assert_eq!(context_pack["template"], "mcp-json-v1");
     assert_eq!(context_pack["adapter_version"], "adapter-view-v1");
     assert_eq!(context_pack["authority"], "recall_not_authority");
     assert_eq!(context_pack["profile"], "personal");
@@ -1975,6 +1976,7 @@ fn cli_adapter_mcp_pack_export_is_deterministic() {
     assert!(markdown.contains("# MCP JSON Context Pack"));
     assert!(markdown.contains("```json"));
     assert!(markdown.contains("\"target\": \"mcp-pack\""));
+    assert!(markdown.contains("\"template\": \"mcp-json-v1\""));
     assert!(markdown.contains("\"authority\": \"recall_not_authority\""));
 
     let legacy = bin()
@@ -2025,6 +2027,7 @@ fn cli_adapter_mcp_pack_export_is_deterministic() {
     assert!(budgeted["budget"]["rendered_bytes"].as_u64().unwrap() <= 160);
     assert_eq!(budgeted["context_pack"]["budget"]["max_bytes"], 160);
     assert_eq!(budgeted["context_pack"]["budget"]["truncated"], true);
+    assert_eq!(budgeted["context_pack"]["template"], "mcp-json-v1");
     assert_eq!(
         budgeted["context_pack"]["budget"]["rendered_bytes"],
         budgeted["budget"]["rendered_bytes"]

@@ -61,6 +61,7 @@ const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
+const MCP_CONTEXT_PACK_TEMPLATE: &str = "mcp-json-v1";
 const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
     "claude-code",
@@ -2365,6 +2366,7 @@ fn build_adapter_context_pack(
 ) -> AdapterContextPack {
     AdapterContextPack {
         target: target.as_str().to_string(),
+        template: MCP_CONTEXT_PACK_TEMPLATE.to_string(),
         adapter_version: ADAPTER_VIEW_VERSION.to_string(),
         authority: "recall_not_authority".to_string(),
         profile: card.profile.clone(),
