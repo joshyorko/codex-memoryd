@@ -361,6 +361,48 @@ pub struct CardShowResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Adapter generated views
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdapterExportRequest {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    pub target: String,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterBudget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    pub rendered_bytes: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterExportResponse {
+    pub target: String,
+    pub adapter_version: String,
+    pub profile: String,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    pub generated_at: String,
+    pub authority: String,
+    pub source_card_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    pub content_hash: String,
+    pub budget: AdapterBudget,
+    pub markdown: String,
+}
+
+// ---------------------------------------------------------------------------
 // Turns (SPEC §6.4)
 // ---------------------------------------------------------------------------
 
