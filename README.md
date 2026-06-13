@@ -8,12 +8,13 @@ instructions, repository state, or policy.
 
 Current landed shape:
 
-- loopback native daemon for local dogfood
+- loopback native daemon on `127.0.0.1:8787`
 - Docker Compose dogfood with `.dogfood/memory.db` as the real daemon DB
 - MCP dogfood with a separate sandbox DB at `.dogfood/mcp-sandbox-memory.db`
 - read-only Codex MCP tools: `memory_status`, `memory_recall`, `memory_search`
-- local Codex memory import
-- evidence ledger for write provenance
+- local Codex memory import via `sync-local`
+- git trailer import via `git-import`
+- cards, packs, adapters, recall policy, and evidence ledger
 - subject / episode substrate for stable anchors
 - Dreamer preview/apply for evidence-backed consolidation
 
@@ -31,9 +32,9 @@ Docs worth skimming first:
 
 - durable records, sources, checkpoints, conclusions, turns
 - stable subjects and episodes
-- recall
-- local Codex memory import
-- safety classification
+- generated cards, packed recall, and adapter exports
+- local Codex memory import and git trailer import
+- recall policy and safety classification
 - export
 - evidence ledger entries
 - Dreamer preview/apply
@@ -49,9 +50,11 @@ Docs worth skimming first:
 
 ## Safety Invariants
 
-- recall is contextual, not authoritative
+- recall is `recall_not_authority`
+- local-first and loopback-only are the default dogfood posture
 - preview happens before apply
-- secrets and prompt-injection attempts are rejected before durable write
+- no auto-apply, no automatic prompt injection
+- secrets, tokens, and `.env` dumps are rejected before durable write
 - profile and workspace boundaries are enforced
 - provider failures fail open instead of blocking Codex turns
 - the read-only Codex MCP path exposes no write tools
@@ -130,6 +133,14 @@ snippet and smoke checks.
 1. Point Codex at the provider backend.
 1. Import local memory with `sync-local --preview` before `--apply`.
 1. Use `recall` as context, not authority.
+
+## Memory Shapes
+
+- `Card`: a compact summary surface for a subject or workspace.
+- `Pack`: the recall envelope, including ranking, policy, citations, and truncation.
+- `Adapter`: a downstream export view such as `agents-md`.
+- `Recall policy`: ranking and admission metadata that keeps recall contextual and safe.
+- `Evidence ledger`: the append-only provenance trail for writes, imports, and synthesis.
 
 ### First-run path (source build)
 
