@@ -4,7 +4,7 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "custom",
+        "subject_key": "custom-for-helper",
         "action": "promote",
         "record_type": "decision",
         "promotion_reason": "assistant_only_proposal_quarantined",

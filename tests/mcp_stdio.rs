@@ -207,3 +207,41 @@ fn mcp_stdio_rejects_unknown_tool_args_field() {
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[1]["error"]["code"], -32602);
 }
+
+#[test]
+fn mcp_stdio_accepts_tool_call_meta() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let responses = run_mcp(
+        &db,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_status",
+                    "arguments": {},
+                    "_meta": { "progressToken": "codex-current" }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["provider_name"],
+        "codex-memoryd"
+    );
+}
