@@ -334,7 +334,7 @@ fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
         })
         .expect("superseding observation");
     assert_eq!(observation.key, observation.id);
-    assert_eq!(observation.subject_key, "storage");
+    assert_eq!(observation.subject_key, "backend-bundled-rusqlite");
     assert_eq!(observation.authority, "recall_not_authority");
     assert!(observation.apply_eligible);
     assert!(observation.content.contains("rusqlite"));
