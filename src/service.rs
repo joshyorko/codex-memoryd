@@ -61,12 +61,13 @@ const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
-const ADAPTER_TARGETS: &[&str] = &["agents-md", "claude-code"];
+const ADAPTER_TARGETS: &[&str] = &["agents-md", "claude-code", "copilot"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
     AgentsMd,
     ClaudeCode,
+    Copilot,
 }
 
 impl AdapterTarget {
@@ -75,6 +76,7 @@ impl AdapterTarget {
         match target.as_str() {
             "agents-md" => Ok(Self::AgentsMd),
             "claude-code" => Ok(Self::ClaudeCode),
+            "copilot" => Ok(Self::Copilot),
             _ => Err(Error::invalid_request(format!(
                 "unknown adapter target '{target}'; use {}",
                 ADAPTER_TARGETS.join(" or ")
@@ -86,6 +88,7 @@ impl AdapterTarget {
         match self {
             Self::AgentsMd => "agents-md",
             Self::ClaudeCode => "claude-code",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -2196,6 +2199,9 @@ fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> String
         }
         AdapterTarget::ClaudeCode => {
             render_memory_markdown_view("CLAUDE.md Memory View", "claude-code", card)
+        }
+        AdapterTarget::Copilot => {
+            render_memory_markdown_view("Copilot Instructions Memory View", "copilot", card)
         }
     }
 }
