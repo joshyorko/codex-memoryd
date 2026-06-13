@@ -66,6 +66,8 @@ pub enum Command {
         query: String,
         #[arg(long)]
         max_tokens: Option<usize>,
+        #[arg(long)]
+        pack_mode: Option<String>,
     },
     /// Search stored memory.
     Search {
@@ -549,6 +551,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             repo,
             query,
             max_tokens,
+            pack_mode,
         } => {
             let service = cli.open_service(None)?;
             let req = RecallRequest {
@@ -562,6 +565,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 query: Some(query.clone()),
                 files: vec![],
                 max_tokens: *max_tokens,
+                pack_mode: pack_mode.clone(),
                 include_types: vec![],
                 exclude_types: vec![],
                 recency_days: None,

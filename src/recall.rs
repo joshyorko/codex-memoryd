@@ -20,6 +20,7 @@ use crate::protocol::RecallCheckpoint;
 use crate::protocol::RecallFact;
 use crate::protocol::RecallFactPolicy;
 use crate::protocol::RecallFreshness;
+use crate::protocol::RecallPack;
 use crate::protocol::RecallPolicy;
 use crate::protocol::RecallProvenance;
 use crate::protocol::RecallResponse;
@@ -44,6 +45,7 @@ pub struct RecallParams<'a> {
     pub query: &'a str,
     pub files: &'a [String],
     pub max_tokens: usize,
+    pub pack_mode: &'a str,
     pub include_types: &'a [RecordType],
     pub exclude_types: &'a [RecordType],
     pub recency_days: Option<i64>,
@@ -102,8 +104,20 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         .into_iter()
         .filter(|r| type_allowed(r.record_type, params.include_types, params.exclude_types))
         .map(|record| {
-            let score = score_record(&record, repo_id, params.files, params.query);
-            let ranking_signals = ranking_signals(&record, repo_id, params.files, params.query);
+            let score = score_record(
+                &record,
+                repo_id,
+                params.files,
+                params.query,
+                params.pack_mode,
+            );
+            let ranking_signals = ranking_signals(
+                &record,
+                repo_id,
+                params.files,
+                params.query,
+                params.pack_mode,
+            );
             Scored {
                 record,
                 score,
@@ -199,6 +213,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     if !params.query.trim().is_empty() {
         top_level_ranking_signals.push("query_match".to_string());
     }
+    top_level_ranking_signals.push(format!("pack_mode:{}", params.pack_mode));
     if scored.len() > facts.len() {
         truncated = true;
     }
@@ -236,6 +251,11 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             admission_gates,
             ranking_signals: top_level_ranking_signals,
         },
+        pack: RecallPack {
+            mode: params.pack_mode.to_string(),
+            max_tokens: params.max_tokens,
+            truncated,
+        },
     })
 }
 
@@ -255,6 +275,7 @@ fn score_record(
     repo_id: Option<&str>,
     files: &[String],
     query: &str,
+    pack_mode: &str,
 ) -> f64 {
     let mut score = 0.0;
 
@@ -297,6 +318,8 @@ fn score_record(
         score += 0.5;
     }
 
+    score += pack_mode_boost(record, pack_mode);
+
     score
 }
 
@@ -305,6 +328,7 @@ fn ranking_signals(
     repo_id: Option<&str>,
     files: &[String],
     query: &str,
+    pack_mode: &str,
 ) -> Vec<String> {
     let mut signals = Vec::new();
 
@@ -346,6 +370,55 @@ fn ranking_signals(
         signals.push("recent_implicit".to_string());
     }
 
+    signals.extend(pack_mode_signals(record, pack_mode));
+
+    signals
+}
+
+fn pack_mode_boost(record: &MemoryRecord, pack_mode: &str) -> f64 {
+    if pack_mode != "debugging" {
+        return 0.0;
+    }
+    let mut boost = match record.record_type {
+        RecordType::Gotcha => 3.0,
+        RecordType::TaskCheckpoint => 1.5,
+        RecordType::Command => 1.0,
+        RecordType::WorkflowPattern => 0.75,
+        _ => 0.0,
+    };
+    let content = record.content.to_ascii_lowercase();
+    if [
+        "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
+    ]
+    .iter()
+    .any(|needle| content.contains(needle))
+    {
+        boost += 0.75;
+    }
+    boost
+}
+
+fn pack_mode_signals(record: &MemoryRecord, pack_mode: &str) -> Vec<String> {
+    if pack_mode != "debugging" {
+        return vec!["pack_mode:default".to_string()];
+    }
+    let mut signals = vec!["pack_mode:debugging".to_string()];
+    match record.record_type {
+        RecordType::Gotcha => signals.push("debugging_gotcha".to_string()),
+        RecordType::TaskCheckpoint => signals.push("debugging_checkpoint".to_string()),
+        RecordType::Command => signals.push("debugging_command".to_string()),
+        RecordType::WorkflowPattern => signals.push("debugging_workflow_pattern".to_string()),
+        _ => {}
+    }
+    let content = record.content.to_ascii_lowercase();
+    if [
+        "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
+    ]
+    .iter()
+    .any(|needle| content.contains(needle))
+    {
+        signals.push("debugging_terms".to_string());
+    }
     signals
 }
 
@@ -566,6 +639,7 @@ mod tests {
             query: "http server",
             files: &files,
             max_tokens: 1000,
+            pack_mode: "default",
             include_types: &[],
             exclude_types: &[],
             recency_days: None,
@@ -590,6 +664,7 @@ mod tests {
             query: "",
             files: &[],
             max_tokens: 1000,
+            pack_mode: "default",
             include_types: &[],
             exclude_types: &[],
             recency_days: None,

@@ -118,7 +118,8 @@ Request:
   },
   "query": "Continue implementing provider-agnostic portable memory in Codex.",
   "files": ["codex-rs/ext/memories/src/runtime.rs"],
-  "max_tokens": 1200
+  "max_tokens": 1200,
+  "pack_mode": "default"
 }
 ```
 
@@ -131,7 +132,12 @@ Response `data`:
   "policy": {
     "authority": "recall_not_authority",
     "admission_gates": ["profile_workspace"],
-    "ranking_signals": ["profile_workspace", "repo_match", "file_match", "query_match"]
+    "ranking_signals": ["profile_workspace", "repo_match", "file_match", "query_match", "pack_mode:default"]
+  },
+  "pack": {
+    "mode": "default",
+    "max_tokens": 1200,
+    "truncated": false
   },
   "facts": [
     {
@@ -167,12 +173,14 @@ Response `data`:
 }
 ```
 
-For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy` and per-fact `policy` objects are additive metadata used for diagnostics and ranking auditability.
+For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy`, `pack`, and per-fact `policy` objects are additive metadata used for diagnostics, pack selection, and ranking auditability.
 
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable
 preferences → broad/old memory. Results are packed to `max_tokens`
-(default 1200). Archived and `secret_blocked` records are never returned.
+(default 1200). Optional `pack_mode` accepts `default` or `debugging`; unknown
+modes return `invalid_request`. Archived and `secret_blocked` records are never
+returned.
 
 **Fail-open contract**: if the provider is down or returns an error, Codex must
 proceed with the turn as if recall returned empty. Recall is best-effort and must
@@ -437,8 +445,8 @@ defaulted server-side; a minimal session is accepted):
 
 - **status**: `GET /v1/status` → envelope wrapping the status object above.
 - **recall**: `POST /v1/recall` with `{ profile, workspace, repo?, query,
-  files?, max_tokens? }` → envelope wrapping `{ summary, facts[], checkpoints[],
-  citations[], truncated, authority }`.
+  files?, max_tokens?, pack_mode? }` → envelope wrapping `{ summary, facts[],
+  checkpoints[], citations[], truncated, authority, policy, pack }`.
 - **turns**: `POST /v1/turns` with `{ profile, workspace, session{ id }, messages[
   { actor, content } ] }` → envelope wrapping `{ accepted, rejected,
   rejections[], source_ids[], derived_record_ids[] }`. The Codex

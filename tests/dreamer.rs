@@ -268,6 +268,7 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
             query: Some("storage backend".to_string()),
             files: vec![],
             max_tokens: Some(1000),
+            pack_mode: None,
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,

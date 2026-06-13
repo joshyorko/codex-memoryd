@@ -62,6 +62,7 @@ fn checkpoint_rejects_secret_in_detail_field_and_does_not_persist() {
             query: Some("OAuth callback".to_string()),
             files: vec![],
             max_tokens: Some(1000),
+            pack_mode: None,
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,

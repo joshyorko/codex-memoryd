@@ -83,6 +83,8 @@ struct RecallArgs {
     query: String,
     #[serde(default)]
     max_tokens: Option<usize>,
+    #[serde(default)]
+    pack_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +306,7 @@ fn handle_tool_call(
                     query: Some(args.query),
                     files: vec![],
                     max_tokens: args.max_tokens,
+                    pack_mode: args.pack_mode,
                     include_types: vec![],
                     exclude_types: vec![],
                     recency_days: None,
@@ -430,7 +433,8 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                     "workspace": { "type": "string" },
                     "repoId": { "type": "string" },
                     "query": { "type": "string" },
-                    "maxTokens": { "type": "integer", "minimum": 1 }
+                    "maxTokens": { "type": "integer", "minimum": 1 },
+                    "packMode": { "type": "string", "enum": ["default", "debugging"] }
                 },
                 "required": ["query"],
                 "additionalProperties": false,

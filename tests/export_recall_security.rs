@@ -96,6 +96,7 @@ fn recall_ignores_secret_blocked_records() {
         query: "recall note",
         files: &[],
         max_tokens: 1000,
+        pack_mode: "default",
         include_types: &[],
         exclude_types: &[],
         recency_days: None,

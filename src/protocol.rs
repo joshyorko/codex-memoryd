@@ -157,6 +157,8 @@ pub struct RecallRequest {
     #[serde(default)]
     pub max_tokens: Option<usize>,
     #[serde(default)]
+    pub pack_mode: Option<String>,
+    #[serde(default)]
     pub include_types: Vec<String>,
     #[serde(default)]
     pub exclude_types: Vec<String>,
@@ -221,6 +223,13 @@ pub struct RecallPolicy {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RecallPack {
+    pub mode: String,
+    pub max_tokens: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RecallCheckpoint {
     pub id: String,
     pub summary: String,
@@ -247,6 +256,7 @@ pub struct RecallResponse {
     /// Always true: provider context is recall, not authority (SPEC §10.4).
     pub authority: String,
     pub policy: RecallPolicy,
+    pub pack: RecallPack,
 }
 
 // ---------------------------------------------------------------------------

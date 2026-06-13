@@ -149,6 +149,7 @@ impl Service {
             .max_tokens
             .unwrap_or(self.config.max_recall_tokens)
             .max(1);
+        let pack_mode = resolve_pack_mode(req.pack_mode.as_deref())?;
 
         let params = RecallParams {
             profile,
@@ -157,6 +158,7 @@ impl Service {
             query: &query,
             files: &req.files,
             max_tokens,
+            pack_mode: &pack_mode,
             include_types: &include_types,
             exclude_types: &exclude_types,
             recency_days: req.recency_days,
@@ -2066,6 +2068,21 @@ fn sanitize_error_summary(raw: &str) -> String {
 
 fn parse_types(raw: &[String]) -> Vec<RecordType> {
     raw.iter().filter_map(|t| RecordType::parse(t)).collect()
+}
+
+fn resolve_pack_mode(raw: Option<&str>) -> Result<String> {
+    let mode = raw
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("default")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match mode.as_str() {
+        "default" | "debugging" => Ok(mode),
+        _ => Err(Error::invalid_request(format!(
+            "unknown pack_mode '{mode}'; use default or debugging"
+        ))),
+    }
 }
 
 fn sanitize_workspace(raw: &str) -> String {
