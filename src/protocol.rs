@@ -295,6 +295,62 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Card snapshots (deterministic generated views)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CardShowRequest {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// `subject_summary` | `workspace_summary`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Optional for workspace summaries.
+    #[serde(default)]
+    pub subject_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CardRecordView {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub scope: String,
+    pub content: String,
+    pub confidence: f64,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub related_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub source_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CardShowResponse {
+    pub card_type: String,
+    pub scope: String,
+    pub profile: String,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    /// Deterministic snapshot generation timestamp.
+    pub generated_at: String,
+    /// Deterministic freshness marker (`empty_snapshot`, `stable`).
+    pub freshness: String,
+    pub content_hash: String,
+    pub build_spec_version: String,
+    pub authority: String,
+    pub records: Vec<CardRecordView>,
+}
+
+// ---------------------------------------------------------------------------
 // Turns (SPEC §6.4)
 // ---------------------------------------------------------------------------
 

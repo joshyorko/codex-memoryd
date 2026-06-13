@@ -132,6 +132,11 @@ pub enum Command {
         #[arg(long)]
         target_profile: Option<String>,
     },
+    /// Show a generated card snapshot.
+    Card {
+        #[command(subcommand)]
+        command: CardCommand,
+    },
     /// Archive (default) or delete a memory record by id.
     Forget {
         /// Record id.
@@ -246,6 +251,23 @@ pub enum PatchCommand {
         preview: bool,
         #[arg(long)]
         apply: bool,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CardCommand {
+    /// Show a deterministic summary card.
+    Show {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        r#type: String,
+        #[arg(long)]
+        subject_id: Option<String>,
         #[arg(long, default_value = "json")]
         format: String,
     },
@@ -747,6 +769,37 @@ fn dispatch(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Command::Card { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                CardCommand::Show {
+                    profile,
+                    workspace,
+                    r#type,
+                    subject_id,
+                    format,
+                } => {
+                    let resp = service.card_show(CardShowRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        r#type: r#type.clone(),
+                        subject_id: subject_id.clone(),
+                    })?;
+                    let format = format.as_str().to_ascii_lowercase();
+                    match format.as_str() {
+                        "markdown" => print_markdown(&render_card_markdown(&resp)),
+                        "json" => print_json(&resp)?,
+                        _ => {
+                            return Err(error::Error::invalid_request(format!(
+                                "invalid --format '{format}'; expected 'json' or 'markdown'",
+                                format = format
+                            )))
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         Command::Forget {
             id,
             profile,
@@ -868,4 +921,48 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 fn print_markdown(text: &str) {
     println!("{text}");
+}
+
+fn render_card_markdown(card: &CardShowResponse) -> String {
+    let mut lines = vec![
+        format!("# Card summary: {}", card.card_type),
+        format!("Profile: {}", card.profile),
+        format!("Workspace: {}", card.workspace),
+        format!("Scope: {}", card.scope),
+        format!("Generated at: {}", card.generated_at),
+        format!("Freshness: {}", card.freshness),
+        format!("Authority: {}", card.authority),
+        format!("Build spec: {}", card.build_spec_version),
+        format!("Content hash: {}", card.content_hash),
+    ];
+
+    if let Some(subject_id) = &card.subject_id {
+        lines.push(format!("Subject: {}", subject_id));
+    }
+
+    lines.push(String::new());
+    lines.push(format!("## Records ({})", card.records.len()));
+    for record in &card.records {
+        lines.push(format!(
+            "- {} [{}] {} ({})",
+            record.id, record.record_type, record.scope, record.confidence
+        ));
+        lines.push(format!("  - updated_at: {}", record.updated_at));
+        if !record.tags.is_empty() {
+            lines.push(format!("  - tags: {}", record.tags.join(", ")));
+        }
+        if !record.related_files.is_empty() {
+            lines.push(format!(
+                "  - related_files: {}",
+                record.related_files.join(", ")
+            ));
+        }
+        if !record.source_ids.is_empty() {
+            lines.push(format!("  - source_ids: {}", record.source_ids.join(", ")));
+        }
+        lines.push(format!("  - content: {}", record.content));
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
 }
