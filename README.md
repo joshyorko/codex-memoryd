@@ -1,390 +1,129 @@
 # codex-memoryd
 
-`codex-memoryd` is a local-first portable memory provider for coding agents. It
-treats memory as recall, not authority. Dreamer proposes candidate memories
-from safe visible turns, checkpoints, conclusions, and imported local memories,
-then shows a preview before any policy-gated apply. Records stay scoped by
-profile, workspace, and repo, with provenance, supersession, and fail-open
-behavior when the provider is unavailable. Hidden reasoning, secrets, raw
-confidential logs, and credentials never become durable memory.
+`codex-memoryd` is an agent-agnostic, local-first memory substrate for coding
+agents. The daemon, CLI, Docker Compose, and MCP stdio surfaces are delivery
+modes; the durable model is the point. Memory is recall, not authority:
+retrieved context may inform a turn, but it never overrides current
+instructions, repository state, or policy.
 
-It is written in Rust and purpose-built for [Codex](../codex)'s provider
-contract in [`SPEC.md`](./SPEC.md): durable memory storage, recall, ingestion,
-dedupe, safety classification, and export across machines, devcontainers, and
-agent surfaces. It is local-first: an SQLite database, a loopback HTTP daemon,
-and a CLI. No embeddings, vector database, dashboard, or cloud hosting are
-required for the MVP.
+Current landed shape:
 
-> **Memory is recall, not authority.** Retrieved memory informs the agent but
-> never overrides current user instructions, repository files, `AGENTS.md`,
-> explicit policy, or verified current state. Recall responses are explicitly
-> tagged `authority = "recall_not_authority"`.
+- loopback native daemon for local dogfood
+- Docker Compose dogfood with `.dogfood/memory.db` as the real daemon DB
+- MCP dogfood with a separate sandbox DB at `.dogfood/mcp-sandbox-memory.db`
+- read-only Codex MCP tools: `memory_status`, `memory_recall`, `memory_search`
+- local Codex memory import
+- evidence ledger for write provenance
+- subject / episode substrate for stable anchors
+- Dreamer preview/apply for evidence-backed consolidation
 
-## Current landed stack
-
-The repo now ships the following live surfaces:
-
-- local-only daemon mode on loopback, with fail-open behavior when the daemon is unavailable;
-- Docker Compose dogfood with host-side loopback publishing and `.dogfood/memory.db` as the real daemon DB;
-- MCP stdio dogfood, including a read-only Codex-facing sandbox path in `docs/dogfood-mcp.md`;
-- local memory import from host Codex memory files under `~/.codex/memories`;
-- evidence ledger, observations, markers, and memory patches for reviewable memory flow;
-- subject and episode storage for stable agent-agnostic entity/event anchors;
-- safe dogfood invariants: no secrets, no hidden reasoning, no automatic prompt injection, and no authority override from recall.
-
-Operational guides:
+Docs worth skimming first:
 
 - [`docs/dogfood-local.md`](./docs/dogfood-local.md)
 - [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md)
 - [`docs/codex-integration.md`](./docs/codex-integration.md)
-- [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)
+- [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)
 - [`docs/agent-agnostic-memory-substrate.md`](./docs/agent-agnostic-memory-substrate.md)
+- [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)
+- [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md)
 
-## What it is (and isn't)
+## What It Owns
 
-Codex owns agent execution, turn lifecycle, sandboxing, approvals, and prompt
-assembly. `codex-memoryd` owns:
+- durable records, sources, checkpoints, conclusions, turns
+- stable subjects and episodes
+- recall
+- local Codex memory import
+- safety classification
+- export
+- evidence ledger entries
+- Dreamer preview/apply
 
-- durable storage of memory records, sources, checkpoints, conclusions, turns;
-- durable storage of subjects and episodes as stable substrate anchors;
-- **recall** — compact, ranked, repo-aware context before a turn;
-- **ingestion** — importing existing local Codex memory artifacts;
-- **dedupe** — idempotent writes and imports via content/source hashing;
-- **safety** — secret + prompt-injection blocking, profile-boundary enforcement;
-- **export** — boundary-aware, secret-omitting record export.
+## What It Does Not Own
 
-It does **not** execute coding tasks, act as a general workflow engine, store
-secrets / hidden reasoning, or auto-merge work and personal memory.
+- agent execution, approvals, or prompt assembly
+- hidden reasoning storage
+- secrets, auth tokens, or `.env` dumps
+- generic workflow orchestration
+- a dashboard or vector DB requirement
+- automatic work/personal memory merging
 
-## Architecture
+## Safety Invariants
 
-A single Rust crate with strict module boundaries (SPEC §3.2):
+- recall is contextual, not authoritative
+- preview happens before apply
+- secrets and prompt-injection attempts are rejected before durable write
+- profile and workspace boundaries are enforced
+- provider failures fail open instead of blocking Codex turns
+- the read-only Codex MCP path exposes no write tools
 
-| Module | Responsibility |
-| --- | --- |
-| `protocol` | Wire request/response types + the common response envelope |
-| `domain` | Durable entities (records, sources, checkpoints, subjects, episodes, …) |
-| `config` | Config resolution (file → env → flags) |
-| `store` | SQLite persistence, migrations, FTS5 probe + LIKE fallback |
-| `policy` | Secret/injection detection, profile boundaries, classification |
-| `ingest` | Local Codex memory import: chunk → classify → dedupe |
-| `recall` | Ranking, token-budget packing, citations, checkpoints |
-| `service` | Transport-agnostic request handling (shared by HTTP + CLI) |
-| `server` | axum HTTP transport |
-| `cli` | clap command-line interface |
-| `export` / `status` / `metrics` | Export, status assembly, counters |
+## Landed Surfaces
 
-Write provenance is tracked in an append-only
-[evidence ledger](./docs/evidence-ledger.md). The ledger is for audit and
-adapter diagnostics only; it is not a recall source and never stores raw
-rejected secret content, hidden reasoning, or raw logs.
+### Native Dogfood Daemon
 
-Stack: **axum** (HTTP), **clap** (CLI), **rusqlite** with bundled SQLite +
-**r2d2** pool (storage), **serde** (types), **tracing** (logs), **regex**
-(secret detection), **sha2** (hashing), **uuid** (ids).
-
-## Subject / Episode Substrate
-
-Schema version 4 adds the first durable entity/event layer underneath ordinary
-memory records. It is intentionally small and agent-agnostic:
-
-- **subjects** are stable anchors inside one profile/workspace boundary:
-  people, agents, orgs, projects, repos, routines, workflows, devices,
-  concepts, or `other`. A subject is idempotent by
-  `(profile_id, workspace_id, subject_key)`.
-- **episodes** are append-oriented evidence events tied to one subject. They
-  carry a source kind/ref, summary, optional status/window/trust metadata, and
-  never replace the subject itself.
-- **memory records** now have optional `subject_id` and `episode_id` columns, so
-  future recall, Dreamer, and adapter flows can bind facts to a stable entity or
-  event without turning the adapter file into the source of truth.
-
-This layer is not a graph engine, CRM, scheduler, or agent harness. It does not
-change recall authority, export boundaries, or policy gates. Subject and episode
-writes still pass the same profile/workspace validation and secret/prompt
-injection screening used elsewhere. Export currently emits portable memory
-records only; raw subject and episode rows are not exported as standalone data.
-
-CLI examples:
+The safest local run is the loopback daemon backed by a persistent SQLite DB:
 
 ```bash
-# Create or retrieve the same subject by scoped subject key.
-codex-memoryd subject create \
-  --profile personal \
-  --workspace josh-personal \
-  --key repo:github:joshyorko/codex-memoryd \
-  --kind repo \
-  --display-name codex-memoryd | jq
-
-SUBJECT_ID="$(codex-memoryd subject list \
-  --profile personal \
-  --workspace josh-personal \
-  --kind repo | jq -r '.subjects[0].id')"
-
-# Append an episode to that subject.
-codex-memoryd episode create \
-  --profile personal \
-  --workspace josh-personal \
-  --subject-id "$SUBJECT_ID" \
-  --source-kind github_issue \
-  --source-ref "joshyorko/codex-memoryd#65" \
-  --summary "Subject and episode storage MVP landed." \
-  --status completed | jq
-
-codex-memoryd subject get --profile personal --workspace josh-personal "$SUBJECT_ID" | jq
-codex-memoryd episode list --profile personal --workspace josh-personal --subject-id "$SUBJECT_ID" | jq
-```
-
-HTTP surfaces mirror the CLI and use the standard response envelope:
-
-| Route | Method | Purpose |
-| --- | --- | --- |
-| `/v1/subjects` | `POST` | create or idempotently return a subject |
-| `/v1/subjects` | `GET` | list scoped subjects, optionally by `kind` |
-| `/v1/subjects/get` | `GET` | get one subject by `id` |
-| `/v1/episodes` | `POST` | append an episode for an existing subject |
-| `/v1/episodes` | `GET` | list scoped episodes, optionally by `subject_id` |
-| `/v1/episodes/get` | `GET` | get one episode by `id` |
-
-These protected `/v1/*` routes are usable when the daemon itself is configured
-with a loopback bind, for example direct `codex-memoryd serve` on
-`127.0.0.1:8787`. The Docker Compose dogfood path binds `0.0.0.0` inside the
-container so Docker can publish the port, and the server therefore returns
-`auth_missing` for protected `/v1/*` routes even though the host publish is
-`127.0.0.1:8787`. Compose dogfood uses CLI commands inside the container and the
-sandboxed MCP stdio path until container-aware transport auth/exposure handling
-lands.
-
-The MCP dogfood namespace remains read-only for Codex. Subject and episode
-writes are available through CLI/HTTP for local operator and adapter work, not
-through the sandboxed Codex MCP tool allow-list.
-
-## Build
-
-```bash
-cd codex-memoryd
 cargo build --release
-# binary at target/release/codex-memoryd
-```
+mkdir -p .dogfood/logs .dogfood/exports
 
-SQLite is compiled from source via the `bundled` feature, so the build needs a C
-compiler but no system libsqlite3. FTS5 is therefore always available; if a
-future build disables it, the store automatically falls back to `LIKE` search
-and reports `degraded` status.
+CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" \
+CODEX_MEMORYD_BIND="127.0.0.1:8787" \
+CODEX_MEMORYD_PROFILE="personal" \
+CODEX_MEMORYD_WORKSPACE="josh-personal" \
+target/release/codex-memoryd serve
 
-## Run the local daemon
-
-```bash
-# Defaults: bind 127.0.0.1:8787, storage ~/.codex-memoryd/memory.db
-codex-memoryd serve
-
-# Override bind / storage:
-codex-memoryd serve --bind 127.0.0.1:8787 --db ~/.codex-memoryd/memory.db
-
-# Check it:
-curl -s http://127.0.0.1:8787/v1/status | jq
-```
-
-The daemon binds loopback by default and shuts down gracefully on SIGINT/SIGTERM.
-This is the supported direct-run mode: `/healthz` is unauthenticated liveness,
-and `/v1/*` is intended only for same-host Codex clients. There is no production
-remote bearer-token/auth implementation in this daemon yet.
-
-Supported bind/exposure modes:
-
-- `127.0.0.1:8787`, `[::1]:8787`, or `localhost:8787`: supported local-only
-  operation. `/v1/status` reports `status = "local_only"` when storage is
-  otherwise healthy.
-- Docker Compose default: the daemon binds `0.0.0.0:8787` inside the container,
-  but the host publishes `127.0.0.1:8787:8787`. This is still a local-only host
-  exposure.
-- Non-loopback host publishing (for example `8787:8787`, `0.0.0.0:8787`, or a
-  LAN address) is unsupported for production remote use until auth/isolation
-  lands. `/v1/status` reports `status = "auth_missing"` and an actionable warning
-  for this configuration; do not expose `/v1/*` to untrusted networks.
-
-## First-run path (source build)
-
-This section stays intentionally small and uses the binary from a clean source
-checkout for a quick portability verification.
-
-```bash
-# 1) Build and install locally from source.
-git clone https://github.com/joshyorko/codex-memoryd.git
-cd codex-memoryd
-cargo build --release
-install -Dm755 target/release/codex-memoryd "$HOME/.local/bin/codex-memoryd"
-export PATH="$HOME/.local/bin:$PATH"
-
-# 2) Start the daemon on a repo-local demo database.
-mkdir -p .demo
-export CODEX_MEMORYD_DB="$PWD/.demo/memory.db"
-codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
-echo $! > .demo/codex-memoryd.pid
+curl -fsS http://127.0.0.1:8787/healthz
 curl -fsS http://127.0.0.1:8787/v1/status | jq
-codex-memoryd status | jq
-codex-memoryd doctor | jq
-
-# 3) Configure this provider in ~/.codex/config.toml.
-# Add this [memories] block, or update only the existing one.
-#
-# [memories]
-[memories]
-backend = "provider"
-provider = "codex_memoryd"
-provider_url = "http://127.0.0.1:8787"
-profile = "personal"
-workspace = "codex-memoryd-demo"
-local_import_policy = "prompt"
-write_policy = "visible_turns"
-sync_policy = "manual"
-cross_profile_policy = "default_deny"
-
-# 4) Import local fixtures with a dry run, then apply.
-mkdir -p .demo/codex-memories/rollout_summaries
-cat > .demo/codex-memories/memory_summary.md <<'MD'
-# Preferences
-- Prefer local-first memory providers for coding agents.
-MD
-codex-memoryd sync-local --preview --profile personal --workspace codex-memoryd-demo .demo/codex-memories | jq
-codex-memoryd sync-local --apply --profile personal --workspace codex-memoryd-demo .demo/codex-memories | jq
-
-# 5) Write one conclusion and recall it.
-codex-memoryd conclude --profile personal --workspace codex-memoryd-demo \
-  --content "Decision: first run confirms source install, status checks, and import flow."
-codex-memoryd recall --profile personal --workspace codex-memoryd-demo \
-  --query "first run codex-memoryd" | jq
-
-# 6) Verify fail-open behavior by stopping the daemon and restarting Codex.
-kill "$(cat .demo/codex-memoryd.pid)"
-codex-memoryd serve > .demo/codex-memoryd.log 2>&1 &
-echo $! > .demo/codex-memoryd.pid
-codex-memoryd status | jq
 ```
 
-Fail-open note: if the daemon is unavailable, provider/hybrid memory usage is
-designed to fail open (recall returns empty, writes are best-effort) rather than
-blocking your Codex turn path.
+The daemon is intended for local-only use. Direct loopback keeps `/v1/*`
+protected routes in the same-host trust boundary.
 
-## CLI
+### Docker Compose Dogfood
 
-The CLI operates on the same code paths as the HTTP server (it opens the store
-directly), so it works without a running daemon. All read commands print JSON to
-stdout; logs go to stderr.
+Compose is useful for local smoke tests, but it is not the primary dogfood
+surface. It binds `0.0.0.0` inside the container, publishes only
+`127.0.0.1:8787` on the host, and keeps the real DB at `.dogfood/memory.db`.
+That means `/v1/status` is available for diagnostics while protected `/v1/*`
+routes report `auth_missing` in this mode.
 
 ```bash
-# Status / self-check
-codex-memoryd status
-codex-memoryd doctor
-
-# Recall and search
-codex-memoryd recall --profile personal --workspace josh-personal --query "how do we serve the provider"
-codex-memoryd search --profile personal --workspace josh-personal --query "axum"
-
-# Write a durable conclusion (becomes a memory record after policy screening)
-codex-memoryd conclude --profile personal --workspace josh-personal \
-  --content "Decision: use rusqlite bundled for storage"
-
-# Create stable subjects and append episodes
-codex-memoryd subject create --profile personal --workspace josh-personal \
-  --key workflow:dogfood-import --kind workflow --display-name "Dogfood import gate"
-codex-memoryd subject list --profile personal --workspace josh-personal --kind workflow
-codex-memoryd episode create --profile personal --workspace josh-personal \
-  --subject-id <subject-id> --source-kind fizzy_card --source-ref 491 \
-  --summary "Container/import/MCP gate verified green."
-
-# Preview deterministic Dreamer candidates (no durable writes)
-codex-memoryd dream --profile personal --workspace josh-personal --preview
-
-# Import local Codex memory (provider local-ingest mode reads the filesystem)
-codex-memoryd sync-local --preview ~/.codex/memories
-codex-memoryd sync-local --apply   ~/.codex/memories
-
-# Export (JSONL by default) and forget
-codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
-codex-memoryd forget <record-id>            # archives by default
-codex-memoryd forget <record-id> --delete   # hard delete (secrets/PII)
-
-# MCP stdio (initialize, tools/list, tools/call)
-codex-memoryd mcp stdio
-```
-
-The initial MCP tool surface is intentionally small: `memory_status`,
-`memory_recall`, `memory_search`, `memory_conclude`, and `memory_checkpoint`.
-Those tools route through the same `Service` and policy gates as the HTTP and
-CLI entrypoints.
-
-## Configure storage
-
-Resolution order (later wins): **defaults → config file → env vars → CLI flags**.
-
-- Config file: `~/.codex-memoryd/config.toml` (see [`config.example.toml`](./config.example.toml))
-- Storage DB: `~/.codex-memoryd/memory.db` (override with `--db` or `CODEX_MEMORYD_DB`)
-- Env vars: `CODEX_MEMORYD_BIND`, `CODEX_MEMORYD_DB`, `CODEX_MEMORYD_PROFILE`,
-  `CODEX_MEMORYD_WORKSPACE`, `CODEX_MEMORYD_LOG`
-
-```toml
-[server]
-bind = "127.0.0.1:8787"
-
-[storage]
-kind = "sqlite"
-path = "~/.codex-memoryd/memory.db"
-
-[policy]
-default_profile = "personal"
-cross_profile_policy = "default_deny"
-
-[recall]
-max_tokens = 1200
-```
-
-## Run with Docker
-
-```bash
-# Build + start with repo-local .dogfood/memory.db:
 mkdir -p .dogfood
 docker compose up -d --build
-
-# Verify status and health:
-curl -s http://127.0.0.1:8787/v1/status | jq
 curl -fsS http://127.0.0.1:8787/healthz
-
-# Logs / stop:
-docker compose logs -f codex-memoryd
-docker compose down            # keeps .dogfood/memory.db on the host
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+docker compose down
 ```
 
-Compose bind-mounts `./.dogfood` at `/data`, so the container's
-`/data/memory.db` is the host-visible `.dogfood/memory.db`. It also mounts
-`~/.codex/memories` read-only at `/host-codex-memories` for local memory import
-inside the container. The service runs as
-`${CODEX_MEMORYD_UID:-1000}:${CODEX_MEMORYD_GID:-1000}` by default so Docker
-and local CLI commands can both write the SQLite files.
+### MCP Dogfood
 
-The daemon binds `0.0.0.0:8787` inside the container but Compose publishes only
-`127.0.0.1:8787` on the host, and the image ships a `HEALTHCHECK` hitting
-`/healthz`. In this mode `/v1/status` is available for diagnostics, while
-protected `/v1/*` routes report `auth_missing`; use direct loopback
-`codex-memoryd serve` for HTTP provider/client testing. Keep the host-side
-publish on `127.0.0.1`; changing it to all interfaces is unsupported without an
-external authenticating proxy. No secrets are baked into the image.
+The Codex-facing MCP runbook is intentionally read-only. It uses the sandbox DB
+at `.dogfood/mcp-sandbox-memory.db` and exposes only:
 
-## How the Codex fork calls it
+- `memory_status`
+- `memory_recall`
+- `memory_search`
 
-The Codex fork has provider-agnostic portable memory (config,
-`PortableMemoryRuntime`, the `MemoryProvider` trait, selected
-local/provider/hybrid behavior, turn-input recall, turn-item writeback).
+The real dogfood daemon remains on `.dogfood/memory.db` at `127.0.0.1:8787`.
+No write tools are exposed to Codex in that config.
 
-### Final config contract
+See [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md) for the exact `~/.codex/config.toml`
+snippet and smoke checks.
 
-This is the canonical `[memories]` shape that codex-memoryd targets:
+## Quickstart
+
+1. Build and start the native daemon.
+1. Confirm `healthz` and `v1/status`.
+1. Point Codex at the provider backend.
+1. Import local memory with `sync-local --preview` before `--apply`.
+1. Use `recall` as context, not authority.
+
+Minimal codex-side memory config:
 
 ```toml
-# Codex-side ~/.codex/config.toml
 [memories]
 backend = "provider"              # local | provider | hybrid
-provider = "codex_memoryd"        # honcho | codex_memoryd  (when backend != local)
+provider = "codex_memoryd"        # honcho | codex_memoryd
 provider_url = "http://127.0.0.1:8787"
 profile = "personal"
 workspace = "josh-personal"
@@ -394,150 +133,136 @@ sync_policy = "manual"            # manual | startup
 cross_profile_policy = "default_deny"
 ```
 
-`backend` stays a small stable enum; `provider` selects the implementation, so
-adding providers never grows the `backend` enum. `provider_url` points the
-runtime's HTTP client at this daemon's `/v1` API.
+`local` preserves upstream Codex behavior. `provider` and `hybrid` select the
+portable provider path; if `codex-memoryd` is unavailable, Codex must fail open.
 
-### Compatibility matrix
+## Core Model
 
-| `backend` | `provider` | Durable store | `provider_url` target | Local memory role |
+- `Subject`: the stable identity of what the memory is about.
+- `Episode`: an append-only evidence event attached to a subject.
+- `Evidence ledger`: the append-only audit trail explaining why a subject or
+  projection exists, changed, or was rejected.
+- `Projection`: the compact durable memory record produced from evidence.
+
+This substrate is intentionally not a graph engine, CRM, scheduler, or agent
+harness. Export remains record-centric for now; subjects and episodes are
+internal anchors, not a standalone exported surface.
+
+See [`docs/agent-agnostic-memory-substrate.md`](./docs/agent-agnostic-memory-substrate.md)
+for the fuller substrate plan.
+
+## Dreamer and Evidence
+
+Dreamer is the background synthesis lane. It consolidates safe evidence from
+visible turns, conclusions, checkpoints, imported local memories, and active
+records into durable candidate memories.
+
+Current rules:
+
+- preview first, apply second
+- evidence is asymmetric: user turns and conclusions are strong; assistant
+  turns are weak unless adopted; imported memories are corroborating only
+- drift-prone facts can be demoted or rewritten
+- apply is idempotent and policy-gated
+- ledger writes are append-only and do not store raw rejected secrets or hidden
+  reasoning
+
+The broader patch / rollback lifecycle lives in the substrate roadmap docs. In
+this repo, Dreamer preview/apply and the evidence ledger are the landed pieces;
+general patch lifecycle is still a roadmap lane.
+
+See:
+
+- [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)
+- [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)
+- [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md)
+
+## CLI
+
+The CLI opens the store directly, so it works without a running daemon.
+
+```bash
+# Status and self-check
+codex-memoryd status
+codex-memoryd doctor
+
+# Recall and search
+codex-memoryd recall --profile personal --workspace josh-personal --query "how do we serve the provider"
+codex-memoryd search --profile personal --workspace josh-personal --query "axum"
+
+# Durable write
+codex-memoryd conclude --profile personal --workspace josh-personal \
+  --content "Decision: use rusqlite bundled for storage"
+
+# Subjects and episodes
+codex-memoryd subject create --profile personal --workspace josh-personal \
+  --key workflow:dogfood-import --kind workflow --display-name "Dogfood import gate"
+codex-memoryd episode create --profile personal --workspace josh-personal \
+  --subject-id <subject-id> --source-kind fizzy_card --source-ref 491 \
+  --summary "Container/import/MCP gate verified green."
+
+# Dreamer preview/apply
+codex-memoryd dream --profile personal --workspace josh-personal --preview
+codex-memoryd dream --profile personal --workspace josh-personal --apply
+
+# Local memory import
+codex-memoryd sync-local --preview ~/.codex/memories
+codex-memoryd sync-local --apply ~/.codex/memories
+
+# Export and forget
+codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
+codex-memoryd forget <record-id>
+codex-memoryd forget <record-id> --delete
+```
+
+## Config and Compatibility
+
+`codex-memoryd` is the provider side of the portable memory contract. The
+Codex fork is the client side. The compatibility target is
+`joshyorko/codex@tap-release`; that branch is the adapter target, not the
+source of truth for this repo.
+
+Canonical Codex-side memory shape:
+
+| `backend` | `provider` | Durable store | Provider target | Local memory role |
 | --- | --- | --- | --- | --- |
-| `local` | — (ignored) | none (upstream local only) | — | source of truth |
-| `provider` | `honcho` | Honcho (cloud/self-host) | Honcho base URL | import source only |
-| `provider` | `codex_memoryd` | codex-memoryd SQLite | `http://127.0.0.1:8787` | import source only |
+| `local` | — | upstream local only | — | source of truth |
+| `provider` | `honcho` | Honcho | Honcho base URL | import source only |
+| `provider` | `codex_memoryd` | codex-memoryd SQLite | `provider_url` → `/v1` | import source only |
 | `hybrid` | `honcho` | Honcho + local cache | Honcho base URL | cache / debug / rebuild |
-| `hybrid` | `codex_memoryd` | codex-memoryd + local cache | `http://127.0.0.1:8787` | cache / debug / rebuild |
-
-In `local` mode, `provider`/`provider_url` are ignored and codex-memoryd is not
-contacted. In `provider`/`hybrid` mode the runtime fails open: if the daemon is
-unreachable, recall returns empty and writes are best-effort (in `hybrid`, local
-memory continues to serve). Provider errors and daemon-down conditions must not
-block the Codex-side user path.
-
-### Status vs. Codex tap-release
-
-The shape above is implemented by `joshyorko/codex@tap-release`, including the
-`provider = "codex_memoryd"` adapter, `provider_url`, manual local import, and
-`visible_turns` writeback over this daemon's `/v1` API. Older Codex PR #55
-snapshots exposed only the Honcho-shaped subset; the historical delta is kept in
-[`docs/codex-integration.md`](./docs/codex-integration.md#historical-codex-side-delta-from-pr-55).
-This repo does not modify `codex/`.
-
-Typical first-run switchover (once both sides ship the final shape):
-
-```bash
-export CODEX_MEMORYD_URL=http://127.0.0.1:8787
-codex memory status
-codex memory import-local --preview   # safe: writes nothing
-codex memory import-local --apply     # idempotent
-codex
-```
-
-Live tap-release proof smoke:
-
-```bash
-# After building or otherwise obtaining a joshyorko/codex@tap-release binary:
-CODEX_BIN=/tmp/codex-tap-release/codex-rs/target/debug/codex \
-  scripts/codex-tap-release-smoke.sh
-```
-
-The smoke starts `codex-memoryd` on loopback, runs Codex in `provider` and
-`hybrid` modes, captures `/v1/status`, recall authority, turn writeback counts,
-local import preview/apply idempotency, and verifies daemon-down fail-open
-behavior.
+| `hybrid` | `codex_memoryd` | codex-memoryd SQLite + local cache | `provider_url` → `/v1` | cache / debug / rebuild |
 
 See [`docs/codex-integration.md`](./docs/codex-integration.md) for the full
-endpoint map, the local-import wire format, and the fail-open contract.
+endpoint map, turn-input recall, writeback shape, local-memory import, and
+fail-open contract.
 
-## Roadmap: Dreamer loop (research)
+## Roadmap by Issue Band
 
-The section below is forward-looking; it describes the next research-backed shape, not the landed stack above.
+These are coarse groupings from the current issue stack. The exact tracker
+mapping lives in the board; the README keeps the bands readable instead of
+pretending the docs spell out every one-to-one issue.
 
-A background/offline memory-synthesis pass — the **Dreamer loop** — consolidates
-repeated safe evidence into durable, provenance-backed records, marks
-drift-prone facts with validity metadata, and supersedes outdated records. It is
-**evidence-backed consolidation, not autonomous authority**: candidates are
-grouped by deterministic `subject_key`, previewed before writes, and accepted,
-quarantined, or rejected by policy and threshold gates.
+| Band | Theme | Notes |
+| --- | --- | --- |
+| `#43-#45` | substrate vocabulary | subject / episode boundaries and evidence ledger MVP |
+| `#50-#57` | substrate hardening | compiled cards, adapter views, capability gates, recall policy, context packs, git import, eval harness |
+| `#66-#70` | frontier lanes | procedural memory, operational valence, quarantine / trust scoring, multimodal evidence, adapter conformance |
+| `#80-#86` | docs and operator polish | runbooks, release-adjacent cleanup, README overhaul (`#86`) |
 
-Dreamer treats evidence asymmetrically. User turns, explicit conclusions, and
-checkpoints are strong signals (with checkpoints strongest for task/repo state);
-assistant turns are weak unless adopted; imported memories are secondary
-corroboration only; active records are only conflict/supersession inputs, never
-primary evidence for creating a new active memory. Candidate apply records carry
-provenance (`origin`, run/window, evidence ids/counts, `subject_key`,
-`promotion_reason`), memory state (`planned`, `active`, `blocked`, `completed`,
-`historical`, or `superseded`), and drift/expiry fields (`drift_prone`,
-`expires_at`, `valid_until`) where applicable.
-
-Public writing about ChatGPT memory is inspiration only. This repository makes no
-claim about private OpenAI memory internals, compatibility, or architecture. See
-[`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md) (motivation,
-threat model, non-claims) and
-[`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md) (CLI/API,
-storage, staleness/supersession, eval fixtures).
-
-Implementation order is tracked by issues: #10 deterministic preview, #11
-fixture sidecars and recall-before/after evals, #19 evidence weighting and
-thresholds, #13 state/staleness/supersession, #12 policy-gated apply, #20
-dream-run audit/watermarks, #14 live Codex smoke, #15 reliability/auth/fail-open
-contracts, #17 first-run demo, #16 local-first bakeoff, and #18 local MCP tools.
-For #19, the fixture set now also includes user-adoption, non-promoted assistant-only,
-and imported-memory self-reinforcement edge cases in `tests/fixtures/dreaming`.
-
-## Safety & profile boundaries
-
-**Secret blocking** (rejected or redacted before any durable write): private
-keys (PEM/OpenSSH/PGP), API keys (OpenAI/Anthropic/Honcho/GitHub/Slack/Google/
-Stripe), AWS keys, generic `key=`/`password=`/`token=` assignments, JWTs,
-connection strings with inline credentials, `.env` dumps, encrypted/hidden
-reasoning markers, and oversized unstructured blobs likely to hide secrets.
-
-**Prompt-injection blocking**: durable memories that look like attempts to
-override system/developer/user policy ("ignore previous instructions", "you are
-now system", "reveal the system prompt", …) are rejected.
-
-**Profile boundaries** (export defaults, SPEC §10.3):
-
-| From → To | Behavior |
-| --- | --- |
-| `work` → `personal` | **deny** |
-| `work` → any other | **deny** |
-| `personal` → `work` | allow **only** generic user operating preferences (preference/identity, public/personal) |
-| `work` → `work`, `personal` → `personal` | allow |
-| `oss`/`homelab` → `personal` | allow (implementation-defined; these are non-confidential surfaces) |
-
-Export always omits `secret_blocked` records and never crosses a `never_export`
-record between profiles. Every policy decision (rejection or boundary denial) is
-recorded in the `policy_events` table for audit and surfaced in metrics.
-
-**Authority**: provider recall is contextual, not authoritative. Codex treats it
-below current user instructions, system/developer instructions, `AGENTS.md`,
-repository files, and verified current state.
-
-## Testing
+## Build and Test
 
 ```bash
-cargo test          # unit + conformance + HTTP smoke + CLI smoke
+cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
-
-The conformance suite ([`tests/conformance.rs`](./tests/conformance.rs)) covers
-the MVP surface from SPEC §15.3: status, profile/workspace isolation, record
-create/search, recall filtering, secret + injection rejection, conclusion →
-record, checkpoint store/recall, local import preview/apply idempotency,
-work→personal export denial, forget archiving, secret omission on export, subject
-CRUD idempotence, episode linking, subject/episode policy screening, and export
-omission of raw subject/episode rows.
 
 ## License
 
 MIT.
 
-## Memory bakeoff
+## Memory Bakeoff
 
-For a narrow comparison of local-only Codex memory, Honcho provider mode, and codex-memoryd provider mode (with explicit scope limits), see [`demos/memory-bakeoff/README.md`](./demos/memory-bakeoff/README.md).
-
-For the next substrate slice behind issues #43, #44, and #45, see
-[`docs/agent-agnostic-memory-substrate.md`](./docs/agent-agnostic-memory-substrate.md).
+For a narrow comparison of local-only Codex memory, Honcho provider mode, and
+codex-memoryd provider mode, see
+[`demos/memory-bakeoff/README.md`](./demos/memory-bakeoff/README.md).
