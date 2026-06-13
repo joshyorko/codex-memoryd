@@ -118,6 +118,37 @@ snippet and smoke checks.
 1. Import local memory with `sync-local --preview` before `--apply`.
 1. Use `recall` as context, not authority.
 
+### First-run path (source build)
+
+```bash
+cargo build --release
+mkdir -p .dogfood/logs .dogfood/exports
+
+CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" \
+CODEX_MEMORYD_BIND="127.0.0.1:8787" \
+CODEX_MEMORYD_PROFILE="personal" \
+CODEX_MEMORYD_WORKSPACE="josh-personal" \
+target/release/codex-memoryd serve
+```
+
+In another shell:
+
+```bash
+CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" target/release/codex-memoryd doctor
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+target/release/codex-memoryd sync-local --preview ~/.codex/memories \
+  --profile personal --workspace josh-personal
+target/release/codex-memoryd sync-local --apply ~/.codex/memories \
+  --profile personal --workspace josh-personal
+target/release/codex-memoryd conclude --profile personal --workspace josh-personal \
+  --content "Decision: keep codex-memoryd local-first."
+target/release/codex-memoryd recall --profile personal --workspace josh-personal \
+  --query "local-first memory"
+```
+
+Fail-open note: if `codex-memoryd` is unavailable, Codex provider/hybrid mode
+should skip provider recall and continue the turn instead of blocking work.
+
 Minimal codex-side memory config:
 
 ```toml
