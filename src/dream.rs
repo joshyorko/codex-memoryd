@@ -47,42 +47,71 @@ static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     .expect("relative-time regex")
 });
 
-const STOPWORDS: &[&str] = &[
+const SUBJECT_NOISE_WORDS: &[&str] = &[
     "about",
     "after",
     "again",
-    "backend",
+    "and",
     "being",
     "blocked",
     "completed",
     "currently",
     "decision",
+    "deploy",
     "deployed",
+    "earlier",
     "done",
     "evaluating",
+    "fix",
     "fixed",
     "going",
+    "implement",
     "implemented",
     "into",
+    "is",
     "later",
     "longer",
+    "merge",
     "merged",
+    "new",
+    "no",
+    "not",
+    "now",
+    "old",
     "options",
     "planned",
     "planning",
     "please",
     "proposal",
+    "resolved",
+    "resolve",
     "right",
     "run",
+    "soon",
     "still",
+    "state",
     "summary",
+    "superseding",
     "that",
     "this",
+    "the",
+    "then",
+    "there",
+    "these",
+    "those",
+    "though",
+    "tbd",
+    "today",
+    "tomorrow",
+    "tonight",
+    "week",
     "use",
     "uses",
+    "using",
     "will",
     "with",
     "yes",
+    "next",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,48 +727,81 @@ fn push_threshold_candidates(
     candidates: &mut Vec<DreamCandidate>,
     rejected: &mut Vec<DreamRejection>,
 ) {
-    let mut groups: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
+    let mut boundary_groups: BTreeMap<(String, String, Option<String>), Vec<&MemoryRecord>> =
+        BTreeMap::new();
     for record in records {
-        groups
-            .entry(subject_key(&record.content))
+        boundary_groups
+            .entry((
+                record.profile_id.clone(),
+                record.workspace_id.clone(),
+                record.repo_id.clone(),
+            ))
             .or_default()
             .push(record);
     }
-    for (subject, mut evidence) in groups {
-        evidence.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        let score = score_evidence(&evidence);
-        if score.candidate_state == "rejected" {
-            continue;
+
+    for mut boundary_records in boundary_groups.into_values() {
+        boundary_records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        let mut groups = subject_groups(&boundary_records);
+        groups.sort_by(|a, b| {
+            a.first()
+                .unwrap()
+                .created_at
+                .cmp(&b.first().unwrap().created_at)
+                .then(a.first().unwrap().id.cmp(&b.first().unwrap().id))
+        });
+
+        for evidence in groups {
+            let subject = subject_key_for_record(evidence.last().unwrap());
+            let score = score_evidence(&evidence);
+            if score.candidate_state == "rejected" {
+                continue;
+            }
+            let Some(content) = threshold_content(&subject, &evidence, &score) else {
+                continue;
+            };
+            let state = if evidence
+                .iter()
+                .any(|record| state_for_record(record) == "completed")
+            {
+                "completed"
+            } else {
+                "active"
+            };
+            let Some(last) = evidence.last().copied() else {
+                continue;
+            };
+            push_candidate_with_score(
+                candidates,
+                rejected,
+                last,
+                "promote",
+                &content,
+                state,
+                is_drift_prone(&content),
+                None,
+                None,
+                vec![],
+                score,
+                &evidence,
+            );
         }
-        let Some(content) = threshold_content(&subject, &evidence, &score) else {
-            continue;
-        };
-        let state = if evidence
-            .iter()
-            .any(|record| state_for_record(record) == "completed")
-        {
-            "completed"
-        } else {
-            "active"
-        };
-        let Some(last) = evidence.last().copied() else {
-            continue;
-        };
-        push_candidate_with_score(
-            candidates,
-            rejected,
-            last,
-            "promote",
-            &content,
-            state,
-            is_drift_prone(&content),
-            None,
-            None,
-            vec![],
-            score,
-            &evidence,
-        );
     }
+}
+
+fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryRecord>> {
+    let mut groups: Vec<Vec<&'a MemoryRecord>> = Vec::new();
+    for record in records {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| same_subject(group[0], record))
+        {
+            group.push(*record);
+        } else {
+            groups.push(vec![*record]);
+        }
+    }
+    groups
 }
 
 fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
@@ -1001,7 +1063,7 @@ fn push_candidate_with_score(
                 supersedes,
                 policy: "accept".to_string(),
                 candidate_state: score.candidate_state,
-                subject_key: subject_key(&evidence.content),
+                subject_key: subject_key_for_record(evidence),
                 threshold_reason: score.reason,
                 evidence_weight: score.weight,
                 evidence_classes,
@@ -1125,20 +1187,18 @@ fn state_for_record(record: &MemoryRecord) -> String {
 }
 
 fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> bool {
-    if subject_key(&newer.content) != subject_key(&older.content) {
-        return false;
-    }
-    if lexical_overlap(&newer.content, &older.content) < 1 {
+    if !same_subject(newer, older) {
         return false;
     }
     let old_state = state_for_record(older);
     let old_lower = older.content.to_ascii_lowercase();
     let new_lower = newer.content.to_ascii_lowercase();
     let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
-        || contains_any(
-            &old_lower,
-            &["tbd", "evaluating", "not decided", "will ", "planned"],
-        );
+        || (old_state != "completed"
+            && contains_any(
+                &old_lower,
+                &["tbd", "evaluating", "not decided", "will ", "planned"],
+            ));
     let new_settled = newer_state == "completed"
         || contains_any(
             &new_lower,
@@ -1188,19 +1248,97 @@ fn infer_valid_until(content: &str, created_at: &str) -> Option<String> {
 }
 
 fn subject_key(content: &str) -> String {
-    tokens(content)
-        .into_iter()
-        .find(|t| !STOPWORDS.contains(&t.as_str()))
-        .unwrap_or_else(|| normalize(content).chars().take(32).collect())
+    let terms = subject_terms(content);
+    if terms.is_empty() {
+        normalize(content).chars().take(32).collect()
+    } else {
+        terms.into_iter().take(3).collect::<Vec<_>>().join("-")
+    }
 }
 
-fn lexical_overlap(a: &str, b: &str) -> usize {
-    let a = tokens(a).into_iter().collect::<BTreeSet<_>>();
-    let b = tokens(b).into_iter().collect::<BTreeSet<_>>();
-    a.intersection(&b)
-        .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .count()
+fn subject_key_for_record(record: &MemoryRecord) -> String {
+    record
+        .metadata
+        .get("subject_key")
+        .and_then(|value| value.as_str())
+        .filter(|subject_key| !subject_key.is_empty())
+        .map(|subject_key| subject_key.to_string())
+        .unwrap_or_else(|| subject_key(&record.content))
 }
+
+fn subject_terms(content: &str) -> Vec<String> {
+    let mut terms = tokens(content)
+        .into_iter()
+        .filter(|t| !SUBJECT_NOISE_WORDS.contains(&t.as_str()))
+        .collect::<Vec<_>>();
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
+fn same_subject(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    let a_subject_key = subject_key_for_record(a);
+    let b_subject_key = subject_key_for_record(b);
+    if !a_subject_key.is_empty() && !b_subject_key.is_empty() && a_subject_key == b_subject_key {
+        return true;
+    }
+
+    let a_terms = subject_terms(&a.content);
+    let b_terms = subject_terms(&b.content);
+    if a_terms.is_empty() || b_terms.is_empty() {
+        return false;
+    }
+    if subject_key(&a.content) == subject_key(&b.content) {
+        return true;
+    }
+
+    let a_terms = a_terms.into_iter().collect::<BTreeSet<_>>();
+    let b_terms = b_terms.into_iter().collect::<BTreeSet<_>>();
+    let shared = a_terms.intersection(&b_terms).collect::<Vec<_>>();
+    let meaningful_shared = shared
+        .iter()
+        .filter(|term| !GENERIC_SHARED_TERMS.contains(&term.as_str()))
+        .count();
+    if meaningful_shared >= 2 {
+        return true;
+    }
+    if shared.len() == 1 && shared[0].as_str() == "cargo" && command_phrase_bridge(a, b) {
+        return true;
+    }
+    if shared.iter().any(|term| term.as_str() == "storage") {
+        return storage_bridge(&a_terms, &b_terms);
+    }
+    false
+}
+
+fn command_phrase_bridge(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    let a = normalize(&a.content);
+    let b = normalize(&b.content);
+    COMMAND_PHRASE_HINTS
+        .iter()
+        .any(|phrase| a.contains(phrase) && b.contains(phrase))
+}
+
+fn storage_bridge(a_terms: &BTreeSet<String>, b_terms: &BTreeSet<String>) -> bool {
+    let a_backend = a_terms.contains("backend");
+    let b_backend = b_terms.contains("backend");
+    let a_tech = contains_any_term(a_terms, STORAGE_TECH_HINTS);
+    let b_tech = contains_any_term(b_terms, STORAGE_TECH_HINTS);
+    (a_backend && b_tech) || (b_backend && a_tech)
+}
+
+fn contains_any_term(terms: &BTreeSet<String>, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| terms.contains(*needle))
+}
+
+const STORAGE_TECH_HINTS: &[&str] = &[
+    "api", "cargo", "command", "commands", "key", "repo", "rusqlite", "script", "sqlite", "test",
+    "tests", "tool", "tools", "fts5", "sqlite3", "bundle", "bundled",
+];
+
+const GENERIC_SHARED_TERMS: &[&str] = &["storage", "sync"];
+
+const COMMAND_PHRASE_HINTS: &[&str] = &["cargo test"];
 
 fn tokens(content: &str) -> Vec<String> {
     normalize(content)

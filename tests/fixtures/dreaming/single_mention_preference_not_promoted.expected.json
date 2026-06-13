@@ -4,7 +4,7 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "prefer",
+        "subject_key": "commit-messages-prefer",
         "action": "promote",
         "record_type": "preference",
         "promotion_reason": "single_unconfirmed_preference",

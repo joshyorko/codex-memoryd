@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "cargo",
+        "subject_key": "cargo-command-native",
         "action": "promote",
         "record_type": "command",
         "promotion_reason": "user_adopted_assistant_proposal",
