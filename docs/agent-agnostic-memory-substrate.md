@@ -293,6 +293,7 @@ This slice is good enough if a reader can answer:
 
 ## Cross-links
 
+- [Adapter conformance kit](../tests/adapter_conformance.rs)
 - [README](../README.md)
 - [SPEC](../SPEC.md)
 - [Dreamer design](./dreamer-loop-design.md)
