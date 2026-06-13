@@ -1,11 +1,14 @@
 //! Local Git history import. This is an evidence-only ingest path: accepted
 //! commit trailers become subject episodes, never active memory records.
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use serde_json::Value;
 
 use crate::error::Error;
 use crate::error::ErrorCode;
@@ -45,6 +48,7 @@ impl GitImportMode {
 
 pub struct GitImportParams<'a> {
     pub repo_path: &'a Path,
+    pub refs_fixture: Option<&'a Path>,
     pub profile: Option<String>,
     pub workspace: Option<String>,
     pub mode: GitImportMode,
@@ -56,8 +60,13 @@ pub struct GitImportEpisodePreview {
     pub trailer: String,
     pub source_ref: String,
     pub summary: String,
-    pub commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
     pub authored_at: Option<String>,
+    #[serde(skip)]
+    source_root: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +74,8 @@ pub struct GitImportRejection {
     pub source_ref: String,
     pub code: String,
     pub reason: String,
+    #[serde(skip)]
+    source_root: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,22 +100,69 @@ struct CommitEntry {
     body: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RefsFixtureItem {
+    kind: String,
+    repo: String,
+    #[serde(default)]
+    number: Option<Value>,
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    authored_at: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default, alias = "text")]
+    body: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ImportSource {
+    source_kind: &'static str,
+    source_ref_root: String,
+    commit: Option<String>,
+    authored_at: Option<String>,
+    body: String,
+    source_metadata: Value,
+}
+
 pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportResponse> {
     let repo_root = git_repo_root(params.repo_path)?;
-    let commits = read_commits(&repo_root, params.max_count.max(1))?;
+    let sources = if let Some(refs_fixture) = params.refs_fixture {
+        read_refs_fixture_sources(&repo_root, refs_fixture, params.max_count.max(1))?
+    } else {
+        read_commits(&repo_root, params.max_count.max(1))?
+            .into_iter()
+            .map(|commit| {
+                let source_ref_root = commit.sha.clone();
+                let authored_at = commit.authored_at.clone();
+                let source_metadata = json!({
+                    "origin": "git-import",
+                    "commit": commit.sha,
+                    "author_name": commit.author_name,
+                    "authored_at": authored_at.clone(),
+                });
+                ImportSource {
+                    source_kind: "git_commit_trailer",
+                    source_ref_root,
+                    commit: Some(commit.sha),
+                    authored_at,
+                    body: commit.body,
+                    source_metadata,
+                }
+            })
+            .collect()
+    };
     let mut episodes = Vec::new();
     let mut rejections = Vec::new();
 
-    for commit in &commits {
-        for (index, (trailer, value)) in parse_memory_trailers(&commit.body).into_iter().enumerate()
+    for source in &sources {
+        for (index, (trailer, value)) in parse_memory_trailers(&source.body).into_iter().enumerate()
         {
             let trailer_kind = trailer_kind(&trailer).unwrap_or("other");
-            let source_ref = format!(
-                "git:{}:{}:{}",
-                commit.sha,
-                trailer.to_ascii_lowercase(),
-                index
-            );
+            let source_ref = source_ref_for_trailer(source, &trailer, index);
             let summary = format!("{}: {}", trailer_label(trailer_kind), value);
             match policy::screen_string_value(&summary) {
                 PolicyDecision::Accept(cleaned) => {
@@ -112,8 +170,14 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                         trailer,
                         source_ref,
                         summary: cleaned,
-                        commit: commit.sha.clone(),
-                        authored_at: commit.authored_at.clone(),
+                        commit: source.commit.clone(),
+                        source: if source.source_kind == "git_commit_trailer" {
+                            None
+                        } else {
+                            Some(source.source_metadata.clone())
+                        },
+                        authored_at: source.authored_at.clone(),
+                        source_root: source.source_ref_root.clone(),
                     });
                 }
                 PolicyDecision::Reject { code, reason } => {
@@ -121,6 +185,7 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                         source_ref,
                         code,
                         reason,
+                        source_root: source.source_ref_root.clone(),
                     });
                 }
             }
@@ -149,14 +214,24 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
             ),
         })?;
         subject_id = Some(subject.subject.id.clone());
+        let source_by_root: std::collections::HashMap<&str, &ImportSource> = sources
+            .iter()
+            .map(|source| (source.source_ref_root.as_str(), source))
+            .collect();
 
         for episode in &episodes {
+            let Some(source) = source_by_root.get(episode.source_root.as_str()) else {
+                return Err(Error::internal(format!(
+                    "missing import source for {}",
+                    episode.source_root
+                )));
+            };
             if service
                 .store
                 .find_episode_by_source(
                     &subject.subject.profile_id,
                     &subject.subject.workspace_id,
-                    "git_commit_trailer",
+                    source.source_kind,
                     &episode.source_ref,
                 )?
                 .is_some()
@@ -169,21 +244,17 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                 profile: Some(subject.subject.profile_id.clone()),
                 workspace: Some(subject.subject.workspace_id.clone()),
                 subject_id: Some(subject.subject.id.clone()),
-                source_kind: Some("git_commit_trailer".to_string()),
+                source_kind: Some(source.source_kind.to_string()),
                 source_ref: Some(episode.source_ref.clone()),
                 started_at: episode.authored_at.clone(),
                 ended_at: None,
                 status: Some("evidence".to_string()),
                 summary: Some(episode.summary.clone()),
                 trust_level: Some("medium".to_string()),
-                source_metadata: Some(json!({
-                    "commit": episode.commit,
-                    "trailer": episode.trailer,
-                    "author_name": commits
-                        .iter()
-                        .find(|commit| commit.sha == episode.commit)
-                        .and_then(|commit| commit.author_name.clone()),
-                })),
+                source_metadata: Some(source_metadata_with_trailer(
+                    &source.source_metadata,
+                    &episode.trailer,
+                )),
                 metadata: Some(json!({"origin": "git-import"})),
             })?;
             service.store.record_evidence_ledger(&EvidenceLedgerEntry {
@@ -191,7 +262,7 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                 workspace_id: subject.subject.workspace_id.clone(),
                 repo_id: Some(format!("git:{}", repo_root.display())),
                 subject_key: Some(subject.subject.subject_key.clone()),
-                source_kind: "git_commit_trailer".to_string(),
+                source_kind: source.source_kind.to_string(),
                 source_id: Some(created_episode.episode.id),
                 source_path: Some(episode.source_ref.clone()),
                 source_hash: ids::source_hash(
@@ -204,20 +275,28 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                 policy_state: "accepted".to_string(),
                 metadata: json!({
                     "origin": "git-import",
-                    "commit": episode.commit,
+                    "source_kind": source.source_kind,
+                    "source_root": source.source_ref_root.clone(),
                     "trailer": episode.trailer,
+                    "source": source.source_metadata.clone(),
                 }),
             })?;
             created += 1;
         }
 
         for rejection in &rejections {
+            let Some(source) = source_by_root.get(rejection.source_root.as_str()) else {
+                return Err(Error::internal(format!(
+                    "missing import source for rejection {}",
+                    rejection.source_ref
+                )));
+            };
             service.store.record_evidence_ledger(&EvidenceLedgerEntry {
                 profile_id: subject.subject.profile_id.clone(),
                 workspace_id: subject.subject.workspace_id.clone(),
                 repo_id: Some(format!("git:{}", repo_root.display())),
                 subject_key: Some(subject.subject.subject_key.clone()),
-                source_kind: "git_commit_trailer".to_string(),
+                source_kind: source.source_kind.to_string(),
                 source_id: None,
                 source_path: Some(rejection.source_ref.clone()),
                 source_hash: ids::source_hash(
@@ -227,11 +306,16 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
                     &rejection.reason,
                 ),
                 safe_summary: ledger_safe_summary(&format!(
-                    "rejected git import trailer: {}",
+                    "rejected git import source: {}",
                     rejection.reason
                 )),
                 policy_state: rejection.code.clone(),
-                metadata: json!({"origin": "git-import"}),
+                metadata: json!({
+                    "origin": "git-import",
+                    "source_kind": source.source_kind,
+                    "source_root": source.source_ref_root.clone(),
+                    "source": source.source_metadata.clone(),
+                }),
             })?;
         }
     }
@@ -240,7 +324,7 @@ pub fn run(service: &Service, params: GitImportParams<'_>) -> Result<GitImportRe
         mode: params.mode.as_str().to_string(),
         repo_path: repo_root.display().to_string(),
         subject_id,
-        commits_scanned: commits.len(),
+        commits_scanned: sources.len(),
         proposed: episodes.len(),
         created,
         skipped,
@@ -306,6 +390,154 @@ fn read_commits(repo_root: &Path, max_count: usize) -> Result<Vec<CommitEntry>> 
         });
     }
     Ok(commits)
+}
+
+fn read_refs_fixture_sources(
+    repo_root: &Path,
+    fixture_path: &Path,
+    max_count: usize,
+) -> Result<Vec<ImportSource>> {
+    let content = fs::read_to_string(fixture_path).map_err(|e| {
+        Error::storage(format!("read refs fixture {}: {e}", fixture_path.display()))
+    })?;
+    let items = parse_refs_fixture_items(&content)?;
+    let mut sources = Vec::new();
+
+    for item in items.into_iter().take(max_count) {
+        let identity = fixture_item_identity(&item)?;
+        let kind = normalize_refs_kind(&item.kind)?;
+        let source_ref_root = format!(
+            "refs:{}:{}:{}",
+            sanitize_source_ref_component(item.repo.trim()),
+            sanitize_source_ref_component(&kind),
+            sanitize_source_ref_component(&identity),
+        );
+        let source_metadata = json!({
+            "origin": "git-import-refs-fixture",
+            "fixture_path": fixture_path.display().to_string(),
+            "repo_root": repo_root.display().to_string(),
+            "repo": item.repo.trim(),
+            "kind": kind,
+            "identity": identity,
+            "author_name": item.author.clone(),
+            "url": item.url.clone(),
+            "authored_at": item.authored_at.clone(),
+        });
+        let body = item.body.clone().unwrap_or_default();
+        sources.push(ImportSource {
+            source_kind: "git_refs_fixture",
+            source_ref_root,
+            commit: None,
+            authored_at: item.authored_at,
+            body,
+            source_metadata,
+        });
+    }
+
+    Ok(sources)
+}
+
+fn parse_refs_fixture_items(content: &str) -> Result<Vec<RefsFixtureItem>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| Error::invalid_request(format!("invalid refs fixture JSON array: {e}")))
+    } else if content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        > 1
+    {
+        let mut items = Vec::new();
+        for (line_no, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let item: RefsFixtureItem = serde_json::from_str(line).map_err(|e| {
+                Error::invalid_request(format!(
+                    "invalid refs fixture JSONL at line {}: {e}",
+                    line_no + 1
+                ))
+            })?;
+            items.push(item);
+        }
+        Ok(items)
+    } else if trimmed.starts_with('{') {
+        let item: RefsFixtureItem = serde_json::from_str(trimmed).map_err(|e| {
+            Error::invalid_request(format!("invalid refs fixture JSON object: {e}"))
+        })?;
+        Ok(vec![item])
+    } else {
+        Err(Error::invalid_request(
+            "refs fixture must be JSON array, JSON object, or JSONL",
+        ))
+    }
+}
+
+fn fixture_item_identity(item: &RefsFixtureItem) -> Result<String> {
+    if let Some(value) = &item.number {
+        return Ok(normalize_json_value(value));
+    }
+    if let Some(value) = &item.id {
+        return Ok(normalize_json_value(value));
+    }
+    if let Some(url) = &item.url {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(Error::invalid_request(
+        "refs fixture item must include number, id, or url",
+    ))
+}
+
+fn normalize_json_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.trim().to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn sanitize_source_ref_component(value: &str) -> String {
+    value.trim().replace('#', "%23")
+}
+
+fn normalize_refs_kind(kind: &str) -> Result<String> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "commit" => Ok("commit".to_string()),
+        "issue" => Ok("issue".to_string()),
+        "pr" | "pull_request" | "pull-request" => Ok("pr".to_string()),
+        "review_comment" | "review-comment" => Ok("review_comment".to_string()),
+        _ => Err(Error::invalid_request(
+            "unsupported refs fixture kind; use commit, pr, issue, or review_comment",
+        )),
+    }
+}
+
+fn source_ref_for_trailer(source: &ImportSource, trailer: &str, index: usize) -> String {
+    if source.source_kind == "git_commit_trailer" {
+        return format!(
+            "git:{}:{}:{}",
+            source.source_ref_root,
+            trailer.to_ascii_lowercase(),
+            index
+        );
+    }
+    format!("{}#{}", source.source_ref_root, index)
+}
+
+fn source_metadata_with_trailer(source_metadata: &Value, trailer: &str) -> Value {
+    let mut metadata = source_metadata.clone();
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("trailer".to_string(), Value::String(trailer.to_string()));
+    }
+    metadata
 }
 
 fn parse_memory_trailers(body: &str) -> Vec<(String, String)> {

@@ -164,6 +164,12 @@ fn init_fixture_repo(dir: &TempDir, commit_args: &[&str]) -> PathBuf {
     repo
 }
 
+fn write_refs_fixture_jsonl(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
 #[test]
 fn cli_doctor_reports_ok() {
     let dir = TempDir::new().unwrap();
@@ -618,6 +624,10 @@ fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
     let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(preview_json["mode"], "preview");
     assert_eq!(preview_json["proposed"], 2);
+    assert!(preview_json["episodes"][0]["source_ref"]
+        .as_str()
+        .unwrap()
+        .starts_with("git:"));
     assert_eq!(preview_json["created"], 0);
     assert_eq!(count_table(&db, "episodes"), 0);
     assert_eq!(count_table(&db, "evidence_ledger"), 0);
@@ -717,6 +727,214 @@ fn cli_git_import_rejects_secret_trailers_without_leaking_content() {
         .unwrap();
     assert_eq!(policy_state, "secret_detected");
     assert!(!safe_summary.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+}
+
+#[test]
+fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = init_fixture_repo(
+        &dir,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Fixture repo",
+            "-m",
+            "Memory-Decision: keep refs fixtures file-based",
+        ],
+    );
+    let fixture = write_refs_fixture_jsonl(
+        &dir,
+        "refs-fixture.jsonl",
+        r#"{"kind":"pr","repo":"joshyorko/codex","number":57,"authored_at":"2026-06-12T10:00:00Z","author":"josh","body":"Memory-Decision: keep refs imports file-based\nMemory-Verify: cargo test --test cli_smoke cli_git_import_refs_fixture"}
+{"kind":"issue","repo":"joshyorko/codex","id":"404","author":"josh","body":"Memory-Gotcha: issue refs stay evidence-only"}
+{"kind":"review_comment","repo":"joshyorko/codex","url":"https://github.com/joshyorko/codex/pull/57#discussion_r2","author":"josh","text":"Memory-Verify: review comments import through refs fixtures"}"#,
+    );
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--preview",
+            "--refs-fixture",
+            fixture.to_str().unwrap(),
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["mode"], "preview");
+    assert_eq!(preview_json["proposed"], 4);
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|episode| episode["source_ref"]
+            .as_str()
+            .unwrap()
+            .contains("review_comment")));
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|episode| episode.get("commit").is_none()));
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|episode| episode["source"]["origin"] == "git-import-refs-fixture"));
+    assert_eq!(preview_json["created"], 0);
+    assert_eq!(count_table(&db, "subjects"), 0);
+    assert_eq!(count_table(&db, "episodes"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--refs-fixture",
+            fixture.to_str().unwrap(),
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["mode"], "apply");
+    assert_eq!(first_json["proposed"], 4);
+    assert_eq!(first_json["created"], 4);
+    assert_eq!(count_table(&db, "subjects"), 1);
+    assert_eq!(count_table(&db, "episodes"), 4);
+    assert_eq!(count_table(&db, "evidence_ledger"), 4);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--refs-fixture",
+            fixture.to_str().unwrap(),
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["created"], 0);
+    assert_eq!(second_json["skipped"], 4);
+    assert_eq!(count_table(&db, "episodes"), 4);
+    assert_eq!(count_table(&db, "evidence_ledger"), 4);
+}
+
+#[test]
+fn cli_git_import_refs_fixture_rejects_secret_items_without_leaking_content() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = init_fixture_repo(
+        &dir,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Fixture repo",
+            "-m",
+            "Memory-Decision: keep refs imports file-based",
+        ],
+    );
+    let fixture = write_refs_fixture_jsonl(
+        &dir,
+        "refs-fixture.json",
+        r#"[{"kind":"review_comment","repo":"joshyorko/codex","url":"https://github.com/joshyorko/codex/pull/57#discussion_r1","author":"josh","text":"Memory-Gotcha: token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"}]"#,
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--refs-fixture",
+            fixture.to_str().unwrap(),
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["proposed"], 0);
+    assert_eq!(parsed["rejected"], 1);
+    assert!(!stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert_eq!(count_table(&db, "episodes"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 1);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+}
+
+#[test]
+fn cli_git_import_refs_fixture_rejects_unknown_kind_without_echoing_it() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = init_fixture_repo(
+        &dir,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Fixture repo",
+            "-m",
+            "Memory-Decision: keep refs imports file-based",
+        ],
+    );
+    let fixture = write_refs_fixture_jsonl(
+        &dir,
+        "refs-fixture.json",
+        r#"[{"kind":"token=ghp_abcdefghijklmnopqrstuvwxyz0123456789","repo":"joshyorko/codex","number":57,"body":"Memory-Decision: this should not parse"}]"#,
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--preview",
+            "--refs-fixture",
+            fixture.to_str().unwrap(),
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported refs fixture kind"));
+    assert!(!stderr.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
 }
 
 #[test]
