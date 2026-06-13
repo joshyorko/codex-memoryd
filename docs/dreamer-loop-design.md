@@ -256,8 +256,10 @@ state (`planned`, `active`, `blocked`, `completed`, `historical`,
 
 `subject_key` is required on every candidate and is the deterministic anchor for
 grouping, thresholding, and supersession. The normalizer lowercases, removes
-volatile words, keeps the record family and scope, and includes repo identity
-when repo-scoped so unrelated workspaces do not collide.
+volatile words, and keeps a compact content-derived anchor so state wording
+does not dominate the key. Same-subject matching can still accept compatible
+overlap/bridge cases within the same scope so related facts with different
+wording stay connected without collapsing unrelated work.
 
 Initial evidence classes are weighted asymmetrically:
 
@@ -353,10 +355,11 @@ When newer evidence contradicts an active record on the same subject:
   `/v1/forget` archival default);
 - record `promotion_reason` and `evidence_window` provenance.
 
-"Same subject" in the heuristic MVP = same deterministic `subject_key` within
-the same profile/workspace (and repo, when scoped to repo), with lexical overlap
-as a guardrail for early heuristics. An LLM synthesizer can refine wording later,
-but it must not bypass the `subject_key` grouping and supersession anchor.
+"Same subject" in the heuristic MVP = same deterministic `subject_key` or a
+compatible same-scope overlap/bridge match within the same profile/workspace
+(and repo, when scoped to repo), with lexical overlap as a guardrail for early
+heuristics. An LLM synthesizer can refine wording later, but it must not bypass
+the subject grouping and supersession anchor.
 
 ### 5.4 Provenance metadata (no migration)
 
