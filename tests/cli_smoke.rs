@@ -37,6 +37,28 @@ fn count_archived(db: &PathBuf) -> i64 {
     .unwrap()
 }
 
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("run git {args:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn init_fixture_repo(dir: &TempDir, commit_args: &[&str]) -> PathBuf {
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    std::fs::write(repo.join("README.md"), "fixture repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, commit_args);
+    repo
+}
+
 #[test]
 fn cli_doctor_reports_ok() {
     let dir = TempDir::new().unwrap();
@@ -407,6 +429,143 @@ fn cli_conclude_rejects_secret() {
         .assert()
         .success()
         .stdout(predicate::str::contains("secret_detected"));
+}
+
+#[test]
+fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = init_fixture_repo(
+        &dir,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Document memory trailers",
+            "-m",
+            "Memory-Decision: import commit trailers as evidence episodes",
+            "-m",
+            "Memory-Verify: cargo test --test cli_smoke cli_git_import",
+        ],
+    );
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["mode"], "preview");
+    assert_eq!(preview_json["proposed"], 2);
+    assert_eq!(preview_json["created"], 0);
+    assert_eq!(count_table(&db, "episodes"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["mode"], "apply");
+    assert_eq!(first_json["proposed"], 2);
+    assert_eq!(first_json["created"], 2);
+    assert_eq!(count_table(&db, "subjects"), 1);
+    assert_eq!(count_table(&db, "episodes"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["created"], 0);
+    assert_eq!(second_json["skipped"], 2);
+    assert_eq!(count_table(&db, "episodes"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+}
+
+#[test]
+fn cli_git_import_rejects_secret_trailers_without_leaking_content() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = init_fixture_repo(
+        &dir,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Secret trailer",
+            "-m",
+            "Memory-Gotcha: token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        ],
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "git-import",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["proposed"], 0);
+    assert_eq!(parsed["rejected"], 1);
+    assert!(!stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert_eq!(count_table(&db, "episodes"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 1);
+
+    let conn = Connection::open(&db).unwrap();
+    let (policy_state, safe_summary): (String, String) = conn
+        .query_row(
+            "SELECT policy_state, safe_summary FROM evidence_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(policy_state, "secret_detected");
+    assert!(!safe_summary.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
 }
 
 #[test]
@@ -1113,6 +1272,7 @@ fn cli_help_lists_all_commands() {
         .stdout(predicate::str::contains("search"))
         .stdout(predicate::str::contains("dream"))
         .stdout(predicate::str::contains("sync-local"))
+        .stdout(predicate::str::contains("git-import"))
         .stdout(predicate::str::contains("export"))
         .stdout(predicate::str::contains("forget"))
         .stdout(predicate::str::contains("doctor"));

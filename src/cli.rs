@@ -14,6 +14,9 @@ use codex_memoryd::config::Config;
 use codex_memoryd::domain;
 use codex_memoryd::error;
 use codex_memoryd::error::Result;
+use codex_memoryd::git_import;
+use codex_memoryd::git_import::GitImportMode;
+use codex_memoryd::git_import::GitImportParams;
 use codex_memoryd::ingest::ArtifactKind;
 use codex_memoryd::mcp;
 use codex_memoryd::protocol::*;
@@ -118,6 +121,25 @@ pub enum Command {
         /// Source root, e.g. ~/.codex/memories.
         #[arg(value_name = "SOURCE_ROOT")]
         source_root: PathBuf,
+    },
+    /// Import local Git commit trailers as evidence episodes.
+    GitImport {
+        /// Preview only (no durable writes).
+        #[arg(long, conflicts_with = "apply")]
+        preview: bool,
+        /// Apply (write subject episodes, idempotent).
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Maximum commits to scan from HEAD.
+        #[arg(long, default_value_t = 100)]
+        max_count: usize,
+        /// Local Git repository path.
+        #[arg(value_name = "REPO")]
+        repo: PathBuf,
     },
     /// Export safe records as JSONL (default) or JSON.
     Export {
@@ -768,6 +790,34 @@ fn dispatch(cli: Cli) -> Result<()> {
                 metadata: None,
             };
             let resp = service.sync_local(req)?;
+            print_json(&resp)?;
+            Ok(())
+        }
+        Command::GitImport {
+            preview,
+            apply,
+            profile,
+            workspace,
+            max_count,
+            repo,
+        } => {
+            let service = cli.open_service(None)?;
+            let mode = if *apply {
+                GitImportMode::Apply
+            } else {
+                GitImportMode::Preview
+            };
+            let _ = preview; // preview is the default; flag is for clarity
+            let resp = git_import::run(
+                &service,
+                GitImportParams {
+                    repo_path: repo,
+                    profile: profile.clone(),
+                    workspace: workspace.clone(),
+                    mode,
+                    max_count: *max_count,
+                },
+            )?;
             print_json(&resp)?;
             Ok(())
         }

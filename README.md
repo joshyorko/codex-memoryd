@@ -253,6 +253,10 @@ codex-memoryd dream --profile personal --workspace josh-personal --apply
 codex-memoryd sync-local --preview ~/.codex/memories
 codex-memoryd sync-local --apply ~/.codex/memories
 
+# Local Git evidence import
+codex-memoryd git-import --preview /path/to/repo
+codex-memoryd git-import --apply /path/to/repo
+
 # Export and forget
 codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
 codex-memoryd adapter export --target agents-md \
@@ -260,6 +264,11 @@ codex-memoryd adapter export --target agents-md \
 codex-memoryd forget <record-id>
 codex-memoryd forget <record-id> --delete
 ```
+
+`git-import` scans recent local commits for explicit `Memory-*` trailers such as
+`Memory-Decision`, `Memory-Verify`, and `Memory-Gotcha`. Apply mode writes safe
+subject episodes and evidence ledger rows only; it does not promote Git evidence
+to active memory records.
 
 ## Config and Compatibility
 

@@ -633,6 +633,28 @@ impl Store {
         Ok(())
     }
 
+    pub fn find_episode_by_source(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        source_kind: &str,
+        source_ref: &str,
+    ) -> Result<Option<Episode>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {EPISODE_COLS} FROM episodes
+                     WHERE profile_id = ?1 AND workspace_id = ?2
+                       AND source_kind = ?3 AND source_ref = ?4"
+                ),
+                params![profile_id, workspace_id, source_kind, source_ref],
+                row_to_episode,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     pub fn get_episode(
         &self,
         profile_id: &str,
