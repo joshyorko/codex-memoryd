@@ -41,7 +41,8 @@ for the deterministic-clock fixture.
 }
 ```
 
-Preview expectations match deterministic candidates by `subject_key`, candidate
+Preview expectations match deterministic candidates by `subject_key` plus the
+same-subject grouping/bridge heuristics used by the Dreamer core, candidate
 state (`accepted`, `quarantined`, or `rejected`), evidence/provenance fields,
 policy result, and drift/supersession metadata. Apply expectations assert
 created/archived counts and that a second apply over the same evidence window is

@@ -60,6 +60,8 @@ struct ToolCallParams {
     name: String,
     #[serde(default)]
     arguments: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    _meta: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
