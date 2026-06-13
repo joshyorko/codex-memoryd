@@ -19,6 +19,7 @@ pub mod domain;
 pub mod dream;
 pub mod error;
 pub mod export;
+pub mod git_import;
 pub mod ids;
 pub mod ingest;
 pub mod mcp;
