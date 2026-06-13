@@ -61,13 +61,14 @@ const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
-const ADAPTER_TARGETS: &[&str] = &["agents-md", "claude-code", "copilot"];
+const ADAPTER_TARGETS: &[&str] = &["agents-md", "claude-code", "copilot", "markdown"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
     AgentsMd,
     ClaudeCode,
     Copilot,
+    Markdown,
 }
 
 impl AdapterTarget {
@@ -77,6 +78,7 @@ impl AdapterTarget {
             "agents-md" => Ok(Self::AgentsMd),
             "claude-code" => Ok(Self::ClaudeCode),
             "copilot" => Ok(Self::Copilot),
+            "markdown" => Ok(Self::Markdown),
             _ => Err(Error::invalid_request(format!(
                 "unknown adapter target '{target}'; use {}",
                 ADAPTER_TARGETS.join(" or ")
@@ -89,6 +91,7 @@ impl AdapterTarget {
             Self::AgentsMd => "agents-md",
             Self::ClaudeCode => "claude-code",
             Self::Copilot => "copilot",
+            Self::Markdown => "markdown",
         }
     }
 }
@@ -2202,6 +2205,9 @@ fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> String
         }
         AdapterTarget::Copilot => {
             render_memory_markdown_view("Copilot Instructions Memory View", "copilot", card)
+        }
+        AdapterTarget::Markdown => {
+            render_memory_markdown_view("Markdown Memory View", "markdown", card)
         }
     }
 }

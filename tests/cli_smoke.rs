@@ -1508,6 +1508,79 @@ fn cli_adapter_copilot_export_is_deterministic() {
 }
 
 #[test]
+fn cli_adapter_markdown_export_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: markdown adapter views use the shared memory card export path",
+        ])
+        .assert()
+        .success();
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "markdown",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "markdown",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["target"], "markdown");
+    assert_eq!(first["adapter_version"], "adapter-view-v1");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["source_card_type"], "workspace_summary");
+    assert_eq!(first["budget"]["truncated"], false);
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    let markdown = first["markdown"].as_str().unwrap();
+    assert!(markdown.contains("# Markdown Memory View"));
+    assert!(markdown.contains("- Adapter target: `markdown`"));
+    assert!(markdown.contains("Source of truth remains the local SQLite store"));
+}
+
+#[test]
 fn cli_adapter_agents_md_budget_and_target_validation() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
