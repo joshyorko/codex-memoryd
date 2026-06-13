@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "now",
+        "subject_key": "daemon-failing-patch",
         "action": "rewrite_historical",
         "record_type": "other",
         "promotion_reason": "expired relative-time content",
@@ -13,7 +13,7 @@
         "must_not_contain": []
       },
       {
-        "subject_key": "now",
+        "subject_key": "daemon-failing-patch",
         "action": "promote",
         "record_type": "other",
         "promotion_reason": "explicit_conclusion",

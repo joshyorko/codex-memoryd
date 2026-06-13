@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "cargo",
+        "subject_key": "cargo-command-supported",
         "action": "promote",
         "record_type": "decision",
         "promotion_reason": "explicit_conclusion",

@@ -2,7 +2,7 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "storage",
+        "subject_key": "backend-bundled-rusqlite",
         "action": "supersede",
         "record_type": "decision",
         "promotion_reason": "newer completed evidence supersedes older active state",
@@ -11,7 +11,7 @@
         "must_not_contain": ["still TBD; evaluating options"]
       },
       {
-        "subject_key": "storage",
+        "subject_key": "backend-bundled-rusqlite",
         "action": "promote",
         "record_type": "decision",
         "promotion_reason": "explicit_conclusion",
@@ -20,7 +20,7 @@
         "must_not_contain": ["still TBD; evaluating options"]
       },
       {
-        "subject_key": "the",
+        "subject_key": "bundled-fallback-fts5",
         "action": "promote",
         "record_type": "task_checkpoint",
         "promotion_reason": "checkpoint_backed_task_state",
