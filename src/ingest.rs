@@ -18,6 +18,8 @@ use crate::protocol::SyncFile;
 use crate::protocol::SyncRejection;
 use crate::protocol::SyncResponse;
 use crate::protocol::SyncTypeBreakdown;
+use crate::store::ledger_safe_summary;
+use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
 use crate::store::Store;
 
@@ -164,6 +166,35 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                     // can't classify is skipped per SPEC.
                     let inferred = ArtifactKind::infer_from_path(&file.path);
                     if inferred == ArtifactKind::Unknown {
+                        if matches!(params.mode, SyncMode::Apply) {
+                            let safe_summary = ledger_safe_summary(&format!(
+                                "rejected sync import {}: unsupported artifact kind",
+                                file.path
+                            ));
+                            let source_hash = ledger_hash(&[
+                                profile_str,
+                                params.workspace,
+                                &file.path,
+                                "sync_source_invalid",
+                                &ids::sha256_hex(file.content.as_bytes()),
+                            ]);
+                            let _ = store.record_evidence_ledger(&EvidenceLedgerEntry {
+                                profile_id: profile_str.to_string(),
+                                workspace_id: params.workspace.to_string(),
+                                repo_id: params.repo_id.map(|s| s.to_string()),
+                                subject_key: None,
+                                source_kind: "sync_local".to_string(),
+                                source_id: None,
+                                source_path: Some(file.path.clone()),
+                                source_hash,
+                                safe_summary,
+                                policy_state: "sync_source_invalid".to_string(),
+                                metadata: json!({
+                                    "artifact_kind": k,
+                                    "source_root": params.source_root,
+                                }),
+                            });
+                        }
                         rejected += 1;
                         rejections.push(SyncRejection {
                             path: file.path.clone(),
@@ -200,6 +231,33 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 reason: "empty file".to_string(),
                 code: "invalid_request".to_string(),
             });
+            if matches!(params.mode, SyncMode::Apply) {
+                let safe_summary =
+                    ledger_safe_summary(&format!("rejected sync import {}: empty file", file.path));
+                let source_hash = ledger_hash(&[
+                    profile_str,
+                    params.workspace,
+                    &file.path,
+                    "invalid_request",
+                    "empty_file",
+                    &ids::sha256_hex(file.content.as_bytes()),
+                ]);
+                let _ = store.record_evidence_ledger(&EvidenceLedgerEntry {
+                    profile_id: profile_str.to_string(),
+                    workspace_id: params.workspace.to_string(),
+                    repo_id: params.repo_id.map(|s| s.to_string()),
+                    subject_key: None,
+                    source_kind: "sync_local".to_string(),
+                    source_id: None,
+                    source_path: Some(file.path.clone()),
+                    source_hash,
+                    safe_summary,
+                    policy_state: "invalid_request".to_string(),
+                    metadata: json!({
+                        "source_root": params.source_root,
+                    }),
+                });
+            }
             continue;
         }
         if let Some(label) = policy::detect_secret(trimmed) {
@@ -209,6 +267,37 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 reason: format!("secret-like content detected: {label}"),
                 code: "secret_detected".to_string(),
             });
+            if matches!(params.mode, SyncMode::Apply) {
+                let safe_summary = ledger_safe_summary(&format!(
+                    "rejected sync import {}: secret-like content detected",
+                    file.path
+                ));
+                let source_hash = ledger_hash(&[
+                    profile_str,
+                    params.workspace,
+                    &file.path,
+                    "secret_detected",
+                    label,
+                    &ids::sha256_hex(trimmed.as_bytes()),
+                ]);
+                let _ = store.record_evidence_ledger(&EvidenceLedgerEntry {
+                    profile_id: profile_str.to_string(),
+                    workspace_id: params.workspace.to_string(),
+                    repo_id: params.repo_id.map(|s| s.to_string()),
+                    subject_key: None,
+                    source_kind: "sync_local".to_string(),
+                    source_id: None,
+                    source_path: Some(file.path.clone()),
+                    source_hash,
+                    safe_summary,
+                    policy_state: "secret_detected".to_string(),
+                    metadata: json!({
+                        "artifact_kind": kind.as_str(),
+                        "source_root": params.source_root,
+                        "label": label,
+                    }),
+                });
+            }
             if matches!(params.mode, SyncMode::Apply) {
                 let _ = store.record_policy_event(
                     Some(profile_str),
@@ -228,6 +317,36 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 reason: "prompt-injection-like content detected".to_string(),
                 code: "policy_denied".to_string(),
             });
+            if matches!(params.mode, SyncMode::Apply) {
+                let safe_summary = ledger_safe_summary(&format!(
+                    "rejected sync import {}: prompt-injection-like content detected",
+                    file.path
+                ));
+                let source_hash = ledger_hash(&[
+                    profile_str,
+                    params.workspace,
+                    &file.path,
+                    "policy_denied",
+                    "injection",
+                    &ids::sha256_hex(trimmed.as_bytes()),
+                ]);
+                let _ = store.record_evidence_ledger(&EvidenceLedgerEntry {
+                    profile_id: profile_str.to_string(),
+                    workspace_id: params.workspace.to_string(),
+                    repo_id: params.repo_id.map(|s| s.to_string()),
+                    subject_key: None,
+                    source_kind: "sync_local".to_string(),
+                    source_id: None,
+                    source_path: Some(file.path.clone()),
+                    source_hash,
+                    safe_summary,
+                    policy_state: "policy_denied".to_string(),
+                    metadata: json!({
+                        "artifact_kind": kind.as_str(),
+                        "source_root": params.source_root,
+                    }),
+                });
+            }
             if matches!(params.mode, SyncMode::Apply) {
                 let _ = store.record_policy_event(
                     Some(profile_str),
@@ -290,6 +409,34 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             &raw_hash,
             &source_metadata,
         )?;
+
+        let source_ledger_summary = ledger_safe_summary(&format!(
+            "imported {} chunk(s) from {}",
+            chunk_count, file.path
+        ));
+        store.record_evidence_ledger(&EvidenceLedgerEntry {
+            profile_id: profile_str.to_string(),
+            workspace_id: params.workspace.to_string(),
+            repo_id: params.repo_id.map(|s| s.to_string()),
+            subject_key: None,
+            source_kind: "sync_local".to_string(),
+            source_id: Some(source.id.clone()),
+            source_path: Some(file.path.clone()),
+            source_hash: raw_hash.clone(),
+            safe_summary: source_ledger_summary,
+            policy_state: "accepted".to_string(),
+            metadata: json!({
+                "artifact_kind": kind.as_str(),
+                "source_root": params.source_root,
+                "source_created": source_created,
+                "already_imported": already_imported,
+                "chunk_count": chunk_count,
+                "created": created,
+                "updated": updated,
+                "skipped": skipped,
+                "rejected": rejected,
+            }),
+        })?;
 
         if already_imported && !source_created {
             // Whole file already imported and unchanged → skip all its chunks.
@@ -416,6 +563,10 @@ fn tally_type(types: &mut SyncTypeBreakdown, t: RecordType) {
         RecordType::TaskCheckpoint => types.task_checkpoint += 1,
         _ => types.other += 1,
     }
+}
+
+fn ledger_hash(parts: &[&str]) -> String {
+    ids::sha256_hex(parts.join("\u{1f}").as_bytes())
 }
 
 /// Derive classified candidate chunks from a file's content using the artifact

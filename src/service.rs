@@ -45,8 +45,10 @@ use crate::recall;
 use crate::recall::RecallParams;
 use crate::recall::SearchParams;
 use crate::status;
+use crate::store::ledger_safe_summary;
 use crate::store::DreamRunAudit;
 use crate::store::DreamRunRecord;
+use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
 use crate::store::Store;
 
@@ -255,6 +257,33 @@ impl Service {
         for (idx, msg) in messages.into_iter().enumerate() {
             let actor = msg.actor.trim().to_ascii_lowercase();
             if actor != "user" && actor != "assistant" {
+                let summary = ledger_safe_summary(&format!(
+                    "rejected visible turn message {idx}: invalid actor"
+                ));
+                let source_hash = ledger_hash(&[
+                    profile.as_str(),
+                    &workspace,
+                    session_id.as_str(),
+                    &idx.to_string(),
+                    "invalid_actor",
+                ]);
+                let _ = self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace.clone(),
+                    repo_id: repo_id.clone(),
+                    subject_key: None,
+                    source_kind: "visible_turn".to_string(),
+                    source_id: None,
+                    source_path: Some(format!("turn:{session_id}:{idx}")),
+                    source_hash,
+                    safe_summary: summary,
+                    policy_state: "invalid_request".to_string(),
+                    metadata: json!({
+                        "actor": actor.clone(),
+                        "message_index": idx,
+                        "session_id": session_id.clone(),
+                    }),
+                });
                 rejections.push(Rejection {
                     index: Some(idx),
                     reason: "invalid actor: must be user or assistant".to_string(),
@@ -270,6 +299,35 @@ impl Service {
             ) {
                 Ok(value) => value.unwrap_or(Value::Null),
                 Err(err) => {
+                    let summary = ledger_safe_summary(&format!(
+                        "rejected visible turn message {idx}: {}",
+                        err.message
+                    ));
+                    let source_hash = ledger_hash(&[
+                        profile.as_str(),
+                        &workspace,
+                        session_id.as_str(),
+                        &idx.to_string(),
+                        err.code.as_str(),
+                    ]);
+                    let _ = self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                        profile_id: profile.as_str().to_string(),
+                        workspace_id: workspace.clone(),
+                        repo_id: repo_id.clone(),
+                        subject_key: None,
+                        source_kind: "visible_turn".to_string(),
+                        source_id: None,
+                        source_path: Some(format!("turn:{session_id}:{idx}")),
+                        source_hash,
+                        safe_summary: summary,
+                        policy_state: err.code.as_str().to_string(),
+                        metadata: json!({
+                            "actor": actor.clone(),
+                            "message_index": idx,
+                            "session_id": session_id.clone(),
+                            "code": err.code.as_str(),
+                        }),
+                    });
                     rejections.push(Rejection {
                         index: Some(idx),
                         reason: err.message.clone(),
@@ -292,6 +350,34 @@ impl Service {
             let content = match decision {
                 PolicyDecision::Accept(c) => c,
                 PolicyDecision::Reject { code, reason } => {
+                    let summary = ledger_safe_summary(&format!(
+                        "rejected visible turn message {idx}: {reason}"
+                    ));
+                    let source_hash = ledger_hash(&[
+                        profile.as_str(),
+                        &workspace,
+                        session_id.as_str(),
+                        &idx.to_string(),
+                        code.as_str(),
+                    ]);
+                    let _ = self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                        profile_id: profile.as_str().to_string(),
+                        workspace_id: workspace.clone(),
+                        repo_id: repo_id.clone(),
+                        subject_key: None,
+                        source_kind: "visible_turn".to_string(),
+                        source_id: None,
+                        source_path: Some(format!("turn:{session_id}:{idx}")),
+                        source_hash,
+                        safe_summary: summary,
+                        policy_state: code.clone(),
+                        metadata: json!({
+                            "actor": actor.clone(),
+                            "message_index": idx,
+                            "session_id": session_id.clone(),
+                            "code": code,
+                        }),
+                    });
                     rejections.push(Rejection {
                         index: Some(idx),
                         reason: reason.clone(),
@@ -329,9 +415,27 @@ impl Service {
                 "visible_turn",
                 Some(&format!("turn:{}", turn.id)),
                 &source_hash,
-                &json!({ "actor": actor, "session_id": session_id }),
+                &json!({ "actor": actor.clone(), "session_id": session_id.clone() }),
             )?;
             source_ids.push(src.id.clone());
+            self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                profile_id: profile.as_str().to_string(),
+                workspace_id: workspace.clone(),
+                repo_id: repo_id.clone(),
+                subject_key: None,
+                source_kind: "visible_turn".to_string(),
+                source_id: Some(src.id.clone()),
+                source_path: Some(format!("turn:{}", turn.id)),
+                source_hash: source_hash,
+                safe_summary: ledger_safe_summary(&content),
+                policy_state: "accepted".to_string(),
+                metadata: json!({
+                    "actor": actor.clone(),
+                    "message_index": idx,
+                    "session_id": session_id.clone(),
+                    "turn_id": turn.id.clone(),
+                }),
+            })?;
             accepted += 1;
             Metrics::incr(&self.metrics.writeback_accepted);
 
@@ -446,6 +550,32 @@ impl Service {
             let content = match decision {
                 PolicyDecision::Accept(c) => c,
                 PolicyDecision::Reject { code, reason } => {
+                    let summary = ledger_safe_summary(&format!("rejected conclusion: {reason}"));
+                    let source_hash = ledger_hash(&[
+                        profile.as_str(),
+                        &workspace,
+                        repo_id.as_deref().unwrap_or(""),
+                        target.as_str(),
+                        code.as_str(),
+                        &ids::sha256_hex(raw.as_bytes()),
+                    ]);
+                    let _ = self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                        profile_id: profile.as_str().to_string(),
+                        workspace_id: workspace.clone(),
+                        repo_id: repo_id.clone(),
+                        subject_key: None,
+                        source_kind: "conclusion".to_string(),
+                        source_id: None,
+                        source_path: Some(format!("conclusion:{}:{code}", target.clone())),
+                        source_hash,
+                        safe_summary: summary,
+                        policy_state: code.clone(),
+                        metadata: json!({
+                            "target": target.clone(),
+                            "reason": reason,
+                            "code": code,
+                        }),
+                    });
                     rejected.push(ConclusionRejection {
                         content: redact_for_echo(&raw),
                         reason: reason.clone(),
@@ -505,13 +635,30 @@ impl Service {
                 portability: class.portability,
                 confidence: class.confidence,
                 source_ids: vec![],
-                content_hash,
+                content_hash: content_hash.clone(),
                 supersedes: vec![],
-                metadata: json!({ "origin": "conclusion", "conclusion_id": conclusion.id, "target": target }),
+                metadata: json!({ "origin": "conclusion", "conclusion_id": conclusion.id, "target": target.clone() }),
             };
             if let crate::store::UpsertOutcome::Created(id) = self.store.upsert_record(&new)? {
                 record_ids.push(id);
             }
+            self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                profile_id: profile.as_str().to_string(),
+                workspace_id: workspace.clone(),
+                repo_id: repo_id.clone(),
+                subject_key: None,
+                source_kind: "conclusion".to_string(),
+                source_id: Some(conclusion.id.clone()),
+                source_path: Some(format!("conclusion:{}", conclusion.id)),
+                source_hash: content_hash,
+                safe_summary: ledger_safe_summary(&new.content),
+                policy_state: "accepted".to_string(),
+                metadata: json!({
+                    "target": target.clone(),
+                    "conclusion_id": conclusion.id,
+                    "record_type": class.record_type.as_str(),
+                }),
+            })?;
             Metrics::incr(&self.metrics.writeback_accepted);
         }
 
@@ -544,6 +691,30 @@ impl Service {
         let summary = match policy::screen_content(&summary, self.config.max_record_chars) {
             PolicyDecision::Accept(c) => c,
             PolicyDecision::Reject { code, reason } => {
+                let safe_summary = ledger_safe_summary(&format!("rejected checkpoint: {reason}"));
+                let source_hash = ledger_hash(&[
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref().unwrap_or(""),
+                    code.as_str(),
+                    &ids::sha256_hex(summary.as_bytes()),
+                ]);
+                let _ = self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace.clone(),
+                    repo_id: repo_id.clone(),
+                    subject_key: None,
+                    source_kind: "checkpoint".to_string(),
+                    source_id: None,
+                    source_path: Some("checkpoint:summary".to_string()),
+                    source_hash,
+                    safe_summary,
+                    policy_state: code.clone(),
+                    metadata: json!({
+                        "code": code,
+                        "reason": reason,
+                    }),
+                });
                 let _ = self.store.record_policy_event(
                     Some(profile.as_str()),
                     Some(&workspace),
@@ -607,17 +778,35 @@ impl Service {
             created_at: ids::now_rfc3339(),
         };
         self.store.insert_checkpoint(&checkpoint)?;
-
-        // Also store a task_checkpoint memory record so recall can surface it as
-        // a fact when checkpoints aren't separately requested.
-        let content_hash = ids::content_hash(
+        let checkpoint_hash = ids::content_hash(
             profile.as_str(),
             &workspace,
             repo_id.as_deref(),
             RecordType::TaskCheckpoint.as_str(),
             Scope::Session.as_str(),
-            &summary,
+            &checkpoint.summary,
         );
+        self.store.record_evidence_ledger(&EvidenceLedgerEntry {
+            profile_id: profile.as_str().to_string(),
+            workspace_id: workspace.clone(),
+            repo_id: repo_id.clone(),
+            subject_key: None,
+            source_kind: "checkpoint".to_string(),
+            source_id: Some(checkpoint.id.clone()),
+            source_path: Some(format!("checkpoint:{}", checkpoint.id)),
+            source_hash: checkpoint_hash.clone(),
+            safe_summary: ledger_safe_summary(&checkpoint.summary),
+            policy_state: "accepted".to_string(),
+            metadata: json!({
+                "checkpoint_id": checkpoint.id.clone(),
+                "session_id": checkpoint.session_id.clone(),
+                "changed_files": checkpoint.changed_files.len(),
+            }),
+        })?;
+
+        // Also store a task_checkpoint memory record so recall can surface it as
+        // a fact when checkpoints aren't separately requested.
+        let content_hash = checkpoint_hash;
         let _ = self.store.upsert_record(&NewRecord {
             profile_id: profile.as_str().to_string(),
             workspace_id: workspace.clone(),
@@ -1245,4 +1434,8 @@ fn map_code(code: &str) -> ErrorCode {
         "invalid_request" => ErrorCode::InvalidRequest,
         _ => ErrorCode::PolicyDenied,
     }
+}
+
+fn ledger_hash(parts: &[&str]) -> String {
+    ids::sha256_hex(parts.join("\u{1f}").as_bytes())
 }
