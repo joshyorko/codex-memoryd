@@ -10,7 +10,7 @@ use codex_memoryd::policy;
 use codex_memoryd::protocol::*;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::{NewRecord, Store, UpsertOutcome};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -149,6 +149,68 @@ fn turn_as(svc: &Service, session_id: &str, actor: &str, content: &str, created_
         write_policy: None,
     })
     .unwrap();
+}
+
+fn seed_direct_evidence_window_refs(svc: &Service, suffix: &str, sentinel: &str) {
+    let session_id = format!("sess_window_{suffix}");
+    svc.store
+        .ensure_session(&session_id, "personal", "ws", None, None, "test")
+        .unwrap();
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: format!("turn_window_{suffix}"),
+            session_id: session_id.clone(),
+            actor: "user".to_string(),
+            content: format!("Visible turn {sentinel}"),
+            created_at: "2026-06-09T00:00:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_conclusion(&Conclusion {
+            id: format!("concl_window_{suffix}"),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            target: "user".to_string(),
+            content: format!("Conclusion {sentinel}"),
+            source_id: None,
+            created_at: "2026-06-09T00:01:00Z".to_string(),
+            metadata: json!({}),
+        })
+        .unwrap();
+    svc.store
+        .insert_checkpoint(&Checkpoint {
+            id: format!("ckpt_window_{suffix}"),
+            session_id: Some(session_id),
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            summary: format!("Checkpoint {sentinel}"),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2026-06-09T00:02:00Z".to_string(),
+        })
+        .unwrap();
+    svc.store
+        .upsert_source(
+            "personal",
+            "ws",
+            "codex_local_memory",
+            Some(&format!("memory/{suffix}.md")),
+            &ids::source_hash("personal", "ws", &format!("memory/{suffix}.md"), sentinel),
+            &json!({
+                "origin": "test",
+                "safe_summary": format!("source {suffix}"),
+            }),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -486,6 +548,8 @@ fn scheduled_dreamer_failed_run_does_not_advance_watermark() {
         .unwrap();
 
     assert_eq!(failed.status, "error");
+    assert_eq!(failed.reason.as_deref(), Some("max_runtime_seconds"));
+    assert!(failed.run.is_none());
     assert_eq!(
         failing
             .store
@@ -539,9 +603,45 @@ fn scheduled_dreamer_enforces_candidate_limit() {
         .scheduled_dream(Some("2030-01-01T00:00:00Z".to_string()))
         .unwrap();
 
-    assert_eq!(scheduled.status, "ok");
+    assert_eq!(scheduled.status, "ok_with_limits");
+    assert_eq!(scheduled.reason.as_deref(), Some("max_candidates"));
     assert!(scheduled.run.unwrap().candidates.len() <= 1);
     assert!(scheduled.limits_hit.contains(&"max_candidates".to_string()));
+    assert_eq!(
+        svc.store
+            .scheduled_dream_watermark("personal", "ws", None)
+            .unwrap()
+            .as_deref(),
+        Some("2030-01-01T00:00:00Z")
+    );
+    let status = svc.status().unwrap();
+    let scheduler = status.features.get("dream_scheduler").unwrap();
+    assert_eq!(scheduler.get("last_status").unwrap(), "ok_with_limits");
+    assert_eq!(scheduler.get("degraded").unwrap(), false);
+}
+
+#[test]
+fn scheduled_dreamer_does_not_mark_limit_hit_on_exact_candidate_count() {
+    let mut cfg = scheduler_config();
+    cfg.max_candidates = 2;
+    let svc = scheduled_service(cfg);
+    conclude(
+        &svc,
+        "Alpha: the cache invalidation job should keep sessions warm.",
+    );
+    conclude(
+        &svc,
+        "Beta: the scheduler should preserve run history and watermark.",
+    );
+
+    let scheduled = svc
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".to_string()))
+        .unwrap();
+
+    assert_eq!(scheduled.status, "ok");
+    assert!(scheduled.reason.is_none());
+    assert!(scheduled.limits_hit.is_empty());
+    assert_eq!(scheduled.run.as_ref().unwrap().candidates.len(), 2);
 }
 
 #[test]
@@ -726,6 +826,67 @@ fn audit_row_does_not_store_raw_evidence_or_candidate_text() {
     assert!(
         !audit_text.contains(text_to_exclude),
         "dream_runs audit row must not store raw evidence or candidate text"
+    );
+}
+
+#[test]
+fn run_id_includes_safe_evidence_window_refs_and_stays_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let base_db = dir.path().join("base.db");
+    let first_db = dir.path().join("first.db");
+    let second_db = dir.path().join("second.db");
+    {
+        let base = Service::new(
+            Store::open(&base_db).expect("open base store"),
+            Config {
+                default_workspace: "ws".to_string(),
+                ..Default::default()
+            },
+        );
+        insert_direct_record(
+            &base,
+            "Decision: durable active memory record stays identical.",
+            json!({ "origin": "test" }),
+        );
+    }
+    std::fs::copy(&base_db, &first_db).unwrap();
+    std::fs::copy(&base_db, &second_db).unwrap();
+
+    let first = Service::new(
+        Store::open(&first_db).expect("open first store"),
+        Config {
+            default_workspace: "ws".to_string(),
+            ..Default::default()
+        },
+    );
+    let second = Service::new(
+        Store::open(&second_db).expect("open second store"),
+        Config {
+            default_workspace: "ws".to_string(),
+            ..Default::default()
+        },
+    );
+    seed_direct_evidence_window_refs(&first, "first", "RAW_WINDOW_SENTINEL_ONE");
+    seed_direct_evidence_window_refs(&second, "second", "RAW_WINDOW_SENTINEL_TWO");
+
+    let first_run = dream(&first, "preview", "2030-01-01T00:00:00Z");
+    let first_repeat = dream(&first, "preview", "2030-01-01T00:00:00Z");
+    let second_run = dream(&second, "preview", "2030-01-01T00:00:00Z");
+
+    assert_eq!(first_run.run_id, first_repeat.run_id);
+    assert_ne!(first_run.run_id, second_run.run_id);
+
+    let conn = Connection::open(&first_db).unwrap();
+    let audit_text: String = conn
+        .query_row(
+            "SELECT source_counts FROM dream_runs WHERE id = ?1",
+            params![first_run.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !audit_text.contains("RAW_WINDOW_SENTINEL_ONE"),
+        "audit source_counts must not store raw evidence text"
     );
 }
 

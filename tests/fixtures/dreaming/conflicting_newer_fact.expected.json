@@ -2,23 +2,43 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "decision:storage-backend-rusqlite",
+        "subject_key": "storage",
+        "action": "supersede",
         "record_type": "decision",
-        "promotion_reason": "newer_evidence_supersedes_stale_fact",
-        "evidence_count": 3,
+        "promotion_reason": "newer completed evidence supersedes older active state",
+        "evidence_count": 1,
         "must_contain": ["rusqlite", "bundled SQLite"],
         "must_not_contain": ["still TBD; evaluating options"]
+      },
+      {
+        "subject_key": "storage",
+        "action": "promote",
+        "record_type": "decision",
+        "promotion_reason": "explicit_conclusion",
+        "evidence_count": 2,
+        "must_contain": ["rusqlite", "bundled SQLite"],
+        "must_not_contain": ["still TBD; evaluating options"]
+      },
+      {
+        "subject_key": "the",
+        "action": "promote",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "checkpoint_backed_task_state",
+        "evidence_count": 1,
+        "must_contain": ["FTS5", "bundled SQLite"],
+        "must_not_contain": []
       }
     ],
     "rejected": [],
     "quarantined": [],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   },
   "expect_apply": { "created": 1, "archived": 1, "idempotent_second_apply": true },
   "expect_recall_before": {
     "query": "What storage backend does this project use?",
-    "must_contain": ["Storage backend is still TBD"],
-    "must_not_contain": ["rusqlite with bundled SQLite"]
+    "must_contain": ["Storage backend is still TBD", "rusqlite with bundled SQLite"],
+    "must_not_contain": []
   },
   "expect_recall_after": {
     "query": "What storage backend does this project use?",

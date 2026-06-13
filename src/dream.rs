@@ -141,7 +141,7 @@ pub struct DreamParams<'a> {
     pub max_candidates: Option<usize>,
 }
 
-pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
+pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     let records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
@@ -240,11 +240,20 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
     }
 
     dedupe_candidates(&mut candidates);
+    let mut max_candidates_hit = false;
     if let Some(max) = params.max_candidates {
-        candidates.truncate(max);
+        if let Some(limit_for_processing) = max.checked_add(1) {
+            candidates.truncate(limit_for_processing);
+            max_candidates_hit = candidates.len() > max;
+            if max_candidates_hit {
+                candidates.truncate(max);
+            }
+        } else {
+            candidates.truncate(max);
+        }
     }
 
-    let run_id = stable_run_id(params, &records);
+    let run_id = stable_run_id(params, &evidence_window, &records);
     let mut archived = Vec::new();
     let mut created = Vec::new();
     if params.mode == "apply" {
@@ -348,21 +357,24 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<DreamResponse> {
         created.dedup();
     }
 
-    Ok(DreamResponse {
-        run_id,
-        mode: params.mode.to_string(),
-        profile: params.profile.as_str().to_string(),
-        workspace: params.workspace.to_string(),
-        repo_id: params.repo_id.map(|s| s.to_string()),
-        now: params.now.to_string(),
-        evidence_window,
-        candidates,
-        stale,
-        rejected,
-        archived,
-        created,
-        authority: "recall_not_authority".to_string(),
-    })
+    Ok((
+        DreamResponse {
+            run_id,
+            mode: params.mode.to_string(),
+            profile: params.profile.as_str().to_string(),
+            workspace: params.workspace.to_string(),
+            repo_id: params.repo_id.map(|s| s.to_string()),
+            now: params.now.to_string(),
+            evidence_window,
+            candidates,
+            stale,
+            rejected,
+            archived,
+            created,
+            authority: "recall_not_authority".to_string(),
+        },
+        max_candidates_hit,
+    ))
 }
 
 fn build_evidence_window(
@@ -518,29 +530,84 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
     }
 }
 
-fn stable_run_id(params: &DreamParams, records: &[MemoryRecord]) -> String {
-    let mut seed = format!(
-        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id.unwrap_or(""),
-        params.mode,
-        params.now
+fn stable_run_id(
+    params: &DreamParams,
+    evidence_window: &DreamEvidenceWindow,
+    records: &[MemoryRecord],
+) -> String {
+    let mut seed = String::new();
+    push_seed_part(&mut seed, params.profile.as_str());
+    push_seed_part(&mut seed, params.workspace);
+    push_seed_part(&mut seed, params.repo_id.unwrap_or(""));
+    push_seed_part(&mut seed, params.mode);
+    push_seed_part(&mut seed, evidence_window.start.as_deref().unwrap_or(""));
+    push_seed_part(&mut seed, &evidence_window.end);
+    push_evidence_stream_seed(
+        &mut seed,
+        "visible_turns",
+        &evidence_window.visible_turns,
+        false,
     );
-    if let Some(source_window_start) = params.recency_cutoff {
-        seed.push('\x1f');
-        seed.push_str(source_window_start);
-    }
-    for record in records {
-        seed.push('\x1f');
-        seed.push_str(&record.id);
-        seed.push('\x1f');
-        seed.push_str(&record.updated_at);
-        seed.push('\x1f');
-        seed.push_str(&record.content);
+    push_evidence_stream_seed(
+        &mut seed,
+        "conclusions",
+        &evidence_window.conclusions,
+        false,
+    );
+    push_evidence_stream_seed(
+        &mut seed,
+        "checkpoints",
+        &evidence_window.checkpoints,
+        false,
+    );
+    push_evidence_stream_seed(
+        &mut seed,
+        "imported_memories",
+        &evidence_window.imported_memories,
+        true,
+    );
+    let mut ordered_records = records.iter().collect::<Vec<_>>();
+    ordered_records.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then(a.id.cmp(&b.id))
+            .then(a.content_hash.cmp(&b.content_hash))
+    });
+    for record in ordered_records {
+        push_seed_part(&mut seed, &record.id);
+        push_seed_part(&mut seed, &record.updated_at);
+        push_seed_part(&mut seed, &record.content_hash);
     }
     let hash = ids::sha256_hex(seed.as_bytes());
     format!("dream_{}", &hash["sha256:".len()..39])
+}
+
+fn push_seed_part(seed: &mut String, value: &str) {
+    seed.push('\x1f');
+    seed.push_str(value);
+}
+
+fn push_evidence_stream_seed(
+    seed: &mut String,
+    label: &str,
+    stream: &DreamEvidenceStream,
+    include_updated_at: bool,
+) {
+    push_seed_part(seed, label);
+    push_seed_part(seed, &stream.count.to_string());
+    let mut sources = stream.sources.iter().collect::<Vec<_>>();
+    sources.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then(a.created_at.cmp(&b.created_at))
+            .then(a.updated_at.cmp(&b.updated_at))
+    });
+    for source in sources {
+        push_seed_part(seed, &source.id);
+        push_seed_part(seed, &source.created_at);
+        if include_updated_at {
+            push_seed_part(seed, source.updated_at.as_deref().unwrap_or(""));
+        }
+    }
 }
 
 pub fn config_hash() -> String {

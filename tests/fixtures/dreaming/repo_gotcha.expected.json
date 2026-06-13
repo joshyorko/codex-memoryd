@@ -2,22 +2,52 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "gotcha:bundled-sqlite-fts5",
+        "subject_key": "spent",
+        "action": "promote",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "checkpoint_backed_task_state",
+        "evidence_count": 1,
+        "must_contain": [
+          "Spent an hour on a test failure that was actually missing FTS5 from a non-bundled SQLite build."
+        ],
+        "must_not_contain": []
+      }
+    ],
+    "quarantined": [
+      {
+        "subject_key": "heads",
+        "action": "promote",
+        "record_type": "command",
+        "promotion_reason": "insufficient_primary_evidence",
+        "evidence_count": 1,
+        "must_contain": [
+          "Quarantined Dreamer candidate for subject `heads`",
+          "Heads up: cargo test fails unless FTS5 is available; the build needs the bundled SQLite feature."
+        ],
+        "must_not_contain": []
+      },
+      {
+        "subject_key": "same",
+        "action": "promote",
         "record_type": "gotcha",
-        "promotion_reason": "repeated_repo_failure_pattern",
-        "evidence_count": 3,
-        "must_contain": ["FTS5", "bundled SQLite"],
+        "promotion_reason": "insufficient_primary_evidence",
+        "evidence_count": 1,
+        "must_contain": [
+          "Quarantined Dreamer candidate for subject `same`",
+          "Same FTS5 build gotcha bit us again — always use the bundled feature."
+        ],
         "must_not_contain": []
       }
     ],
     "rejected": [],
-    "quarantined": [],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   },
   "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true },
   "expect_recall_before": {
     "query": "Why do cargo tests fail around FTS5?",
-    "must_not_contain": ["non-bundled SQLite", "bundled SQLite feature"]
+    "must_contain": ["non-bundled SQLite", "bundled SQLite feature"],
+    "must_not_contain": []
   },
   "expect_recall_after": {
     "query": "Why do cargo tests fail around FTS5?",

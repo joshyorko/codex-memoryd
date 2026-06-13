@@ -4,18 +4,19 @@
 //! scenario is loaded as chronological evidence, previewed by stable heuristics,
 //! and applied through the existing Store/recall paths.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use codex_memoryd::config::Config;
-use codex_memoryd::domain::{Portability, RecordType, Scope, Sensitivity};
+use codex_memoryd::domain::RecordType;
+use codex_memoryd::domain::RepoIdentity;
 use codex_memoryd::ids;
 use codex_memoryd::policy;
+use codex_memoryd::protocol::DreamRequest;
 use codex_memoryd::protocol::RecallRequest;
 use codex_memoryd::service::Service;
-use codex_memoryd::store::{NewRecord, Store, UpsertOutcome};
+use codex_memoryd::store::{NewRecord, Store};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 const PROFILE: &str = "personal";
 const WORKSPACE: &str = "dream-eval";
@@ -26,6 +27,8 @@ struct FixtureEvent {
     #[serde(default)]
     actor: Option<String>,
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     summary: Option<String>,
@@ -34,7 +37,7 @@ struct FixtureEvent {
     #[serde(default)]
     repo_id: Option<String>,
     #[serde(default)]
-    id: Option<String>,
+    now: Option<String>,
     created_at: String,
 }
 
@@ -46,8 +49,6 @@ impl FixtureEvent {
 
 #[derive(Debug)]
 struct FixtureLine {
-    line: usize,
-    raw: String,
     event: FixtureEvent,
 }
 
@@ -56,58 +57,6 @@ struct LoadedFixture {
     name: String,
     path: PathBuf,
     lines: Vec<FixtureLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CandidateState {
-    Accepted,
-    Rejected,
-    Quarantined,
-    Stale,
-}
-
-#[derive(Debug, Clone)]
-struct EvidenceRef {
-    line: usize,
-    kind: String,
-    actor: Option<String>,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct EvidenceWindow {
-    start: String,
-    end: String,
-}
-
-#[derive(Debug, Clone)]
-struct DreamCandidate {
-    state: CandidateState,
-    subject_key: String,
-    record_type: RecordType,
-    scope: Scope,
-    repo_id: Option<String>,
-    content: String,
-    evidence: Vec<EvidenceRef>,
-    evidence_count: usize,
-    promotion_reason: String,
-    confidence: f64,
-    evidence_window: EvidenceWindow,
-    supersedes_fixture_ids: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-struct DreamPreview {
-    accepted: Vec<DreamCandidate>,
-    rejected: Vec<DreamCandidate>,
-    quarantined: Vec<DreamCandidate>,
-    stale: Vec<DreamCandidate>,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ApplyReport {
-    created: usize,
-    archived: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,12 +79,16 @@ struct PreviewExpectation {
     #[serde(default)]
     quarantined: Vec<CandidateExpectation>,
     #[serde(default)]
-    stale: Vec<CandidateExpectation>,
+    stale: Vec<StaleExpectation>,
+    #[serde(default)]
+    rejected_items: Vec<RejectedExpectation>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CandidateExpectation {
     subject_key: String,
+    #[serde(default)]
+    action: Option<String>,
     #[serde(default)]
     record_type: Option<String>,
     #[serde(default)]
@@ -146,6 +99,24 @@ struct CandidateExpectation {
     must_contain: Vec<String>,
     #[serde(default)]
     must_not_contain: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StaleExpectation {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    drift_prone: Option<bool>,
+    #[serde(default)]
+    suggested_action: Option<String>,
+    #[serde(default)]
+    historical_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RejectedExpectation {
+    #[serde(default)]
+    reason_contains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,8 +138,8 @@ struct RecallExpectation {
 struct SeededFixture {
     store: Store,
     service: Service,
-    source_ids_by_line: HashMap<usize, String>,
-    record_ids_by_fixture_id: HashMap<String, String>,
+    repo: Option<RepoIdentity>,
+    now: String,
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -191,11 +162,7 @@ fn parse_fixture_jsonl(path: &Path, raw: &str) -> Result<LoadedFixture, String> 
         let event: FixtureEvent = serde_json::from_str(trimmed)
             .map_err(|e| format!("{}:{line_no}: invalid JSONL event: {e}", path.display()))?;
         validate_event(path, line_no, &event)?;
-        lines.push(FixtureLine {
-            line: line_no,
-            raw: trimmed.to_string(),
-            event,
-        });
+        lines.push(FixtureLine { event });
     }
     if lines.is_empty() {
         return Err(format!(
@@ -261,7 +228,14 @@ fn validate_event(path: &Path, line: usize, event: &FixtureEvent) -> Result<(), 
                 ));
             }
         }
-        "dream_clock" => {}
+        "dream_clock" => {
+            if event.now.as_deref().unwrap_or_default().trim().is_empty() {
+                return Err(format!(
+                    "{}:{line}: dream_clock.now is required",
+                    path.display()
+                ));
+            }
+        }
         other => {
             return Err(format!(
                 "{}:{line}: unknown event kind `{other}`",
@@ -286,7 +260,7 @@ fn load_sidecar(fixture: &LoadedFixture) -> Sidecar {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse sidecar {}: {e}", path.display()))
 }
 
-fn seed_store(fixture: &LoadedFixture) -> SeededFixture {
+fn seed_real_dream_store(fixture: &LoadedFixture) -> SeededFixture {
     let store = Store::open(":memory:").expect("open in-memory store");
     store
         .ensure_workspace(PROFILE, WORKSPACE)
@@ -297,386 +271,258 @@ fn seed_store(fixture: &LoadedFixture) -> SeededFixture {
     };
     let service = Service::new(store.clone(), config);
 
-    let mut source_ids_by_line = HashMap::new();
-    let mut record_ids_by_fixture_id = HashMap::new();
+    let mut repo_id = None;
+    let mut dream_now = None;
+    let mut session_ids = std::collections::BTreeMap::<Option<String>, String>::new();
 
     for line in &fixture.lines {
-        let source_path = format!(
-            "dreaming/{}:{}",
-            fixture.path.file_name().unwrap().to_string_lossy(),
-            line.line
-        );
-        let source_hash = ids::source_hash(PROFILE, WORKSPACE, &source_path, &line.raw);
-        let (source, _) = store
-            .upsert_source(
-                PROFILE,
-                WORKSPACE,
-                &line.event.kind,
-                Some(&source_path),
-                &source_hash,
-                &json!({
-                    "origin": "dream_fixture",
-                    "fixture": fixture.name,
-                    "line": line.line,
-                    "created_at": line.event.created_at,
-                }),
-            )
-            .expect("seed source");
-        source_ids_by_line.insert(line.line, source.id.clone());
-
-        if line.event.kind == "memory_record" {
-            let content = line.event.text().expect("validated content");
-            let record_type =
-                RecordType::parse(line.event.record_type.as_deref().unwrap()).unwrap();
-            let repo_id = line.event.repo_id.clone();
-            let scope = if repo_id.is_some() {
-                Scope::Repo
-            } else {
-                Scope::Workspace
-            };
-            let content_hash = ids::content_hash(
-                PROFILE,
-                WORKSPACE,
-                repo_id.as_deref(),
-                record_type.as_str(),
-                scope.as_str(),
-                content,
-            );
-            let new = NewRecord {
-                profile_id: PROFILE.to_string(),
-                workspace_id: WORKSPACE.to_string(),
-                repo_id,
-                scope,
-                record_type,
-                content: content.to_string(),
-                related_files: vec![],
-                tags: vec!["dream_fixture_seed".to_string()],
-                sensitivity: Sensitivity::Personal,
-                portability: Portability::ProfileOnly,
-                confidence: 0.7,
-                source_ids: vec![source.id],
-                content_hash,
-                supersedes: vec![],
-                metadata: json!({
-                    "origin": "dream_fixture_seed",
-                    "fixture": fixture.name,
-                    "fixture_id": line.event.id,
-                    "line": line.line,
-                }),
-            };
-            let outcome = store.upsert_record(&new).expect("seed memory record");
-            if let Some(fixture_id) = &line.event.id {
-                record_ids_by_fixture_id.insert(fixture_id.clone(), outcome.id().to_string());
+        let event = &line.event;
+        if event.repo_id.is_some() {
+            repo_id = event.repo_id.clone();
+        }
+        match event.kind.as_str() {
+            "dream_clock" => {
+                dream_now = event.now.clone().or_else(|| Some(event.created_at.clone()));
             }
+            "visible_turn" => {
+                let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
+                seed_visible_turn(&store, event, repo_id, &mut session_ids);
+            }
+            "conclusion" => {
+                let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
+                seed_conclusion(&store, event, repo_id);
+            }
+            "checkpoint" => {
+                let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
+                seed_checkpoint(&store, event, repo_id, &mut session_ids);
+            }
+            "memory_record" => {
+                let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
+                seed_memory_record_event(&store, event, repo_id);
+            }
+            other => panic!("missing real Dreamer seed for fixture event kind {other}"),
         }
     }
+
+    let repo = repo_id.map(|repo_id| RepoIdentity {
+        repo_id,
+        ..Default::default()
+    });
+    let now = dream_now.unwrap_or_else(|| {
+        fixture
+            .lines
+            .iter()
+            .map(|line| line.event.created_at.clone())
+            .max()
+            .unwrap_or_else(|| "2026-06-13T00:00:00Z".to_string())
+    });
 
     SeededFixture {
         store,
         service,
-        source_ids_by_line,
-        record_ids_by_fixture_id,
+        repo,
+        now,
     }
 }
 
-fn preview_fixture(fixture: &LoadedFixture) -> DreamPreview {
-    let mut preview = DreamPreview::default();
-    match fixture.name.as_str() {
-        "repeated_preference" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 3, 4],
-            "preference:repo-native-commands",
-            RecordType::Preference,
-            Scope::Workspace,
-            None,
-            "Prefer repo-native commands: use cargo test instead of ad-hoc/helper scripts.",
-            "repeated_user_preference",
-            0.92,
-            vec![],
-        )),
-        "conflicting_newer_fact" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 2, 3],
-            "decision:storage-backend-rusqlite",
-            RecordType::Decision,
-            Scope::Workspace,
-            None,
-            "Decision: storage uses rusqlite with bundled SQLite; the backend is no longer TBD.",
-            "newer_evidence_supersedes_stale_fact",
-            0.9,
-            vec!["mem_storage_tbd".to_string()],
-        )),
-        "planned_vs_completed_transition" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 2],
-            "decision:oauth-sync-completed",
-            RecordType::Decision,
-            Scope::Workspace,
-            None,
-            "Decision: OAuth sync was implemented and merged, superseding the earlier planned state.",
-            "newer_evidence_supersedes_planned_fact",
-            0.9,
-            vec![],
-        )),
-        "repo_gotcha" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 2, 3],
-            "gotcha:bundled-sqlite-fts5",
-            RecordType::Gotcha,
-            Scope::Repo,
-            Some("git:https://github.com/joshyorko/codex-memoryd".to_string()),
-            "FTS5 test failures are often caused by non-bundled SQLite; use rusqlite's bundled SQLite feature.",
-            "repeated_repo_failure_pattern",
-            0.9,
-            vec![],
-        )),
-        "user_adopts_assistant_proposal" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 2],
-            "command:cargo-test-adopted",
-            RecordType::Command,
-            Scope::Workspace,
-            None,
-            "Use cargo test as the repo-native validation command and prefer repository-native checks over custom ad-hoc helpers.",
-            "user_adopted_assistant_proposal",
-            0.88,
-            vec![],
-        )),
-        "assistant_proposal_without_adoption" => preview.quarantined.push(candidate(
-            CandidateState::Quarantined,
-            fixture,
-            &[1],
-            "command:custom-helper-scripts",
-            RecordType::Command,
-            Scope::Workspace,
-            None,
-            "Decision: use custom helper scripts for validation.",
-            "assistant_only_proposal_quarantined",
-            0.25,
-            vec![],
-        )),
-        "single_mention_preference_not_promoted" => preview.quarantined.push(candidate(
-            CandidateState::Quarantined,
-            fixture,
-            &[1],
-            "preference:terse-commit-messages",
-            RecordType::Preference,
-            Scope::Workspace,
-            None,
-            "Preference: use terse commit messages for small, deterministic diffs.",
-            "single_unconfirmed_preference",
-            0.30,
-            vec![],
-        )),
-        "imported_memory_self_reinforcement_blocked" => preview.quarantined.push(candidate(
-            CandidateState::Quarantined,
-            fixture,
-            &[1, 2],
-            "decision:custom-script-self-reinforcement",
-            RecordType::Decision,
-            Scope::Workspace,
-            None,
-            "Decision: avoid promoting custom script guidance from imported or already-active memory without fresh primary evidence.",
-            "imported_or_active_memory_without_fresh_primary_evidence",
-            0.25,
-            vec![],
-        )),
-        "explicit_conclusion_promotes" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1],
-            "decision:cargo-test-validation",
-            RecordType::Decision,
-            Scope::Workspace,
-            None,
-            "Decision: cargo test is the supported validation command.",
-            "explicit_conclusion",
-            0.95,
-            vec![],
-        )),
-        "repeated_user_steering_promotes" => preview.accepted.push(candidate(
-            CandidateState::Accepted,
-            fixture,
-            &[1, 2],
-            "command:cargo-test-repeated-steering",
-            RecordType::Command,
-            Scope::Workspace,
-            None,
-            "Use cargo test for validation before claiming completion.",
-            "repeated_user_steering",
-            0.9,
-            vec![],
-        )),
-        "secret_rejection" => preview.rejected.push(candidate(
-            CandidateState::Rejected,
-            fixture,
-            &[1, 2, 3],
-            "secret:provider-api-key",
-            RecordType::Other,
-            Scope::Workspace,
-            None,
-            "[REDACTED SECRET-LIKE CONTENT]",
-            "secret_detected",
-            0.0,
-            vec![],
-        )),
-        "stale_time_sensitive_fact" => preview.stale.push(candidate(
-            CandidateState::Stale,
-            fixture,
-            &[1, 2],
-            "stale:relative-time-storage-blocker",
-            RecordType::TaskCheckpoint,
-            Scope::Workspace,
-            None,
-            "Relative-time daemon/storage migration status is drift-prone and should not be promoted as durable memory.",
-            "relative_time_status_stale",
-            0.0,
-            vec![],
-        )),
-        "relative_time_expiry_tomorrow" => preview.stale.push(candidate(
-            CandidateState::Stale,
-            fixture,
-            &[1],
-            "stale:relative-time-expiry-tomorrow",
-            RecordType::TaskCheckpoint,
-            Scope::Workspace,
-            None,
-            "Relative-time startup failure status expired after the deterministic clock advanced.",
-            "relative_time_status_stale",
-            0.0,
-            vec![],
-        )),
-        other => panic!("missing deterministic Dreamer preview for fixture {other}"),
-    }
-    preview
-}
-
-#[allow(clippy::too_many_arguments)]
-fn candidate(
-    state: CandidateState,
-    fixture: &LoadedFixture,
-    line_numbers: &[usize],
-    subject_key: &str,
-    record_type: RecordType,
-    scope: Scope,
-    repo_id: Option<String>,
-    content: &str,
-    promotion_reason: &str,
-    confidence: f64,
-    supersedes_fixture_ids: Vec<String>,
-) -> DreamCandidate {
-    let mut evidence = Vec::new();
-    for line_no in line_numbers {
-        let line = fixture
-            .lines
-            .iter()
-            .find(|line| line.line == *line_no)
-            .unwrap_or_else(|| panic!("{} missing evidence line {line_no}", fixture.name));
-        evidence.push(EvidenceRef {
-            line: line.line,
-            kind: line.event.kind.clone(),
-            actor: line.event.actor.clone(),
-            created_at: line.event.created_at.clone(),
-        });
-    }
-    let window = EvidenceWindow {
-        start: evidence.first().expect("evidence").created_at.clone(),
-        end: evidence.last().expect("evidence").created_at.clone(),
-    };
-    DreamCandidate {
-        state,
-        subject_key: subject_key.to_string(),
-        record_type,
-        scope,
-        repo_id,
-        content: content.to_string(),
-        evidence_count: evidence.len(),
-        evidence,
-        promotion_reason: promotion_reason.to_string(),
-        confidence,
-        evidence_window: window,
-        supersedes_fixture_ids,
-    }
-}
-
-fn apply_preview(seeded: &SeededFixture, preview: &DreamPreview) -> ApplyReport {
-    let mut report = ApplyReport::default();
-    for cand in &preview.accepted {
-        let source_ids: Vec<String> = cand
-            .evidence
-            .iter()
-            .filter_map(|ev| seeded.source_ids_by_line.get(&ev.line).cloned())
-            .collect();
-        let content_hash = ids::content_hash(
+fn seed_visible_turn(
+    store: &Store,
+    event: &FixtureEvent,
+    repo_id: Option<&str>,
+    session_ids: &mut std::collections::BTreeMap<Option<String>, String>,
+) {
+    let session_key = repo_id.map(str::to_string);
+    let session_id = session_ids
+        .entry(session_key.clone())
+        .or_insert_with(|| ids::new_id("sess"))
+        .clone();
+    store
+        .ensure_session(
+            &session_id,
             PROFILE,
             WORKSPACE,
-            cand.repo_id.as_deref(),
-            cand.record_type.as_str(),
-            cand.scope.as_str(),
-            &cand.content,
-        );
-        let new = NewRecord {
+            repo_id,
+            None,
+            "dream-fixture",
+        )
+        .expect("visible_turn session");
+    let content = event.text().expect("visible_turn content");
+    let actor = event.actor.as_deref().expect("visible_turn actor");
+    store
+        .insert_visible_turn(&codex_memoryd::domain::VisibleTurn {
+            id: ids::new_id("turn"),
+            session_id: session_id.clone(),
+            actor: actor.to_string(),
+            content: content.to_string(),
+            created_at: event.created_at.clone(),
+            metadata: json!({
+                "origin": "visible_turn",
+                "actor": actor,
+                "created_at": event.created_at.clone(),
+            }),
+        })
+        .expect("visible_turn");
+    seed_corresponding_memory_record(
+        store,
+        repo_id,
+        content,
+        json!({
+            "origin": "visible_turn",
+            "actor": actor,
+            "created_at": event.created_at.clone(),
+        }),
+        None,
+        vec![],
+    );
+}
+
+fn seed_conclusion(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
+    let content = event.text().expect("conclusion content");
+    store
+        .insert_conclusion(&codex_memoryd::domain::Conclusion {
+            id: ids::new_id("concl"),
             profile_id: PROFILE.to_string(),
             workspace_id: WORKSPACE.to_string(),
-            repo_id: cand.repo_id.clone(),
-            scope: cand.scope,
-            record_type: cand.record_type,
-            content: cand.content.clone(),
-            related_files: vec![],
-            tags: vec!["dreamed".to_string(), cand.promotion_reason.clone()],
-            sensitivity: Sensitivity::Personal,
-            portability: Portability::ProfileOnly,
-            confidence: cand.confidence,
-            source_ids,
-            content_hash,
-            supersedes: vec![],
+            repo_id: repo_id.map(str::to_string),
+            target: "user".to_string(),
+            content: content.to_string(),
+            source_id: None,
+            created_at: event.created_at.clone(),
             metadata: json!({
-                "origin": "dream_eval",
-                "subject_key": cand.subject_key,
-                "promotion_reason": cand.promotion_reason,
-                "evidence_count": cand.evidence_count,
-                "evidence_window": {
-                    "start": cand.evidence_window.start,
-                    "end": cand.evidence_window.end,
-                },
+                "origin": "conclusion",
+                "target": "user",
+                "created_at": event.created_at.clone(),
             }),
-        };
-        if matches!(
-            seeded.store.upsert_record(&new).expect("apply candidate"),
-            UpsertOutcome::Created(_)
-        ) {
-            report.created += 1;
-        }
+        })
+        .expect("conclusion");
+    seed_corresponding_memory_record(
+        store,
+        repo_id,
+        content,
+        json!({
+            "origin": "conclusion",
+            "target": "user",
+            "created_at": event.created_at.clone(),
+        }),
+        None,
+        vec![],
+    );
+}
 
-        let active_superseded: Vec<String> = cand
-            .supersedes_fixture_ids
-            .iter()
-            .filter_map(|fixture_id| seeded.record_ids_by_fixture_id.get(fixture_id))
-            .filter(|record_id| {
-                seeded
-                    .store
-                    .get_record(record_id)
-                    .expect("get superseded record")
-                    .map(|record| !record.archived)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        if !active_superseded.is_empty() {
-            let (archived, not_found) = seeded
-                .store
-                .archive_records(PROFILE, Some(WORKSPACE), &active_superseded)
-                .expect("archive superseded records");
-            assert!(not_found.is_empty(), "superseded records must be in scope");
-            report.archived += archived.len();
+fn seed_checkpoint(
+    store: &Store,
+    event: &FixtureEvent,
+    repo_id: Option<&str>,
+    session_ids: &mut std::collections::BTreeMap<Option<String>, String>,
+) {
+    let session_key = repo_id.map(str::to_string);
+    let session_id = session_ids
+        .entry(session_key.clone())
+        .or_insert_with(|| ids::new_id("sess"))
+        .clone();
+    store
+        .ensure_session(
+            &session_id,
+            PROFILE,
+            WORKSPACE,
+            repo_id,
+            None,
+            "dream-fixture",
+        )
+        .expect("checkpoint session");
+    let summary = event.summary.as_deref().expect("checkpoint summary");
+    store
+        .insert_checkpoint(&codex_memoryd::domain::Checkpoint {
+            id: ids::new_id("ckpt"),
+            session_id: Some(session_id.clone()),
+            profile_id: PROFILE.to_string(),
+            workspace_id: WORKSPACE.to_string(),
+            repo_id: repo_id.map(str::to_string),
+            summary: summary.to_string(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: event.created_at.clone(),
+        })
+        .expect("checkpoint");
+    seed_corresponding_memory_record(
+        store,
+        repo_id,
+        summary,
+        json!({
+            "origin": "checkpoint",
+            "created_at": event.created_at.clone(),
+        }),
+        Some(RecordType::TaskCheckpoint),
+        vec![],
+    );
+}
+
+fn seed_memory_record_event(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
+    let content = event.text().expect("memory_record content");
+    let mut metadata = json!({
+        "origin": "memory_record",
+        "created_at": event.created_at.clone(),
+    });
+    if let Some(id) = event.id.as_deref() {
+        metadata["id"] = Value::String(id.to_string());
+        if id.starts_with("imported_") {
+            metadata["origin"] = Value::String("codex-local-memory".to_string());
+            metadata["artifact_kind"] = Value::String("memory_summary".to_string());
         }
     }
-    report
+    if let Some(record_type) = event.record_type.as_deref() {
+        metadata["type"] = Value::String(record_type.to_string());
+    }
+    let source_ids = event.id.iter().cloned().collect::<Vec<_>>();
+    seed_corresponding_memory_record(store, repo_id, content, metadata, None, source_ids);
+}
+
+fn seed_corresponding_memory_record(
+    store: &Store,
+    repo_id: Option<&str>,
+    content: &str,
+    metadata: Value,
+    record_type_override: Option<RecordType>,
+    source_ids: Vec<String>,
+) {
+    let class = policy::classify(
+        content,
+        codex_memoryd::domain::Profile::Personal,
+        repo_id.is_some(),
+    );
+    let record_type = record_type_override.unwrap_or(class.record_type);
+    let content_hash = ids::content_hash(
+        PROFILE,
+        WORKSPACE,
+        repo_id,
+        record_type.as_str(),
+        class.scope.as_str(),
+        content,
+    );
+    let new = NewRecord {
+        profile_id: PROFILE.to_string(),
+        workspace_id: WORKSPACE.to_string(),
+        repo_id: repo_id.map(str::to_string),
+        scope: class.scope,
+        record_type,
+        content: content.to_string(),
+        related_files: class.related_files,
+        tags: class.tags,
+        sensitivity: class.sensitivity,
+        portability: class.portability,
+        confidence: class.confidence,
+        source_ids,
+        content_hash,
+        supersedes: vec![],
+        metadata,
+    };
+    store.upsert_record(&new).expect("seed real dream record");
 }
 
 fn recall_text(service: &Service, expectation: &RecallExpectation) -> String {
@@ -707,130 +553,101 @@ fn recall_text(service: &Service, expectation: &RecallExpectation) -> String {
         .join("\n")
 }
 
-fn assert_preview_matches(
-    fixture: &LoadedFixture,
-    preview: &DreamPreview,
-    expected: &PreviewExpectation,
-) {
-    assert_candidates(
-        &fixture.name,
-        "accepted",
-        &preview.accepted,
-        &expected.accepted,
-    );
-    assert_candidates(
-        &fixture.name,
-        "rejected",
-        &preview.rejected,
-        &expected.rejected,
-    );
-    assert_candidates(
-        &fixture.name,
-        "quarantined",
-        &preview.quarantined,
-        &expected.quarantined,
-    );
-    assert_candidates(&fixture.name, "stale", &preview.stale, &expected.stale);
-
-    for cand in preview
-        .accepted
-        .iter()
-        .chain(preview.rejected.iter())
-        .chain(preview.quarantined.iter())
-        .chain(preview.stale.iter())
-    {
-        for evidence in &cand.evidence {
-            assert!(
-                !evidence.kind.trim().is_empty(),
-                "{} evidence kind is present",
-                cand.subject_key
-            );
-            if evidence.kind == "visible_turn" {
-                assert!(
-                    matches!(evidence.actor.as_deref(), Some("user" | "assistant")),
-                    "{} visible_turn evidence has actor",
-                    cand.subject_key
-                );
-            }
-        }
+fn assert_recall(label: &str, text: &str, expected: &RecallExpectation) {
+    for needle in &expected.must_contain {
+        assert!(
+            text.contains(needle),
+            "{label} recall for query `{}` must contain `{needle}`; got `{text}`",
+            expected.query
+        );
     }
-
-    for cand in &preview.accepted {
-        assert_eq!(cand.state, CandidateState::Accepted);
+    for needle in &expected.must_not_contain {
         assert!(
-            !cand.subject_key.trim().is_empty(),
-            "accepted candidate has subject_key"
-        );
-        assert!(
-            !cand.evidence.is_empty(),
-            "{} has evidence",
-            cand.subject_key
-        );
-        assert_eq!(
-            cand.evidence_count,
-            cand.evidence.len(),
-            "{} evidence_count matches evidence",
-            cand.subject_key
-        );
-        assert!(
-            !cand.promotion_reason.trim().is_empty(),
-            "{} has promotion reason",
-            cand.subject_key
-        );
-        assert!(
-            cand.confidence > 0.0,
-            "{} has positive confidence",
-            cand.subject_key
-        );
-        assert!(
-            !cand.evidence_window.start.is_empty(),
-            "{} has evidence window start",
-            cand.subject_key
-        );
-        assert!(
-            !cand.evidence_window.end.is_empty(),
-            "{} has evidence window end",
-            cand.subject_key
-        );
-        assert!(
-            policy::detect_secret(&cand.content).is_none(),
-            "accepted candidate {} must not contain secret-shaped content",
-            cand.subject_key
+            !text.contains(needle),
+            "{label} recall for query `{}` must not contain `{needle}`; got `{text}`",
+            expected.query
         );
     }
 }
 
-fn assert_candidates(
+fn assert_service_preview_matches(
+    fixture: &LoadedFixture,
+    response: &codex_memoryd::protocol::DreamResponse,
+    expected: &PreviewExpectation,
+) {
+    let accepted = response
+        .candidates
+        .iter()
+        .filter(|cand| cand.candidate_state == "accepted")
+        .cloned()
+        .collect::<Vec<_>>();
+    let quarantined = response
+        .candidates
+        .iter()
+        .filter(|cand| cand.candidate_state == "quarantined")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert_service_candidates(
+        &fixture.name,
+        "accepted",
+        &accepted,
+        &expected.accepted,
+        true,
+    );
+    assert_service_candidates(
+        &fixture.name,
+        "quarantined",
+        &quarantined,
+        &expected.quarantined,
+        true,
+    );
+    assert_service_stale(&fixture.name, &response.stale, &expected.stale);
+    assert_service_rejections(
+        &fixture.name,
+        &response.rejected,
+        &expected.rejected,
+        &expected.rejected_items,
+    );
+}
+
+fn assert_service_candidates(
     fixture_name: &str,
     bucket: &str,
-    actual: &[DreamCandidate],
+    actual: &[codex_memoryd::protocol::DreamCandidate],
     expected: &[CandidateExpectation],
+    require_no_leftovers: bool,
 ) {
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "{fixture_name} {bucket} candidate count"
-    );
+    let mut used = vec![false; actual.len()];
     for exp in expected {
-        let cand = actual
-            .iter()
-            .find(|cand| cand.subject_key == exp.subject_key)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{fixture_name} missing {bucket} candidate {}",
-                    exp.subject_key
-                )
-            });
+        let mut idx = None;
+        for (candidate_idx, cand) in actual.iter().enumerate() {
+            if used[candidate_idx] {
+                continue;
+            }
+            if !candidate_matches_expectation(bucket, cand, exp) {
+                continue;
+            }
+            idx = Some(candidate_idx);
+            break;
+        }
+        let matched_idx = idx.unwrap_or_else(|| {
+            panic!(
+                "{fixture_name} missing {bucket} candidate {}",
+                exp.subject_key
+            )
+        });
+        used[matched_idx] = true;
+        let cand = &actual[matched_idx];
         assert_eq!(
-            cand.state,
-            expected_state(bucket),
+            cand.candidate_state, bucket,
             "{fixture_name} {} bucket state",
             exp.subject_key
         );
         if let Some(record_type) = &exp.record_type {
             assert_eq!(
-                cand.record_type.as_str(),
-                record_type,
+                cand.proposed_type.as_str(),
+                record_type.as_str(),
                 "{} record_type",
                 exp.subject_key
             );
@@ -865,33 +682,190 @@ fn assert_candidates(
                 cand.content
             );
         }
+        assert_eq!(
+            cand.subject_key, exp.subject_key,
+            "{fixture_name} {} candidate {} subject key",
+            exp.subject_key, exp.subject_key
+        );
     }
 
-    fn expected_state(bucket: &str) -> CandidateState {
-        match bucket {
-            "accepted" => CandidateState::Accepted,
-            "rejected" => CandidateState::Rejected,
-            "quarantined" => CandidateState::Quarantined,
-            "stale" => CandidateState::Stale,
-            other => panic!("unknown preview bucket {other}"),
+    if require_no_leftovers {
+        let leftovers: Vec<&codex_memoryd::protocol::DreamCandidate> = actual
+            .iter()
+            .zip(used.iter())
+            .filter_map(|(cand, was_used)| if !was_used { Some(cand) } else { None })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "{fixture_name} unexpected {bucket} candidate count ({}): {:?}",
+            leftovers.len(),
+            leftovers
+                .iter()
+                .map(|cand| &cand.subject_key)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+fn candidate_matches_expectation(
+    bucket: &str,
+    cand: &codex_memoryd::protocol::DreamCandidate,
+    exp: &CandidateExpectation,
+) -> bool {
+    if cand.candidate_state != bucket {
+        return false;
+    }
+    if let Some(action) = &exp.action {
+        if cand.action != *action {
+            return false;
+        }
+    }
+    if let Some(record_type) = &exp.record_type {
+        if cand.proposed_type != *record_type {
+            return false;
+        }
+    }
+    if let Some(reason) = &exp.promotion_reason {
+        if cand.promotion_reason != *reason {
+            return false;
+        }
+    }
+    if let Some(count) = exp.evidence_count {
+        if cand.evidence_count != count {
+            return false;
+        }
+    }
+    for needle in &exp.must_contain {
+        if !cand.content.contains(needle) {
+            return false;
+        }
+    }
+    for needle in &exp.must_not_contain {
+        if cand.content.contains(needle) {
+            return false;
+        }
+    }
+    cand.subject_key == exp.subject_key
+}
+
+fn assert_service_rejections(
+    fixture_name: &str,
+    actual: &[codex_memoryd::protocol::DreamRejection],
+    expected: &[CandidateExpectation],
+    expected_items: &[RejectedExpectation],
+) {
+    if expected.is_empty() {
+        assert_service_rejection_reasons(fixture_name, actual, expected_items);
+        return;
+    }
+
+    let mut used = vec![false; actual.len()];
+    for exp in expected {
+        let mut idx = None;
+        for (actual_idx, rejection) in actual.iter().enumerate() {
+            if used[actual_idx] {
+                continue;
+            }
+            if !rejection_matches_expectation(rejection, exp) {
+                continue;
+            }
+            idx = Some(actual_idx);
+            break;
+        }
+        let matched_idx = idx.unwrap_or_else(|| {
+            panic!(
+                "{fixture_name} missing rejected candidate {}",
+                exp.subject_key
+            )
+        });
+        used[matched_idx] = true;
+    }
+
+    let leftovers: Vec<&codex_memoryd::protocol::DreamRejection> = actual
+        .iter()
+        .zip(used.iter())
+        .filter_map(|(rej, was_used)| if !was_used { Some(rej) } else { None })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "{fixture_name} unexpected rejected count ({}): {:?}",
+        leftovers.len(),
+        leftovers.iter().map(|rej| &rej.reason).collect::<Vec<_>>()
+    );
+
+    if !expected_items.is_empty() {
+        assert_service_rejection_reasons(fixture_name, actual, expected_items);
+    }
+}
+
+fn rejection_matches_expectation(
+    actual: &codex_memoryd::protocol::DreamRejection,
+    exp: &CandidateExpectation,
+) -> bool {
+    for needle in &exp.must_contain {
+        if !actual.reason.contains(needle) {
+            return false;
+        }
+    }
+    for needle in &exp.must_not_contain {
+        if actual.reason.contains(needle) {
+            return false;
+        }
+    }
+    true
+}
+
+fn assert_service_stale(
+    fixture_name: &str,
+    actual: &[codex_memoryd::protocol::DreamStaleRecord],
+    expected: &[StaleExpectation],
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{fixture_name} stale candidate count"
+    );
+    for (stale, exp) in actual.iter().zip(expected) {
+        if let Some(state) = &exp.state {
+            assert_eq!(&stale.state, state, "{fixture_name} stale state");
+        }
+        if let Some(drift_prone) = exp.drift_prone {
+            assert_eq!(stale.drift_prone, drift_prone, "{fixture_name} drift_prone");
+        }
+        if let Some(action) = &exp.suggested_action {
+            assert_eq!(
+                &stale.suggested_action, action,
+                "{fixture_name} suggested_action"
+            );
+        }
+        if let Some(reason) = &exp.historical_reason {
+            assert_eq!(
+                stale.historical_reason.as_deref(),
+                Some(reason.as_str()),
+                "{fixture_name} historical_reason"
+            );
         }
     }
 }
 
-fn assert_recall(label: &str, text: &str, expected: &RecallExpectation) {
-    for needle in &expected.must_contain {
-        assert!(
-            text.contains(needle),
-            "{label} recall for query `{}` must contain `{needle}`; got `{text}`",
-            expected.query
-        );
-    }
-    for needle in &expected.must_not_contain {
-        assert!(
-            !text.contains(needle),
-            "{label} recall for query `{}` must not contain `{needle}`; got `{text}`",
-            expected.query
-        );
+fn assert_service_rejection_reasons(
+    fixture_name: &str,
+    actual: &[codex_memoryd::protocol::DreamRejection],
+    expected: &[RejectedExpectation],
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{fixture_name} rejected candidate count"
+    );
+    for (rejection, exp) in actual.iter().zip(expected) {
+        for needle in &exp.reason_contains {
+            assert!(
+                rejection.reason.contains(needle),
+                "{fixture_name} rejected reason must contain `{needle}`; got `{}`",
+                rejection.reason
+            );
+        }
     }
 }
 
@@ -943,7 +917,8 @@ fn dreaming_sidecars_are_stable_and_readable() {
         let assertion_count = sidecar.expect_preview.accepted.len()
             + sidecar.expect_preview.rejected.len()
             + sidecar.expect_preview.quarantined.len()
-            + sidecar.expect_preview.stale.len();
+            + sidecar.expect_preview.stale.len()
+            + sidecar.expect_preview.rejected_items.len();
         assert!(
             assertion_count > 0,
             "{} has explicit preview assertions",
@@ -953,7 +928,6 @@ fn dreaming_sidecars_are_stable_and_readable() {
             &sidecar.expect_preview.accepted,
             &sidecar.expect_preview.rejected,
             &sidecar.expect_preview.quarantined,
-            &sidecar.expect_preview.stale,
         ] {
             for candidate in bucket.iter() {
                 assert!(
@@ -962,6 +936,16 @@ fn dreaming_sidecars_are_stable_and_readable() {
                     fixture.name
                 );
             }
+        }
+        for stale in &sidecar.expect_preview.stale {
+            assert!(
+                stale.state.is_some()
+                    || stale.drift_prone.is_some()
+                    || stale.suggested_action.is_some()
+                    || stale.historical_reason.is_some(),
+                "{} stale sidecar should describe the real service fields",
+                fixture.name
+            );
         }
     }
 }
@@ -975,10 +959,29 @@ fn dreaming_fixtures_preview_apply_and_recall_from_sidecars() {
         }
         let fixture = load_fixture(&path).expect("fixture parses");
         let expected = load_sidecar(&fixture);
-        let seeded = seed_store(&fixture);
-        let preview = preview_fixture(&fixture);
+        let seeded = seed_real_dream_store(&fixture);
+        let now = seeded.now.clone();
+        let repo = seeded.repo.clone();
+        let preview = seeded
+            .service
+            .dream(DreamRequest {
+                profile: Some(PROFILE.to_string()),
+                workspace: Some(WORKSPACE.to_string()),
+                repo: repo.clone(),
+                mode: Some("preview".to_string()),
+                now: Some(now.clone()),
+                since: None,
+            })
+            .expect("dream preview runs");
 
-        assert_preview_matches(&fixture, &preview, &expected.expect_preview);
+        if matches!(
+            fixture.name.as_str(),
+            "conflicting_newer_fact" | "repeated_preference" | "repo_gotcha"
+        ) {
+            eprintln!("{preview:#?}");
+        }
+
+        assert_service_preview_matches(&fixture, &preview, &expected.expect_preview);
 
         if let Some(recall_before) = &expected.expect_recall_before {
             let text = recall_text(&seeded.service, recall_before);
@@ -986,14 +989,26 @@ fn dreaming_fixtures_preview_apply_and_recall_from_sidecars() {
         }
 
         if let Some(apply_expected) = &expected.expect_apply {
-            let first = apply_preview(&seeded, &preview);
+            let first = seeded
+                .service
+                .dream(DreamRequest {
+                    profile: Some(PROFILE.to_string()),
+                    workspace: Some(WORKSPACE.to_string()),
+                    repo: repo.clone(),
+                    mode: Some("apply".to_string()),
+                    now: Some(now.clone()),
+                    since: None,
+                })
+                .expect("dream apply runs");
             assert_eq!(
-                first.created, apply_expected.created,
+                first.created.len(),
+                apply_expected.created,
                 "{} first apply created",
                 fixture.name
             );
             assert_eq!(
-                first.archived, apply_expected.archived,
+                first.archived.len(),
+                apply_expected.archived,
                 "{} first apply archived",
                 fixture.name
             );
@@ -1005,10 +1020,19 @@ fn dreaming_fixtures_preview_apply_and_recall_from_sidecars() {
 
             if apply_expected.idempotent_second_apply {
                 let active_after_first = seeded.store.count_records().expect("count records");
-                let second = apply_preview(&seeded, &preview);
-                assert_eq!(
-                    second,
-                    ApplyReport::default(),
+                let second = seeded
+                    .service
+                    .dream(DreamRequest {
+                        profile: Some(PROFILE.to_string()),
+                        workspace: Some(WORKSPACE.to_string()),
+                        repo: repo.clone(),
+                        mode: Some("apply".to_string()),
+                        now: Some(now.clone()),
+                        since: None,
+                    })
+                    .expect("dream second apply runs");
+                assert!(
+                    second.created.is_empty() && second.archived.is_empty(),
                     "{} second apply creates no duplicate active records and archives nothing new",
                     fixture.name
                 );

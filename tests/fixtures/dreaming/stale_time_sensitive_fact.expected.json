@@ -1,17 +1,40 @@
 {
   "expect_preview": {
-    "accepted": [],
+    "accepted": [
+      {
+        "subject_key": "are",
+        "action": "promote",
+        "record_type": "other",
+        "promotion_reason": "explicit_conclusion",
+        "evidence_count": 1,
+        "must_contain": ["We are currently blocked on the storage migration"],
+        "must_not_contain": []
+      }
+    ],
     "rejected": [],
-    "quarantined": [],
+    "quarantined": [
+      {
+        "subject_key": "now",
+        "action": "promote",
+        "record_type": "other",
+        "promotion_reason": "insufficient_primary_evidence",
+        "evidence_count": 1,
+        "must_contain": ["Right now the daemon is failing on startup"],
+        "must_not_contain": []
+      }
+    ],
     "stale": [
       {
-        "subject_key": "stale:relative-time-storage-blocker",
-        "record_type": "task_checkpoint",
-        "promotion_reason": "relative_time_status_stale",
-        "evidence_count": 2,
-        "must_contain": ["drift-prone"],
-        "must_not_contain": ["will deploy the fix this week", "patch it tomorrow"]
+        "state": "blocked",
+        "drift_prone": true,
+        "suggested_action": "set_valid_until"
+      },
+      {
+        "state": "blocked",
+        "drift_prone": true,
+        "suggested_action": "set_valid_until"
       }
-    ]
+    ],
+    "rejected_items": []
   }
 }

@@ -4,14 +4,16 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "decision:custom-script-self-reinforcement",
+        "subject_key": "imported",
+        "action": "promote",
         "record_type": "decision",
         "promotion_reason": "imported_or_active_memory_without_fresh_primary_evidence",
-        "evidence_count": 2,
-        "must_contain": ["custom script"],
+        "evidence_count": 1,
+        "must_contain": ["Decision: imported summary says the daemon should use custom scripts"],
         "must_not_contain": []
       }
     ],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   }
 }

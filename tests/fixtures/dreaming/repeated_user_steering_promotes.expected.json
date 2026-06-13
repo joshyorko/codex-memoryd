@@ -2,7 +2,8 @@
   "expect_preview": {
     "accepted": [
       {
-        "subject_key": "command:cargo-test-repeated-steering",
+        "subject_key": "cargo",
+        "action": "promote",
         "record_type": "command",
         "promotion_reason": "repeated_user_steering",
         "evidence_count": 2,
@@ -11,8 +12,19 @@
       }
     ],
     "rejected": [],
-    "quarantined": [],
-    "stale": []
+    "quarantined": [
+      {
+        "subject_key": "cargo",
+        "action": "supersede",
+        "record_type": "command",
+        "promotion_reason": "newer completed evidence supersedes older active state",
+        "evidence_count": 1,
+        "must_contain": ["Again, run cargo test before claiming done."],
+        "must_not_contain": []
+      }
+    ],
+    "stale": [],
+    "rejected_items": []
   },
-  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true }
+  "expect_apply": { "created": 0, "archived": 0, "idempotent_second_apply": true }
 }

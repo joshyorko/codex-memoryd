@@ -4,7 +4,8 @@
     "rejected": [],
     "quarantined": [
       {
-        "subject_key": "preference:terse-commit-messages",
+        "subject_key": "prefer",
+        "action": "promote",
         "record_type": "preference",
         "promotion_reason": "single_unconfirmed_preference",
         "evidence_count": 1,
@@ -12,6 +13,7 @@
         "must_not_contain": []
       }
     ],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   }
 }

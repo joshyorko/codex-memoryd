@@ -1,23 +1,53 @@
 {
   "expect_preview": {
-    "accepted": [
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [
       {
-        "subject_key": "preference:repo-native-commands",
+        "subject_key": "cargo",
+        "action": "promote",
+        "record_type": "command",
+        "promotion_reason": "insufficient_primary_evidence",
+        "evidence_count": 1,
+        "must_contain": ["cargo test", "custom script"],
+        "must_not_contain": []
+      },
+      {
+        "subject_key": "repo",
+        "action": "promote",
         "record_type": "preference",
-        "promotion_reason": "repeated_user_preference",
-        "evidence_count": 3,
+        "promotion_reason": "single_unconfirmed_preference",
+        "evidence_count": 1,
+        "must_contain": ["cargo test", "ad-hoc shell scripts"],
+        "must_not_contain": []
+      },
+      {
+        "subject_key": "stop",
+        "action": "promote",
+        "record_type": "command",
+        "promotion_reason": "insufficient_primary_evidence",
+        "evidence_count": 1,
         "must_contain": ["cargo test", "helper scripts"],
+        "must_not_contain": []
+      },
+      {
+        "subject_key": "understood",
+        "action": "promote",
+        "record_type": "command",
+        "promotion_reason": "assistant_only_proposal_quarantined",
+        "evidence_count": 1,
+        "must_contain": ["cargo test"],
         "must_not_contain": []
       }
     ],
-    "rejected": [],
-    "quarantined": [],
-    "stale": []
+    "stale": [],
+    "rejected_items": []
   },
-  "expect_apply": { "created": 1, "archived": 0, "idempotent_second_apply": true },
+  "expect_apply": { "created": 0, "archived": 0, "idempotent_second_apply": true },
   "expect_recall_before": {
     "query": "How should I run tests in this repo?",
-    "must_not_contain": ["cargo test", "helper scripts"]
+    "must_contain": ["cargo test", "helper scripts"],
+    "must_not_contain": []
   },
   "expect_recall_after": {
     "query": "How should I run tests in this repo?",

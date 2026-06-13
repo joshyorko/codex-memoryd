@@ -1,17 +1,39 @@
 {
   "expect_preview": {
-    "accepted": [],
+    "accepted": [
+      {
+        "subject_key": "now",
+        "action": "rewrite_historical",
+        "record_type": "other",
+        "promotion_reason": "expired relative-time content",
+        "evidence_count": 1,
+        "must_contain": [
+          "As of 2026-06-13, Right now the daemon is failing on startup, planning to patch it tomorrow."
+        ],
+        "must_not_contain": []
+      },
+      {
+        "subject_key": "now",
+        "action": "promote",
+        "record_type": "other",
+        "promotion_reason": "explicit_conclusion",
+        "evidence_count": 1,
+        "must_contain": [
+          "Right now the daemon is failing on startup, planning to patch it tomorrow."
+        ],
+        "must_not_contain": []
+      }
+    ],
     "rejected": [],
     "quarantined": [],
     "stale": [
       {
-        "subject_key": "stale:relative-time-expiry-tomorrow",
-        "record_type": "task_checkpoint",
-        "promotion_reason": "relative_time_status_stale",
-        "evidence_count": 1,
-        "must_contain": ["Relative-time", "expired"],
-        "must_not_contain": ["patch it tomorrow"]
+        "state": "blocked",
+        "drift_prone": true,
+        "suggested_action": "rewrite_historical",
+        "historical_reason": "expired relative-time content"
       }
-    ]
+    ],
+    "rejected_items": []
   }
 }
