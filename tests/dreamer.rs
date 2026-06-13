@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use codex_memoryd::config::{Config, DreamSchedulerConfig};
@@ -248,12 +249,12 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
         "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
     );
 
-    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let preview = dream(&svc, "preview", "2030-01-01T00:00:00Z");
     assert!(preview.candidates.iter().any(|candidate| {
         candidate.action == "supersede" && candidate.supersedes == vec![old_id.clone()]
     }));
 
-    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2030-01-01T00:00:00Z");
     assert!(applied.archived.contains(&old_id));
 
     let recall = svc
@@ -313,9 +314,9 @@ fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
     );
 
     let before_preview = svc.store.count_records().unwrap();
-    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let preview = dream(&svc, "preview", "2030-01-01T00:00:00Z");
     assert_eq!(svc.store.count_records().unwrap(), before_preview);
-    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    let applied = dream(&svc, "apply", "2030-01-01T00:00:00Z");
 
     assert_eq!(preview.authority, "recall_not_authority");
     assert_eq!(applied.authority, "recall_not_authority");
@@ -349,6 +350,121 @@ fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
         .iter()
         .all(|reference| reference.kind == "conclusion"));
     assert!(applied.archived.contains(&old_id));
+}
+
+#[test]
+fn preview_and_apply_emit_experience_markers_with_required_fields() {
+    let svc = service();
+
+    conclude(
+        &svc,
+        "Battle scar: the cache writes failed before, but we recovered by switching to the fallback path.",
+    );
+    conclude(
+        &svc,
+        "Comfort path: cargo test is the known-good path for this repo.",
+    );
+    conclude(
+        &svc,
+        "Surprise: the slow path was unexpectedly the shortest one.",
+    );
+    conclude(
+        &svc,
+        "Recovery pattern: retry once, then fall back to local cache, then resume.",
+    );
+    conclude(
+        &svc,
+        "Confidence delta: after a second confirmation, confidence increased that this path is stable.",
+    );
+
+    let before = svc.store.count_records().unwrap();
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    assert_eq!(svc.store.count_records().unwrap(), before);
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+
+    assert_eq!(preview.authority, "recall_not_authority");
+    assert_eq!(applied.authority, "recall_not_authority");
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    let marker_kinds = preview
+        .markers
+        .iter()
+        .map(|marker| marker.marker_kind.as_deref().expect("marker kind"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        marker_kinds,
+        BTreeSet::from([
+            "battle_scar",
+            "comfort_path",
+            "confidence_delta",
+            "recovery_pattern",
+            "surprise",
+        ])
+    );
+
+    for marker in &preview.markers {
+        assert_eq!(marker.authority, "recall_not_authority");
+        assert!(marker.marker_kind.is_some());
+        assert!(marker.trigger.as_deref().unwrap().len() > 0);
+        assert!(marker.outcome.as_deref().unwrap().len() > 0);
+        assert!(marker.recovery.as_deref().unwrap().len() > 0);
+        assert!(marker.future_guidance.as_deref().unwrap().len() > 0);
+        assert!(!marker.evidence_refs.is_empty());
+    }
+}
+
+#[test]
+fn apply_persists_marker_provenance_for_created_records() {
+    let svc = service();
+    conclude(
+        &svc,
+        "Battle scar: the cache writes failed tomorrow, but we recovered by switching to the fallback path.",
+    );
+
+    let preview = dream(&svc, "preview", "2030-01-01T00:00:00Z");
+    assert!(preview
+        .markers
+        .iter()
+        .any(|marker| marker.marker_kind.as_deref() == Some("battle_scar")));
+
+    let applied = dream(&svc, "apply", "2030-01-01T00:00:00Z");
+    assert!(!applied.created.is_empty());
+    assert_eq!(
+        serde_json::to_value(&preview.markers).unwrap(),
+        serde_json::to_value(&applied.markers).unwrap()
+    );
+
+    let created = applied
+        .created
+        .iter()
+        .filter_map(|id| svc.store.get_record(id).unwrap())
+        .find(|record| record.metadata.get("marker").is_some())
+        .expect("created dreamer record with marker metadata");
+    assert_eq!(created.metadata["origin"], "dreamer");
+    assert_eq!(created.metadata["dream_run_id"], applied.run_id);
+    assert_eq!(
+        created.metadata["marker"]["marker_kind"],
+        json!("battle_scar")
+    );
+    assert_eq!(
+        created.metadata["observation"]["marker_kind"],
+        json!("battle_scar")
+    );
+    assert_eq!(
+        created.metadata["observation"]["authority"],
+        json!("recall_not_authority")
+    );
+    assert!(created.metadata["observation"]["trigger"]
+        .as_str()
+        .unwrap()
+        .contains("Battle scar"));
+    assert!(!created.metadata["marker"]["evidence_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
