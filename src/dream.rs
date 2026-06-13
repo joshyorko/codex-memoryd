@@ -734,12 +734,18 @@ fn push_threshold_candidates(
 }
 
 fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryRecord>> {
-    let mut groups: BTreeMap<String, Vec<&'a MemoryRecord>> = BTreeMap::new();
+    let mut groups: Vec<Vec<&'a MemoryRecord>> = Vec::new();
     for record in records {
-        let subject_key = subject_key_for_record(record);
-        groups.entry(subject_key).or_default().push(*record);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| same_subject(group[0], record))
+        {
+            group.push(*record);
+        } else {
+            groups.push(vec![*record]);
+        }
     }
-    groups.into_values().collect()
+    groups
 }
 
 fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
@@ -1132,10 +1138,11 @@ fn supersedes(newer: &MemoryRecord, older: &MemoryRecord, newer_state: &str) -> 
     let old_lower = older.content.to_ascii_lowercase();
     let new_lower = newer.content.to_ascii_lowercase();
     let old_unsettled = matches!(old_state.as_str(), "planned" | "blocked" | "active")
-        || contains_any(
-            &old_lower,
-            &["tbd", "evaluating", "not decided", "will ", "planned"],
-        );
+        || (old_state != "completed"
+            && contains_any(
+                &old_lower,
+                &["tbd", "evaluating", "not decided", "will ", "planned"],
+            ));
     let new_settled = newer_state == "completed"
         || contains_any(
             &new_lower,
@@ -1232,13 +1239,28 @@ fn same_subject(a: &MemoryRecord, b: &MemoryRecord) -> bool {
     let a_terms = a_terms.into_iter().collect::<BTreeSet<_>>();
     let b_terms = b_terms.into_iter().collect::<BTreeSet<_>>();
     let shared = a_terms.intersection(&b_terms).collect::<Vec<_>>();
-    if shared.len() >= 2 {
+    let meaningful_shared = shared
+        .iter()
+        .filter(|term| !GENERIC_SHARED_TERMS.contains(&term.as_str()))
+        .count();
+    if meaningful_shared >= 2 {
         return true;
     }
-    if shared.len() == 1 && shared[0].as_str() == "storage" {
+    if shared.len() == 1 && shared[0].as_str() == "cargo" && command_phrase_bridge(a, b) {
+        return true;
+    }
+    if shared.iter().any(|term| term.as_str() == "storage") {
         return storage_bridge(&a_terms, &b_terms);
     }
     false
+}
+
+fn command_phrase_bridge(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    let a = normalize(&a.content);
+    let b = normalize(&b.content);
+    COMMAND_PHRASE_HINTS
+        .iter()
+        .any(|phrase| a.contains(phrase) && b.contains(phrase))
 }
 
 fn storage_bridge(a_terms: &BTreeSet<String>, b_terms: &BTreeSet<String>) -> bool {
@@ -1254,9 +1276,13 @@ fn contains_any_term(terms: &BTreeSet<String>, needles: &[&str]) -> bool {
 }
 
 const STORAGE_TECH_HINTS: &[&str] = &[
-    "api", "cargo", "command", "commands", "key", "oauth", "repo", "rusqlite", "script", "sqlite",
-    "sync", "test", "tests", "tool", "tools", "fts5", "sqlite3", "bundle", "bundled",
+    "api", "cargo", "command", "commands", "key", "repo", "rusqlite", "script", "sqlite", "test",
+    "tests", "tool", "tools", "fts5", "sqlite3", "bundle", "bundled",
 ];
+
+const GENERIC_SHARED_TERMS: &[&str] = &["storage", "sync"];
+
+const COMMAND_PHRASE_HINTS: &[&str] = &["cargo test"];
 
 fn tokens(content: &str) -> Vec<String> {
     normalize(content)
