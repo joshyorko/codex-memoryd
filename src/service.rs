@@ -61,13 +61,20 @@ const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
-const ADAPTER_TARGETS: &[&str] = &["agents-md", "claude-code", "copilot", "markdown"];
+const ADAPTER_TARGETS: &[&str] = &[
+    "agents-md",
+    "claude-code",
+    "copilot",
+    "github-instructions",
+    "markdown",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
     AgentsMd,
     ClaudeCode,
     Copilot,
+    GitHubInstructions,
     Markdown,
 }
 
@@ -78,6 +85,7 @@ impl AdapterTarget {
             "agents-md" => Ok(Self::AgentsMd),
             "claude-code" => Ok(Self::ClaudeCode),
             "copilot" => Ok(Self::Copilot),
+            "github-instructions" => Ok(Self::GitHubInstructions),
             "markdown" => Ok(Self::Markdown),
             _ => Err(Error::invalid_request(format!(
                 "unknown adapter target '{target}'; use {}",
@@ -91,6 +99,7 @@ impl AdapterTarget {
             Self::AgentsMd => "agents-md",
             Self::ClaudeCode => "claude-code",
             Self::Copilot => "copilot",
+            Self::GitHubInstructions => "github-instructions",
             Self::Markdown => "markdown",
         }
     }
@@ -2206,6 +2215,11 @@ fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> String
         AdapterTarget::Copilot => {
             render_memory_markdown_view("Copilot Instructions Memory View", "copilot", card)
         }
+        AdapterTarget::GitHubInstructions => render_memory_markdown_view(
+            "GitHub Instructions Memory View",
+            "github-instructions",
+            card,
+        ),
         AdapterTarget::Markdown => {
             render_memory_markdown_view("Markdown Memory View", "markdown", card)
         }
