@@ -26,9 +26,13 @@ use serde_json::Value;
 use crate::error::{Error, ErrorCode};
 use crate::ids;
 use crate::protocol::Envelope;
+use crate::protocol::EpisodeGetRequest;
+use crate::protocol::EpisodeListRequest;
 use crate::protocol::ErrorBody;
 use crate::protocol::ExportQuery;
 use crate::protocol::ProviderTag;
+use crate::protocol::SubjectGetRequest;
+use crate::protocol::SubjectListRequest;
 use crate::service::Service;
 use crate::PROVIDER_NAME;
 use crate::PROVIDER_VERSION;
@@ -54,6 +58,16 @@ pub fn router(service: Service) -> Router {
         .route("/v1/search", post(search_handler))
         .route("/v1/turns", post(turns_handler))
         .route("/v1/conclusions", post(conclusions_handler))
+        .route(
+            "/v1/subjects",
+            post(subject_create_handler).get(subject_list_handler),
+        )
+        .route("/v1/subjects/get", get(subject_get_handler))
+        .route(
+            "/v1/episodes",
+            post(episode_create_handler).get(episode_list_handler),
+        )
+        .route("/v1/episodes/get", get(episode_get_handler))
         .route("/v1/checkpoints", post(checkpoints_handler))
         .route("/v1/dream", post(dream_handler))
         .route("/v1/sync/local-codex-memory", post(sync_handler))
@@ -182,6 +196,74 @@ async fn conclusions_handler(
             };
             ok_envelope(data, warnings)
         }
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn subject_create_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.create_subject(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn subject_list_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SubjectListRequest>,
+) -> Response {
+    match state.service.list_subjects(query) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn subject_get_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SubjectGetRequest>,
+) -> Response {
+    match state.service.get_subject(query) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn episode_create_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.create_episode(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn episode_list_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EpisodeListRequest>,
+) -> Response {
+    match state.service.list_episodes(query) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn episode_get_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EpisodeGetRequest>,
+) -> Response {
+    match state.service.get_episode(query) {
+        Ok(data) => ok_envelope(data, vec![]),
         Err(e) => err_envelope(e),
     }
 }

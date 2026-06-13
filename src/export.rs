@@ -142,6 +142,8 @@ mod tests {
             profile_id: profile.to_string(),
             workspace_id: "ws".to_string(),
             repo_id: None,
+            subject_id: None,
+            episode_id: None,
             scope: Scope::Workspace,
             record_type: rt,
             content: "exportable content".to_string(),

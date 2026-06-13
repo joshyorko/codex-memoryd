@@ -487,6 +487,8 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 profile_id: profile_str.to_string(),
                 workspace_id: params.workspace.to_string(),
                 repo_id: params.repo_id.map(|s| s.to_string()),
+                subject_id: None,
+                episode_id: None,
                 scope: class.scope,
                 record_type: class.record_type,
                 content,

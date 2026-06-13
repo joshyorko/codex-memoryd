@@ -107,6 +107,8 @@ fn insert_direct_record_for_repo(
             profile_id: "personal".to_string(),
             workspace_id: "ws".to_string(),
             repo_id: repo_id.map(str::to_string),
+            subject_id: None,
+            episode_id: None,
             scope: Scope::Session,
             record_type: RecordType::Decision,
             content: content.to_string(),

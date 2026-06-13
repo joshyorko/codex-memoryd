@@ -26,6 +26,8 @@ fn seed_turns(svc: &Service, db_path: &std::path::Path) -> String {
         profile_id: "personal".to_string(),
         workspace_id: "ws".to_string(),
         repo_id: None,
+        subject_id: None,
+        episode_id: None,
         scope: Scope::Workspace,
         record_type: RecordType::Decision,
         content: content.clone(),

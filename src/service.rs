@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
+use crate::domain::Episode;
 use crate::domain::MemoryRecord;
 use crate::domain::Portability;
 use crate::domain::Profile;
@@ -25,6 +26,8 @@ use crate::domain::RecordType;
 use crate::domain::RepoIdentity;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
+use crate::domain::Subject;
+use crate::domain::SubjectKind;
 use crate::domain::VisibleTurn;
 use crate::dream;
 use crate::error::Error;
@@ -500,6 +503,8 @@ impl Service {
             profile_id: profile.as_str().to_string(),
             workspace_id: workspace.to_string(),
             repo_id: repo_id.map(|s| s.to_string()),
+            subject_id: None,
+            episode_id: None,
             scope: class.scope,
             record_type: class.record_type,
             content: content.to_string(),
@@ -627,6 +632,8 @@ impl Service {
                 profile_id: profile.as_str().to_string(),
                 workspace_id: workspace.clone(),
                 repo_id: repo_id.clone(),
+                subject_id: None,
+                episode_id: None,
                 scope: class.scope,
                 record_type: class.record_type,
                 content,
@@ -668,6 +675,209 @@ impl Service {
             record_ids,
             rejected,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Subjects & episodes
+    // ------------------------------------------------------------------
+
+    pub fn create_subject(&self, req: SubjectCreateRequest) -> Result<SubjectCreateResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        self.store.ensure_workspace(profile.as_str(), &workspace)?;
+
+        let subject_key = req
+            .subject_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("subject_key is required"))
+            .and_then(|s| screen_persisted_string("subject.subject_key", s))?;
+        let kind = req
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|raw| {
+                SubjectKind::parse(raw)
+                    .ok_or_else(|| Error::invalid_request(format!("unknown subject kind '{raw}'")))
+            })
+            .transpose()?
+            .unwrap_or(SubjectKind::Other);
+        let display_name = req
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("display_name is required"))
+            .and_then(|s| screen_persisted_string("subject.display_name", s))?;
+        let metadata = screen_optional_json_metadata("subject.metadata", &req.metadata)?
+            .unwrap_or_else(|| json!({}));
+
+        let now = ids::now_rfc3339();
+        let subject = Subject {
+            id: ids::new_id("subj"),
+            profile_id: profile.as_str().to_string(),
+            workspace_id: workspace,
+            subject_key,
+            kind,
+            display_name,
+            created_at: now.clone(),
+            updated_at: now,
+            metadata,
+        };
+        let (subject, created) = self.store.insert_or_get_subject(&subject)?;
+        Ok(SubjectCreateResponse { subject, created })
+    }
+
+    pub fn list_subjects(&self, req: SubjectListRequest) -> Result<SubjectListResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let kind = req
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|raw| {
+                SubjectKind::parse(raw)
+                    .ok_or_else(|| Error::invalid_request(format!("unknown subject kind '{raw}'")))
+            })
+            .transpose()?;
+        Ok(SubjectListResponse {
+            subjects: self
+                .store
+                .list_subjects(profile.as_str(), &workspace, kind)?,
+        })
+    }
+
+    pub fn get_subject(&self, req: SubjectGetRequest) -> Result<SubjectGetResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let id = req
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("subject id is required"))
+            .and_then(|s| screen_persisted_string("subject.id", s))?;
+        let subject = self
+            .store
+            .get_subject(profile.as_str(), &workspace, &id)?
+            .ok_or_else(|| Error::not_found(format!("subject '{id}'")))?;
+        Ok(SubjectGetResponse { subject })
+    }
+
+    pub fn create_episode(&self, req: EpisodeCreateRequest) -> Result<EpisodeCreateResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        self.store.ensure_workspace(profile.as_str(), &workspace)?;
+
+        let subject_id = req
+            .subject_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("subject_id is required"))
+            .and_then(|s| screen_persisted_string("episode.subject_id", s))?;
+        if !self
+            .store
+            .subject_exists_in_scope(profile.as_str(), &workspace, &subject_id)?
+        {
+            return Err(Error::not_found(format!("subject '{subject_id}'")));
+        }
+        let source_kind = req
+            .source_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("source_kind is required"))
+            .and_then(|s| screen_persisted_string("episode.source_kind", s))?;
+        let source_ref = req
+            .source_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("source_ref is required"))
+            .and_then(|s| screen_persisted_string("episode.source_ref", s))?;
+        let summary = req
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("summary is required"))
+            .and_then(|s| screen_persisted_string("episode.summary", s))?;
+        let started_at = screen_optional_persisted_string("episode.started_at", &req.started_at)?;
+        let ended_at = screen_optional_persisted_string("episode.ended_at", &req.ended_at)?;
+        let status = screen_optional_persisted_string("episode.status", &req.status)?;
+        let trust_level =
+            screen_optional_persisted_string("episode.trust_level", &req.trust_level)?;
+        let source_metadata =
+            screen_optional_json_metadata("episode.source_metadata", &req.source_metadata)?
+                .unwrap_or_else(|| json!({}));
+        let metadata = screen_optional_json_metadata("episode.metadata", &req.metadata)?
+            .unwrap_or_else(|| json!({}));
+
+        let now = ids::now_rfc3339();
+        let episode = Episode {
+            id: ids::new_id("ep"),
+            profile_id: profile.as_str().to_string(),
+            workspace_id: workspace,
+            subject_id,
+            source_kind,
+            source_ref,
+            started_at,
+            ended_at,
+            status,
+            summary,
+            trust_level,
+            source_metadata,
+            created_at: now.clone(),
+            updated_at: now,
+            metadata,
+        };
+        self.store.insert_episode(&episode)?;
+        Ok(EpisodeCreateResponse {
+            episode,
+            created: true,
+        })
+    }
+
+    pub fn list_episodes(&self, req: EpisodeListRequest) -> Result<EpisodeListResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let subject_id = screen_optional_persisted_string("episode.subject_id", &req.subject_id)?;
+        if let Some(subject_id) = &subject_id {
+            if !self
+                .store
+                .subject_exists_in_scope(profile.as_str(), &workspace, subject_id)?
+            {
+                return Err(Error::not_found(format!("subject '{subject_id}'")));
+            }
+        }
+        Ok(EpisodeListResponse {
+            episodes: self.store.list_episodes(
+                profile.as_str(),
+                &workspace,
+                subject_id.as_deref(),
+            )?,
+        })
+    }
+
+    pub fn get_episode(&self, req: EpisodeGetRequest) -> Result<EpisodeGetResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let id = req
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::invalid_request("episode id is required"))
+            .and_then(|s| screen_persisted_string("episode.id", s))?;
+        let episode = self
+            .store
+            .get_episode(profile.as_str(), &workspace, &id)?
+            .ok_or_else(|| Error::not_found(format!("episode '{id}'")))?;
+        Ok(EpisodeGetResponse { episode })
     }
 
     // ------------------------------------------------------------------
@@ -812,6 +1022,8 @@ impl Service {
             profile_id: profile.as_str().to_string(),
             workspace_id: workspace.clone(),
             repo_id: repo_id.clone(),
+            subject_id: None,
+            episode_id: None,
             scope: if repo_id.is_some() {
                 Scope::Repo
             } else {

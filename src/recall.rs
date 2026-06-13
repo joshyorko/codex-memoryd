@@ -408,6 +408,8 @@ mod tests {
                 profile_id: "personal".to_string(),
                 workspace_id: "ws".to_string(),
                 repo_id: repo.map(|s| s.to_string()),
+                subject_id: None,
+                episode_id: None,
                 scope: Scope::Repo,
                 record_type: *rt,
                 content: content.to_string(),

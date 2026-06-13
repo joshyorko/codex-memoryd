@@ -425,6 +425,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 profile_id: params.profile.as_str().to_string(),
                 workspace_id: params.workspace.to_string(),
                 repo_id: params.repo_id.map(|s| s.to_string()),
+                subject_id: None,
+                episode_id: None,
                 scope: class.scope,
                 record_type: class.record_type,
                 content,

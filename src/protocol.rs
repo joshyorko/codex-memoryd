@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::domain::Episode;
 use crate::domain::RepoIdentity;
+use crate::domain::Subject;
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -334,6 +336,105 @@ pub struct ConclusionsResponse {
     pub created: Vec<String>,
     pub record_ids: Vec<String>,
     pub rejected: Vec<ConclusionRejection>,
+}
+
+// ---------------------------------------------------------------------------
+// Subjects and episodes (agent-agnostic substrate)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubjectCreateRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    pub subject_key: Option<String>,
+    pub kind: Option<String>,
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubjectCreateResponse {
+    pub subject: Subject,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubjectListRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubjectListResponse {
+    pub subjects: Vec<Subject>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubjectGetRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubjectGetResponse {
+    pub subject: Subject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EpisodeCreateRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    pub subject_id: Option<String>,
+    pub source_kind: Option<String>,
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub trust_level: Option<String>,
+    #[serde(default)]
+    pub source_metadata: Option<Value>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EpisodeCreateResponse {
+    pub episode: Episode,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EpisodeListRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EpisodeListResponse {
+    pub episodes: Vec<Episode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EpisodeGetRequest {
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EpisodeGetResponse {
+    pub episode: Episode,
 }
 
 // ---------------------------------------------------------------------------

@@ -509,6 +509,8 @@ fn seed_corresponding_memory_record(
         profile_id: PROFILE.to_string(),
         workspace_id: WORKSPACE.to_string(),
         repo_id: repo_id.map(str::to_string),
+        subject_id: None,
+        episode_id: None,
         scope: class.scope,
         record_type,
         content: content.to_string(),

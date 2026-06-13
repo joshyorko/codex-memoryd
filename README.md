@@ -20,12 +20,33 @@ required for the MVP.
 > explicit policy, or verified current state. Recall responses are explicitly
 > tagged `authority = "recall_not_authority"`.
 
+## Current landed stack
+
+The repo now ships the following live surfaces:
+
+- local-only daemon mode on loopback, with fail-open behavior when the daemon is unavailable;
+- Docker Compose dogfood with host-side loopback publishing and `.dogfood/memory.db` as the real daemon DB;
+- MCP stdio dogfood, including a read-only Codex-facing sandbox path in `docs/dogfood-mcp.md`;
+- local memory import from host Codex memory files under `~/.codex/memories`;
+- evidence ledger, observations, markers, and memory patches for reviewable memory flow;
+- subject and episode storage for stable agent-agnostic entity/event anchors;
+- safe dogfood invariants: no secrets, no hidden reasoning, no automatic prompt injection, and no authority override from recall.
+
+Operational guides:
+
+- [`docs/dogfood-local.md`](./docs/dogfood-local.md)
+- [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md)
+- [`docs/codex-integration.md`](./docs/codex-integration.md)
+- [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)
+- [`docs/agent-agnostic-memory-substrate.md`](./docs/agent-agnostic-memory-substrate.md)
+
 ## What it is (and isn't)
 
 Codex owns agent execution, turn lifecycle, sandboxing, approvals, and prompt
 assembly. `codex-memoryd` owns:
 
 - durable storage of memory records, sources, checkpoints, conclusions, turns;
+- durable storage of subjects and episodes as stable substrate anchors;
 - **recall** — compact, ranked, repo-aware context before a turn;
 - **ingestion** — importing existing local Codex memory artifacts;
 - **dedupe** — idempotent writes and imports via content/source hashing;
@@ -42,7 +63,7 @@ A single Rust crate with strict module boundaries (SPEC §3.2):
 | Module | Responsibility |
 | --- | --- |
 | `protocol` | Wire request/response types + the common response envelope |
-| `domain` | Durable entities (records, sources, checkpoints, …) |
+| `domain` | Durable entities (records, sources, checkpoints, subjects, episodes, …) |
 | `config` | Config resolution (file → env → flags) |
 | `store` | SQLite persistence, migrations, FTS5 probe + LIKE fallback |
 | `policy` | Secret/injection detection, profile boundaries, classification |
@@ -61,6 +82,82 @@ rejected secret content, hidden reasoning, or raw logs.
 Stack: **axum** (HTTP), **clap** (CLI), **rusqlite** with bundled SQLite +
 **r2d2** pool (storage), **serde** (types), **tracing** (logs), **regex**
 (secret detection), **sha2** (hashing), **uuid** (ids).
+
+## Subject / Episode Substrate
+
+Schema version 4 adds the first durable entity/event layer underneath ordinary
+memory records. It is intentionally small and agent-agnostic:
+
+- **subjects** are stable anchors inside one profile/workspace boundary:
+  people, agents, orgs, projects, repos, routines, workflows, devices,
+  concepts, or `other`. A subject is idempotent by
+  `(profile_id, workspace_id, subject_key)`.
+- **episodes** are append-oriented evidence events tied to one subject. They
+  carry a source kind/ref, summary, optional status/window/trust metadata, and
+  never replace the subject itself.
+- **memory records** now have optional `subject_id` and `episode_id` columns, so
+  future recall, Dreamer, and adapter flows can bind facts to a stable entity or
+  event without turning the adapter file into the source of truth.
+
+This layer is not a graph engine, CRM, scheduler, or agent harness. It does not
+change recall authority, export boundaries, or policy gates. Subject and episode
+writes still pass the same profile/workspace validation and secret/prompt
+injection screening used elsewhere. Export currently emits portable memory
+records only; raw subject and episode rows are not exported as standalone data.
+
+CLI examples:
+
+```bash
+# Create or retrieve the same subject by scoped subject key.
+codex-memoryd subject create \
+  --profile personal \
+  --workspace josh-personal \
+  --key repo:github:joshyorko/codex-memoryd \
+  --kind repo \
+  --display-name codex-memoryd | jq
+
+SUBJECT_ID="$(codex-memoryd subject list \
+  --profile personal \
+  --workspace josh-personal \
+  --kind repo | jq -r '.subjects[0].id')"
+
+# Append an episode to that subject.
+codex-memoryd episode create \
+  --profile personal \
+  --workspace josh-personal \
+  --subject-id "$SUBJECT_ID" \
+  --source-kind github_issue \
+  --source-ref "joshyorko/codex-memoryd#65" \
+  --summary "Subject and episode storage MVP landed." \
+  --status completed | jq
+
+codex-memoryd subject get --profile personal --workspace josh-personal "$SUBJECT_ID" | jq
+codex-memoryd episode list --profile personal --workspace josh-personal --subject-id "$SUBJECT_ID" | jq
+```
+
+HTTP surfaces mirror the CLI and use the standard response envelope:
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/v1/subjects` | `POST` | create or idempotently return a subject |
+| `/v1/subjects` | `GET` | list scoped subjects, optionally by `kind` |
+| `/v1/subjects/get` | `GET` | get one subject by `id` |
+| `/v1/episodes` | `POST` | append an episode for an existing subject |
+| `/v1/episodes` | `GET` | list scoped episodes, optionally by `subject_id` |
+| `/v1/episodes/get` | `GET` | get one episode by `id` |
+
+These protected `/v1/*` routes are usable when the daemon itself is configured
+with a loopback bind, for example direct `codex-memoryd serve` on
+`127.0.0.1:8787`. The Docker Compose dogfood path binds `0.0.0.0` inside the
+container so Docker can publish the port, and the server therefore returns
+`auth_missing` for protected `/v1/*` routes even though the host publish is
+`127.0.0.1:8787`. Compose dogfood uses CLI commands inside the container and the
+sandboxed MCP stdio path until container-aware transport auth/exposure handling
+lands.
+
+The MCP dogfood namespace remains read-only for Codex. Subject and episode
+writes are available through CLI/HTTP for local operator and adapter work, not
+through the sandboxed Codex MCP tool allow-list.
 
 ## Build
 
@@ -188,6 +285,14 @@ codex-memoryd search --profile personal --workspace josh-personal --query "axum"
 codex-memoryd conclude --profile personal --workspace josh-personal \
   --content "Decision: use rusqlite bundled for storage"
 
+# Create stable subjects and append episodes
+codex-memoryd subject create --profile personal --workspace josh-personal \
+  --key workflow:dogfood-import --kind workflow --display-name "Dogfood import gate"
+codex-memoryd subject list --profile personal --workspace josh-personal --kind workflow
+codex-memoryd episode create --profile personal --workspace josh-personal \
+  --subject-id <subject-id> --source-kind fizzy_card --source-ref 491 \
+  --summary "Container/import/MCP gate verified green."
+
 # Preview deterministic Dreamer candidates (no durable writes)
 codex-memoryd dream --profile personal --workspace josh-personal --preview
 
@@ -237,22 +342,33 @@ max_tokens = 1200
 ## Run with Docker
 
 ```bash
-# Build + start with a persistent named volume (codex_memoryd_data):
+# Build + start with repo-local .dogfood/memory.db:
+mkdir -p .dogfood
 docker compose up -d --build
 
-# Verify:
+# Verify status and health:
 curl -s http://127.0.0.1:8787/v1/status | jq
+curl -fsS http://127.0.0.1:8787/healthz
 
 # Logs / stop:
 docker compose logs -f codex-memoryd
-docker compose down            # keeps the volume
+docker compose down            # keeps .dogfood/memory.db on the host
 ```
 
-The image runs as a non-root user, stores data under the `/data` volume, binds
-`0.0.0.0:8787` inside the container (published to `127.0.0.1:8787` on the host),
-and ships a `HEALTHCHECK` hitting `/healthz`. Keep the host-side publish on
-`127.0.0.1`; changing it to all interfaces is unsupported without an external
-authenticating proxy. No secrets are baked into the image.
+Compose bind-mounts `./.dogfood` at `/data`, so the container's
+`/data/memory.db` is the host-visible `.dogfood/memory.db`. It also mounts
+`~/.codex/memories` read-only at `/host-codex-memories` for local memory import
+inside the container. The service runs as
+`${CODEX_MEMORYD_UID:-1000}:${CODEX_MEMORYD_GID:-1000}` by default so Docker
+and local CLI commands can both write the SQLite files.
+
+The daemon binds `0.0.0.0:8787` inside the container but Compose publishes only
+`127.0.0.1:8787` on the host, and the image ships a `HEALTHCHECK` hitting
+`/healthz`. In this mode `/v1/status` is available for diagnostics, while
+protected `/v1/*` routes report `auth_missing`; use direct loopback
+`codex-memoryd serve` for HTTP provider/client testing. Keep the host-side
+publish on `127.0.0.1`; changing it to all interfaces is unsupported without an
+external authenticating proxy. No secrets are baked into the image.
 
 ## How the Codex fork calls it
 
@@ -335,6 +451,8 @@ endpoint map, the local-import wire format, and the fail-open contract.
 
 ## Roadmap: Dreamer loop (research)
 
+The section below is forward-looking; it describes the next research-backed shape, not the landed stack above.
+
 A background/offline memory-synthesis pass — the **Dreamer loop** — consolidates
 repeated safe evidence into durable, provenance-backed records, marks
 drift-prone facts with validity metadata, and supersedes outdated records. It is
@@ -409,7 +527,9 @@ The conformance suite ([`tests/conformance.rs`](./tests/conformance.rs)) covers
 the MVP surface from SPEC §15.3: status, profile/workspace isolation, record
 create/search, recall filtering, secret + injection rejection, conclusion →
 record, checkpoint store/recall, local import preview/apply idempotency,
-work→personal export denial, forget archiving, and secret omission on export.
+work→personal export denial, forget archiving, secret omission on export, subject
+CRUD idempotence, episode linking, subject/episode policy screening, and export
+omission of raw subject/episode rows.
 
 ## License
 

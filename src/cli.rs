@@ -91,6 +91,16 @@ pub enum Command {
         #[arg(long)]
         content: String,
     },
+    /// Create, list, or inspect durable subjects.
+    Subject {
+        #[command(subcommand)]
+        command: SubjectCommand,
+    },
+    /// Create, list, or inspect subject episodes.
+    Episode {
+        #[command(subcommand)]
+        command: EpisodeCommand,
+    },
     /// Import local Codex memory from a directory (provider local-ingest mode).
     SyncLocal {
         /// Preview only (no durable writes).
@@ -234,6 +244,84 @@ pub enum PatchCommand {
         apply: bool,
         #[arg(long, default_value = "json")]
         format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SubjectCommand {
+    /// Create a subject, idempotent by profile/workspace/key.
+    Create {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value = "other")]
+        kind: String,
+        #[arg(long)]
+        display_name: String,
+    },
+    /// List subjects in a workspace.
+    List {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Get a subject by id.
+    Get {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EpisodeCommand {
+    /// Create an episode for a subject.
+    Create {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        subject_id: String,
+        #[arg(long)]
+        source_kind: String,
+        #[arg(long)]
+        source_ref: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        started_at: Option<String>,
+        #[arg(long)]
+        ended_at: Option<String>,
+        #[arg(long)]
+        trust_level: Option<String>,
+    },
+    /// List episodes in a workspace, optionally filtered by subject.
+    List {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        subject_id: Option<String>,
+    },
+    /// Get an episode by id.
+    Get {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        id: String,
     },
 }
 
@@ -498,6 +586,111 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let resp = service.conclusions(req)?;
             print_json(&resp)?;
+            Ok(())
+        }
+        Command::Subject { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                SubjectCommand::Create {
+                    profile,
+                    workspace,
+                    key,
+                    kind,
+                    display_name,
+                } => {
+                    let resp = service.create_subject(SubjectCreateRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        subject_key: Some(key.clone()),
+                        kind: Some(kind.clone()),
+                        display_name: Some(display_name.clone()),
+                        metadata: None,
+                    })?;
+                    print_json(&resp)?;
+                }
+                SubjectCommand::List {
+                    profile,
+                    workspace,
+                    kind,
+                } => {
+                    let resp = service.list_subjects(SubjectListRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        kind: kind.clone(),
+                    })?;
+                    print_json(&resp)?;
+                }
+                SubjectCommand::Get {
+                    profile,
+                    workspace,
+                    id,
+                } => {
+                    let resp = service.get_subject(SubjectGetRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        id: Some(id.clone()),
+                    })?;
+                    print_json(&resp)?;
+                }
+            }
+            Ok(())
+        }
+        Command::Episode { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                EpisodeCommand::Create {
+                    profile,
+                    workspace,
+                    subject_id,
+                    source_kind,
+                    source_ref,
+                    summary,
+                    status,
+                    started_at,
+                    ended_at,
+                    trust_level,
+                } => {
+                    let resp = service.create_episode(EpisodeCreateRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        subject_id: Some(subject_id.clone()),
+                        source_kind: Some(source_kind.clone()),
+                        source_ref: Some(source_ref.clone()),
+                        started_at: started_at.clone(),
+                        ended_at: ended_at.clone(),
+                        status: status.clone(),
+                        summary: Some(summary.clone()),
+                        trust_level: trust_level.clone(),
+                        source_metadata: None,
+                        metadata: None,
+                    })?;
+                    print_json(&resp)?;
+                }
+                EpisodeCommand::List {
+                    profile,
+                    workspace,
+                    subject_id,
+                } => {
+                    let resp = service.list_episodes(EpisodeListRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        subject_id: subject_id.clone(),
+                    })?;
+                    print_json(&resp)?;
+                }
+                EpisodeCommand::Get {
+                    profile,
+                    workspace,
+                    id,
+                } => {
+                    let resp = service.get_episode(EpisodeGetRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        id: Some(id.clone()),
+                    })?;
+                    print_json(&resp)?;
+                }
+            }
             Ok(())
         }
         Command::SyncLocal {

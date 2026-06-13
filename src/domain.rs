@@ -228,6 +228,90 @@ pub struct RepoIdentity {
     pub is_git: bool,
 }
 
+/// Durable subject identity for grouping evidence and memories around stable
+/// people, repos, projects, workflows, or concepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectKind {
+    Person,
+    Agent,
+    Org,
+    Project,
+    Repo,
+    Routine,
+    Workflow,
+    Device,
+    Concept,
+    Other,
+}
+
+impl SubjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubjectKind::Person => "person",
+            SubjectKind::Agent => "agent",
+            SubjectKind::Org => "org",
+            SubjectKind::Project => "project",
+            SubjectKind::Repo => "repo",
+            SubjectKind::Routine => "routine",
+            SubjectKind::Workflow => "workflow",
+            SubjectKind::Device => "device",
+            SubjectKind::Concept => "concept",
+            SubjectKind::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<SubjectKind> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "person" => Some(SubjectKind::Person),
+            "agent" => Some(SubjectKind::Agent),
+            "org" => Some(SubjectKind::Org),
+            "project" => Some(SubjectKind::Project),
+            "repo" => Some(SubjectKind::Repo),
+            "routine" => Some(SubjectKind::Routine),
+            "workflow" => Some(SubjectKind::Workflow),
+            "device" => Some(SubjectKind::Device),
+            "concept" => Some(SubjectKind::Concept),
+            "other" => Some(SubjectKind::Other),
+            _ => None,
+        }
+    }
+}
+
+/// Stable entity anchor inside one profile/workspace boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Subject {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub subject_key: String,
+    pub kind: SubjectKind,
+    pub display_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Value,
+}
+
+/// Append-oriented evidence episode tied to a subject.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Episode {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub subject_id: String,
+    pub source_kind: String,
+    pub source_ref: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub status: Option<String>,
+    pub summary: String,
+    pub trust_level: Option<String>,
+    pub source_metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Value,
+}
+
 /// The primary durable memory unit (SPEC §4.1.7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
@@ -235,6 +319,8 @@ pub struct MemoryRecord {
     pub profile_id: String,
     pub workspace_id: String,
     pub repo_id: Option<String>,
+    pub subject_id: Option<String>,
+    pub episode_id: Option<String>,
     pub scope: Scope,
     #[serde(rename = "type")]
     pub record_type: RecordType,
