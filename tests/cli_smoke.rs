@@ -520,6 +520,295 @@ fn cli_sync_local_skips_external_symlinked_files_and_dirs() {
 }
 
 #[test]
+fn cli_card_workspace_summary_json_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: pin cargo to v1.0.0",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("record_ids"));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: enable deterministic cards for issue #50",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("record_ids"));
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "workspace_summary");
+    assert_eq!(first["scope"], "workspace");
+    assert_eq!(first["profile"], "personal");
+    assert_eq!(first["workspace"], "josh-personal");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["build_spec_version"], "card-summary-v1");
+    assert!(first["content_hash"].as_str().is_some());
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn cli_card_workspace_summary_markdown_renders() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: keep markdown output for card views",
+        ])
+        .assert()
+        .success();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Card summary: workspace_summary"));
+    assert!(stdout.contains("Profile: personal"));
+    assert!(stdout.contains("Authority: recall_not_authority"));
+    assert!(stdout.contains("Content hash: "));
+}
+
+#[test]
+fn cli_card_show_rejects_invalid_format() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "html",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --format 'html'"));
+}
+
+#[test]
+fn cli_card_subject_summary_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let subject_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--key",
+            "issue50-subject-summary",
+            "--kind",
+            "workflow",
+            "--display-name",
+            "Issue #50 card smoke",
+        ])
+        .output()
+        .unwrap();
+    assert!(subject_output.status.success());
+    let subject: Value = serde_json::from_slice(&subject_output.stdout).unwrap();
+    let subject_id = subject["subject"]["id"].as_str().unwrap().to_string();
+
+    // Optional record-binding path if supported: episode records can be attached
+    // to a subject and may appear in subject snapshots when present.
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "episode",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--subject-id",
+            &subject_id,
+            "--source-kind",
+            "fizzy_card",
+            "--source-ref",
+            "50",
+            "--summary",
+            "Issue #50 subject card path",
+            "--status",
+            "completed",
+        ])
+        .assert()
+        .success();
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "subject_summary",
+            "--subject-id",
+            &subject_id,
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "subject_summary",
+            "--subject-id",
+            &subject_id,
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "subject_summary");
+    assert_eq!(first["scope"], "subject");
+    assert_eq!(first["subject_id"], subject_id);
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert!(first["content_hash"].as_str().is_some());
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+
+    let markdown = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "subject_summary",
+            "--subject-id",
+            &subject_id,
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(markdown.status.success());
+    let markdown = String::from_utf8_lossy(&markdown.stdout);
+    assert!(markdown.contains(&format!("Subject: {subject_id}")));
+    assert!(markdown.contains("# Card summary: subject_summary"));
+}
+
+#[test]
 fn cli_dream_preview_empty_workspace_is_json() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

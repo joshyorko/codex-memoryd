@@ -58,6 +58,7 @@ use crate::store::Store;
 
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
+const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 
 /// The provider service. Cheaply cloneable (Arc inside).
 #[derive(Clone)]
@@ -208,6 +209,119 @@ impl Service {
             offset,
         };
         recall::search(&self.store, &params)
+    }
+
+    // ------------------------------------------------------------------
+    // Cards
+    // ------------------------------------------------------------------
+
+    pub fn card_show(&self, req: CardShowRequest) -> Result<CardShowResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let card_type = req
+            .r#type
+            .trim()
+            .to_ascii_lowercase()
+            .trim_matches('_')
+            .replace("__", "_");
+        let (scope_label, subject_id) = match card_type.as_str() {
+            "subject_summary" => {
+                let subject_id = screen_persisted_string(
+                    "card.subject_id",
+                    req.subject_id
+                        .as_deref()
+                        .ok_or_else(|| {
+                            Error::invalid_request("subject_id is required for subject_summary")
+                        })?
+                        .trim(),
+                )?;
+                let exists = self.store.subject_exists_in_scope(
+                    profile.as_str(),
+                    &workspace,
+                    &subject_id,
+                )?;
+                if !exists {
+                    return Err(Error::not_found(format!("subject '{subject_id}'")));
+                }
+                ("subject", Some(subject_id))
+            }
+            "workspace_summary" => ("workspace", None),
+            _ => {
+                return Err(Error::invalid_request(format!(
+                    "unknown card type '{card_type}'; use subject_summary or workspace_summary"
+                )))
+            }
+        };
+
+        let mut records = self.store.query_records(&crate::store::RecordQuery {
+            profile_id: Some(profile.as_str().to_string()),
+            workspace_id: Some(workspace.clone()),
+            ..Default::default()
+        })?;
+        if let Some(subject_id) = subject_id.as_deref() {
+            records.retain(|record| record.subject_id.as_deref() == Some(subject_id));
+        }
+        records.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.id.cmp(&a.id))
+                .then(b.created_at.cmp(&a.created_at))
+        });
+
+        let views = records
+            .iter()
+            .map(|record| CardRecordView {
+                id: record.id.clone(),
+                record_type: record.record_type.as_str().to_string(),
+                scope: record.scope.as_str().to_string(),
+                content: record.content.clone(),
+                confidence: record.confidence,
+                updated_at: record.updated_at.clone(),
+                related_files: record.related_files.clone(),
+                tags: record.tags.clone(),
+                subject_id: record.subject_id.clone(),
+                episode_id: record.episode_id.clone(),
+                source_ids: record.source_ids.clone(),
+            })
+            .collect::<Vec<_>>();
+        let generated_at = views
+            .iter()
+            .next()
+            .map(|record| record.updated_at.clone())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        let freshness = if views.is_empty() {
+            "empty_snapshot".to_string()
+        } else {
+            "stable".to_string()
+        };
+        let digest_target = serde_json::json!({
+            "card_type": card_type,
+            "scope": scope_label,
+            "profile": profile.as_str(),
+            "workspace": workspace,
+            "subject_id": subject_id,
+            "generated_at": generated_at,
+            "freshness": freshness,
+            "records": views.clone(),
+            "build_spec_version": CARD_BUILD_SPEC_VERSION,
+        });
+        let digest_bytes = serde_json::to_vec(&digest_target)
+            .map_err(|err| Error::internal(format!("failed to serialize card digest: {err}")))?;
+        let content_hash = ids::sha256_hex(&digest_bytes);
+
+        Ok(CardShowResponse {
+            card_type,
+            scope: scope_label.to_string(),
+            profile: profile.as_str().to_string(),
+            workspace,
+            subject_id,
+            generated_at,
+            freshness,
+            content_hash,
+            build_spec_version: CARD_BUILD_SPEC_VERSION.to_string(),
+            authority: "recall_not_authority".to_string(),
+            records: views,
+        })
     }
 
     // ------------------------------------------------------------------
