@@ -9,7 +9,7 @@ This runbook connects current Codex to `codex-memoryd` through MCP stdio in safe
 - MCP test database: `.dogfood/mcp-sandbox-memory.db`.
 - Transport: local stdio only.
 - Codex-facing tools: `memory_status`, `memory_recall`, and `memory_search` only.
-- Write tools are not exposed to Codex in this config.
+- Write tools are not exposed to Codex in this config, and stdio now enforces `--read-only` server-side.
 - Recall is `recall_not_authority`; user instructions, repo files, and tests override memory.
 - No automatic memory writes, hidden reasoning storage, secret storage, prompt injection, or Dreamer auto-apply.
 
@@ -36,7 +36,7 @@ Add this to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.codex_memoryd_dogfood]
 command = "/var/home/kdlocpanda/second_brain/Resources/codex-memory-lab/codex-memoryd/target/debug/codex-memoryd"
-args = ["--db", "/var/home/kdlocpanda/second_brain/Resources/codex-memory-lab/codex-memoryd/.dogfood/mcp-sandbox-memory.db", "mcp", "stdio"]
+args = ["--db", "/var/home/kdlocpanda/second_brain/Resources/codex-memory-lab/codex-memoryd/.dogfood/mcp-sandbox-memory.db", "mcp", "stdio", "--read-only"]
 enabled_tools = ["memory_status", "memory_recall", "memory_search"]
 default_tools_approval_mode = "approve"
 startup_timeout_sec = 30
@@ -63,13 +63,13 @@ default_tools_approval_mode: approve
 Use direct JSON-RPC over stdio to verify the server before asking Codex to call it:
 
 ```bash
-target/debug/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio < .dogfood/mcp-smoke.requests.jsonl
+target/debug/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio --read-only < .dogfood/mcp-smoke.requests.jsonl
 ```
 
-Observed direct results:
+Observed direct results in read-only mode:
 
 - `initialize`: ok
-- `tools/list`: `memory_status`, `memory_recall`, `memory_search`, `memory_conclude`, `memory_checkpoint`
+- `tools/list`: `memory_status`, `memory_recall`, `memory_search`
 - `memory_status`: `local_only`, storage `.dogfood/mcp-sandbox-memory.db`, Dreamer scheduler disabled
 - `memory_recall`, north star canary: returned useful facts with `authority = "recall_not_authority"`
 - `memory_recall`, safe dogfood canary: returned useful facts with `authority = "recall_not_authority"`
@@ -132,11 +132,10 @@ Regression:
 cargo test --test mcp_stdio
 ```
 
-Observed: `4 passed`.
+Observed: `5 passed`.
 
 ## Known Limits
 
-- Server-native read-only mode is not implemented yet. Codex read-only dogfood uses `enabled_tools` to expose only read tools, plus the sandbox DB to absorb accidental writes.
-- Direct `tools/list` from the raw server still includes `memory_conclude` and `memory_checkpoint`; current Codex does not expose them under the configured allow-list.
+- Keep `--read-only` enabled for stdio dogfood so the server itself gates hidden write tools.
 - Search quality depends on terms. `safe dogfood`, `dogfood`, and `Dreamer` returned matches; `codex-memoryd` alone did not.
 - The real dogfood daemon continues to run separately against `.dogfood/memory.db` on `127.0.0.1:8787`.

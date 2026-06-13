@@ -180,7 +180,11 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum McpCommand {
     /// Run the MCP server over stdio.
-    Stdio,
+    Stdio {
+        /// Expose only the read tools and reject write tool calls.
+        #[arg(long)]
+        read_only: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -782,9 +786,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Mcp { command } => match command {
-            McpCommand::Stdio => {
+            McpCommand::Stdio { read_only } => {
                 let service = cli.open_service(None)?;
-                mcp::run_stdio(service)?;
+                mcp::run_stdio(service, *read_only)?;
                 Ok(())
             }
         },
