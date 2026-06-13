@@ -141,6 +141,11 @@ pub enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Review, apply, explain, or rollback Dreamer-generated memory patches.
+    Patch {
+        #[command(subcommand)]
+        command: PatchCommand,
+    },
     /// Run the Dreamer loop in preview or apply mode.
     Dream {
         #[arg(long)]
@@ -166,6 +171,70 @@ pub enum Command {
 pub enum McpCommand {
     /// Run the MCP server over stdio.
     Stdio,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PatchCommand {
+    /// Preview the patch as JSON or Markdown.
+    Preview {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        now: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Apply a patch after verifying the preview run id.
+    Apply {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        now: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Explain a patch or memory record.
+    Explain {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        memory_id: Option<String>,
+    },
+    /// Roll back a patch in preview or apply mode.
+    Rollback {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, conflicts_with = "apply")]
+        preview: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
 }
 
 impl Cli {
@@ -224,6 +293,103 @@ fn dispatch(cli: Cli) -> Result<()> {
             let service = cli.open_service(None)?;
             let status = service.status()?;
             print_json(&status)?;
+            Ok(())
+        }
+        Command::Patch { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                PatchCommand::Preview {
+                    profile,
+                    workspace,
+                    repo,
+                    now,
+                    since,
+                    format,
+                } => {
+                    let resp = service.patch_preview(DreamRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        repo: repo.clone().map(|repo_id| domain::RepoIdentity {
+                            repo_id,
+                            ..Default::default()
+                        }),
+                        mode: Some("preview".to_string()),
+                        now: now.clone(),
+                        since: since.clone(),
+                    })?;
+                    if format.eq_ignore_ascii_case("markdown") {
+                        print_markdown(&resp.markdown);
+                    } else {
+                        print_json(&resp)?;
+                    }
+                }
+                PatchCommand::Apply {
+                    profile,
+                    workspace,
+                    repo,
+                    run_id,
+                    now,
+                    since,
+                } => {
+                    let resp = service.patch_apply(MemoryPatchApplyRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        repo: repo.clone().map(|repo_id| domain::RepoIdentity {
+                            repo_id,
+                            ..Default::default()
+                        }),
+                        run_id: run_id.clone(),
+                        now: now.clone(),
+                        since: since.clone(),
+                    })?;
+                    print_json(&resp)?;
+                }
+                PatchCommand::Explain {
+                    profile,
+                    workspace,
+                    repo,
+                    run_id,
+                    memory_id,
+                } => {
+                    let resp = service.patch_explain(MemoryPatchExplainRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        repo: repo.clone().map(|repo_id| domain::RepoIdentity {
+                            repo_id,
+                            ..Default::default()
+                        }),
+                        run_id: run_id.clone(),
+                        memory_id: memory_id.clone(),
+                    })?;
+                    print_json(&resp)?;
+                }
+                PatchCommand::Rollback {
+                    profile,
+                    workspace,
+                    repo,
+                    run_id,
+                    preview,
+                    apply,
+                    format,
+                } => {
+                    let resp = service.patch_rollback(MemoryPatchRollbackRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        repo: repo.clone().map(|repo_id| domain::RepoIdentity {
+                            repo_id,
+                            ..Default::default()
+                        }),
+                        run_id: run_id.clone(),
+                        preview: *preview || !*apply,
+                        now: None,
+                    })?;
+                    if format.eq_ignore_ascii_case("markdown") {
+                        print_markdown(&resp.markdown);
+                    } else {
+                        print_json(&resp)?;
+                    }
+                }
+            }
             Ok(())
         }
         Command::Dream {
@@ -501,4 +667,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value)?;
     println!("{text}");
     Ok(())
+}
+
+fn print_markdown(text: &str) {
+    println!("{text}");
 }

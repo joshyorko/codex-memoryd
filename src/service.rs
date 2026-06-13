@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
+use crate::domain::MemoryRecord;
 use crate::domain::Portability;
 use crate::domain::Profile;
 use crate::domain::RecordType;
@@ -840,6 +841,14 @@ impl Service {
     // ------------------------------------------------------------------
 
     pub fn dream(&self, req: DreamRequest) -> Result<DreamResponse> {
+        self.dream_with_patch_binding(req, None)
+    }
+
+    fn dream_with_patch_binding(
+        &self,
+        req: DreamRequest,
+        patch_run_id: Option<&str>,
+    ) -> Result<DreamResponse> {
         let profile = self.resolve_profile(&req.profile)?;
         let workspace = self.resolve_workspace(&req.workspace);
         let repo_id = self.register_repo(&req.repo)?;
@@ -916,6 +925,7 @@ impl Service {
                 include_archived_sources: explicit_since,
                 max_records: 500,
                 max_candidates: None,
+                patch_run_id,
             },
         );
         match result {
@@ -1057,6 +1067,7 @@ impl Service {
                 include_archived_sources: false,
                 max_records: cfg.max_batch_size,
                 max_candidates: Some(cfg.max_candidates),
+                patch_run_id: None,
             },
         );
         let elapsed = started.elapsed();
@@ -1121,6 +1132,214 @@ impl Service {
                 Err(err)
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Memory patches
+    // ------------------------------------------------------------------
+
+    pub fn patch_preview(&self, mut req: DreamRequest) -> Result<MemoryPatchPreviewResponse> {
+        req.mode = Some("preview".to_string());
+        build_patch_preview_response(&self.store, self.dream(req)?)
+    }
+
+    pub fn patch_apply(&self, req: MemoryPatchApplyRequest) -> Result<MemoryPatchApplyResponse> {
+        let MemoryPatchApplyRequest {
+            profile,
+            workspace,
+            repo,
+            run_id,
+            now,
+            since,
+        } = req;
+        let preview_req = DreamRequest {
+            profile: profile.clone(),
+            workspace: workspace.clone(),
+            repo: repo.clone(),
+            mode: Some("preview".to_string()),
+            now: now.clone(),
+            since: since.clone(),
+        };
+        let preview_dream = self.dream(preview_req)?;
+        if preview_dream.run_id != run_id {
+            return Err(Error::invalid_request(format!(
+                "run_id mismatch: expected {}, got {}",
+                preview_dream.run_id, run_id
+            )));
+        }
+        let preview = build_patch_preview_response(&self.store, preview_dream.clone())?;
+        let applied = self.dream_with_patch_binding(
+            DreamRequest {
+                profile,
+                workspace,
+                repo,
+                mode: Some("apply".to_string()),
+                now,
+                since,
+            },
+            Some(&preview.run_id),
+        )?;
+        Ok(MemoryPatchApplyResponse {
+            requested_run_id: run_id,
+            preview_run_id: preview.run_id.clone(),
+            preview,
+            applied,
+        })
+    }
+
+    pub fn patch_explain(
+        &self,
+        req: MemoryPatchExplainRequest,
+    ) -> Result<MemoryPatchExplainResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let repo_id = self.register_repo(&req.repo)?;
+        let mut records = Vec::new();
+
+        if let Some(memory_id) = req.memory_id.as_deref() {
+            let record = self
+                .store
+                .get_record(memory_id)?
+                .ok_or_else(|| Error::not_found(format!("memory record '{memory_id}'")))?;
+            records.push(record);
+        } else if let Some(run_id) = req.run_id.as_deref() {
+            records.extend(self.store.records_by_patch_run_id(
+                profile.as_str(),
+                &workspace,
+                repo_id.as_deref(),
+                run_id,
+                true,
+            )?);
+            records.extend(self.store.archived_records_by_patch_run_id(
+                profile.as_str(),
+                &workspace,
+                repo_id.as_deref(),
+                run_id,
+            )?);
+        } else {
+            return Err(Error::invalid_request(
+                "either run_id or memory_id is required",
+            ));
+        }
+
+        let items = records
+            .into_iter()
+            .map(|record| explain_item_from_record(&record))
+            .collect::<Result<Vec<_>>>()?;
+        let top_level_run_id = req.run_id.or_else(|| {
+            items
+                .first()
+                .and_then(|item| item.patch_run_id.clone().or(item.run_id.clone()))
+        });
+        Ok(MemoryPatchExplainResponse {
+            profile: profile.as_str().to_string(),
+            workspace,
+            repo_id,
+            run_id: top_level_run_id,
+            memory_id: req.memory_id,
+            items,
+        })
+    }
+
+    pub fn patch_rollback(
+        &self,
+        req: MemoryPatchRollbackRequest,
+    ) -> Result<MemoryPatchRollbackResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let repo_id = self.register_repo(&req.repo)?;
+        let created = self.store.records_by_patch_run_id(
+            profile.as_str(),
+            &workspace,
+            repo_id.as_deref(),
+            &req.run_id,
+            false,
+        )?;
+        let archived = self.store.archived_records_by_patch_run_id(
+            profile.as_str(),
+            &workspace,
+            repo_id.as_deref(),
+            &req.run_id,
+        )?;
+
+        let mut actions = Vec::new();
+        let mut archived_ids = Vec::new();
+        let mut restored_ids = Vec::new();
+        let mut skipped = Vec::new();
+
+        for record in &created {
+            actions.push(rollback_action_from_record("archive", &req.run_id, record));
+            archived_ids.push(record.id.clone());
+        }
+        for record in &archived {
+            actions.push(rollback_action_from_record("restore", &req.run_id, record));
+            restored_ids.push(record.id.clone());
+        }
+
+        if !req.preview {
+            if !archived_ids.is_empty() {
+                let (archived, not_found) = self.store.archive_records_with_metadata(
+                    profile.as_str(),
+                    Some(&workspace),
+                    &archived_ids,
+                    "rolled_back",
+                    "rolled back Dreamer patch",
+                    None,
+                )?;
+                archived_ids = archived;
+                skipped.extend(not_found);
+            }
+            if !restored_ids.is_empty() {
+                let (restored, not_found) = self.store.restore_records_with_metadata(
+                    profile.as_str(),
+                    Some(&workspace),
+                    &restored_ids,
+                    &req.run_id,
+                    "rolled back Dreamer patch",
+                )?;
+                if !restored.is_empty() {
+                    restored_ids = restored;
+                }
+                skipped.extend(not_found);
+            }
+        }
+
+        archived_ids.sort();
+        archived_ids.dedup();
+        restored_ids.sort();
+        restored_ids.dedup();
+        skipped.sort();
+        skipped.dedup();
+
+        let markdown = render_patch_markdown(
+            if req.preview {
+                "Rollback preview"
+            } else {
+                "Rollback apply"
+            },
+            &req.run_id,
+            profile.as_str(),
+            &workspace,
+            repo_id.as_deref(),
+            &actions,
+        );
+
+        Ok(MemoryPatchRollbackResponse {
+            run_id: req.run_id,
+            mode: if req.preview {
+                "preview".to_string()
+            } else {
+                "apply".to_string()
+            },
+            profile: profile.as_str().to_string(),
+            workspace,
+            repo_id,
+            archived: archived_ids,
+            restored: restored_ids,
+            skipped,
+            actions,
+            markdown,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1239,6 +1458,231 @@ impl Service {
         };
         export::export(&self.store, &params)
     }
+}
+
+fn build_patch_preview_response(
+    store: &Store,
+    dream: DreamResponse,
+) -> Result<MemoryPatchPreviewResponse> {
+    let actions = build_patch_actions_for_preview(store, &dream)?;
+    let markdown = render_patch_markdown(
+        "Memory patch preview",
+        &dream.run_id,
+        &dream.profile,
+        &dream.workspace,
+        dream.repo_id.as_deref(),
+        &actions,
+    );
+    Ok(MemoryPatchPreviewResponse {
+        run_id: dream.run_id.clone(),
+        profile: dream.profile.clone(),
+        workspace: dream.workspace.clone(),
+        repo_id: dream.repo_id.clone(),
+        now: dream.now.clone(),
+        dream,
+        actions,
+        markdown,
+    })
+}
+
+fn build_patch_actions_for_preview(
+    store: &Store,
+    dream: &DreamResponse,
+) -> Result<Vec<MemoryPatchAction>> {
+    let mut actions = Vec::new();
+    for candidate in dream
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.apply_eligible)
+    {
+        actions.push(MemoryPatchAction {
+            op: "create".to_string(),
+            record_type: candidate.proposed_type.clone(),
+            subject_key: candidate.subject_key.clone(),
+            memory_id: None,
+            content: candidate.content.clone(),
+            policy_outcome: candidate.candidate_state.clone(),
+            supersedes: candidate.supersedes.clone(),
+            source_refs: candidate.evidence_refs.clone(),
+            run_id: dream.run_id.clone(),
+            note: Some(candidate.promotion_reason.clone()),
+        });
+
+        for superseded_id in &candidate.supersedes {
+            let record = store.get_record(superseded_id)?;
+            let (record_type, content, source_refs, note) = match record {
+                Some(record) => (
+                    record.record_type.as_str().to_string(),
+                    truncate_for_display(&record.content, 180),
+                    extract_evidence_refs(&record.metadata),
+                    extract_metadata_string(&record.metadata, "historical_reason")
+                        .or_else(|| extract_metadata_string(&record.metadata, "policy_outcome")),
+                ),
+                None => (
+                    "unknown".to_string(),
+                    "<missing>".to_string(),
+                    Vec::new(),
+                    Some("missing record".to_string()),
+                ),
+            };
+            actions.push(MemoryPatchAction {
+                op: "archive".to_string(),
+                record_type,
+                subject_key: candidate.subject_key.clone(),
+                memory_id: Some(superseded_id.clone()),
+                content,
+                policy_outcome: "superseded".to_string(),
+                supersedes: vec![],
+                source_refs,
+                run_id: dream.run_id.clone(),
+                note,
+            });
+        }
+    }
+    Ok(actions)
+}
+
+fn explain_item_from_record(record: &MemoryRecord) -> Result<MemoryPatchExplainItem> {
+    let run_id = extract_metadata_string(&record.metadata, "dream_run_id");
+    let patch_run_id = extract_metadata_string(&record.metadata, "patch_run_id")
+        .or_else(|| extract_metadata_string(&record.metadata, "archived_by_patch_run_id"))
+        .or_else(|| extract_metadata_string(&record.metadata, "restored_by_patch_run_id"));
+    let policy_outcome = extract_metadata_string(&record.metadata, "policy_outcome")
+        .unwrap_or_else(|| {
+            if record.archived {
+                "archived"
+            } else {
+                "active"
+            }
+            .to_string()
+        });
+    Ok(MemoryPatchExplainItem {
+        memory_id: record.id.clone(),
+        run_id,
+        patch_run_id,
+        policy_outcome,
+        state: extract_metadata_string(&record.metadata, "state").unwrap_or_else(|| {
+            if record.archived {
+                "archived"
+            } else {
+                "active"
+            }
+            .to_string()
+        }),
+        archived: record.archived,
+        supersedes: record.supersedes.clone(),
+        source_refs: extract_evidence_refs(&record.metadata),
+    })
+}
+
+fn rollback_action_from_record(op: &str, run_id: &str, record: &MemoryRecord) -> MemoryPatchAction {
+    MemoryPatchAction {
+        op: op.to_string(),
+        record_type: record.record_type.as_str().to_string(),
+        subject_key: extract_metadata_string(&record.metadata, "subject_key")
+            .unwrap_or_else(|| record.id.clone()),
+        memory_id: Some(record.id.clone()),
+        content: truncate_for_display(&record.content, 180),
+        policy_outcome: extract_metadata_string(&record.metadata, "policy_outcome").unwrap_or_else(
+            || {
+                if record.archived {
+                    "archived"
+                } else {
+                    "active"
+                }
+                .to_string()
+            },
+        ),
+        supersedes: record.supersedes.clone(),
+        source_refs: extract_evidence_refs(&record.metadata),
+        run_id: run_id.to_string(),
+        note: extract_metadata_string(&record.metadata, "historical_reason")
+            .or_else(|| extract_metadata_string(&record.metadata, "restored_reason")),
+    }
+}
+
+fn render_patch_markdown(
+    title: &str,
+    run_id: &str,
+    profile: &str,
+    workspace: &str,
+    repo_id: Option<&str>,
+    actions: &[MemoryPatchAction],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {title}\n"));
+    out.push_str(&format!("- run_id: `{run_id}`\n"));
+    out.push_str(&format!("- profile: `{profile}`\n"));
+    out.push_str(&format!("- workspace: `{workspace}`\n"));
+    out.push_str(&format!("- repo_id: `{}`\n", repo_id.unwrap_or("<none>")));
+    out.push_str("\n## Actions\n");
+    for action in actions {
+        let prefix = match action.op.as_str() {
+            "create" => "+",
+            "archive" => "-",
+            "restore" => "~",
+            other => other,
+        };
+        out.push_str(&format!(
+            "- {} {} `{}`: {}\n",
+            prefix,
+            action.record_type,
+            action.subject_key,
+            truncate_for_display(&action.content, 120)
+        ));
+        out.push_str(&format!("  - policy: `{}`\n", action.policy_outcome));
+        if let Some(id) = &action.memory_id {
+            out.push_str(&format!("  - memory_id: `{id}`\n"));
+        }
+        if !action.supersedes.is_empty() {
+            out.push_str(&format!(
+                "  - supersedes: {}\n",
+                action.supersedes.join(", ")
+            ));
+        }
+        if !action.source_refs.is_empty() {
+            let refs = action
+                .source_refs
+                .iter()
+                .map(|source| source.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("  - source_refs: {refs}\n"));
+        }
+        if let Some(note) = &action.note {
+            out.push_str(&format!("  - note: {note}\n"));
+        }
+    }
+    out
+}
+
+fn truncate_for_display(raw: &str, limit: usize) -> String {
+    let cleaned = raw.replace(['\n', '\r'], " ");
+    if cleaned.chars().count() <= limit {
+        cleaned
+    } else {
+        let mut out = cleaned
+            .chars()
+            .take(limit.saturating_sub(1))
+            .collect::<String>();
+        out.push_str("...");
+        out
+    }
+}
+
+fn extract_metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn extract_evidence_refs(metadata: &Value) -> Vec<DreamEvidenceSource> {
+    metadata
+        .get("evidence_refs")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 fn dream_error_audit(

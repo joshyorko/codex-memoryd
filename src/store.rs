@@ -590,6 +590,7 @@ impl Store {
         ids_to_archive: &[String],
         state: &str,
         historical_reason: &str,
+        archived_by_patch_run_id: Option<&str>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         let now = ids::now_rfc3339();
         let mut archived = Vec::new();
@@ -616,10 +617,20 @@ impl Store {
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("state".to_string(), Value::String(state.to_string()));
                     obj.insert(
+                        "policy_outcome".to_string(),
+                        Value::String(state.to_string()),
+                    );
+                    obj.insert(
                         "historical_reason".to_string(),
                         Value::String(historical_reason.to_string()),
                     );
                     obj.insert("archived_at".to_string(), Value::String(now.clone()));
+                    if let Some(run_id) = archived_by_patch_run_id {
+                        obj.insert(
+                            "archived_by_patch_run_id".to_string(),
+                            Value::String(run_id.to_string()),
+                        );
+                    }
                 }
                 if update.execute(params![now, metadata.to_string(), id])? > 0 {
                     archived.push(id.clone());
@@ -628,6 +639,75 @@ impl Store {
         }
         tx.commit()?;
         Ok((archived, not_found))
+    }
+
+    pub fn restore_records_with_metadata(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_restore: &[String],
+        patch_run_id: &str,
+        reason: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let now = ids::now_rfc3339();
+        let mut restored = Vec::new();
+        let mut not_found = Vec::new();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut select =
+                tx.prepare("SELECT metadata, archived FROM memory_records WHERE id = ?1")?;
+            let mut update = tx.prepare(
+                "UPDATE memory_records SET archived = 0, updated_at = ?1, metadata = ?2 WHERE id = ?3 AND archived = 1",
+            )?;
+            for id in ids_to_restore {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                let (raw, archived_flag): (String, i64) = select
+                    .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| Error::storage(format!("load metadata for restore {id}: {e}")))?;
+                if archived_flag == 0 {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+                if !metadata.is_object() {
+                    metadata = serde_json::json!({});
+                }
+                let allow_restore = metadata
+                    .get("archived_by_patch_run_id")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value == patch_run_id)
+                    .unwrap_or(false);
+                if !allow_restore {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("state".to_string(), Value::String("restored".to_string()));
+                    obj.insert(
+                        "policy_outcome".to_string(),
+                        Value::String("restored".to_string()),
+                    );
+                    obj.insert("restored_at".to_string(), Value::String(now.clone()));
+                    obj.insert(
+                        "restored_by_patch_run_id".to_string(),
+                        Value::String(patch_run_id.to_string()),
+                    );
+                    obj.insert(
+                        "restored_reason".to_string(),
+                        Value::String(reason.to_string()),
+                    );
+                }
+                if update.execute(params![now, metadata.to_string(), id])? > 0 {
+                    restored.push(id.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((restored, not_found))
     }
 
     pub fn find_by_content_hash(&self, content_hash: &str) -> Result<Option<MemoryRecord>> {
@@ -652,6 +732,72 @@ impl Store {
             )
             .optional()?;
         Ok(result)
+    }
+
+    pub fn records_by_patch_run_id(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+        patch_run_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<MemoryRecord>> {
+        let conn = self.conn()?;
+        let mut sql = format!(
+            "SELECT {RECORD_COLS} FROM memory_records WHERE profile_id = ?1 AND workspace_id = ?2"
+        );
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo_id) = repo_id {
+            sql.push_str(" AND repo_id = ?");
+            args.push(Box::new(repo_id.to_string()));
+        }
+        if !include_archived {
+            sql.push_str(" AND archived = 0");
+        }
+        sql.push_str(" AND json_extract(metadata, '$.patch_run_id') = ?");
+        args.push(Box::new(patch_run_id.to_string()));
+        sql.push_str(" ORDER BY updated_at DESC, id ASC");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_ref.as_slice(), row_to_record)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn archived_records_by_patch_run_id(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+        patch_run_id: &str,
+    ) -> Result<Vec<MemoryRecord>> {
+        let conn = self.conn()?;
+        let mut sql = format!(
+            "SELECT {RECORD_COLS} FROM memory_records WHERE profile_id = ?1 AND workspace_id = ?2 AND archived = 1"
+        );
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(profile_id.to_string()),
+            Box::new(workspace_id.to_string()),
+        ];
+        if let Some(repo_id) = repo_id {
+            sql.push_str(" AND repo_id = ?");
+            args.push(Box::new(repo_id.to_string()));
+        }
+        sql.push_str(" AND json_extract(metadata, '$.archived_by_patch_run_id') = ?");
+        args.push(Box::new(patch_run_id.to_string()));
+        sql.push_str(" ORDER BY updated_at DESC, id ASC");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_ref.as_slice(), row_to_record)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn count_records(&self) -> Result<i64> {

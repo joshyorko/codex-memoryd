@@ -164,6 +164,7 @@ pub struct DreamParams<'a> {
     pub include_archived_sources: bool,
     pub max_records: usize,
     pub max_candidates: Option<usize>,
+    pub patch_run_id: Option<&'a str>,
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
@@ -318,6 +319,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                         policy_state: code.clone(),
                         metadata: json!({
                             "dream_run_id": run_id.clone(),
+                            "patch_run_id": params.patch_run_id,
                             "action": candidate.action,
                             "subject_key": candidate.subject_key,
                             "reason": reason,
@@ -357,6 +359,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 "origin": "dreamer",
                 "dream_run_id": run_id.clone(),
                 "run_id": run_id.clone(),
+                "patch_run_id": params.patch_run_id,
+                "policy_outcome": candidate.candidate_state,
                 "subject_key": candidate.subject_key,
                 "candidate_state": candidate.candidate_state,
                 "threshold_reason": candidate.threshold_reason,
@@ -418,6 +422,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 policy_state: "accepted".to_string(),
                 metadata: json!({
                     "dream_run_id": run_id.clone(),
+                    "patch_run_id": params.patch_run_id,
                     "action": candidate.action,
                     "subject_key": candidate.subject_key,
                     "promotion_reason": candidate.promotion_reason,
@@ -440,6 +445,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                     &candidate.supersedes,
                     "superseded",
                     reason,
+                    params.patch_run_id,
                 )?;
                 archived.append(&mut newly_archived);
             }
