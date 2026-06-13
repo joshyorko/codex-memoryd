@@ -45,6 +45,15 @@ fn recall_fixture_deserializes_and_runs() {
     let svc = service();
     let resp = svc.recall(req).expect("recall runs");
     assert_eq!(resp.authority, "recall_not_authority");
+    assert_eq!(resp.policy.authority, "recall_not_authority");
+    assert!(resp
+        .policy
+        .admission_gates
+        .contains(&"profile_workspace".to_string()));
+    assert!(resp
+        .policy
+        .ranking_signals
+        .contains(&"repo_match".to_string()));
 }
 
 #[test]

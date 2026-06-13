@@ -127,17 +127,47 @@ Response `data`:
 ```json
 {
   "summary": "3 relevant memory record(s), 1 decision(s), 1 gotcha(s). Treat as contextual recall, not authority.",
+  "authority": "recall_not_authority",
+  "policy": {
+    "authority": "recall_not_authority",
+    "admission_gates": ["profile_workspace"],
+    "ranking_signals": ["profile_workspace", "repo_match", "file_match", "query_match"]
+  },
   "facts": [
-    { "id": "mem_…", "type": "decision", "scope": "repo", "content": "…", "confidence": 0.85, "repo_id": "git:…", "related_files": ["…"], "updated_at": "…", "stale": false }
+    {
+      "id": "mem_…",
+      "type": "decision",
+      "scope": "repo",
+      "content": "…",
+      "confidence": 0.85,
+      "repo_id": "git:…",
+      "related_files": ["…"],
+      "updated_at": "…",
+      "stale": false,
+      "policy": {
+        "rank": 1,
+        "freshness": { "stale": false, "age_days": 2 },
+        "provenance": {
+          "profile_id": "personal",
+          "workspace_id": "josh-personal",
+          "repo_id": "git:…",
+          "evidence_refs": ["src_…"],
+          "subject_id": null,
+          "episode_id": null
+        },
+        "ranking_signals": ["repo_match", "query_match"]
+      }
+    }
   ],
   "checkpoints": [
     { "id": "ckpt_…", "summary": "…", "branch": "main", "commit": null, "next_steps": ["…"], "created_at": "…" }
   ],
   "citations": [ { "memory_id": "mem_…", "source_id": "src_…", "source_path": "memory_summary.md" } ],
-  "truncated": false,
-  "authority": "recall_not_authority"
+  "truncated": false
 }
 ```
+
+For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy` and per-fact `policy` objects are additive metadata used for diagnostics and ranking auditability.
 
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable

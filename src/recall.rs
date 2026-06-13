@@ -5,6 +5,7 @@
 //! budget, attaches recent checkpoints + citations, and marks the context as
 //! recall (not authority).
 
+use std::collections::BTreeSet;
 use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
@@ -17,6 +18,10 @@ use crate::error::Result;
 use crate::protocol::Citation;
 use crate::protocol::RecallCheckpoint;
 use crate::protocol::RecallFact;
+use crate::protocol::RecallFactPolicy;
+use crate::protocol::RecallFreshness;
+use crate::protocol::RecallPolicy;
+use crate::protocol::RecallProvenance;
 use crate::protocol::RecallResponse;
 use crate::protocol::SearchMatch;
 use crate::protocol::SearchResponse;
@@ -48,6 +53,18 @@ pub struct RecallParams<'a> {
 struct Scored {
     record: MemoryRecord,
     score: f64,
+    ranking_signals: Vec<String>,
+}
+
+fn dedupe_ordered_signals(signals: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for signal in signals {
+        if seen.insert(signal.clone()) {
+            deduped.push(signal);
+        }
+    }
+    deduped
 }
 
 /// Execute recall: gather, rank, pack, attach checkpoints + citations.
@@ -86,7 +103,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         .filter(|r| type_allowed(r.record_type, params.include_types, params.exclude_types))
         .map(|record| {
             let score = score_record(&record, repo_id, params.files, params.query);
-            Scored { record, score }
+            let ranking_signals = ranking_signals(&record, repo_id, params.files, params.query);
+            Scored {
+                record,
+                score,
+                ranking_signals,
+            }
         })
         .collect();
 
@@ -102,6 +124,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
                     .partial_cmp(&a.record.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.record.id.cmp(&b.record.id))
     });
 
     // Pack within the token budget.
@@ -110,6 +133,8 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     let mut touched: Vec<String> = Vec::new();
     let mut used_tokens = 0usize;
     let mut truncated = false;
+    let mut top_level_ranking_signals = Vec::new();
+    let admission_gates = vec!["profile_workspace".to_string()];
 
     for scored in &scored {
         let r = &scored.record;
@@ -120,6 +145,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         }
         used_tokens += cost;
         let stale = is_stale(&r.updated_at);
+        let age_days = days_since(&r.updated_at);
+        let freshness = RecallFreshness { stale, age_days };
+        let rank = facts.len() + 1;
+        for signal in &scored.ranking_signals {
+            top_level_ranking_signals.push(signal.clone());
+        }
         facts.push(RecallFact {
             id: r.id.clone(),
             record_type: r.record_type.as_str().to_string(),
@@ -130,6 +161,19 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             related_files: r.related_files.clone(),
             updated_at: r.updated_at.clone(),
             stale,
+            policy: RecallFactPolicy {
+                rank,
+                freshness,
+                provenance: RecallProvenance {
+                    profile_id: r.profile_id.clone(),
+                    workspace_id: r.workspace_id.clone(),
+                    repo_id: r.repo_id.clone(),
+                    evidence_refs: r.source_ids.clone(),
+                    subject_id: r.subject_id.clone(),
+                    episode_id: r.episode_id.clone(),
+                },
+                ranking_signals: scored.ranking_signals.clone(),
+            },
         });
         citations.push(Citation {
             memory_id: r.id.clone(),
@@ -146,9 +190,19 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             break;
         }
     }
+    if params.repo.is_some() {
+        top_level_ranking_signals.push("repo_match".to_string());
+    }
+    if !params.files.is_empty() {
+        top_level_ranking_signals.push("file_match".to_string());
+    }
+    if !params.query.trim().is_empty() {
+        top_level_ranking_signals.push("query_match".to_string());
+    }
     if scored.len() > facts.len() {
         truncated = true;
     }
+    let top_level_ranking_signals = dedupe_ordered_signals(top_level_ranking_signals);
 
     // Recent checkpoints (repo-scoped first).
     let checkpoints = store
@@ -177,6 +231,11 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         citations,
         truncated,
         authority: "recall_not_authority".to_string(),
+        policy: RecallPolicy {
+            authority: "recall_not_authority".to_string(),
+            admission_gates,
+            ranking_signals: top_level_ranking_signals,
+        },
     })
 }
 
@@ -239,6 +298,55 @@ fn score_record(
     }
 
     score
+}
+
+fn ranking_signals(
+    record: &MemoryRecord,
+    repo_id: Option<&str>,
+    files: &[String],
+    query: &str,
+) -> Vec<String> {
+    let mut signals = Vec::new();
+
+    if let (Some(want), Some(have)) = (repo_id, record.repo_id.as_deref()) {
+        if want == have {
+            signals.push("repo_match".to_string());
+        }
+    }
+
+    if !files.is_empty() && !record.related_files.is_empty() {
+        let file_match = record.related_files.iter().any(|rf| {
+            files
+                .iter()
+                .any(|f| f == rf || f.ends_with(rf) || rf.ends_with(f.as_str()))
+        });
+        if file_match {
+            signals.push("file_match".to_string());
+        }
+    }
+
+    // recency always contributes to ranking so expose that signal.
+    if recency_boost(&record.updated_at) > 0.0 {
+        signals.push("recency".to_string());
+    }
+
+    if lexical_overlap(query, &record.content) > 0.0 {
+        signals.push("query_match".to_string());
+    }
+
+    if matches!(record.record_type, RecordType::TaskCheckpoint) {
+        signals.push("checkpoint_boost".to_string());
+    }
+
+    if record.record_type != RecordType::Other {
+        signals.push("record_type_weight".to_string());
+    }
+
+    if recency_boost(&record.updated_at) > 0.0 && query.is_empty() {
+        signals.push("recent_implicit".to_string());
+    }
+
+    signals
 }
 
 fn lexical_overlap(query: &str, content: &str) -> f64 {
