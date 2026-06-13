@@ -610,6 +610,16 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
     );
     assert!(recall.facts[1]
         .policy
+        .admission
+        .gates
+        .contains(&"profile_workspace".to_string()));
+    assert!(recall.facts[1]
+        .policy
+        .admission
+        .gates
+        .contains(&"freshness_stale_deprioritized".to_string()));
+    assert!(recall.facts[1]
+        .policy
         .ranking_signals
         .contains(&"stale_deprioritized".to_string()));
 }
