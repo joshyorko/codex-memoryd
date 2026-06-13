@@ -159,7 +159,9 @@ Response `data`:
           "repo_id": "git:…",
           "evidence_refs": ["src_…"],
           "subject_id": null,
-          "episode_id": null
+          "episode_id": null,
+          "source_risk": "medium",
+          "trust_level": "high"
         },
         "admission": {
           "decision": "admitted",
@@ -183,6 +185,7 @@ Response `data`:
 ```
 
 For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy`, `pack`, and per-fact `policy` objects are additive metadata used for diagnostics, pack selection, and ranking auditability.
+`facts[].policy.provenance.source_risk` and `facts[].policy.provenance.trust_level` are additive diagnostics derived from existing record sensitivity and source metadata; they do not affect ranking, storage, or admission.
 `facts[].policy.admission` explains why an emitted item was admitted. `withheld`
 is optional and reports deterministic counts by gate only; it never includes raw
 withheld content.

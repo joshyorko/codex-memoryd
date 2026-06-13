@@ -144,6 +144,14 @@ fn http_status_recall_sync_roundtrip() {
         facts[0]["policy"]["provenance"]["workspace_id"],
         json!("josh-personal")
     );
+    assert_eq!(
+        facts[0]["policy"]["provenance"]["source_risk"],
+        json!("medium")
+    );
+    assert_eq!(
+        facts[0]["policy"]["provenance"]["trust_level"],
+        json!("high")
+    );
 
     // POST /v1/sync/local-codex-memory preview writes nothing.
     let preview: Value = http
