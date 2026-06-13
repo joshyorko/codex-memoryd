@@ -63,6 +63,7 @@ const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
 const AGENTS_MD_CONTEXT_PACK_TEMPLATE: &str = "agents-md-v1";
 const CLAUDE_CODE_CONTEXT_PACK_TEMPLATE: &str = "claude-code-v1";
+const COPILOT_CONTEXT_PACK_TEMPLATE: &str = "copilot-v1";
 const MCP_CONTEXT_PACK_TEMPLATE: &str = "mcp-json-v1";
 const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
@@ -430,7 +431,10 @@ impl Service {
                 rendered.truncated,
                 Some(rendered.context_pack),
             )
-        } else if matches!(target, AdapterTarget::AgentsMd | AdapterTarget::ClaudeCode) {
+        } else if matches!(
+            target,
+            AdapterTarget::AgentsMd | AdapterTarget::ClaudeCode | AdapterTarget::Copilot
+        ) {
             let markdown = render_adapter_view(target, &card)?;
             let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
             let rendered_bytes = markdown.len();
@@ -452,6 +456,7 @@ impl Service {
             let template = match target {
                 AdapterTarget::AgentsMd => AGENTS_MD_CONTEXT_PACK_TEMPLATE,
                 AdapterTarget::ClaudeCode => CLAUDE_CODE_CONTEXT_PACK_TEMPLATE,
+                AdapterTarget::Copilot => COPILOT_CONTEXT_PACK_TEMPLATE,
                 _ => unreachable!("only markdown adapter targets reach this branch"),
             };
             (

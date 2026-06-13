@@ -2307,10 +2307,93 @@ fn cli_adapter_copilot_export_is_deterministic() {
     assert_eq!(first["budget"]["truncated"], false);
     assert_eq!(first["content_hash"], second["content_hash"]);
     assert_eq!(first, second);
+    let context_pack = &first["context_pack"];
+    assert_eq!(context_pack["target"], "copilot");
+    assert_eq!(context_pack["template"], "copilot-v1");
+    assert_eq!(context_pack["adapter_version"], "adapter-view-v1");
+    assert_eq!(context_pack["authority"], "recall_not_authority");
+    assert_eq!(context_pack["profile"], "personal");
+    assert_eq!(context_pack["workspace"], "josh-personal");
+    assert_eq!(context_pack["card_type"], "workspace_summary");
+    assert_eq!(context_pack["budget"]["truncated"], false);
+    assert_eq!(
+        context_pack["source_ids"],
+        first
+            .get("source_ids")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]))
+    );
+    assert_eq!(context_pack["records"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        context_pack["records"][0]["content"],
+        "Decision: copilot adapter views use the shared memory card export path"
+    );
     let markdown = first["markdown"].as_str().unwrap();
     assert!(markdown.contains("# Copilot Instructions Memory View"));
     assert!(markdown.contains("- Adapter target: `copilot`"));
     assert!(markdown.contains("Source of truth remains the local SQLite store"));
+    let response_source_ids = first
+        .get("source_ids")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let legacy_digest = serde_json::json!({
+        "target": first["target"],
+        "adapter_version": first["adapter_version"],
+        "profile": first["profile"],
+        "workspace": first["workspace"],
+        "subject_id": Value::Null,
+        "source_card_type": first["source_card_type"],
+        "source_ids": response_source_ids,
+        "markdown": markdown,
+    });
+    let legacy_digest = ids::sha256_hex(&serde_json::to_vec(&legacy_digest).unwrap());
+    assert_eq!(first["content_hash"], legacy_digest);
+
+    let budgeted = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "copilot",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--max-bytes",
+            "160",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(budgeted.status.success());
+    let budgeted: Value = serde_json::from_slice(&budgeted.stdout).unwrap();
+    let markdown = budgeted["markdown"].as_str().unwrap();
+    assert_eq!(budgeted["budget"]["max_bytes"], 160);
+    assert_eq!(budgeted["budget"]["truncated"], true);
+    assert!(budgeted["budget"]["rendered_bytes"].as_u64().unwrap() <= 160);
+    assert_eq!(budgeted["context_pack"]["target"], "copilot");
+    assert_eq!(budgeted["context_pack"]["template"], "copilot-v1");
+    assert_eq!(budgeted["context_pack"]["budget"]["max_bytes"], 160);
+    assert_eq!(budgeted["context_pack"]["budget"]["truncated"], true);
+    assert_eq!(
+        budgeted["context_pack"]["budget"]["rendered_bytes"],
+        budgeted["budget"]["rendered_bytes"]
+    );
+    assert!(budgeted["context_pack"]["source_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(budgeted["context_pack"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        markdown.len() as u64,
+        budgeted["budget"]["rendered_bytes"].as_u64().unwrap()
+    );
 }
 
 #[test]
