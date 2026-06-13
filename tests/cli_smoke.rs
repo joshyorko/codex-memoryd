@@ -2051,7 +2051,34 @@ fn cli_adapter_agents_md_export_is_deterministic() {
     assert_eq!(first["budget"]["truncated"], false);
     assert_eq!(first["content_hash"], second["content_hash"]);
     assert_eq!(first, second);
+    let context_pack = &first["context_pack"];
+    assert_eq!(context_pack["target"], "agents-md");
+    assert_eq!(context_pack["template"], "agents-md-v1");
+    assert_eq!(context_pack["adapter_version"], "adapter-view-v1");
+    assert_eq!(context_pack["authority"], "recall_not_authority");
+    assert_eq!(context_pack["profile"], "personal");
+    assert_eq!(context_pack["workspace"], "josh-personal");
+    assert_eq!(context_pack["card_type"], "workspace_summary");
+    assert_eq!(context_pack["budget"]["truncated"], false);
+    assert!(context_pack["records"].as_array().is_some());
+    assert!(context_pack["source_ids"].as_array().is_some());
     let markdown = first["markdown"].as_str().unwrap();
+    let response_source_ids = first
+        .get("source_ids")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let legacy_digest = serde_json::json!({
+        "target": first["target"],
+        "adapter_version": first["adapter_version"],
+        "profile": first["profile"],
+        "workspace": first["workspace"],
+        "subject_id": Value::Null,
+        "source_card_type": first["source_card_type"],
+        "source_ids": response_source_ids,
+        "markdown": markdown,
+    });
+    let legacy_digest = ids::sha256_hex(&serde_json::to_vec(&legacy_digest).unwrap());
+    assert_eq!(first["content_hash"], legacy_digest);
     assert!(markdown.contains("# AGENTS.md Memory View"));
     assert!(markdown.contains("Source of truth remains the local SQLite store"));
     assert!(markdown.contains("agents-md adapter views"));
@@ -2446,7 +2473,7 @@ fn cli_adapter_mcp_pack_export_is_deterministic() {
             "adapter",
             "export",
             "--target",
-            "agents-md",
+            "claude-code",
             "--profile",
             "personal",
             "--workspace",
@@ -2550,6 +2577,22 @@ fn cli_adapter_agents_md_budget_and_target_validation() {
     assert_eq!(export["budget"]["max_bytes"], 160);
     assert_eq!(export["budget"]["truncated"], true);
     assert!(export["budget"]["rendered_bytes"].as_u64().unwrap() <= 160);
+    assert_eq!(export["context_pack"]["target"], "agents-md");
+    assert_eq!(export["context_pack"]["template"], "agents-md-v1");
+    assert_eq!(export["context_pack"]["budget"]["max_bytes"], 160);
+    assert_eq!(export["context_pack"]["budget"]["truncated"], true);
+    assert_eq!(
+        export["context_pack"]["budget"]["rendered_bytes"],
+        export["budget"]["rendered_bytes"]
+    );
+    assert!(export["context_pack"]["source_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(export["context_pack"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     bin()
         .arg("--db")

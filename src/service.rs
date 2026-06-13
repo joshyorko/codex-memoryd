@@ -61,6 +61,7 @@ const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
+const AGENTS_MD_CONTEXT_PACK_TEMPLATE: &str = "agents-md-v1";
 const MCP_CONTEXT_PACK_TEMPLATE: &str = "mcp-json-v1";
 const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
@@ -418,21 +419,53 @@ impl Service {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let context_pack;
-        let (markdown, rendered_bytes, truncated) = if target == AdapterTarget::McpPack {
+        let (markdown, rendered_bytes, truncated, context_pack) = if target
+            == AdapterTarget::McpPack
+        {
             let rendered = render_mcp_pack_adapter_view(target, &card, &source_ids, req.max_bytes)?;
-            context_pack = Some(rendered.context_pack);
             (
                 rendered.markdown,
                 rendered.rendered_bytes,
                 rendered.truncated,
+                Some(rendered.context_pack),
+            )
+        } else if target == AdapterTarget::AgentsMd {
+            let markdown = render_adapter_view(target, &card)?;
+            let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
+            let rendered_bytes = markdown.len();
+            let budget = AdapterContextPackBudget {
+                max_bytes: req.max_bytes,
+                rendered_bytes,
+                truncated,
+            };
+            let source_ids = if truncated {
+                Vec::new()
+            } else {
+                source_ids.clone()
+            };
+            let records = if truncated {
+                Vec::new()
+            } else {
+                adapter_context_pack_records(&card)
+            };
+            (
+                markdown,
+                rendered_bytes,
+                truncated,
+                Some(build_adapter_context_pack(
+                    target,
+                    AGENTS_MD_CONTEXT_PACK_TEMPLATE,
+                    &card,
+                    &source_ids,
+                    budget,
+                    &records,
+                )),
             )
         } else {
             let markdown = render_adapter_view(target, &card)?;
             let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
             let rendered_bytes = markdown.len();
-            context_pack = None;
-            (markdown, rendered_bytes, truncated)
+            (markdown, rendered_bytes, truncated, None)
         };
         let mut digest_target = serde_json::json!({
             "target": target.as_str(),
@@ -444,7 +477,12 @@ impl Service {
             "source_ids": source_ids,
             "markdown": markdown,
         });
-        if let Some(context_pack) = &context_pack {
+        // `agents-md` context packs are additive metadata; keep the legacy
+        // markdown/source digest stable for existing adapter consumers.
+        if target == AdapterTarget::McpPack {
+            let context_pack = context_pack
+                .as_ref()
+                .expect("mcp-pack always builds a context pack");
             let context_pack = serde_json::to_value(context_pack).map_err(|err| {
                 Error::internal(format!("failed to serialize MCP context pack: {err}"))
             })?;
@@ -2350,7 +2388,14 @@ fn render_mcp_pack_with_records(
     let mut rendered = String::new();
 
     for _ in 0..5 {
-        let pack = build_adapter_context_pack(target, card, source_ids, budget.clone(), &records);
+        let pack = build_adapter_context_pack(
+            target,
+            MCP_CONTEXT_PACK_TEMPLATE,
+            card,
+            source_ids,
+            budget.clone(),
+            &records,
+        );
         let raw = render_mcp_pack_markdown(&pack)?;
         let (limited, truncated) = apply_byte_budget(raw, max_bytes);
         let next_budget = AdapterContextPackBudget {
@@ -2363,8 +2408,14 @@ fn render_mcp_pack_with_records(
             && next_budget.truncated == budget.truncated;
         budget = next_budget;
         if stable {
-            let context_pack =
-                build_adapter_context_pack(target, card, source_ids, budget, &records);
+            let context_pack = build_adapter_context_pack(
+                target,
+                MCP_CONTEXT_PACK_TEMPLATE,
+                card,
+                source_ids,
+                budget,
+                &records,
+            );
             return Ok(RenderedMcpPack {
                 markdown: rendered,
                 rendered_bytes: context_pack.budget.rendered_bytes,
@@ -2374,7 +2425,14 @@ fn render_mcp_pack_with_records(
         }
     }
 
-    let context_pack = build_adapter_context_pack(target, card, source_ids, budget, &records);
+    let context_pack = build_adapter_context_pack(
+        target,
+        MCP_CONTEXT_PACK_TEMPLATE,
+        card,
+        source_ids,
+        budget,
+        &records,
+    );
     Ok(RenderedMcpPack {
         markdown: rendered,
         rendered_bytes: context_pack.budget.rendered_bytes,
@@ -2398,6 +2456,7 @@ fn adapter_context_pack_records(card: &CardShowResponse) -> Vec<AdapterContextPa
 
 fn build_adapter_context_pack(
     target: AdapterTarget,
+    template: &str,
     card: &CardShowResponse,
     source_ids: &[String],
     budget: AdapterContextPackBudget,
@@ -2405,7 +2464,7 @@ fn build_adapter_context_pack(
 ) -> AdapterContextPack {
     AdapterContextPack {
         target: target.as_str().to_string(),
-        template: MCP_CONTEXT_PACK_TEMPLATE.to_string(),
+        template: template.to_string(),
         adapter_version: ADAPTER_VIEW_VERSION.to_string(),
         authority: "recall_not_authority".to_string(),
         profile: card.profile.clone(),
