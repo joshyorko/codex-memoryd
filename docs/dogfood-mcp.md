@@ -23,6 +23,8 @@ sqlite3 .dogfood/mcp-sandbox-memory.db \
   "select count(*) from memory_records; select count(*) from checkpoints; select count(*) from conclusions;"
 ```
 
+This backup refresh is also what the compose heartbeat script runs automatically.
+
 Bootstrap result on 2026-06-13:
 
 - `memory_records`: `346`
@@ -65,6 +67,12 @@ Use direct JSON-RPC over stdio to verify the server before asking Codex to call 
 ```bash
 target/debug/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio --read-only < .dogfood/mcp-smoke.requests.jsonl
 ```
+
+The compose heartbeat script runs an equivalent raw `mcp stdio --read-only` request
+canary and enforces:
+
+- tools/list returns exactly `memory_status`, `memory_recall`, `memory_search`
+- `memory_conclude` is rejected
 
 Observed direct results in read-only mode:
 
