@@ -17,6 +17,8 @@ use codex_memoryd::protocol::*;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::NewRecord;
 use codex_memoryd::store::Store;
+use rusqlite::params;
+use rusqlite::Connection;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -480,6 +482,82 @@ fn checkpoint_stores_and_recalls() {
         "checkpoint must surface in recall"
     );
     assert_eq!(recall.checkpoints[0].next_steps, vec!["wire HTTP server"]);
+}
+
+#[test]
+fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
+    let (svc, dir) = temp_service();
+
+    let fresh = svc
+        .turns(TurnsRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None,
+            session: Some(TurnSession {
+                id: Some("fresh-session".to_string()),
+                thread_id: None,
+                source: Some("test".to_string()),
+                metadata: None,
+            }),
+            messages: Some(vec![TurnMessage {
+                actor: "user".to_string(),
+                content: "Decision: keep the server simple with tower".to_string(),
+                created_at: None,
+                metadata: None,
+            }]),
+            write_policy: None,
+        })
+        .unwrap();
+    let stale = svc
+        .turns(TurnsRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None,
+            session: Some(TurnSession {
+                id: Some("stale-session".to_string()),
+                thread_id: None,
+                source: Some("test".to_string()),
+                metadata: None,
+            }),
+            messages: Some(vec![TurnMessage {
+                actor: "user".to_string(),
+                content: "Decision: use axum for server routing".to_string(),
+                created_at: None,
+                metadata: None,
+            }]),
+            write_policy: None,
+        })
+        .unwrap();
+
+    let stale_id = stale.derived_record_ids[0].clone();
+    let fresh_id = fresh.derived_record_ids[0].clone();
+    let db_path = dir.path().join("memory.db");
+    let conn = Connection::open(db_path).expect("open raw sqlite");
+    conn.execute(
+        "UPDATE memory_records SET updated_at = ?1 WHERE id = ?2",
+        params!["2025-01-01T00:00:00Z", stale_id],
+    )
+    .expect("mark stale");
+
+    let recall = svc.recall(recall_req("personal", "ws", "server")).unwrap();
+    assert_eq!(recall.policy.authority, "recall_not_authority");
+    assert!(recall
+        .policy
+        .admission_gates
+        .contains(&"profile_workspace".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"recency".to_string()));
+    assert!(recall.facts.len() >= 2);
+    assert_eq!(recall.facts[0].id, fresh_id);
+    assert_eq!(recall.facts[0].policy.rank, 1);
+    assert!(!recall.facts[0].policy.freshness.stale);
+    assert_eq!(recall.facts[0].policy.provenance.profile_id, "personal");
+    assert_eq!(recall.facts[0].policy.provenance.workspace_id, "ws");
+    assert!(!recall.facts[0].policy.provenance.evidence_refs.is_empty());
+    assert!(!recall.facts[0].policy.ranking_signals.is_empty());
+    assert!(recall.facts[1].policy.freshness.stale);
 }
 
 #[test]

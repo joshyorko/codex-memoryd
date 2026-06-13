@@ -129,8 +129,21 @@ fn http_status_recall_sync_roundtrip() {
         .unwrap();
     assert_eq!(recall["ok"], json!(true));
     assert_eq!(recall["data"]["authority"], json!("recall_not_authority"));
+    assert_eq!(
+        recall["data"]["policy"]["authority"],
+        json!("recall_not_authority")
+    );
     let facts = recall["data"]["facts"].as_array().unwrap();
     assert!(!facts.is_empty());
+    assert_eq!(facts[0]["policy"]["rank"], json!(1));
+    assert_eq!(
+        facts[0]["policy"]["provenance"]["profile_id"],
+        json!("personal")
+    );
+    assert_eq!(
+        facts[0]["policy"]["provenance"]["workspace_id"],
+        json!("josh-personal")
+    );
 
     // POST /v1/sync/local-codex-memory preview writes nothing.
     let preview: Value = http

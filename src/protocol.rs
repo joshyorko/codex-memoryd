@@ -178,6 +178,46 @@ pub struct RecallFact {
     pub related_files: Vec<String>,
     pub updated_at: String,
     pub stale: bool,
+    pub policy: RecallFactPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallFreshness {
+    pub stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallProvenance {
+    pub profile_id: String,
+    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallFactPolicy {
+    pub rank: usize,
+    pub freshness: RecallFreshness,
+    pub provenance: RecallProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranking_signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallPolicy {
+    pub authority: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admission_gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranking_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +246,7 @@ pub struct RecallResponse {
     pub truncated: bool,
     /// Always true: provider context is recall, not authority (SPEC §10.4).
     pub authority: String,
+    pub policy: RecallPolicy,
 }
 
 // ---------------------------------------------------------------------------
