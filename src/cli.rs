@@ -139,6 +139,11 @@ pub enum Command {
         #[command(subcommand)]
         command: CardCommand,
     },
+    /// Render generated adapter views.
+    Adapter {
+        #[command(subcommand)]
+        command: AdapterCommand,
+    },
     /// Archive (default) or delete a memory record by id.
     Forget {
         /// Record id.
@@ -271,6 +276,25 @@ pub enum CardCommand {
         #[arg(long)]
         subject_id: Option<String>,
         #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdapterCommand {
+    /// Export a generated adapter view to stdout.
+    Export {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        subject_id: Option<String>,
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        #[arg(long, default_value = "markdown")]
         format: String,
     },
 }
@@ -792,6 +816,39 @@ fn dispatch(cli: Cli) -> Result<()> {
                     let format = format.as_str().to_ascii_lowercase();
                     match format.as_str() {
                         "markdown" => print_markdown(&render_card_markdown(&resp)),
+                        "json" => print_json(&resp)?,
+                        _ => {
+                            return Err(error::Error::invalid_request(format!(
+                                "invalid --format '{format}'; expected 'json' or 'markdown'",
+                                format = format
+                            )))
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Adapter { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                AdapterCommand::Export {
+                    profile,
+                    workspace,
+                    target,
+                    subject_id,
+                    max_bytes,
+                    format,
+                } => {
+                    let resp = service.adapter_export(AdapterExportRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        target: target.clone(),
+                        subject_id: subject_id.clone(),
+                        max_bytes: *max_bytes,
+                    })?;
+                    let format = format.as_str().to_ascii_lowercase();
+                    match format.as_str() {
+                        "markdown" => print_markdown(&resp.markdown),
                         "json" => print_json(&resp)?,
                         _ => {
                             return Err(error::Error::invalid_request(format!(

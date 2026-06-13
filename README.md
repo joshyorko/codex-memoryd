@@ -255,6 +255,8 @@ codex-memoryd sync-local --apply ~/.codex/memories
 
 # Export and forget
 codex-memoryd export --profile personal --workspace josh-personal > backup.jsonl
+codex-memoryd adapter export --target agents-md \
+  --profile personal --workspace josh-personal > AGENTS.memory.md
 codex-memoryd forget <record-id>
 codex-memoryd forget <record-id> --delete
 ```

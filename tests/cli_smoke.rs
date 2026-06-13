@@ -873,6 +873,142 @@ fn cli_card_subject_summary_is_deterministic() {
 }
 
 #[test]
+fn cli_adapter_agents_md_export_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: agents-md adapter views are generated from memory cards",
+        ])
+        .assert()
+        .success();
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "agents-md",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "agents-md",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["target"], "agents-md");
+    assert_eq!(first["adapter_version"], "adapter-view-v1");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["source_card_type"], "workspace_summary");
+    assert_eq!(first["budget"]["truncated"], false);
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    let markdown = first["markdown"].as_str().unwrap();
+    assert!(markdown.contains("# AGENTS.md Memory View"));
+    assert!(markdown.contains("Source of truth remains the local SQLite store"));
+    assert!(markdown.contains("agents-md adapter views"));
+}
+
+#[test]
+fn cli_adapter_agents_md_budget_and_target_validation() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "conclude",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--content",
+            "Decision: this long adapter export record should be truncated by a tiny byte budget",
+        ])
+        .assert()
+        .success();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "agents-md",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--max-bytes",
+            "160",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let export: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(export["budget"]["max_bytes"], 160);
+    assert_eq!(export["budget"]["truncated"], true);
+    assert!(export["budget"]["rendered_bytes"].as_u64().unwrap() <= 160);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "adapter",
+            "export",
+            "--target",
+            "claude-code",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown adapter target"));
+}
+
+#[test]
 fn cli_dream_preview_empty_workspace_is_json() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
