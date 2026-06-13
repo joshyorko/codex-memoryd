@@ -142,6 +142,57 @@ fn seed_record(
     id
 }
 
+fn seed_record_with_details(
+    db: &PathBuf,
+    profile: &str,
+    workspace: &str,
+    record_type: RecordType,
+    content: &str,
+    updated_at: &str,
+    archived: bool,
+    source_ids: Vec<String>,
+    tags: Vec<String>,
+    metadata: Value,
+) -> String {
+    let store = Store::open(db).unwrap();
+    let record = NewRecord {
+        profile_id: profile.to_string(),
+        workspace_id: workspace.to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type,
+        content: content.to_string(),
+        related_files: vec![],
+        tags,
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.9,
+        source_ids,
+        content_hash: ids::content_hash(
+            profile,
+            workspace,
+            None,
+            record_type.as_str(),
+            Scope::Workspace.as_str(),
+            content,
+        ),
+        supersedes: vec![],
+        metadata,
+    };
+    let id = match store.upsert_record(&record).unwrap() {
+        UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+    };
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE memory_records SET created_at = ?1, updated_at = ?1, archived = ?3 WHERE id = ?2",
+        params![updated_at, id, archived as i64],
+    )
+    .unwrap();
+    id
+}
+
 fn git(repo: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -1584,6 +1635,197 @@ fn cli_card_active_preferences_markdown_renders() {
     assert!(stdout.contains("Workspace: josh-personal"));
     assert!(stdout.contains("Preference: render active preferences as markdown"));
     assert!(!stdout.contains("Preference: archived markdown preference should not show"));
+}
+
+#[test]
+fn cli_card_recent_scars_json_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record_with_details(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Other,
+        "Battle scar: the cache writes failed before, but we recovered by switching to the fallback path.",
+        "2026-06-13T13:00:00Z",
+        false,
+        vec!["src_scar_1".to_string()],
+        vec!["battle_scar".to_string()],
+        serde_json::json!({
+            "origin": "dreamer",
+            "marker": { "marker_kind": "battle_scar" }
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Other,
+        "Experience marker: retrying the fallback path was the clean path.",
+        "2026-06-13T14:00:00Z",
+        false,
+        vec!["src_experience_marker".to_string()],
+        vec!["experience_marker".to_string()],
+        serde_json::json!({
+            "origin": "dreamer",
+            "marker_kind": "experience_marker"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "personal",
+        "other-workspace",
+        RecordType::Other,
+        "Battle scar: other workspace must stay out of the card.",
+        "2026-06-13T15:00:00Z",
+        false,
+        vec!["src_other_workspace".to_string()],
+        vec!["battle_scar".to_string()],
+        serde_json::json!({
+            "origin": "dreamer",
+            "marker": { "marker_kind": "battle_scar" }
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Other,
+        "Battle scar: archived scar records should not show.",
+        "2026-06-13T16:00:00Z",
+        true,
+        vec!["src_archived".to_string()],
+        vec!["battle_scar".to_string()],
+        serde_json::json!({
+            "origin": "dreamer",
+            "marker": { "marker_kind": "battle_scar" }
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Other,
+        "The cache failed and recovered after a fallback.",
+        "2026-06-13T17:00:00Z",
+        false,
+        vec!["src_failure_text".to_string()],
+        vec![],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "recent_scars",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "recent_scars",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "recent_scars");
+    assert_eq!(first["scope"], "workspace");
+    assert_eq!(first["profile"], "personal");
+    assert_eq!(first["workspace"], "josh-personal");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["build_spec_version"], "card-summary-v1");
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    assert_eq!(first["records"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        first["records"][0]["source_ids"],
+        serde_json::json!(["src_scar_1"])
+    );
+    assert!(!first.to_string().contains("src_other_workspace"));
+    assert!(!first.to_string().contains("src_archived"));
+    assert!(!first.to_string().contains("src_experience_marker"));
+    assert!(!first
+        .to_string()
+        .contains("Experience marker: retrying the fallback path was the clean path."));
+    assert!(!first.to_string().contains("src_failure_text"));
+    assert!(!first
+        .to_string()
+        .contains("The cache failed and recovered after a fallback."));
+}
+
+#[test]
+fn cli_card_recent_scars_markdown_renders() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record_with_details(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Other,
+        "Battle scar: keep the fallback path handy.",
+        "2026-06-13T12:00:00Z",
+        false,
+        vec!["src_recent_scar".to_string()],
+        vec!["battle_scar".to_string()],
+        serde_json::json!({
+            "origin": "dreamer",
+            "marker": { "marker_kind": "battle_scar" }
+        }),
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "recent_scars",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Card summary: recent_scars"));
+    assert!(stdout.contains("Authority: recall_not_authority"));
+    assert!(stdout.contains("Battle scar: keep the fallback path handy."));
+    assert!(stdout.contains("source_ids: src_recent_scar"));
 }
 
 #[test]

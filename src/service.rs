@@ -70,6 +70,7 @@ const ADAPTER_TARGETS: &[&str] = &[
     "mcp-pack",
     "markdown",
 ];
+const RECENT_SCAR_PREFIXES: &[&str] = &["battle scar:", "scar:"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
@@ -309,9 +310,10 @@ impl Service {
                 ("workspace", None)
             }
             "open_questions" => ("workspace", None),
+            "recent_scars" => ("workspace", None),
             _ => {
                 return Err(Error::invalid_request(format!(
-                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, active_preferences, or open_questions"
+                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, active_preferences, open_questions, or recent_scars"
                 )))
             }
         };
@@ -322,6 +324,8 @@ impl Service {
         }
         if card_type == "open_questions" {
             records.retain(is_open_question_record);
+        } else if card_type == "recent_scars" {
+            records.retain(is_recent_scar_record);
         }
         records.sort_by(|a, b| {
             b.updated_at
@@ -2227,6 +2231,41 @@ fn is_open_question_record(record: &MemoryRecord) -> bool {
     }
     let lower = content.to_ascii_lowercase();
     lower.starts_with("question:") || lower.starts_with("open question:")
+}
+
+fn is_recent_scar_record(record: &MemoryRecord) -> bool {
+    if recent_scar_metadata_kind(&record.metadata).is_some() {
+        return true;
+    }
+    if record.tags.iter().any(|tag| {
+        let normalized = tag.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "battle_scar" | "scar")
+    }) {
+        return true;
+    }
+
+    let content = record.content.trim();
+    if content.is_empty() {
+        return false;
+    }
+    let lower = content.to_ascii_lowercase();
+    RECENT_SCAR_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn recent_scar_metadata_kind(metadata: &Value) -> Option<String> {
+    let marker_kind = metadata
+        .get("marker")
+        .and_then(|marker| marker.get("marker_kind"))
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("marker_kind").and_then(Value::as_str))?;
+    let normalized = marker_kind.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "battle_scar" | "scar") {
+        Some(normalized)
+    } else {
+        None
+    }
 }
 
 fn resolve_pack_mode(raw: Option<&str>) -> Result<String> {
