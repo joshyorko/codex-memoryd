@@ -151,6 +151,25 @@ pub fn detect_secret(content: &str) -> Option<&'static str> {
     None
 }
 
+/// Redact high-signal secret shapes from extracted evidence text before it can
+/// become durable memory content. This is intentionally label-only: the matched
+/// secret bytes are not returned to callers.
+pub fn redact_secret_like(content: &str) -> (String, bool) {
+    let mut redacted = content.to_string();
+    let mut changed = false;
+
+    for (re, label) in SECRET_PATTERNS.iter() {
+        if re.is_match(&redacted) {
+            redacted = re
+                .replace_all(&redacted, format!("[redacted:{label}]"))
+                .to_string();
+            changed = true;
+        }
+    }
+
+    (redacted, changed)
+}
+
 // ---------------------------------------------------------------------------
 // Prompt-injection detection (SPEC §10.2)
 // ---------------------------------------------------------------------------

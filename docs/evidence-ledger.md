@@ -50,6 +50,22 @@ Accepted summaries are still screened by the same write policy before the
 provider stores them. They are capped and normalized so they are useful for
 debugging without becoming a second unbounded content store.
 
+## Multimodal Evidence
+
+Sync imports can reference evidence that is not plain local-memory markdown:
+screenshots/images, OCR extracts, log excerpts, document excerpts, git diffs,
+and terminal output excerpts. The daemon treats `content` for these kinds as an
+already-extracted text excerpt, not as a raw image/blob/document payload.
+
+Raw artifacts are not stored in SQLite by default. The source path, caller hash,
+and allowlisted metadata such as `artifact_ref` and `media_type` preserve the
+artifact reference for audit and dedupe. The metadata also records
+`raw_artifact_stored: false` and a `redaction_state`.
+
+Secret-like material in extracted multimodal text is redacted before durable
+record storage. The redaction marker names the detection class, not the matched
+secret bytes. Prompt-injection text is still rejected rather than imported.
+
 ## Mutation Rules
 
 `sync-local --preview` does not write ledger rows. Apply-mode sync writes one
