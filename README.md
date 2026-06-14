@@ -21,7 +21,7 @@ This is the landed MVP surface today:
 | Recall policy metadata | landed | `recall_not_authority`, ranking, admission, and provenance metadata travel with recall. |
 | Current-state cards | landed MVP | `workspace_summary`, `subject_summary`, `active_preferences`, `open_questions`, `recent_scars`, `procedures_index`. |
 | Context packs | landed MVP | `default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and `personal_context` pack modes are supported. |
-| Adapter exports | landed | `agents-md`, `claude-code`, `copilot`, `github-instructions`, `markdown`, and `mcp-pack`. |
+| Adapter exports | landed | `agents-md`, `claude-code`, `copilot`, `github-instructions`, `mcp-json`, `mcp-pack`, `markdown`, and `markdown-wiki`. |
 | Adapter conformance | landed | `conformance adapters` emits a deterministic report for adapter authority, provenance, and budget behavior. |
 | Adapter packages | landed | Installable templates for Codex MCP, Claude-style local MCP, Copilot instructions, and generic MCP/markdown clients. |
 | Git import | landed | Imports commit trailers plus refs fixtures for JSON and JSONL exports. |
@@ -171,6 +171,8 @@ target/release/codex-memoryd adapter export --target agents-md \
   --profile personal --workspace josh-personal > AGENTS.memory.md
 target/release/codex-memoryd adapter export --target mcp-pack \
   --profile personal --workspace josh-personal > mcp-pack.json
+target/release/codex-memoryd adapter export --target mcp-json \
+  --profile personal --workspace josh-personal > mcp-json.json
 target/release/codex-memoryd conformance adapters --format json
 ```
 
@@ -233,7 +235,7 @@ See [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md) for the exact
 - `Evidence ledger`: append-only provenance for writes, imports, and synthesis.
 - `Card`: deterministic current-state view for cheap recall.
 - `Pack`: budgeted recall bundle for a specific adapter or mode.
-- `Adapter export`: downstream rendering such as `AGENTS.md`, `CLAUDE.md`, or `mcp-pack`.
+- `Adapter export`: downstream rendering such as `AGENTS.md`, `CLAUDE.md`, `mcp-json`, or `markdown-wiki`.
 - `Recall policy metadata`: admission, ranking, provenance, and `recall_not_authority`.
 
 This substrate is intentionally not a graph engine, CRM, scheduler, or agent
@@ -250,7 +252,7 @@ that the product is done:
 | `#50` | current-state cards | landed deterministic cards with stale metadata and fixture-backed rendering coverage |
 | `#53` | eval suite | open; still validating capability gates, recall, and context-pack behavior |
 | `#55` | recall policy | admission gates now withhold quarantined/high-risk/unsafe/superseded records by default; remaining work depends on broader eval/review lanes |
-| `#56` | adapter context packs | landed MVP modes and adapter targets; card-first composition and memory-curse fixtures remain |
+| `#56` | adapter context packs | closeable by this implementation: deterministic recall packs, adapter-specific pack names, budget/truncation reporting, and regression coverage are present |
 | `#57` | git import | landed for local trailers and refs fixtures covering commits, PRs, issues, and review comments |
 | `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |
 

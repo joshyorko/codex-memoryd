@@ -136,7 +136,13 @@ Response `data`:
   },
   "pack": {
     "mode": "default",
+    "template": "default",
+    "template_budget_tokens": 1200,
     "max_tokens": 1200,
+    "used_tokens": 830,
+    "candidate_count": 5,
+    "admitted_count": 3,
+    "withheld_count": 2,
     "truncated": false
   },
   "facts": [
@@ -201,12 +207,16 @@ versa, without an explicit future policy exception.
 
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable
-preferences → broad/old memory. Results are packed to `max_tokens`
-(default 1200). Optional `pack_mode` accepts `default`, `debugging`,
-`onboarding`, `planning`, `active_task`, `review`, and `personal_context`.
-Hyphenated client input such as `active-task` is normalized to `active_task`.
+preferences → broad/old memory. Results are packed to the lower of request
+`max_tokens` and the selected template budget. Optional `pack_mode` accepts
+`default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and
+`personal_context`; hyphenated aliases such as `active-task` are normalized.
 Unknown modes return `invalid_request`. Archived and `secret_blocked` records
 are never returned.
+
+Pack reports include deterministic budget/truncation counters:
+`template_budget_tokens`, effective `max_tokens`, estimated `used_tokens`,
+`candidate_count`, `admitted_count`, `withheld_count`, and `truncated`.
 
 **Fail-open contract**: if the provider is down or returns an error, Codex must
 proceed with the turn as if recall returned empty. Recall is best-effort and must

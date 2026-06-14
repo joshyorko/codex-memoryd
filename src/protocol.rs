@@ -249,6 +249,10 @@ pub struct RecallPack {
     pub template: String,
     pub template_budget_tokens: usize,
     pub max_tokens: usize,
+    pub used_tokens: usize,
+    pub candidate_count: usize,
+    pub admitted_count: usize,
+    pub withheld_count: usize,
     pub truncated: bool,
 }
 

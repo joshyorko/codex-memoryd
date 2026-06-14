@@ -898,23 +898,27 @@ fn recall_planning_pack_mode_reports_metadata_and_prioritizes_planning_records()
 }
 
 #[test]
-fn recall_active_task_pack_mode_reports_metadata_and_prioritizes_current_work() {
+fn recall_active_task_pack_mode_is_card_first_and_reports_budget_usage() {
     let svc = onboarding_service();
     svc.store.ensure_workspace("personal", "ws").unwrap();
-    insert_test_record(
-        &svc,
-        RecordType::Decision,
-        "Decision: server architecture should stay boring and stable.",
-        Sensitivity::Personal,
-    );
-    insert_test_record(
-        &svc,
-        RecordType::TaskCheckpoint,
-        "Task checkpoint: active task on the server is blocked; next step is to update the handoff status.",
-        Sensitivity::Personal,
-    );
+    for (content, record_type) in [
+        (
+            "Current-state card: active task issue #56 is in progress implementing context packs and budget reporting.",
+            RecordType::TaskCheckpoint,
+        ),
+        (
+            "Observation: context packs should include evidence refs without making recall authoritative.",
+            RecordType::Decision,
+        ),
+        (
+            "Raw transcript excerpt: context pack discussion repeated a low-signal tangent many times.",
+            RecordType::Other,
+        ),
+    ] {
+        insert_test_record(&svc, record_type, content, Sensitivity::Personal);
+    }
 
-    let mut req = recall_req("personal", "ws", "server");
+    let mut req = recall_req("personal", "ws", "context packs issue #56");
     req.pack_mode = Some("active-task".to_string());
     req.max_tokens = Some(2_000);
     let recall = svc.recall(req).unwrap();
@@ -935,6 +939,8 @@ fn recall_active_task_pack_mode_reports_metadata_and_prioritizes_current_work() 
         .policy
         .ranking_signals
         .contains(&"pack_budget:900".to_string()));
+    assert!(recall.pack.used_tokens > 0);
+    assert!(recall.pack.candidate_count >= recall.facts.len());
     assert_eq!(recall.facts[0].record_type, "task_checkpoint");
     assert!(recall.facts[0]
         .policy
@@ -947,7 +953,12 @@ fn recall_active_task_pack_mode_reports_metadata_and_prioritizes_current_work() 
     assert!(recall.facts[0]
         .policy
         .ranking_signals
-        .contains(&"active_task_blocker".to_string()));
+        .contains(&"pack_layer:cards".to_string()));
+    assert!(recall.facts[1]
+        .policy
+        .ranking_signals
+        .contains(&"pack_layer:observations".to_string()));
+    assert_eq!(recall.facts.last().unwrap().record_type, "other");
 }
 
 #[test]
@@ -1008,23 +1019,27 @@ fn recall_review_pack_mode_reports_metadata_and_prioritizes_review_risk() {
 }
 
 #[test]
-fn recall_personal_context_pack_mode_reports_metadata_and_prioritizes_preferences() {
+fn recall_personal_context_pack_mode_prioritizes_identity_and_preferences() {
     let svc = onboarding_service();
     svc.store.ensure_workspace("personal", "ws").unwrap();
-    insert_test_record(
-        &svc,
-        RecordType::Decision,
-        "Decision: workflow can use the default server path.",
-        Sensitivity::Personal,
-    );
-    insert_test_record(
-        &svc,
-        RecordType::Preference,
-        "Preference: prefer personal workflow defaults that keep review output concise.",
-        Sensitivity::Personal,
-    );
+    for (content, record_type) in [
+        (
+            "Identity: Josh is Linux-first and prefers zsh-friendly commands.",
+            RecordType::Identity,
+        ),
+        (
+            "Preference: keep host changes boring and avoid unnecessary package layering.",
+            RecordType::Preference,
+        ),
+        (
+            "Raw excerpt: unrelated implementation detail from an old terminal transcript.",
+            RecordType::Other,
+        ),
+    ] {
+        insert_test_record(&svc, record_type, content, Sensitivity::Personal);
+    }
 
-    let mut req = recall_req("personal", "ws", "workflow");
+    let mut req = recall_req("personal", "ws", "Josh commands");
     req.pack_mode = Some("personal-context".to_string());
     req.max_tokens = Some(2_000);
     let recall = svc.recall(req).unwrap();
@@ -1045,19 +1060,58 @@ fn recall_personal_context_pack_mode_reports_metadata_and_prioritizes_preference
         .policy
         .ranking_signals
         .contains(&"pack_budget:900".to_string()));
-    assert_eq!(recall.facts[0].record_type, "preference");
+    assert_eq!(recall.facts[0].record_type, "identity");
     assert!(recall.facts[0]
         .policy
         .ranking_signals
-        .contains(&"personal_context_preference".to_string()));
-    assert!(recall.facts[0]
-        .policy
-        .ranking_signals
-        .contains(&"personal_context_terms".to_string()));
-    assert!(recall.facts[0]
-        .policy
-        .ranking_signals
-        .contains(&"personal_context_preference_terms".to_string()));
+        .contains(&"personal_context_identity".to_string()));
+}
+
+#[test]
+fn recall_memory_curse_fixture_prefers_compiled_surfaces_over_over_recall() {
+    let svc = onboarding_service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::TaskCheckpoint,
+        "Current-state card: use the checked-in devcontainer path for issue #56 validation.",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Observation: budgeted packs should admit compiled surfaces before raw excerpts.",
+        Sensitivity::Personal,
+    );
+    for idx in 0..24 {
+        insert_test_record(
+            &svc,
+            RecordType::Other,
+            &format!(
+                "Raw transcript excerpt {idx}: issue #56 repeated context pack tangent with no durable instruction."
+            ),
+            Sensitivity::Personal,
+        );
+    }
+
+    let mut req = recall_req("personal", "ws", "issue #56 context pack validation");
+    req.pack_mode = Some("active_task".to_string());
+    req.max_tokens = Some(90);
+    let recall = svc.recall(req).unwrap();
+
+    assert!(recall.truncated);
+    assert!(recall.pack.truncated);
+    assert_eq!(recall.pack.candidate_count, 26);
+    assert!(recall.pack.withheld_count >= 20);
+    assert_eq!(recall.facts[0].record_type, "task_checkpoint");
+    assert_eq!(recall.facts[1].record_type, "decision");
+    assert!(
+        recall
+            .withheld
+            .iter()
+            .any(|entry| entry.reason == "pack_truncated"
+                && entry.count == recall.pack.withheld_count)
+    );
 }
 
 #[test]
