@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "codex-memoryd": {
+      "command": "${CODEX_MEMORYD_BIN}",
+      "args": [
+        "--db",
+        "${CODEX_MEMORYD_DB}",
+        "mcp",
+        "stdio",
+        "--read-only"
+      ],
+      "env": {
+        "CODEX_MEMORYD_PROFILE": "${CODEX_MEMORYD_PROFILE}",
+        "CODEX_MEMORYD_WORKSPACE": "${CODEX_MEMORYD_WORKSPACE}",
+        "CODEX_MEMORYD_READ_ONLY": "true"
+      },
+      "enabled_tools": [
+        "memory_status",
+        "memory_recall",
+        "memory_search"
+      ],
+      "read_only": true,
+      "disabled": false
+    }
+  }
+}

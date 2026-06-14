@@ -23,6 +23,7 @@ This is the landed MVP surface today:
 | Context packs | landed MVP | `default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and `personal_context` pack modes are supported. |
 | Adapter exports | landed | `agents-md`, `claude-code`, `copilot`, `github-instructions`, `markdown`, and `mcp-pack`. |
 | Adapter conformance | landed | `conformance adapters` emits a deterministic report for adapter authority, provenance, and budget behavior. |
+| Adapter packages | landed | Installable templates for Codex MCP, Claude-style local MCP, Copilot instructions, and generic MCP/markdown clients. |
 | Git import | landed | Imports commit trailers plus refs fixtures for JSON and JSONL exports. |
 | MCP dogfood | landed read-only | Exposes `memory_status`, `memory_recall`, and `memory_search` only. |
 | Dreamer patch lifecycle | landed MVP | Preview/apply exists for reviewable consolidation; broader procedural automation is still roadmap work. |
@@ -179,6 +180,22 @@ Each record carries explicit freshness metadata (`freshness.stale` and
 `contains_stale_records` whenever any included record is past the stale display
 window. CLI markdown and adapter views render the same fresh/stale label. The
 card smoke suite includes a fixture-backed markdown snapshot for this contract.
+
+### Adapter packages
+
+Installable adapter package templates live under [`adapters/`](./adapters/).
+They are thin host-specific wrappers around `codex-memoryd` and default to
+read-only operation:
+
+- `adapters/codex-mcp`: Codex `~/.codex/config.toml` MCP snippet.
+- `adapters/claude-local`: Claude-style local MCP server JSON snippet.
+- `adapters/copilot-instructions`: Copilot instructions export wrapper.
+- `adapters/generic-mcp-markdown`: generic MCP plus `AGENTS.md` and
+  `GEMINI.md` markdown export wrappers.
+
+Each package includes `.env.example`, install steps, verify commands, and
+uninstall notes. The packages do not duplicate memory logic; they call
+`codex-memoryd mcp stdio --read-only` or `codex-memoryd adapter export`.
 
 ### Git evidence import
 

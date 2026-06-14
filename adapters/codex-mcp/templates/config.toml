@@ -1,0 +1,7 @@
+[mcp_servers.codex_memoryd]
+command = "${CODEX_MEMORYD_BIN}"
+args = ["--db", "${CODEX_MEMORYD_DB}", "mcp", "stdio", "--read-only"]
+enabled_tools = ["memory_status", "memory_recall", "memory_search"]
+default_tools_approval_mode = "approve"
+startup_timeout_sec = 30
+tool_timeout_sec = 30
