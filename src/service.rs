@@ -314,9 +314,10 @@ impl Service {
             }
             "open_questions" => ("workspace", None),
             "recent_scars" => ("workspace", None),
+            "procedures_index" => ("workspace", None),
             _ => {
                 return Err(Error::invalid_request(format!(
-                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, active_preferences, open_questions, or recent_scars"
+                    "unknown card type '{card_type}'; use subject_summary, workspace_summary, active_preferences, open_questions, recent_scars, or procedures_index"
                 )))
             }
         };
@@ -329,6 +330,8 @@ impl Service {
             records.retain(is_open_question_record);
         } else if card_type == "recent_scars" {
             records.retain(is_recent_scar_record);
+        } else if card_type == "procedures_index" {
+            records.retain(is_procedure_record);
         }
         records.sort_by(|a, b| {
             b.updated_at
@@ -2301,6 +2304,37 @@ fn is_recent_scar_record(record: &MemoryRecord) -> bool {
     RECENT_SCAR_PREFIXES
         .iter()
         .any(|prefix| lower.starts_with(prefix))
+}
+
+fn is_procedure_record(record: &MemoryRecord) -> bool {
+    if record.record_type == RecordType::WorkflowPattern {
+        return true;
+    }
+    if record.tags.iter().any(|tag| {
+        let normalized = tag.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "procedure" | "workflow_pattern")
+    }) {
+        return true;
+    }
+
+    procedure_metadata_kind(&record.metadata).is_some()
+}
+
+fn procedure_metadata_kind(metadata: &Value) -> Option<String> {
+    let marker_kind = metadata
+        .get("marker")
+        .and_then(|marker| marker.get("marker_kind"))
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("marker_kind").and_then(Value::as_str))
+        .or_else(|| metadata.get("procedure_kind").and_then(Value::as_str))
+        .or_else(|| metadata.get("kind").and_then(Value::as_str))
+        .or_else(|| metadata.get("type").and_then(Value::as_str))?;
+    let normalized = marker_kind.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "procedure" | "workflow_pattern") {
+        Some(normalized)
+    } else {
+        None
+    }
 }
 
 fn recent_scar_metadata_kind(metadata: &Value) -> Option<String> {
