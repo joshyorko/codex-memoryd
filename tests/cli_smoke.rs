@@ -278,6 +278,67 @@ fn cli_status_is_json() {
 }
 
 #[test]
+fn cli_eval_substrate_emits_deterministic_json_and_summary() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .arg("eval")
+        .arg("substrate")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .arg("eval")
+        .arg("substrate")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(first, second, "eval JSON output should be deterministic");
+    let report: Value = serde_json::from_slice(&first).expect("eval report JSON");
+    assert_eq!(report["suite"], "substrate");
+    assert_eq!(report["status"], "pass");
+    assert_eq!(report["metrics"]["cross_profile_bleed_rate"], 0.0);
+    assert_eq!(report["metrics"]["poison_acceptance_rate"], 0.0);
+    assert_eq!(report["checks"]["patch_rollback"]["status"], "pass");
+    assert_eq!(report["checks"]["procedure_memory"]["status"], "pass");
+    assert_eq!(report["checks"]["adapter_context_pack"]["status"], "pass");
+    assert!(report["metrics"]["pack_cost"]["bytes"].as_u64().unwrap() > 0);
+
+    bin()
+        .arg("--db")
+        .arg(db)
+        .arg("eval")
+        .arg("substrate")
+        .arg("--format")
+        .arg("summary")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "codex-memoryd substrate eval: pass",
+        ))
+        .stdout(predicate::str::contains("cross-profile bleed: 0/"))
+        .stdout(predicate::str::contains("poison acceptance: 0/"))
+        .stdout(predicate::str::contains("patch rollback: pass"))
+        .stdout(predicate::str::contains("procedure memory: pass"))
+        .stdout(predicate::str::contains("adapter/context pack: pass"));
+}
+
+#[test]
 fn cli_status_storage_path_failure_is_actionable() {
     let dir = TempDir::new().unwrap();
     let not_a_dir = dir.path().join("not-a-dir");

@@ -19,6 +19,7 @@ pub mod conformance;
 pub mod domain;
 pub mod dream;
 pub mod error;
+pub mod eval;
 pub mod export;
 pub mod git_import;
 pub mod ids;

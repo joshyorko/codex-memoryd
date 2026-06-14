@@ -174,6 +174,8 @@ target/release/codex-memoryd adapter export --target mcp-pack \
 target/release/codex-memoryd adapter export --target mcp-json \
   --profile personal --workspace josh-personal > mcp-json.json
 target/release/codex-memoryd conformance adapters --format json
+target/release/codex-memoryd eval substrate --format summary
+target/release/codex-memoryd eval substrate --format json
 ```
 
 Cards are generated on demand, so there is no persisted card cache to invalidate.
@@ -182,6 +184,11 @@ Each record carries explicit freshness metadata (`freshness.stale` and
 `contains_stale_records` whenever any included record is past the stale display
 window. CLI markdown and adapter views render the same fresh/stale label. The
 card smoke suite includes a fixture-backed markdown snapshot for this contract.
+
+`eval substrate` is the deterministic, model-free review gate for substrate
+correctness, safety, procedure memory, patch rollback, and adapter/context-pack
+economics. See
+[`docs/eval-substrate.md`](./docs/eval-substrate.md).
 
 ### Adapter packages
 
@@ -262,20 +269,31 @@ This substrate is intentionally not a graph engine, CRM, scheduler, or agent
 harness. Subjects and episodes are internal anchors, not a standalone exported
 surface.
 
-## Roadmap
+## Release Snapshot
 
-The board still has open work. The lanes below are status snapshots, not claims
-that the product is done:
+The #50-#86 substrate tranche is now landed or closed by this README's eval
+suite PR. Future work should add sharper evals, production hardening, and
+operator polish rather than reopen the old stale snapshot.
 
 | Issue | Lane | Status |
 | --- | --- | --- |
 | `#50` | current-state cards | landed deterministic cards with stale metadata and fixture-backed rendering coverage |
-| `#53` | eval suite | open; still validating capability gates, recall, and context-pack behavior |
-| `#55` | recall policy | admission gates now withhold quarantined/high-risk/unsafe/superseded records by default; remaining work depends on broader eval/review lanes |
-| `#56` | adapter context packs | closeable by this implementation: deterministic recall packs, adapter-specific pack names, budget/truncation reporting, and regression coverage are present |
+| `#53` | eval suite | closed by `eval substrate`: deterministic JSON/summary report for recall, safety, procedure memory, patch rollback, and adapter/context-pack economics |
+| `#55` | recall policy | landed admission gates that withhold quarantined/high-risk/unsafe/superseded records by default; further hardening belongs to newer eval/review lanes |
+| `#56` | adapter context packs | landed deterministic recall packs, adapter-specific pack names, budget/truncation reporting, and regression coverage |
 | `#57` | git import | landed for local trailers and refs fixtures covering commits, PRs, issues, and review comments |
+| `#66` | procedural memory | landed schema v6 procedure records, candidate preview/apply flow, and recall/export surfaces |
 | `#67` | operational valence | landed marker v2 fields, deterministic decay, counter-evidence retirement, and ranking-only recall signals |
+| `#68` | trust quarantine | landed trust/quarantine controls that keep unsafe evidence out of default recall |
+| `#69` | multimodal evidence | landed artifact metadata, redaction policy, and non-text evidence import shape |
 | `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |
+| `#80` | deployment runtime | landed local runtime helper and restart-survival smoke path |
+| `#81` | MCP v2 | landed default read-only tier plus explicit write-tool tier |
+| `#82` | hosted app adapter | landed design doc for hosted app memory adapter boundaries |
+| `#83` | plugin packages | landed installable adapter package templates |
+| `#84` | native Codex migration | landed migration plan, parity canaries, and duplicate-loop guardrails |
+| `#85` | dogfood heartbeat | landed Compose heartbeat rebuild/import/MCP canary script |
+| `#86` | README overhaul | landed refreshed first-run and substrate story |
 
 ## Related Docs
 
@@ -283,6 +301,7 @@ that the product is done:
 - [`docs/codex-integration.md`](./docs/codex-integration.md)
 - [`docs/dogfood-local.md`](./docs/dogfood-local.md)
 - [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md)
+- [`docs/eval-substrate.md`](./docs/eval-substrate.md)
 - [`docs/native-codex-memory-migration.md`](./docs/native-codex-memory-migration.md)
 - [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)
 - [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md)
