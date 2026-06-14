@@ -187,6 +187,11 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Quarantine or promote a memory record by id.
+    Quarantine {
+        #[command(subcommand)]
+        command: QuarantineCommand,
+    },
     /// Run self-checks (storage writable, FTS5, schema).
     Doctor,
     /// Run MCP transport entrypoints.
@@ -336,6 +341,28 @@ pub enum ConformanceCommand {
     Adapters {
         #[arg(long, default_value = "json")]
         format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QuarantineCommand {
+    /// Withhold a record from default recall, cards, exports, and adapters.
+    Add {
+        id: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Promote a quarantined record back into default recall/export surfaces.
+    Promote {
+        id: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
     },
 }
 
@@ -862,8 +889,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             // Print the raw export body to stdout (pipe to a file).
             print!("{}", result.body);
             eprintln!(
-                "exported {} record(s); omitted {} secret, {} boundary",
-                result.record_count, result.omitted_secret, result.omitted_boundary
+                "exported {} record(s); omitted {} secret, {} quarantined, {} boundary",
+                result.record_count,
+                result.omitted_secret,
+                result.omitted_quarantined,
+                result.omitted_boundary
             );
             Ok(())
         }
@@ -966,6 +996,48 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let resp = service.forget(req)?;
             print_json(&resp)?;
+            Ok(())
+        }
+        Command::Quarantine { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                QuarantineCommand::Add {
+                    id,
+                    profile,
+                    workspace,
+                    reason,
+                } => {
+                    let profile = service.resolve_profile(profile)?;
+                    let workspace = workspace.as_deref();
+                    let (quarantined, not_found) = service.store.quarantine_records(
+                        profile.as_str(),
+                        workspace,
+                        std::slice::from_ref(id),
+                        reason,
+                    )?;
+                    print_json(&json!({
+                        "quarantined": quarantined,
+                        "not_found": not_found,
+                    }))?;
+                }
+                QuarantineCommand::Promote {
+                    id,
+                    profile,
+                    workspace,
+                } => {
+                    let profile = service.resolve_profile(profile)?;
+                    let workspace = workspace.as_deref();
+                    let (promoted, not_found) = service.store.promote_quarantined_records(
+                        profile.as_str(),
+                        workspace,
+                        std::slice::from_ref(id),
+                    )?;
+                    print_json(&json!({
+                        "promoted": promoted,
+                        "not_found": not_found,
+                    }))?;
+                }
+            }
             Ok(())
         }
         Command::Doctor => {

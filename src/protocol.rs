@@ -206,6 +206,8 @@ pub struct RecallProvenance {
     pub source_risk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

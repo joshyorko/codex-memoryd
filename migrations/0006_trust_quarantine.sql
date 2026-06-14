@@ -1,0 +1,3 @@
+-- Trust/quarantine metadata (storage_schema_version = 5).
+-- Column additions are performed idempotently in store::ensure_trust_columns
+-- because this project replays migrations on every open.

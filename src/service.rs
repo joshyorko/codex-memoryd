@@ -146,7 +146,7 @@ impl Service {
     // ------------------------------------------------------------------
 
     /// Resolve a profile string, applying the configured default when absent.
-    fn resolve_profile(&self, raw: &Option<String>) -> Result<Profile> {
+    pub fn resolve_profile(&self, raw: &Option<String>) -> Result<Profile> {
         let value = raw
             .as_deref()
             .map(str::trim)
