@@ -1098,6 +1098,14 @@ fn render_card_markdown(card: &CardShowResponse) -> String {
             record.id, record.record_type, record.scope, record.confidence
         ));
         lines.push(format!("  - updated_at: {}", record.updated_at));
+        lines.push(format!(
+            "  - freshness: {}",
+            if record.freshness.stale {
+                "stale"
+            } else {
+                "fresh"
+            }
+        ));
         if !record.tags.is_empty() {
             lines.push(format!("  - tags: {}", record.tags.join(", ")));
         }

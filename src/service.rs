@@ -60,6 +60,7 @@ use crate::store::Store;
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
 const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
+const CARD_STALE_DAYS: i64 = 120;
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
 const AGENTS_MD_CONTEXT_PACK_TEMPLATE: &str = "agents-md-v1";
 const CLAUDE_CODE_CONTEXT_PACK_TEMPLATE: &str = "claude-code-v1";
@@ -349,6 +350,7 @@ impl Service {
                 content: record.content.clone(),
                 confidence: record.confidence,
                 updated_at: record.updated_at.clone(),
+                freshness: card_record_freshness(&record.updated_at),
                 related_files: record.related_files.clone(),
                 tags: record.tags.clone(),
                 subject_id: record.subject_id.clone(),
@@ -363,6 +365,8 @@ impl Service {
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         let freshness = if views.is_empty() {
             "empty_snapshot".to_string()
+        } else if views.iter().any(|record| record.freshness.stale) {
+            "contains_stale_records".to_string()
         } else {
             "stable".to_string()
         };
@@ -2525,6 +2529,19 @@ fn build_adapter_context_pack(
     }
 }
 
+fn card_record_freshness(updated_at: &str) -> RecallFreshness {
+    let age_days = card_record_age_days(updated_at);
+    RecallFreshness {
+        stale: age_days.map(|days| days > CARD_STALE_DAYS).unwrap_or(false),
+        age_days,
+    }
+}
+
+fn card_record_age_days(updated_at: &str) -> Option<i64> {
+    let parsed = OffsetDateTime::parse(updated_at, &Rfc3339).ok()?;
+    Some((OffsetDateTime::now_utc() - parsed).whole_days())
+}
+
 fn render_mcp_pack_markdown(pack: &AdapterContextPack) -> Result<String> {
     let json = serde_json::to_string_pretty(pack)
         .map_err(|err| Error::internal(format!("failed to serialize MCP context pack: {err}")))?;
@@ -2558,6 +2575,14 @@ fn render_memory_markdown_view(title: &str, target: &str, card: &CardShowRespons
             record.id, record.record_type, record.scope, record.confidence
         ));
         out.push_str(&format!("  - {}\n", record.content));
+        out.push_str(&format!(
+            "  - Freshness: `{}`\n",
+            if record.freshness.stale {
+                "stale"
+            } else {
+                "fresh"
+            }
+        ));
         if !record.source_ids.is_empty() {
             out.push_str(&format!(
                 "  - Evidence refs: `{}`\n",

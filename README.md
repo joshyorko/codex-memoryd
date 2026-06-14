@@ -142,6 +142,13 @@ target/release/codex-memoryd adapter export --target mcp-pack \
 target/release/codex-memoryd conformance adapters --format json
 ```
 
+Cards are generated on demand, so there is no persisted card cache to invalidate.
+Each record carries explicit freshness metadata (`freshness.stale` and
+`freshness.age_days`), and the card-level `freshness` value is
+`contains_stale_records` whenever any included record is past the stale display
+window. CLI markdown and adapter views render the same fresh/stale label. The
+card smoke suite includes a fixture-backed markdown snapshot for this contract.
+
 ### Git evidence import
 
 `git-import` reads recent commit trailers such as `Memory-Decision`,
@@ -192,7 +199,7 @@ that the product is done:
 
 | Issue | Lane | Status |
 | --- | --- | --- |
-| `#50` | current-state cards | landed MVP surface; follow-on coverage and polish remain |
+| `#50` | current-state cards | landed deterministic cards with stale metadata and fixture-backed rendering coverage |
 | `#53` | eval suite | open; still validating capability gates, recall, and context-pack behavior |
 | `#55` | recall policy | landed metadata plus `recall_not_authority`; hardening remains |
 | `#56` | adapter context packs | landed MVP modes and adapter targets; card-first composition and memory-curse fixtures remain |
