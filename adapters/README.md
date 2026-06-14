@@ -18,6 +18,9 @@ or a host-specific database.
 - Default mode is read-only.
 - MCP adapters expose only `memory_status`, `memory_recall`, and
   `memory_search`.
+- Write-capable MCP tools require an explicit `mcp stdio --write-tools`
+  process plus a reviewed adapter capability policy. Do not expose write tools
+  from generic Codex sandbox configs.
 - Recall remains `recall_not_authority`; user instructions, repository files,
   and current tool output override memory.
 - Packages point at an existing `codex-memoryd` binary and database; they do not

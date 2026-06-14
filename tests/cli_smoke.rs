@@ -120,6 +120,7 @@ fn seed_preference_record(
     id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_record(
     db: &PathBuf,
     profile: &str,
@@ -169,6 +170,7 @@ fn seed_record(
     id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_record_with_details(
     db: &PathBuf,
     profile: &str,

@@ -37,6 +37,7 @@ fn temp_service() -> (Service, TempDir, std::path::PathBuf) {
     (Service::new(store, config), tempdir, db_path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_record(
     store: &Store,
     profile_id: &str,

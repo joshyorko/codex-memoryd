@@ -232,6 +232,9 @@ pub enum McpCommand {
         /// Expose only the read tools and reject write tool calls.
         #[arg(long)]
         read_only: bool,
+        /// Opt in to write-capable MCP tools. The default stdio surface is read-only.
+        #[arg(long, conflicts_with = "read_only")]
+        write_tools: bool,
     },
 }
 
@@ -615,13 +618,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 print_json(&resp)?;
                 return Ok(());
             }
-            let mode = if *apply {
-                "apply"
-            } else if *preview {
-                "preview"
-            } else {
-                "preview"
-            };
+            let mode = if *apply { "apply" } else { "preview" };
+            let _ = preview;
             let resp = service.dream(DreamRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
@@ -1061,9 +1059,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Mcp { command } => match command {
-            McpCommand::Stdio { read_only } => {
+            McpCommand::Stdio {
+                read_only: _,
+                write_tools,
+            } => {
                 let service = cli.open_service(None)?;
-                mcp::run_stdio(service, *read_only)?;
+                mcp::run_stdio(service, *write_tools)?;
                 Ok(())
             }
         },

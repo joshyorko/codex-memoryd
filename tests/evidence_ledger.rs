@@ -183,7 +183,7 @@ fn accepted_writes_append_scoped_evidence_rows() {
     assert_eq!(ckpt.policy_state, "accepted");
     assert_eq!(ckpt.subject_key, None);
     assert!(ckpt.safe_summary.contains("evidence ledger"));
-    assert_eq!(ckpt.metadata["checkpoint_id"].as_str().is_some(), true);
+    assert!(ckpt.metadata["checkpoint_id"].as_str().is_some());
 }
 
 #[test]

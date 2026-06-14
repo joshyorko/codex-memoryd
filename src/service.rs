@@ -368,8 +368,7 @@ impl Service {
             })
             .collect::<Vec<_>>();
         let generated_at = views
-            .iter()
-            .next()
+            .first()
             .map(|record| record.updated_at.clone())
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         let freshness = if views.is_empty() {
@@ -766,7 +765,7 @@ impl Service {
                 source_kind: "visible_turn".to_string(),
                 source_id: Some(src.id.clone()),
                 source_path: Some(format!("turn:{}", turn.id)),
-                source_hash: source_hash,
+                source_hash,
                 safe_summary: ledger_safe_summary(&content),
                 policy_state: "accepted".to_string(),
                 metadata: json!({
@@ -2233,6 +2232,7 @@ fn extract_evidence_refs(metadata: &Value) -> Vec<DreamEvidenceSource> {
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dream_error_audit(
     profile_id: &str,
     workspace_id: &str,

@@ -13,6 +13,8 @@ use crate::protocol::CheckpointRequest;
 use crate::protocol::ConclusionsRequest;
 use crate::protocol::RecallRequest;
 use crate::protocol::SearchRequest;
+use crate::protocol::SyncFile;
+use crate::protocol::SyncRequest;
 use crate::service::Service;
 use crate::PROVIDER_NAME;
 use crate::PROVIDER_VERSION;
@@ -21,6 +23,13 @@ const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const TOOL_TEXT_TYPE: &str = "text";
 const READ_ONLY_TOOL_NAMES: &[&str] = &["memory_status", "memory_recall", "memory_search"];
+const WRITE_TOOL_NAMES: &[&str] = &[
+    "memory_create",
+    "memory_conclude",
+    "memory_checkpoint",
+    "memory_import_preview",
+    "memory_import_apply",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +128,8 @@ struct ConcludeArgs {
     #[serde(default)]
     repo_id: Option<String>,
     content: String,
+    #[serde(rename = "type", default)]
+    record_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +165,20 @@ struct CheckpointArgs {
     thread_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct ImportArgs {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    source_root: String,
+    files: Vec<SyncFile>,
+}
+
 struct ServerState {
     initialized: bool,
 }
@@ -170,9 +195,18 @@ struct ToolDefinition {
     name: &'static str,
     description: &'static str,
     input_schema: Value,
+    annotations: ToolAnnotations,
 }
 
-pub fn run_stdio(service: Service, read_only: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolAnnotations {
+    read_only_hint: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destructive_hint: Option<bool>,
+}
+
+pub fn run_stdio(service: Service, write_tools: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -192,7 +226,7 @@ pub fn run_stdio(service: Service, read_only: bool) -> Result<()> {
             continue;
         }
 
-        let response = handle_message(&service, &mut state, trimmed, read_only);
+        let response = handle_message(&service, &mut state, trimmed, write_tools);
         if let Some(response) = response {
             let text = serde_json::to_string(&response)?;
             writeln!(writer, "{text}")?;
@@ -207,7 +241,7 @@ fn handle_message(
     service: &Service,
     state: &mut ServerState,
     raw: &str,
-    read_only: bool,
+    write_tools: bool,
 ) -> Option<RpcResponse> {
     let parsed = match serde_json::from_str::<RpcRequest>(raw) {
         Ok(request) => request,
@@ -244,7 +278,7 @@ fn handle_message(
         "initialized" => None,
         "tools/list" => Some(match ensure_initialized(state, id.clone()) {
             Some(error) => error,
-            None => ok(id, json!({ "tools": tool_definitions(read_only) })),
+            None => ok(id, json!({ "tools": tool_definitions(write_tools) })),
         }),
         "tools/call" => Some(match ensure_initialized(state, id.clone()) {
             Some(error) => error,
@@ -252,7 +286,7 @@ fn handle_message(
                 .params
                 .and_then(|params| serde_json::from_value::<ToolCallParams>(params).ok())
             {
-                Some(params) => handle_tool_call(service, id, params, read_only),
+                Some(params) => handle_tool_call(service, id, params, write_tools),
                 None => invalid_params(id, "invalid tools/call params"),
             },
         }),
@@ -277,10 +311,16 @@ fn handle_tool_call(
     service: &Service,
     id: Value,
     params: ToolCallParams,
-    read_only: bool,
+    write_tools: bool,
 ) -> RpcResponse {
-    if read_only && !READ_ONLY_TOOL_NAMES.contains(&params.name.as_str()) {
+    if !write_tools && !READ_ONLY_TOOL_NAMES.contains(&params.name.as_str()) {
         return read_only_tool_disabled(id, params.name);
+    }
+    if write_tools
+        && !READ_ONLY_TOOL_NAMES.contains(&params.name.as_str())
+        && !WRITE_TOOL_NAMES.contains(&params.name.as_str())
+    {
+        return method_not_found(id, params.name);
     }
 
     match params.name.as_str() {
@@ -343,28 +383,30 @@ fn handle_tool_call(
             }
             Err(err) => invalid_params(id, err),
         },
-        "memory_conclude" => match parse_tool_args::<ConcludeArgs>(params.arguments) {
-            Ok(args) => {
-                let repo = args.repo_id.map(|repo_id| domain::RepoIdentity {
-                    repo_id,
-                    ..Default::default()
-                });
-                let req = ConclusionsRequest {
-                    profile: args.profile,
-                    workspace: args.workspace,
-                    repo,
-                    target: Some("user".to_string()),
-                    conclusions: Some(vec![args.content]),
-                    metadata: None,
-                    record_type: None,
-                };
-                match service.conclusions(req) {
-                    Ok(resp) => ok_tool_result(id, json!(resp)),
-                    Err(err) => service_error(id, err),
+        "memory_create" | "memory_conclude" => {
+            match parse_tool_args::<ConcludeArgs>(params.arguments) {
+                Ok(args) => {
+                    let repo = args.repo_id.map(|repo_id| domain::RepoIdentity {
+                        repo_id,
+                        ..Default::default()
+                    });
+                    let req = ConclusionsRequest {
+                        profile: args.profile,
+                        workspace: args.workspace,
+                        repo,
+                        target: Some("user".to_string()),
+                        conclusions: Some(vec![args.content]),
+                        metadata: None,
+                        record_type: args.record_type,
+                    };
+                    match service.conclusions(req) {
+                        Ok(resp) => ok_tool_result(id, json!(resp)),
+                        Err(err) => service_error(id, err),
+                    }
                 }
+                Err(err) => invalid_params(id, err),
             }
-            Err(err) => invalid_params(id, err),
-        },
+        }
         "memory_checkpoint" => match parse_tool_args::<CheckpointArgs>(params.arguments) {
             Ok(args) => {
                 let repo = args.repo_id.map(|repo_id| domain::RepoIdentity {
@@ -401,7 +443,39 @@ fn handle_tool_call(
             }
             Err(err) => invalid_params(id, err),
         },
+        "memory_import_preview" => handle_import_tool(service, id, params.arguments, "preview"),
+        "memory_import_apply" => handle_import_tool(service, id, params.arguments, "apply"),
         _ => method_not_found(id, params.name),
+    }
+}
+
+fn handle_import_tool(
+    service: &Service,
+    id: Value,
+    arguments: Option<Value>,
+    mode: &'static str,
+) -> RpcResponse {
+    match parse_tool_args::<ImportArgs>(arguments) {
+        Ok(args) => {
+            let repo = args.repo_id.map(|repo_id| domain::RepoIdentity {
+                repo_id,
+                ..Default::default()
+            });
+            let req = SyncRequest {
+                profile: args.profile,
+                workspace: args.workspace,
+                repo,
+                source_root: Some(args.source_root),
+                mode: Some(mode.to_string()),
+                files: Some(args.files),
+                metadata: None,
+            };
+            match service.sync_local(req) {
+                Ok(resp) => ok_tool_result(id, json!(resp)),
+                Err(err) => service_error(id, err),
+            }
+        }
+        Err(err) => invalid_params(id, err),
     }
 }
 
@@ -412,7 +486,7 @@ fn parse_tool_args<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(value).map_err(|err| err.to_string())
 }
 
-fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
+fn tool_definitions(write_tools: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
         ToolDefinition {
             name: "memory_status",
@@ -422,10 +496,11 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                 "properties": {},
                 "additionalProperties": false,
             }),
+            annotations: read_annotations(),
         },
         ToolDefinition {
             name: "memory_recall",
-            description: "Recall task-relevant memory for a profile and workspace.",
+            description: "Recall task-relevant memory for a profile and workspace. Results are recall-not-authority and include evidence/provenance metadata where available.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -439,10 +514,11 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                 "required": ["query"],
                 "additionalProperties": false,
             }),
+            annotations: read_annotations(),
         },
         ToolDefinition {
             name: "memory_search",
-            description: "Search safe memory records with existing privacy filters.",
+            description: "Search safe memory records with existing privacy filters. Results are recall-not-authority and include record provenance.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -458,25 +534,23 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                 "required": ["query"],
                 "additionalProperties": false,
             }),
+            annotations: read_annotations(),
         },
     ];
 
-    if !read_only {
+    if write_tools {
         tools.extend([
+            ToolDefinition {
+                name: "memory_create",
+                description: "Write a durable memory conclusion through the existing policy and provenance gates.",
+                input_schema: conclusion_schema(),
+                annotations: write_annotations(None),
+            },
             ToolDefinition {
                 name: "memory_conclude",
                 description: "Write a durable conclusion using the existing write policy.",
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "profile": { "type": "string" },
-                        "workspace": { "type": "string" },
-                        "repoId": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["content"],
-                    "additionalProperties": false,
-                }),
+                input_schema: conclusion_schema(),
+                annotations: write_annotations(None),
             },
             ToolDefinition {
                 name: "memory_checkpoint",
@@ -502,11 +576,87 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                     "required": ["summary"],
                     "additionalProperties": false,
                 }),
+                annotations: write_annotations(None),
+            },
+            ToolDefinition {
+                name: "memory_import_preview",
+                description: "Preview a local Codex memory import. This never writes durable records.",
+                input_schema: import_schema(),
+                annotations: write_annotations(Some(false)),
+            },
+            ToolDefinition {
+                name: "memory_import_apply",
+                description: "Apply a local Codex memory import through the existing sync policy and idempotency gates.",
+                input_schema: import_schema(),
+                annotations: write_annotations(Some(true)),
             },
         ]);
     }
 
     tools
+}
+
+fn read_annotations() -> ToolAnnotations {
+    ToolAnnotations {
+        read_only_hint: true,
+        destructive_hint: None,
+    }
+}
+
+fn write_annotations(destructive_hint: Option<bool>) -> ToolAnnotations {
+    ToolAnnotations {
+        read_only_hint: false,
+        destructive_hint,
+    }
+}
+
+fn conclusion_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "profile": { "type": "string" },
+            "workspace": { "type": "string" },
+            "repoId": { "type": "string" },
+            "content": { "type": "string" },
+            "type": { "type": "string" }
+        },
+        "required": ["content"],
+        "additionalProperties": false,
+    })
+}
+
+fn import_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "profile": { "type": "string" },
+            "workspace": { "type": "string" },
+            "repoId": { "type": "string" },
+            "sourceRoot": { "type": "string" },
+            "files": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/syncFile" }
+            }
+        },
+        "required": ["sourceRoot", "files"],
+        "additionalProperties": false,
+        "$defs": {
+            "syncFile": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "content": { "type": "string" },
+                    "hash": { "type": "string" },
+                    "modifiedAt": { "type": "string" },
+                    "idempotencyKey": { "type": "string" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn ok(id: Value, result: Value) -> RpcResponse {

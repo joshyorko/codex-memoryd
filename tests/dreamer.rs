@@ -411,10 +411,10 @@ fn preview_and_apply_emit_experience_markers_with_required_fields() {
     for marker in &preview.markers {
         assert_eq!(marker.authority, "recall_not_authority");
         assert!(marker.marker_kind.is_some());
-        assert!(marker.trigger.as_deref().unwrap().len() > 0);
-        assert!(marker.outcome.as_deref().unwrap().len() > 0);
-        assert!(marker.recovery.as_deref().unwrap().len() > 0);
-        assert!(marker.future_guidance.as_deref().unwrap().len() > 0);
+        assert!(!marker.trigger.as_deref().unwrap().is_empty());
+        assert!(!marker.outcome.as_deref().unwrap().is_empty());
+        assert!(!marker.recovery.as_deref().unwrap().is_empty());
+        assert!(!marker.future_guidance.as_deref().unwrap().is_empty());
         assert!(!marker.evidence_refs.is_empty());
     }
 }
