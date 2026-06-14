@@ -149,6 +149,61 @@ fn status_response_fixture_matches_protocol_shape() {
 }
 
 #[test]
+fn hosted_app_tool_only_fixture_covers_status_recall_and_search() {
+    let raw = read_fixture("hosted_app_adapter.tool_only.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(&raw).expect("hosted app fixture is valid JSON");
+
+    assert_eq!(fixture["adapter"], "hosted-app");
+    assert_eq!(fixture["settings"]["mode"], "read_only");
+
+    let tools = fixture["tools"].as_array().expect("tools array");
+    let paths: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["path"].as_str().expect("tool path"))
+        .collect();
+    assert_eq!(paths, vec!["/v1/status", "/v1/recall", "/v1/search"]);
+
+    for tool in tools {
+        assert_eq!(
+            tool["writes"], false,
+            "hosted app MVP fixture must stay read-only"
+        );
+    }
+
+    let recall_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "memory_recall")
+        .expect("recall tool");
+    let recall_req: RecallRequest =
+        serde_json::from_value(recall_tool["request"].clone()).expect("recall request");
+    assert_eq!(recall_req.profile.as_deref(), Some("personal"));
+    assert_eq!(recall_req.workspace.as_deref(), Some("josh-personal"));
+    assert_eq!(recall_req.pack_mode.as_deref(), Some("default"));
+
+    let search_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "memory_search")
+        .expect("search tool");
+    let search_req: SearchRequest =
+        serde_json::from_value(search_tool["request"].clone()).expect("search request");
+    assert_eq!(search_req.profile.as_deref(), Some("personal"));
+    assert_eq!(search_req.workspace.as_deref(), Some("josh-personal"));
+    assert_eq!(search_req.limit, Some(10));
+    assert!(!search_req.include_archived);
+
+    let svc = service();
+    let status = svc.status().expect("status runs");
+    assert_eq!(status.provider_name, "codex-memoryd");
+
+    let recall = svc.recall(recall_req).expect("hosted app recall runs");
+    assert_eq!(recall.authority, "recall_not_authority");
+
+    let search = svc.search(search_req).expect("hosted app search runs");
+    assert!(search.matches.is_empty());
+}
+
+#[test]
 fn dream_preview_report_fixture_matches_stable_shape() {
     let svc = service();
     svc.store

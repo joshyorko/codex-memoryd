@@ -1,0 +1,65 @@
+{
+  "adapter": "hosted-app",
+  "version": 1,
+  "settings": {
+    "base_url": "https://memory.example.invalid",
+    "profile": "personal",
+    "workspace": "josh-personal",
+    "mode": "read_only",
+    "credential_ref": "user-managed-secret-ref",
+    "pack_mode": "default",
+    "max_tokens": 1200
+  },
+  "tools": [
+    {
+      "name": "memory_status",
+      "method": "GET",
+      "path": "/v1/status",
+      "capability": null,
+      "writes": false
+    },
+    {
+      "name": "memory_recall",
+      "method": "POST",
+      "path": "/v1/recall",
+      "capability": "recall.read",
+      "writes": false,
+      "request": {
+        "profile": "personal",
+        "workspace": "josh-personal",
+        "query": "Continue the hosted app adapter design.",
+        "files": ["docs/hosted-app-adapter.md"],
+        "max_tokens": 1200,
+        "pack_mode": "default",
+        "metadata": {
+          "adapter": "hosted-app",
+          "mode": "read_only"
+        }
+      }
+    },
+    {
+      "name": "memory_search",
+      "method": "POST",
+      "path": "/v1/search",
+      "capability": "search.read",
+      "writes": false,
+      "request": {
+        "profile": "personal",
+        "workspace": "josh-personal",
+        "query": "hosted app adapter",
+        "limit": 10,
+        "include_archived": false
+      }
+    }
+  ],
+  "later_interactive_layer": {
+    "review_required_for": [
+      "observations.apply",
+      "patches.apply",
+      "forget.archive",
+      "forget.delete",
+      "export.records"
+    ],
+    "notes": "Write, apply, export, forget, and cross-profile flows require explicit capability gates and user review before they can be exposed."
+  }
+}
