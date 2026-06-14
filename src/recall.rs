@@ -58,6 +58,10 @@ const PACK_TEMPLATES: &[PackTemplate] = &[
         mode: "onboarding",
         budget_tokens: 1400,
     },
+    PackTemplate {
+        mode: "planning",
+        budget_tokens: 1300,
+    },
 ];
 
 const ONBOARDING_CONTENT_TERMS: &[&str] = &[
@@ -69,6 +73,24 @@ const ONBOARDING_CONTENT_TERMS: &[&str] = &[
     "architecture",
     "current state",
     "current-state",
+];
+
+const PLANNING_CONTENT_TERMS: &[&str] = &[
+    "plan",
+    "planning",
+    "next step",
+    "next steps",
+    "todo",
+    "todos",
+    "blocker",
+    "blockers",
+    "milestone",
+    "milestones",
+    "scope",
+    "question",
+    "questions",
+    "open question",
+    "open questions",
 ];
 
 /// Parameters resolved for a recall request.
@@ -109,7 +131,7 @@ fn pack_template(mode: &str) -> Result<&'static PackTemplate> {
         .find(|template| template.mode == mode)
         .ok_or_else(|| {
             crate::error::Error::invalid_request(format!(
-                "unknown pack_mode '{mode}'; use default, debugging, or onboarding"
+                "unknown pack_mode '{mode}'; use default, debugging, onboarding, or planning"
             ))
         })
 }
@@ -552,6 +574,33 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
             }
             boost
         }
+        "planning" => {
+            let mut boost = match record.record_type {
+                RecordType::TaskCheckpoint => 2.2,
+                RecordType::Decision => 2.0,
+                RecordType::RepoConvention => 1.8,
+                RecordType::WorkflowPattern => 1.7,
+                RecordType::Command => 0.9,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if PLANNING_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                boost += 1.0;
+            }
+            if content.contains("open question") || content.contains("open questions") {
+                boost += 0.5;
+            }
+            if content.contains("next step") || content.contains("next steps") {
+                boost += 0.5;
+            }
+            if content.contains("blocker") || content.contains("blockers") {
+                boost += 0.25;
+            }
+            boost
+        }
         "onboarding" => {
             let mut boost = match record.record_type {
                 RecordType::RepoConvention => 2.0,
@@ -601,6 +650,36 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
             .any(|needle| content.contains(needle))
             {
                 signals.push("debugging_terms".to_string());
+            }
+            signals
+        }
+        "planning" => {
+            let mut signals = vec!["pack_mode:planning".to_string()];
+            match record.record_type {
+                RecordType::TaskCheckpoint => signals.push("planning_checkpoint".to_string()),
+                RecordType::Decision => signals.push("planning_decision".to_string()),
+                RecordType::RepoConvention => signals.push("planning_repo_convention".to_string()),
+                RecordType::WorkflowPattern => {
+                    signals.push("planning_workflow_pattern".to_string())
+                }
+                RecordType::Command => signals.push("planning_command".to_string()),
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if PLANNING_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                signals.push("planning_terms".to_string());
+            }
+            if content.contains("open question") || content.contains("open questions") {
+                signals.push("planning_open_question".to_string());
+            }
+            if content.contains("next step") || content.contains("next steps") {
+                signals.push("planning_next_step".to_string());
+            }
+            if content.contains("blocker") || content.contains("blockers") {
+                signals.push("planning_blocker".to_string());
             }
             signals
         }

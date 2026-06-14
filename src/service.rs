@@ -2359,9 +2359,9 @@ fn resolve_pack_mode(raw: Option<&str>) -> Result<String> {
         .to_ascii_lowercase()
         .replace('-', "_");
     match mode.as_str() {
-        "default" | "debugging" | "onboarding" => Ok(mode),
+        "default" | "debugging" | "onboarding" | "planning" => Ok(mode),
         _ => Err(Error::invalid_request(format!(
-            "unknown pack_mode '{mode}'; use default, debugging, or onboarding"
+            "unknown pack_mode '{mode}'; use default, debugging, onboarding, or planning"
         ))),
     }
 }
