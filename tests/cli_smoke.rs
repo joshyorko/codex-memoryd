@@ -3427,6 +3427,7 @@ fn readme_keeps_first_run_path_documented() {
         "codex-memoryd sync-local --apply",
         "codex-memoryd conclude --profile personal",
         "codex-memoryd recall --profile personal",
+        "docs/native-codex-memory-migration.md",
         "Fail-open note",
     ] {
         assert!(readme.contains(required), "README missing {required:?}");
