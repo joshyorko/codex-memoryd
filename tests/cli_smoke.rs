@@ -653,6 +653,12 @@ fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
             "-m",
             "Memory-Decision: import commit trailers as evidence episodes",
             "-m",
+            "Memory-Rejected: reject unsupported draft paths",
+            "-m",
+            "Memory-Procedure: run cargo test --test cli_smoke cli_git_import",
+            "-m",
+            "Memory-Scar: avoid stale fixture assumptions",
+            "-m",
             "Memory-Verify: cargo test --test cli_smoke cli_git_import",
         ],
     );
@@ -674,7 +680,20 @@ fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
     assert!(preview.status.success());
     let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(preview_json["mode"], "preview");
-    assert_eq!(preview_json["proposed"], 2);
+    assert_eq!(preview_json["proposed"], 5);
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|episode| episode["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Procedure: ")));
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|episode| episode["summary"].as_str().unwrap().starts_with("Scar: ")));
     assert!(preview_json["episodes"][0]["source_ref"]
         .as_str()
         .unwrap()
@@ -700,11 +719,11 @@ fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
     assert!(first.status.success());
     let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first_json["mode"], "apply");
-    assert_eq!(first_json["proposed"], 2);
-    assert_eq!(first_json["created"], 2);
+    assert_eq!(first_json["proposed"], 5);
+    assert_eq!(first_json["created"], 5);
     assert_eq!(count_table(&db, "subjects"), 1);
-    assert_eq!(count_table(&db, "episodes"), 2);
-    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+    assert_eq!(count_table(&db, "episodes"), 5);
+    assert_eq!(count_table(&db, "evidence_ledger"), 5);
     assert_eq!(count_table(&db, "memory_records"), 0);
 
     let second = bin()
@@ -724,9 +743,9 @@ fn cli_git_import_preview_apply_and_second_apply_are_idempotent() {
     assert!(second.status.success());
     let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second_json["created"], 0);
-    assert_eq!(second_json["skipped"], 2);
-    assert_eq!(count_table(&db, "episodes"), 2);
-    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+    assert_eq!(second_json["skipped"], 5);
+    assert_eq!(count_table(&db, "episodes"), 5);
+    assert_eq!(count_table(&db, "evidence_ledger"), 5);
 }
 
 #[test]
@@ -741,7 +760,7 @@ fn cli_git_import_rejects_secret_trailers_without_leaking_content() {
             "-m",
             "Secret trailer",
             "-m",
-            "Memory-Gotcha: token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "Memory-Procedure: token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
         ],
     );
 
@@ -798,7 +817,8 @@ fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
     let fixture = write_refs_fixture_jsonl(
         &dir,
         "refs-fixture.jsonl",
-        r#"{"kind":"pr","repo":"joshyorko/codex","number":57,"authored_at":"2026-06-12T10:00:00Z","author":"josh","body":"Memory-Decision: keep refs imports file-based\nMemory-Verify: cargo test --test cli_smoke cli_git_import_refs_fixture"}
+        r#"{"kind":"commit","repo":"joshyorko/codex","id":"abc123def","authored_at":"2026-06-12T09:00:00Z","author":"josh","body":"Memory-Procedure: import commit refs fixtures"}
+{"kind":"pr","repo":"joshyorko/codex","number":57,"authored_at":"2026-06-12T10:00:00Z","author":"josh","body":"Memory-Decision: keep refs imports file-based\nMemory-Verify: cargo test --test cli_smoke cli_git_import_refs_fixture"}
 {"kind":"issue","repo":"joshyorko/codex","id":"404","author":"josh","body":"Memory-Gotcha: issue refs stay evidence-only"}
 {"kind":"review_comment","repo":"joshyorko/codex","url":"https://github.com/joshyorko/codex/pull/57#discussion_r2","author":"josh","text":"Memory-Verify: review comments import through refs fixtures"}"#,
     );
@@ -822,7 +842,7 @@ fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
     assert!(preview.status.success());
     let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(preview_json["mode"], "preview");
-    assert_eq!(preview_json["proposed"], 4);
+    assert_eq!(preview_json["proposed"], 5);
     assert!(preview_json["episodes"]
         .as_array()
         .unwrap()
@@ -831,6 +851,11 @@ fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
             .as_str()
             .unwrap()
             .contains("review_comment")));
+    assert!(preview_json["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|episode| episode["source"]["kind"] == "commit"));
     assert!(preview_json["episodes"]
         .as_array()
         .unwrap()
@@ -866,11 +891,11 @@ fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
     assert!(first.status.success());
     let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first_json["mode"], "apply");
-    assert_eq!(first_json["proposed"], 4);
-    assert_eq!(first_json["created"], 4);
+    assert_eq!(first_json["proposed"], 5);
+    assert_eq!(first_json["created"], 5);
     assert_eq!(count_table(&db, "subjects"), 1);
-    assert_eq!(count_table(&db, "episodes"), 4);
-    assert_eq!(count_table(&db, "evidence_ledger"), 4);
+    assert_eq!(count_table(&db, "episodes"), 5);
+    assert_eq!(count_table(&db, "evidence_ledger"), 5);
     assert_eq!(count_table(&db, "memory_records"), 0);
 
     let second = bin()
@@ -892,9 +917,9 @@ fn cli_git_import_refs_fixture_preview_apply_and_second_apply_are_idempotent() {
     assert!(second.status.success());
     let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second_json["created"], 0);
-    assert_eq!(second_json["skipped"], 4);
-    assert_eq!(count_table(&db, "episodes"), 4);
-    assert_eq!(count_table(&db, "evidence_ledger"), 4);
+    assert_eq!(second_json["skipped"], 5);
+    assert_eq!(count_table(&db, "episodes"), 5);
+    assert_eq!(count_table(&db, "evidence_ledger"), 5);
 }
 
 #[test]
