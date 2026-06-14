@@ -1,0 +1,66 @@
+{
+  "category": "allow",
+  "description": "Safe content that previously triggered, or could plausibly trigger, a false positive. Each must pass the write-path gate unmodified.",
+  "cases": [
+    {
+      "name": "gha_id_token_permission",
+      "note": "The dogfood false positive from #138: GitHub Actions permission wording must not match the bare `token` credential rule.",
+      "content": "id-token: write"
+    },
+    {
+      "name": "gha_permissions_block",
+      "note": "A full GitHub Actions permissions block. None of these YAML keys are credential assignments.",
+      "content": "permissions:\n  contents: read\n  id-token: write\n  packages: read"
+    },
+    {
+      "name": "bearer_token_prose",
+      "note": "Documentation that mentions a bearer token without assigning a value.",
+      "content": "Use a bearer token for service-to-service auth and rotate it on a schedule."
+    },
+    {
+      "name": "api_key_rotation_prose",
+      "note": "Operational note about an API key with no value present.",
+      "content": "Rotate the API key every 90 days and store it in the secrets manager, never in the repo."
+    },
+    {
+      "name": "client_secret_policy_prose",
+      "note": "Policy text referencing a client-secret without a value.",
+      "content": "The client-secret rotation policy requires a new credential before the old one expires."
+    },
+    {
+      "name": "password_reset_prose",
+      "note": "Feature description; `password` is a topic word, not an assignment.",
+      "content": "The password reset flow emails a one-time link that expires after fifteen minutes."
+    },
+    {
+      "name": "secret_santa_prose",
+      "note": "The word `secret` in ordinary prose must not be flagged.",
+      "content": "Notes for the team secret santa gift exchange in December."
+    },
+    {
+      "name": "jwt_concept_prose",
+      "note": "Discussing JWTs without embedding an actual token.",
+      "content": "We validate the JWT signature and expiry on every request before trusting the claims."
+    },
+    {
+      "name": "env_var_doc_short",
+      "note": "A short configuration doc with a couple of non-credential env examples (under the dense-dump threshold, no `.env` reference).",
+      "content": "Set DATABASE_URL=postgres://localhost/app for local development and RUST_LOG=debug for verbose tracing."
+    },
+    {
+      "name": "connection_string_no_creds",
+      "note": "A connection string without inline userinfo is not a credential.",
+      "content": "Point the service at postgres://localhost:5432/app and let the pooler manage connections."
+    },
+    {
+      "name": "decision_record_prose",
+      "note": "A normal durable decision record.",
+      "content": "Decision: use bundled SQLite with FTS5 so the daemon has no external service dependency."
+    },
+    {
+      "name": "battle_scar_prose",
+      "note": "A normal gotcha/scar record describing a past failure.",
+      "content": "Gotcha: WAL journal mode must be enabled once on a bootstrap connection or pooled opens race to a locked database."
+    }
+  ]
+}

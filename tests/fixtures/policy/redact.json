@@ -1,0 +1,36 @@
+{
+  "category": "redact",
+  "description": "Content that may be summarized into the evidence ledger only after redaction. `redact_secret_like` must report redacted=true and the output must contain none of the joined `must_not_contain_parts`. Mirrors logs, diffs, docs, OCR/screenshot extracts, and commit trailers. Content and raw values use fragment arrays (joined with no separator at test time) so the committed fixture holds no contiguous secret-shaped literal. All secrets are synthetic.",
+  "cases": [
+    {
+      "name": "log_line_with_openai_key",
+      "content_parts": ["2030-01-01T00:00:00Z INFO startup: using sk-", "abcdefghijklmnop", "qrstuvwxyz0123456789 for embeddings"],
+      "must_not_contain_parts": [["sk-", "abcdefghijklmnop", "qrstuvwxyz0123456789"]]
+    },
+    {
+      "name": "diff_hunk_with_aws_key",
+      "content_parts": ["+  const AWS_KEY = \"AKIA", "IOSFODNN7", "EXAMPLE\";\n-  const AWS_KEY = process.env.AWS_KEY;"],
+      "must_not_contain_parts": [["AKIA", "IOSFODNN7", "EXAMPLE"]]
+    },
+    {
+      "name": "doc_with_github_token",
+      "content_parts": ["To authenticate, export GITHUB_TOKEN=ghp_", "abcdefghijklmnop", "qrstuvwxyz0123456789 and retry."],
+      "must_not_contain_parts": [["ghp_", "abcdefghijklmnop", "qrstuvwxyz0123456789"]]
+    },
+    {
+      "name": "ocr_extract_with_jwt",
+      "content_parts": ["Screenshot OCR: session = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", "eyJzdWIiOiIxMjM0NTY3ODkwIn0.", "dozjgNryP4J3jVmNHl0w5N (expires soon)"],
+      "must_not_contain_parts": [["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", "eyJzdWIiOiIxMjM0NTY3ODkwIn0.", "dozjgNryP4J3jVmNHl0w5N"]]
+    },
+    {
+      "name": "commit_trailer_with_connection_string",
+      "content_parts": ["Memory-Decision: migrated to postgres://admin:", "hunter2placeholder", "@db.internal:5432/app for prod"],
+      "must_not_contain_parts": [["admin:", "hunter2placeholder"]]
+    },
+    {
+      "name": "log_with_slack_token",
+      "content_parts": ["notify failed for xoxb-", "1234567890-", "abcdefghijklmnop: channel archived"],
+      "must_not_contain_parts": [["xoxb-", "1234567890-", "abcdefghijklmnop"]]
+    }
+  ]
+}
