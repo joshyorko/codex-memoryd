@@ -1,0 +1,25 @@
+{
+  "scenario": "owns_depends_on",
+  "description": "Two-hop traversal: Alice owns the billing project, which depends on Stripe. 'What does the project Alice owns depend on?' should return Stripe. Tests whether relation-aware recall answers directly vs. chained recall requiring a manual join.",
+  "profile": "personal",
+  "workspace": "semantic-eval",
+  "subjects": [
+    { "id": "alice", "subject_key": "person:alice", "kind": "person", "display_name": "Alice" },
+    { "id": "billing", "subject_key": "project:billing", "kind": "project", "display_name": "Billing" },
+    { "id": "stripe", "subject_key": "service:stripe", "kind": "concept", "display_name": "Stripe" }
+  ],
+  "aliases": [],
+  "episodes": [
+    { "id": "ep_owns", "subject_id": "alice", "summary": "Alice owns the billing project.", "status": "success" },
+    { "id": "ep_depends", "subject_id": "billing", "summary": "The billing project depends on Stripe for payments.", "status": "success" }
+  ],
+  "relations": [
+    { "from_subject_id": "alice", "relation_type": "owns", "to_subject_id": "billing", "source_episode_ids": ["ep_owns"], "state": "active" },
+    { "from_subject_id": "billing", "relation_type": "depends_on", "to_subject_id": "stripe", "source_episode_ids": ["ep_depends"], "state": "active" }
+  ],
+  "question": "What does the project Alice owns depend on?",
+  "expect": {
+    "chained_recall": { "answerable": true, "note": "agent resolves owns(alice)->billing, then depends_on(billing)->stripe via two recalls" },
+    "relation_aware": { "answerable": true, "answer_subject_ids": ["stripe"], "max_depth": 2 }
+  }
+}

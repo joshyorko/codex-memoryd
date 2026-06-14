@@ -1,0 +1,25 @@
+{
+  "scenario": "works_on_blocked_by",
+  "description": "Two-hop traversal across different relation types: Bob works_on the api project, which is blocked_by the auth-migration. 'Is anything Bob works on blocked?' should return the auth-migration blocker.",
+  "profile": "personal",
+  "workspace": "semantic-eval",
+  "subjects": [
+    { "id": "bob", "subject_key": "person:bob", "kind": "person", "display_name": "Bob" },
+    { "id": "api", "subject_key": "project:api", "kind": "project", "display_name": "API" },
+    { "id": "authmig", "subject_key": "task:auth-migration", "kind": "workflow", "display_name": "Auth migration" }
+  ],
+  "aliases": [],
+  "episodes": [
+    { "id": "ep_works", "subject_id": "bob", "summary": "Bob works on the api project this sprint.", "status": "success" },
+    { "id": "ep_blocked", "subject_id": "api", "summary": "The api project is blocked by the auth-migration.", "status": "success" }
+  ],
+  "relations": [
+    { "from_subject_id": "bob", "relation_type": "works_on", "to_subject_id": "api", "source_episode_ids": ["ep_works"], "state": "active" },
+    { "from_subject_id": "api", "relation_type": "blocked_by", "to_subject_id": "authmig", "source_episode_ids": ["ep_blocked"], "state": "active" }
+  ],
+  "question": "Is anything Bob works on blocked?",
+  "expect": {
+    "chained_recall": { "answerable": true, "note": "agent joins works_on(bob)->api and blocked_by(api)->authmig" },
+    "relation_aware": { "answerable": true, "answer_subject_ids": ["authmig"], "max_depth": 2 }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "scenario": "changed_preference",
+  "description": "Editor indentation preference changed from spaces to tabs. Default recall returns only the current (tabs) preference; as-of before the switch returns spaces.",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "pref_spaces",
+      "content": "Indent with spaces in this workspace.",
+      "type": "preference",
+      "temporal_state": "superseded",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2026-04-01T00:00:00Z",
+      "observed_at": "2026-01-01T00:00:00Z",
+      "superseded_by": "pref_tabs",
+      "historical_reason": "superseded"
+    },
+    {
+      "id": "pref_tabs",
+      "content": "Indent with tabs in this workspace.",
+      "type": "preference",
+      "temporal_state": "current",
+      "valid_from": "2026-04-01T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-04-01T00:00:00Z"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-tabs-only",
+      "as_of": null,
+      "expect_visible": ["pref_tabs"],
+      "expect_withheld_reasons": ["temporal_historical"]
+    },
+    {
+      "name": "as-of-february-spaces",
+      "as_of": "2026-02-15T00:00:00Z",
+      "expect_visible": ["pref_spaces"]
+    },
+    {
+      "name": "as-of-may-tabs",
+      "as_of": "2026-05-01T00:00:00Z",
+      "expect_visible": ["pref_tabs"]
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "scenario": "relative_time_record",
+  "description": "A planned record ('deploy tomorrow') has a valid_from in the future relative to `now`. It must NOT be emitted as current context before its valid_from, but becomes current once the clock reaches it (as-of after valid_from).",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "plan_deploy",
+      "content": "Deploy the temporal migration to the dogfood daemon.",
+      "type": "task_checkpoint",
+      "temporal_state": "planned",
+      "valid_from": "2026-06-15T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-06-14T00:00:00Z"
+    },
+    {
+      "id": "fact_now",
+      "content": "The dogfood daemon binds 127.0.0.1:8787.",
+      "type": "repo_convention",
+      "temporal_state": "current",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-planned-withheld",
+      "as_of": null,
+      "expect_visible": ["fact_now"],
+      "expect_withheld_reasons": ["temporal_planned"]
+    },
+    {
+      "name": "as-of-after-valid-from-planned-now-current",
+      "as_of": "2026-06-16T00:00:00Z",
+      "expect_visible": ["plan_deploy", "fact_now"]
+    }
+  ]
+}

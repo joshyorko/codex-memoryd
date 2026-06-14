@@ -1,0 +1,40 @@
+{
+  "scenario": "contradicted_claim",
+  "description": "An earlier claim 'the integration tests pass' is contradicted by newer trusted evidence 'the integration tests fail'. The newer record invalidates the older current claim; default recall must not emit the invalidated claim as current context.",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "claim_pass",
+      "content": "The integration tests pass on main.",
+      "type": "decision",
+      "temporal_state": "invalidated",
+      "valid_from": "2026-06-01T00:00:00Z",
+      "valid_until": "2026-06-10T00:00:00Z",
+      "observed_at": "2026-06-01T00:00:00Z",
+      "invalidated_at": "2026-06-10T00:00:00Z",
+      "historical_reason": "contradicted"
+    },
+    {
+      "id": "claim_fail",
+      "content": "The integration tests fail on main after the temporal migration.",
+      "type": "decision",
+      "temporal_state": "current",
+      "valid_from": "2026-06-10T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-06-10T00:00:00Z"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-only-current-claim",
+      "as_of": null,
+      "expect_visible": ["claim_fail"],
+      "expect_withheld_reasons": ["temporal_historical"]
+    },
+    {
+      "name": "as-of-june-5-old-claim-was-current",
+      "as_of": "2026-06-05T00:00:00Z",
+      "expect_visible": ["claim_pass"]
+    }
+  ]
+}
