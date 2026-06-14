@@ -818,6 +818,86 @@ fn recall_onboarding_pack_mode_reports_metadata_and_prioritizes_current_state_re
 }
 
 #[test]
+fn recall_planning_pack_mode_reports_metadata_and_prioritizes_planning_records() {
+    let svc = onboarding_service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    for (content, record_type) in [
+        (
+            "Plan: next step is to resolve blockers, confirm milestone scope, and write down the open questions.",
+            RecordType::TaskCheckpoint,
+        ),
+        (
+            "Generic note about a garden fence and spare parts.",
+            RecordType::Other,
+        ),
+    ] {
+        let record = NewRecord {
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Workspace,
+            record_type,
+            content: content.to_string(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: 0.8,
+            source_ids: vec!["test-source".to_string()],
+            content_hash: ids::content_hash(
+                "personal",
+                "ws",
+                None,
+                record_type.as_str(),
+                "workspace",
+                content,
+            ),
+            supersedes: vec![],
+            metadata: serde_json::Value::Null,
+        };
+        svc.store.upsert_record(&record).unwrap();
+    }
+
+    let mut req = recall_req("personal", "ws", "project update");
+    req.pack_mode = Some("planning".to_string());
+    req.max_tokens = Some(2_000);
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "planning");
+    assert_eq!(recall.pack.template, "planning");
+    assert_eq!(recall.pack.template_budget_tokens, 1_300);
+    assert_eq!(recall.pack.max_tokens, 1_300);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:planning".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:planning".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:1300".to_string()));
+    assert_eq!(recall.facts[0].record_type, "task_checkpoint");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"planning_checkpoint".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"planning_terms".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:planning".to_string()));
+    assert_eq!(recall.facts[1].record_type, "other");
+}
+
+#[test]
 fn recall_reports_withheld_policy_diagnostics_without_leaking_content() {
     let svc = service();
     svc.store.ensure_workspace("personal", "ws").unwrap();
