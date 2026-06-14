@@ -193,9 +193,11 @@ withheld content.
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable
 preferences → broad/old memory. Results are packed to `max_tokens`
-(default 1200). Optional `pack_mode` accepts `default` or `debugging`; unknown
-modes return `invalid_request`. Archived and `secret_blocked` records are never
-returned.
+(default 1200). Optional `pack_mode` accepts `default`, `debugging`,
+`onboarding`, `planning`, `active_task`, `review`, and `personal_context`.
+Hyphenated client input such as `active-task` is normalized to `active_task`.
+Unknown modes return `invalid_request`. Archived and `secret_blocked` records
+are never returned.
 
 **Fail-open contract**: if the provider is down or returns an error, Codex must
 proceed with the turn as if recall returned empty. Recall is best-effort and must

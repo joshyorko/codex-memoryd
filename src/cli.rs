@@ -11,6 +11,7 @@ use serde_json::json;
 
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
+use codex_memoryd::conformance;
 use codex_memoryd::domain;
 use codex_memoryd::error;
 use codex_memoryd::error::Result;
@@ -169,6 +170,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AdapterCommand,
     },
+    /// Run local conformance reports.
+    Conformance {
+        #[command(subcommand)]
+        command: ConformanceCommand,
+    },
     /// Archive (default) or delete a memory record by id.
     Forget {
         /// Record id.
@@ -320,6 +326,15 @@ pub enum AdapterCommand {
         #[arg(long)]
         max_bytes: Option<usize>,
         #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConformanceCommand {
+    /// Run the adapter conformance report.
+    Adapters {
+        #[arg(long, default_value = "json")]
         format: String,
     },
 }
@@ -916,6 +931,25 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Conformance { command } => match command {
+            ConformanceCommand::Adapters { format } => {
+                let report = conformance::run_adapter_conformance()?;
+                let format = format.as_str().to_ascii_lowercase();
+                match format.as_str() {
+                    "markdown" => {
+                        print_markdown(&conformance::render_adapter_conformance_markdown(&report))
+                    }
+                    "json" => print_json(&report)?,
+                    _ => {
+                        return Err(error::Error::invalid_request(format!(
+                            "invalid --format '{format}'; expected 'json' or 'markdown'",
+                            format = format
+                        )))
+                    }
+                }
+                Ok(())
+            }
+        },
         Command::Forget {
             id,
             profile,

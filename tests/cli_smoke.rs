@@ -409,6 +409,39 @@ fn cli_recall_accepts_pack_mode_and_rejects_unknown_pack() {
         .iter()
         .any(|signal| signal == "pack_budget:1000"));
 
+    for (mode, normalized, budget) in [
+        ("active-task", "active_task", 900),
+        ("review", "review", 1_100),
+        ("personal-context", "personal_context", 900),
+    ] {
+        let output = bin()
+            .arg("--db")
+            .arg(&db)
+            .args([
+                "recall",
+                "--profile",
+                "personal",
+                "--workspace",
+                "josh-personal",
+                "--query",
+                "sqlite",
+                "--pack-mode",
+                mode,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let recall: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(recall["pack"]["mode"], normalized);
+        assert_eq!(recall["pack"]["template"], normalized);
+        assert_eq!(recall["pack"]["template_budget_tokens"], budget);
+        assert!(recall["policy"]["ranking_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|signal| signal == &format!("pack_mode:{normalized}")));
+    }
+
     bin()
         .arg("--db")
         .arg(&db)
@@ -3004,6 +3037,46 @@ fn cli_adapter_mcp_pack_export_is_deterministic() {
         markdown.len() as u64,
         budgeted["budget"]["rendered_bytes"].as_u64().unwrap()
     );
+}
+
+#[test]
+fn cli_conformance_adapters_report_is_deterministic() {
+    let output = bin()
+        .args(["conformance", "adapters", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let first: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let second = bin()
+        .args(["conformance", "adapters", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first["report"], "adapter_conformance_v1");
+    assert_eq!(first["status"], "passed");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["targets"].as_array().unwrap().len(), 6);
+    assert!(first["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["target"] == "mcp-pack" && target["context_pack"] == true));
+    assert!(first["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|check| check["status"] == "passed"));
+
+    bin()
+        .args(["conformance", "adapters", "--format", "markdown"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Adapter conformance report"))
+        .stdout(predicate::str::contains("`mcp-pack`: passed"));
 }
 
 #[test]

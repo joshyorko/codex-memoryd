@@ -15,6 +15,7 @@
 //! - [`error`] / [`ids`] — error model + identifiers
 
 pub mod config;
+pub mod conformance;
 pub mod domain;
 pub mod dream;
 pub mod error;

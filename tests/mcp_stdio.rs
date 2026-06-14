@@ -108,7 +108,15 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
         .expect("memory_recall tool");
     assert_eq!(
         recall_tool["inputSchema"]["properties"]["packMode"]["enum"],
-        json!(["default", "debugging", "onboarding", "planning"])
+        json!([
+            "default",
+            "debugging",
+            "onboarding",
+            "planning",
+            "active_task",
+            "review",
+            "personal_context"
+        ])
     );
 
     assert_eq!(
