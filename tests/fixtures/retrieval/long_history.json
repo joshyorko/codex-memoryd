@@ -178,7 +178,7 @@
       "related_files": ["docs/release/v0.1-hardening.md"],
       "tags": ["release", "evidence"],
       "source_ids": ["turn:multihop-evidence"],
-      "subject_key": "project_lighthouse",
+      "subject_key": "project_blue_harbor",
       "episode_key": "release_quality"
     },
     {
@@ -252,6 +252,23 @@
       "episode_key": "chat"
     }
   ],
+  "aliases": [
+    {
+      "alias_key": "lighthouse",
+      "subject_key": "project_lighthouse",
+      "source_record_ids": ["lh_multihop_project"]
+    }
+  ],
+  "relations": [
+    {
+      "from_subject_key": "project_lighthouse",
+      "relation_type": "uses",
+      "to_subject_key": "project_blue_harbor",
+      "source_record_ids": ["lh_multihop_project"],
+      "source_evidence": "fixture:lh_multihop_project",
+      "state": "active"
+    }
+  ],
   "questions": [
     {
       "id": "q_single_command",
@@ -320,7 +337,7 @@
       "pack_mode": "review",
       "expected_record_ids": ["lh_multihop_project", "lh_multihop_evidence"],
       "answer_markers": ["Project Lighthouse uses codename Blue Harbor", "docs/release/v0.1-hardening.md"],
-      "subject_key": "project_lighthouse",
+      "subject_key": "lighthouse",
       "episode_key": "release_quality"
     },
     {

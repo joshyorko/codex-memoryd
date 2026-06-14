@@ -312,6 +312,47 @@ pub struct Episode {
     pub metadata: Value,
 }
 
+/// Deterministic alias pointer to a canonical subject inside one scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectAlias {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub subject_id: String,
+    pub alias_key: String,
+    pub source_evidence: String,
+    pub created_at: String,
+    pub metadata: Value,
+}
+
+/// Evidence-backed relation between scoped subjects. Relations inform recall
+/// expansion only; they are not authoritative facts by themselves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Relation {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub from_subject_id: String,
+    pub relation_type: String,
+    pub to_subject_id: String,
+    pub confidence: f64,
+    pub state: String,
+    pub source_episode_ids: Vec<String>,
+    pub source_evidence: Option<String>,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub metadata: Value,
+}
+
+/// Bounded relation traversal result used by relation-aware recall experiments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelationExpansion {
+    pub subject_id: String,
+    pub depth: usize,
+    pub via_relation_ids: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
 /// Reviewable reusable procedure derived from repeated successful experience.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Procedure {
