@@ -166,6 +166,33 @@ struct Scored {
     ranking_signals: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallDenyReason {
+    Quarantined,
+    HighRisk,
+    Unsafe,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RecallPolicyWithheldCounts {
+    quarantined: usize,
+    high_risk: usize,
+    unsafe_record: usize,
+    superseded: usize,
+}
+
+impl RecallPolicyWithheldCounts {
+    fn increment(&mut self, reason: RecallDenyReason) {
+        match reason {
+            RecallDenyReason::Quarantined => self.quarantined += 1,
+            RecallDenyReason::HighRisk => self.high_risk += 1,
+            RecallDenyReason::Unsafe => self.unsafe_record += 1,
+            RecallDenyReason::Superseded => self.superseded += 1,
+        }
+    }
+}
+
 fn dedupe_ordered_signals(signals: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -200,6 +227,7 @@ fn build_withheld(
     secret_blocked: usize,
     type_filtered: usize,
     pack_withheld: usize,
+    policy_withheld: &RecallPolicyWithheldCounts,
 ) -> Vec<RecallWithheld> {
     let mut withheld = Vec::new();
     if archived > 0 {
@@ -221,6 +249,34 @@ fn build_withheld(
             reason: "type_filtered".to_string(),
             count: type_filtered,
             gates: vec!["include_exclude_types".to_string()],
+        });
+    }
+    if policy_withheld.quarantined > 0 {
+        withheld.push(RecallWithheld {
+            reason: "policy_quarantined".to_string(),
+            count: policy_withheld.quarantined,
+            gates: vec!["admission_policy".to_string(), "quarantine".to_string()],
+        });
+    }
+    if policy_withheld.high_risk > 0 {
+        withheld.push(RecallWithheld {
+            reason: "policy_high_risk".to_string(),
+            count: policy_withheld.high_risk,
+            gates: vec!["admission_policy".to_string(), "source_risk".to_string()],
+        });
+    }
+    if policy_withheld.unsafe_record > 0 {
+        withheld.push(RecallWithheld {
+            reason: "policy_unsafe".to_string(),
+            count: policy_withheld.unsafe_record,
+            gates: vec!["admission_policy".to_string(), "unsafe".to_string()],
+        });
+    }
+    if policy_withheld.superseded > 0 {
+        withheld.push(RecallWithheld {
+            reason: "policy_superseded".to_string(),
+            count: policy_withheld.superseded,
+            gates: vec!["admission_policy".to_string(), "supersession".to_string()],
         });
     }
     if pack_withheld > 0 {
@@ -268,9 +324,14 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
 
     let repo_id = params.repo.map(|r| r.repo_id.as_str());
     let mut type_filtered = 0usize;
+    let mut policy_withheld = RecallPolicyWithheldCounts::default();
     let mut scored: Vec<Scored> = candidates
         .into_iter()
         .filter_map(|record| {
+            if let Some(reason) = default_recall_deny_reason(&record) {
+                policy_withheld.increment(reason);
+                return None;
+            }
             if !type_allowed(
                 record.record_type,
                 params.include_types,
@@ -400,6 +461,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         recall_omissions.secret_blocked,
         type_filtered,
         pack_withheld,
+        &policy_withheld,
     );
 
     // Recent checkpoints (repo-scoped first).
@@ -443,6 +505,40 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             truncated,
         },
     })
+}
+
+fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason> {
+    let metadata = &record.metadata;
+    let state = metadata_string(metadata, "state")
+        .or_else(|| metadata_string(metadata, "candidate_state"))
+        .or_else(|| metadata_string(metadata, "policy_outcome"))
+        .or_else(|| metadata_string(metadata, "admission"));
+    let state = state.as_deref().map(normalized_policy_value);
+
+    match state.as_deref() {
+        Some("quarantined") | Some("quarantine") => Some(RecallDenyReason::Quarantined),
+        Some("unsafe") | Some("rejected") | Some("reject") | Some("blocked") => {
+            Some(RecallDenyReason::Unsafe)
+        }
+        Some("superseded") => Some(RecallDenyReason::Superseded),
+        _ => metadata_string(metadata, "source_risk")
+            .map(|value| normalized_policy_value(&value))
+            .and_then(|risk| match risk.as_str() {
+                "high" | "unsafe" | "blocked" => Some(RecallDenyReason::HighRisk),
+                _ => None,
+            }),
+    }
+}
+
+fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn normalized_policy_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {

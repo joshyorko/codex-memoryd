@@ -78,6 +78,44 @@ fn insert_scoped_record(
     id
 }
 
+fn insert_record_with_metadata(
+    store: &Store,
+    content: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let rec = NewRecord {
+        profile_id: "personal".to_string(),
+        workspace_id: "ws".to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type: RecordType::Other,
+        content: content.to_string(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::Portable,
+        confidence: 0.8,
+        source_ids: vec![],
+        content_hash: ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            RecordType::Other.as_str(),
+            "workspace",
+            content,
+        ),
+        supersedes: vec![],
+        metadata,
+    };
+    store
+        .upsert_record(&rec)
+        .expect("insert record")
+        .id()
+        .to_string()
+}
+
 #[test]
 fn recall_ignores_secret_blocked_records() {
     let store = store();
@@ -114,6 +152,144 @@ fn recall_ignores_secret_blocked_records() {
         .as_deref()
         .unwrap_or("")
         .contains("1 relevant memory record"));
+}
+
+#[test]
+fn recall_withholds_quarantined_high_risk_unsafe_and_superseded_metadata_by_default() {
+    let store = store();
+    let visible_id = insert_record_with_metadata(
+        &store,
+        "visible safe recall note",
+        serde_json::json!({"origin": "conclusion"}),
+    );
+    insert_record_with_metadata(
+        &store,
+        "poison quarantined recall note",
+        serde_json::json!({"candidate_state": "quarantined"}),
+    );
+    insert_record_with_metadata(
+        &store,
+        "poison high risk recall note",
+        serde_json::json!({"source_risk": "high"}),
+    );
+    insert_record_with_metadata(
+        &store,
+        "poison unsafe recall note",
+        serde_json::json!({"admission": "unsafe"}),
+    );
+    insert_record_with_metadata(
+        &store,
+        "poison superseded recall note",
+        serde_json::json!({"state": "superseded"}),
+    );
+
+    let params = RecallParams {
+        profile: Profile::Personal,
+        workspace: "ws",
+        repo: None,
+        query: "recall note",
+        files: &[],
+        max_tokens: 1000,
+        pack_mode: "default",
+        include_types: &[],
+        exclude_types: &[],
+        recency_days: None,
+    };
+
+    let resp = recall::recall(&store, &params).expect("recall");
+    assert_eq!(resp.authority, "recall_not_authority");
+    assert_eq!(resp.facts.len(), 1);
+    assert_eq!(resp.facts[0].id, visible_id);
+    assert!(resp
+        .facts
+        .iter()
+        .all(|fact| !fact.content.contains("poison")));
+    assert!(resp
+        .withheld
+        .iter()
+        .any(|withheld| { withheld.reason == "policy_quarantined" && withheld.count == 1 }));
+    assert!(resp
+        .withheld
+        .iter()
+        .any(|withheld| { withheld.reason == "policy_high_risk" && withheld.count == 1 }));
+    assert!(resp
+        .withheld
+        .iter()
+        .any(|withheld| { withheld.reason == "policy_unsafe" && withheld.count == 1 }));
+    assert!(resp
+        .withheld
+        .iter()
+        .any(|withheld| { withheld.reason == "policy_superseded" && withheld.count == 1 }));
+}
+
+#[test]
+fn recall_cross_profile_bleed_remains_default_deny() {
+    let store = store();
+    store
+        .ensure_workspace("work", "ws")
+        .expect("work workspace");
+    insert_scoped_record(
+        &store,
+        "work",
+        "ws",
+        None,
+        "same query work-only recall note",
+        Sensitivity::WorkConfidential,
+        false,
+    );
+    let personal_id = insert_record(
+        &store,
+        "same query personal recall note",
+        Sensitivity::Personal,
+        false,
+    );
+
+    let params = RecallParams {
+        profile: Profile::Personal,
+        workspace: "ws",
+        repo: None,
+        query: "same query recall note",
+        files: &[],
+        max_tokens: 1000,
+        pack_mode: "default",
+        include_types: &[],
+        exclude_types: &[],
+        recency_days: None,
+    };
+
+    let resp = recall::recall(&store, &params).expect("recall");
+    assert_eq!(resp.facts.len(), 1);
+    assert_eq!(resp.facts[0].id, personal_id);
+    assert!(!resp.facts[0].content.contains("work-only"));
+}
+
+#[test]
+fn recall_allows_legacy_metadata_without_admission_markers() {
+    let store = store();
+    let id = insert_record_with_metadata(
+        &store,
+        "legacy metadata recall note",
+        serde_json::json!({"origin": "sync_local", "local_path": "memory/MEMORY.md"}),
+    );
+
+    let params = RecallParams {
+        profile: Profile::Personal,
+        workspace: "ws",
+        repo: None,
+        query: "legacy metadata",
+        files: &[],
+        max_tokens: 1000,
+        pack_mode: "default",
+        include_types: &[],
+        exclude_types: &[],
+        recency_days: None,
+    };
+
+    let resp = recall::recall(&store, &params).expect("recall");
+    assert_eq!(resp.authority, "recall_not_authority");
+    assert_eq!(resp.policy.authority, "recall_not_authority");
+    assert_eq!(resp.facts.len(), 1);
+    assert_eq!(resp.facts[0].id, id);
 }
 
 #[test]

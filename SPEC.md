@@ -581,6 +581,13 @@ Recall behavior:
 - Provider MUST respect `max_tokens` or an implementation-defined default budget.
 - Provider MUST NOT return archived records by default.
 - Provider MUST NOT return `secret_blocked` records.
+- Provider MUST NOT return records marked by admission metadata as quarantined,
+  high-risk, unsafe, rejected, blocked, or superseded by default.
+- Provider MUST keep cross-profile recall default-deny. A recall request for one
+  profile MUST NOT return records from another profile unless a future explicit
+  policy adds a reviewed exception.
+- Provider SHOULD report deterministic withheld counts and gate names without
+  exposing raw withheld content.
 
 ### 6.3 `POST /v1/search`
 
@@ -1136,6 +1143,11 @@ Memory records SHOULD have `updated_at` and `last_used_at`.
 Recall responses SHOULD indicate stale or old records when relevant.
 
 Drift-prone facts SHOULD be verified by Codex against the current repository when cheap.
+
+Stale active records MAY be admitted with stale/deprioritized metadata so the
+caller can verify them. Superseded records SHOULD be archived or marked
+`superseded`; default recall MUST withhold them and explain the omission through
+withheld policy metadata.
 
 ## 9. Writeback Semantics
 
