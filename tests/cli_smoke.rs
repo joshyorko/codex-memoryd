@@ -253,13 +253,44 @@ fn write_refs_fixture_jsonl(dir: &TempDir, name: &str, content: &str) -> PathBuf
 #[test]
 fn cli_doctor_reports_ok() {
     let dir = TempDir::new().unwrap();
+    // Default (summary) output names the substrate and reports writable storage.
     bin()
         .arg("--db")
         .arg(db_path(&dir))
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"storage_writable\": true"));
+        .stdout(predicate::str::contains("codex-memoryd doctor"))
+        .stdout(predicate::str::contains("writable=true"));
+}
+
+#[test]
+fn cli_doctor_json_has_all_sections() {
+    let dir = TempDir::new().unwrap();
+    let assert = bin()
+        .arg("--db")
+        .arg(db_path(&dir))
+        .arg("doctor")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout);
+    let v: Value = serde_json::from_str(&out).expect("doctor json");
+    for section in [
+        "storage",
+        "schema",
+        "backup",
+        "policy_corpus",
+        "mcp",
+        "quarantine",
+        "procedures",
+        "adapters",
+    ] {
+        assert!(v.get(section).is_some(), "doctor json missing '{section}'");
+    }
+    assert_eq!(v["storage"]["writable"], serde_json::json!(true));
+    assert_eq!(v["mcp"]["read_only_tools"].as_array().unwrap().len(), 3);
 }
 
 #[test]

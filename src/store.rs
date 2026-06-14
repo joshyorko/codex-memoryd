@@ -33,7 +33,7 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 6;
+pub const STORAGE_SCHEMA_VERSION: i64 = 7;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -42,6 +42,8 @@ const MIGRATION_EVIDENCE_LEDGER: &str = include_str!("../migrations/0004_evidenc
 const MIGRATION_SUBJECTS_EPISODES: &str = include_str!("../migrations/0005_subjects_episodes.sql");
 const MIGRATION_TRUST_QUARANTINE: &str = include_str!("../migrations/0006_trust_quarantine.sql");
 const MIGRATION_PROCEDURES: &str = include_str!("../migrations/0007_procedures.sql");
+const MIGRATION_PROCEDURE_LIFECYCLE: &str =
+    include_str!("../migrations/0008_procedure_lifecycle.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -323,6 +325,8 @@ impl Store {
         conn.execute_batch(MIGRATION_TRUST_QUARANTINE)?;
         ensure_trust_columns(&conn)?;
         conn.execute_batch(MIGRATION_PROCEDURES)?;
+        conn.execute_batch(MIGRATION_PROCEDURE_LIFECYCLE)?;
+        ensure_procedure_lifecycle_columns(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -358,6 +362,33 @@ impl Store {
             return false;
         };
         conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok()
+    }
+
+    /// Run SQLite's `PRAGMA integrity_check` and report whether the database is
+    /// structurally sound. Used by the backup/restore workflow and `doctor`.
+    pub fn integrity_ok(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        let result: String = conn.query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))?;
+        Ok(result.eq_ignore_ascii_case("ok"))
+    }
+
+    /// Produce a self-contained backup of this database at `dest` using SQLite's
+    /// online backup API. The backup checkpoints WAL content into the
+    /// destination file, so the result is consistent without copying `-wal`
+    /// sidecars. The source database is not mutated.
+    pub fn online_backup_to(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Error::storage(format!("create backup dir {}: {e}", parent.display()))
+                })?;
+            }
+        }
+        let conn = self.conn()?;
+        conn.backup(rusqlite::DatabaseName::Main, dest, None)
+            .map_err(|e| Error::storage(format!("online backup to {}: {e}", dest.display())))?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -674,9 +705,11 @@ impl Store {
             "INSERT OR IGNORE INTO procedures(
                 id, profile_id, workspace_id, subject_id, repo_id, name, activation_query,
                 steps, guardrails, termination_condition, source_episode_ids, confidence,
-                state, created_at, retired_at, metadata
+                state, created_at, retired_at, version, first_seen, last_validated,
+                superseded_by, counter_evidence_count, negative_examples, metadata
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 procedure.id,
                 procedure.profile_id,
@@ -694,6 +727,13 @@ impl Store {
                 procedure.state,
                 procedure.created_at,
                 procedure.retired_at,
+                procedure.version,
+                procedure.first_seen,
+                procedure.last_validated,
+                procedure.superseded_by,
+                procedure.counter_evidence_count,
+                serde_json::to_string(&procedure.negative_examples)
+                    .unwrap_or_else(|_| "[]".to_string()),
                 serde_json::to_string(&procedure.metadata).unwrap_or_else(|_| "{}".to_string())
             ],
         )?;
@@ -702,13 +742,13 @@ impl Store {
         } else {
             let existing = conn
                 .query_row(
-                    "SELECT id, profile_id, workspace_id, subject_id, repo_id, name,
-                            activation_query, steps, guardrails, termination_condition,
-                            source_episode_ids, confidence, state, created_at, retired_at, metadata
+                    &format!(
+                        "SELECT {PROCEDURE_COLS}
                      FROM procedures
                      WHERE profile_id = ?1 AND workspace_id = ?2
                        AND ((subject_id IS NULL AND ?3 IS NULL) OR subject_id = ?3)
-                       AND activation_query = ?4 AND steps = ?5 AND retired_at IS NULL",
+                       AND activation_query = ?4 AND steps = ?5 AND retired_at IS NULL"
+                    ),
                     params![
                         procedure.profile_id,
                         procedure.workspace_id,
@@ -740,19 +780,19 @@ impl Store {
             .filter(|q| !q.is_empty())
             .map(|q| format!("%{q}%"));
         let include_retired = if include_retired { 1 } else { 0 };
-        let mut stmt = conn.prepare(
-            "SELECT id, profile_id, workspace_id, subject_id, repo_id, name,
-                    activation_query, steps, guardrails, termination_condition,
-                    source_episode_ids, confidence, state, created_at, retired_at, metadata
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROCEDURE_COLS}
              FROM procedures
              WHERE profile_id = ?1 AND workspace_id = ?2
                AND (?3 IS NULL OR subject_id = ?3)
-               AND (?4 = 1 OR (state != 'retired' AND retired_at IS NULL))
+               AND (?4 = 1 OR (state NOT IN ('retired','superseded','quarantined')
+                               AND retired_at IS NULL))
                AND (?5 IS NULL OR lower(name) LIKE lower(?5)
                     OR lower(activation_query) LIKE lower(?5)
                     OR lower(steps) LIKE lower(?5))
-             ORDER BY confidence DESC, created_at DESC, id DESC LIMIT ?6",
-        )?;
+             ORDER BY (state = 'active') DESC, confidence DESC,
+                      last_validated DESC, created_at DESC, id DESC LIMIT ?6"
+        ))?;
         let rows = stmt
             .query_map(
                 params![
@@ -767,6 +807,148 @@ impl Store {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Fetch a single procedure by id within scope.
+    pub fn get_procedure(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+    ) -> Result<Option<Procedure>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {PROCEDURE_COLS} FROM procedures
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3"
+                ),
+                params![profile_id, workspace_id, id],
+                row_to_procedure,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Transition a procedure to the `retired` state (issue #146). Historical
+    /// procedures remain inspectable but drop out of default recall. Returns the
+    /// updated procedure, or `None` if it is not found in scope.
+    pub fn retire_procedure(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+        now: &str,
+    ) -> Result<Option<Procedure>> {
+        {
+            let conn = self.conn()?;
+            conn.execute(
+                "UPDATE procedures
+                    SET state = 'retired', retired_at = ?4
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3
+                    AND state != 'retired'",
+                params![profile_id, workspace_id, id, now],
+            )?;
+        }
+        // Connection is released above before the follow-up read (the in-memory
+        // pool has a single connection).
+        self.get_procedure(profile_id, workspace_id, id)
+    }
+
+    /// Supersede `old_id` with `new_id` (issue #146). The old procedure is
+    /// marked `superseded`, links to the successor, and the successor's version
+    /// is bumped past the old one. Both must already exist in scope.
+    pub fn supersede_procedure(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        old_id: &str,
+        new_id: &str,
+        now: &str,
+    ) -> Result<Option<Procedure>> {
+        {
+            let mut conn = self.conn()?;
+            let tx = conn.transaction()?;
+            let old_version: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM procedures
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                    params![profile_id, workspace_id, old_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(old_version) = old_version else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE procedures
+                    SET state = 'superseded', retired_at = ?4, superseded_by = ?5
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                params![profile_id, workspace_id, old_id, now, new_id],
+            )?;
+            tx.execute(
+                "UPDATE procedures
+                    SET version = ?4, last_validated = ?5
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                params![profile_id, workspace_id, new_id, old_version + 1, now],
+            )?;
+            tx.commit()?;
+        }
+        self.get_procedure(profile_id, workspace_id, new_id)
+    }
+
+    /// Record counter-evidence (failed reuse / contradiction) against a
+    /// procedure (issue #146). Increments the counter; once it reaches
+    /// `quarantine_threshold`, the procedure is quarantined out of recall.
+    /// Returns the updated procedure.
+    pub fn record_procedure_counter_evidence(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+        quarantine_threshold: i64,
+        now: &str,
+    ) -> Result<Option<Procedure>> {
+        {
+            let conn = self.conn()?;
+            let changed = conn.execute(
+                "UPDATE procedures
+                    SET counter_evidence_count = counter_evidence_count + 1
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                params![profile_id, workspace_id, id],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            conn.execute(
+                "UPDATE procedures
+                    SET state = 'quarantined', retired_at = ?4
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3
+                    AND counter_evidence_count >= ?5
+                    AND state NOT IN ('retired','superseded')",
+                params![profile_id, workspace_id, id, now, quarantine_threshold],
+            )?;
+        }
+        self.get_procedure(profile_id, workspace_id, id)
+    }
+
+    /// Mark a procedure validated now (successful reuse / eval pass).
+    pub fn validate_procedure(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+        now: &str,
+    ) -> Result<Option<Procedure>> {
+        {
+            let conn = self.conn()?;
+            conn.execute(
+                "UPDATE procedures SET last_validated = ?4
+                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                params![profile_id, workspace_id, id, now],
+            )?;
+        }
+        self.get_procedure(profile_id, workspace_id, id)
     }
 
     pub fn find_episode_by_source(
@@ -2269,6 +2451,130 @@ impl Store {
         )?;
         Ok(n)
     }
+
+    /// Count records currently in the quarantine state across all profiles.
+    /// Content-free aggregate for diagnostics.
+    pub fn count_quarantined_records(&self) -> Result<i64> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_records WHERE trust_state = 'quarantined'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Count procedures grouped by lifecycle state (active, retired, …).
+    /// Returns pairs sorted by state for stable diagnostics output.
+    pub fn count_procedures_by_state(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT state, COUNT(*) FROM procedures GROUP BY state ORDER BY state")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Count rows in a table; returns 0 if the table does not exist (e.g. an
+    /// older schema generation before that table was introduced). Used by the
+    /// schema report and the upgrade-safety matrix.
+    pub fn count_table_rows(&self, table: &str) -> Result<i64> {
+        if !is_safe_identifier(table) {
+            return Err(Error::invalid_request(format!(
+                "invalid table identifier '{table}'"
+            )));
+        }
+        let conn = self.conn()?;
+        let exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1")?
+            .exists(params![table])?;
+        if !exists {
+            return Ok(0);
+        }
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Machine-readable schema/storage report: the recorded schema version, the
+    /// compiled `STORAGE_SCHEMA_VERSION`, whether they match, and row counts for
+    /// the durable tables. Diagnostics never include stored content — only
+    /// counts and structural facts — so this is safe to print and snapshot.
+    pub fn schema_report(&self) -> Result<SchemaReport> {
+        let conn = self.conn()?;
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let recorded_version = recorded.as_deref().and_then(|v| v.parse::<i64>().ok());
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+        let mut tables = Vec::new();
+        for table in DURABLE_TABLES {
+            tables.push(TableCount {
+                table,
+                rows: self.count_table_rows(table)?,
+            });
+        }
+
+        Ok(SchemaReport {
+            recorded_version,
+            user_version,
+            expected_version: STORAGE_SCHEMA_VERSION,
+            up_to_date: recorded_version == Some(STORAGE_SCHEMA_VERSION),
+            fts_enabled: self.fts_enabled,
+            tables,
+        })
+    }
+}
+
+/// The durable tables tracked by the schema report and upgrade-safety matrix.
+/// Order is stable so the report is snapshot-friendly.
+pub const DURABLE_TABLES: &[&str] = &[
+    "memory_records",
+    "conclusions",
+    "checkpoints",
+    "subjects",
+    "episodes",
+    "evidence_ledger",
+    "procedures",
+    "memory_sources",
+    "dream_runs",
+    "policy_events",
+];
+
+/// A table name and its row count.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableCount {
+    pub table: &'static str,
+    pub rows: i64,
+}
+
+/// Structured schema/storage diagnostics. Content-free: counts and structural
+/// facts only, safe to print and snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaReport {
+    /// Version recorded in `schema_meta` (None on a pre-meta-table DB).
+    pub recorded_version: Option<i64>,
+    /// SQLite `PRAGMA user_version`.
+    pub user_version: i64,
+    /// The version this binary writes (`STORAGE_SCHEMA_VERSION`).
+    pub expected_version: i64,
+    /// True when the recorded version matches the expected version.
+    pub up_to_date: bool,
+    /// Whether FTS5 search is active (vs. the LIKE fallback).
+    pub fts_enabled: bool,
+    /// Row counts for the durable tables.
+    pub tables: Vec<TableCount>,
+}
+
+/// Conservative SQLite identifier guard for the few places we interpolate a
+/// table name into SQL (no bound-parameter form exists for identifiers).
+fn is_safe_identifier(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
@@ -2353,6 +2659,39 @@ fn ensure_trust_columns(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_evidence_ledger_trust_state
          ON evidence_ledger(trust_state)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Back-fill procedure lifecycle columns (issue #146): versioning, validation
+/// timestamps, supersession links, counter-evidence counters, and negative
+/// activation examples. Idempotent; runs on every open.
+fn ensure_procedure_lifecycle_columns(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "procedures", "version", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "procedures", "first_seen", "TEXT")?;
+    ensure_column(conn, "procedures", "last_validated", "TEXT")?;
+    ensure_column(conn, "procedures", "superseded_by", "TEXT")?;
+    ensure_column(
+        conn,
+        "procedures",
+        "counter_evidence_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "procedures",
+        "negative_examples",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_procedures_superseded_by
+         ON procedures(superseded_by)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_procedures_last_validated
+         ON procedures(profile_id, workspace_id, last_validated)",
         [],
     )?;
     Ok(())
@@ -2446,6 +2785,7 @@ const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
 const EPISODE_COLS: &str =
     "id, profile_id, workspace_id, subject_id, source_kind, source_ref, started_at, ended_at, status, summary, trust_level, source_metadata, created_at, updated_at, metadata";
+const PROCEDURE_COLS: &str = "id, profile_id, workspace_id, subject_id, repo_id, name, activation_query, steps, guardrails, termination_condition, source_episode_ids, confidence, state, created_at, retired_at, version, first_seen, last_validated, superseded_by, counter_evidence_count, negative_examples, metadata";
 
 fn record_cols_prefixed(prefix: &str) -> String {
     RECORD_COLS
@@ -2700,7 +3040,13 @@ fn row_to_procedure(row: &Row) -> rusqlite::Result<Procedure> {
         state: row.get(12)?,
         created_at: row.get(13)?,
         retired_at: row.get(14)?,
-        metadata: json_value(&row.get::<_, String>(15)?),
+        version: row.get(15)?,
+        first_seen: row.get(16)?,
+        last_validated: row.get(17)?,
+        superseded_by: row.get(18)?,
+        counter_evidence_count: row.get(19)?,
+        negative_examples: json_str_list(&row.get::<_, String>(20)?),
+        metadata: json_value(&row.get::<_, String>(21)?),
     })
 }
 

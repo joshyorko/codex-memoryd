@@ -108,6 +108,11 @@ pub enum Command {
         #[command(subcommand)]
         command: EpisodeCommand,
     },
+    /// Preview, apply, recall, or manage the lifecycle of procedures.
+    Procedure {
+        #[command(subcommand)]
+        command: ProcedureCommand,
+    },
     /// Import local Codex memory from a directory (provider local-ingest mode).
     SyncLocal {
         /// Preview only (no durable writes).
@@ -193,8 +198,17 @@ pub enum Command {
         #[command(subcommand)]
         command: QuarantineCommand,
     },
-    /// Run self-checks (storage writable, FTS5, schema).
-    Doctor,
+    /// Run self-checks across storage, schema, backup, policy, MCP, quarantine,
+    /// procedures, and adapters.
+    Doctor {
+        #[arg(long, default_value = "summary")]
+        format: String,
+    },
+    /// Back up, verify, or restore the durable store.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Run deterministic eval suites.
     Eval {
         #[command(subcommand)]
@@ -245,9 +259,114 @@ pub enum McpCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ProcedureCommand {
+    /// Preview procedure candidates derived from successful episodes.
+    Preview {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        subject_id: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Recall active procedures, applying activation matching with abstention.
+    Recall {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        subject_id: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include retired/superseded/quarantined procedures.
+        #[arg(long)]
+        include_retired: bool,
+    },
+    /// Retire a procedure (drops out of default recall, stays inspectable).
+    Retire {
+        id: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Supersede one procedure with another (lifecycle transition).
+    Supersede {
+        /// The procedure being replaced.
+        #[arg(long)]
+        old_id: String,
+        /// The replacement procedure.
+        #[arg(long)]
+        new_id: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Record counter-evidence (failed reuse) against a procedure.
+    CounterEvidence {
+        id: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Counter-evidence count at which the procedure is quarantined.
+        #[arg(long, default_value_t = 2)]
+        quarantine_threshold: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupCommand {
+    /// Create a verified backup of the durable store plus a manifest.
+    Create {
+        /// Destination database path (a `.manifest.json` is written beside it).
+        #[arg(long, value_name = "FILE")]
+        dest: PathBuf,
+    },
+    /// Verify a backup database against its manifest (digest, integrity, schema).
+    Verify {
+        /// Backup database path (its manifest must sit beside it).
+        #[arg(long, value_name = "FILE")]
+        path: PathBuf,
+    },
+    /// Preview what restoring a backup over the target store would change.
+    RestorePreview {
+        /// Backup database path to restore from.
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Restore target (defaults to the configured storage path).
+        #[arg(long, value_name = "FILE")]
+        target: Option<PathBuf>,
+    },
+    /// Apply a restore after re-verifying the backup (takes a safety copy).
+    RestoreApply {
+        /// Backup database path to restore from.
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Restore target (defaults to the configured storage path).
+        #[arg(long, value_name = "FILE")]
+        target: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum EvalCommand {
     /// Run the agent-agnostic substrate eval suite.
     Substrate {
+        #[arg(long, default_value = "summary")]
+        format: String,
+        /// Also run deterministic local baselines and emit a comparison.
+        #[arg(long)]
+        compare: bool,
+    },
+    /// Run the procedure-focused eval suite (activation, lifecycle, evidence).
+    Procedures {
         #[arg(long, default_value = "summary")]
         format: String,
     },
@@ -826,6 +945,81 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Procedure { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                ProcedureCommand::Preview {
+                    profile,
+                    workspace,
+                    subject_id,
+                    limit,
+                } => {
+                    let resp = service.procedures_preview(ProceduresPreviewRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        subject_id: subject_id.clone(),
+                        limit: *limit,
+                    })?;
+                    print_json(&resp)?;
+                }
+                ProcedureCommand::Recall {
+                    profile,
+                    workspace,
+                    query,
+                    subject_id,
+                    limit,
+                    include_retired,
+                } => {
+                    let resp = service.procedures_recall(ProceduresRecallRequest {
+                        profile: profile.clone(),
+                        workspace: workspace.clone(),
+                        query: query.clone(),
+                        subject_id: subject_id.clone(),
+                        limit: *limit,
+                        include_retired: *include_retired,
+                    })?;
+                    print_json(&resp)?;
+                }
+                ProcedureCommand::Retire {
+                    id,
+                    profile,
+                    workspace,
+                } => {
+                    let resp =
+                        service.procedure_retire(profile.as_deref(), workspace.as_deref(), id)?;
+                    print_json(&resp)?;
+                }
+                ProcedureCommand::Supersede {
+                    old_id,
+                    new_id,
+                    profile,
+                    workspace,
+                } => {
+                    let resp = service.procedure_supersede(
+                        profile.as_deref(),
+                        workspace.as_deref(),
+                        old_id,
+                        new_id,
+                    )?;
+                    print_json(&resp)?;
+                }
+                ProcedureCommand::CounterEvidence {
+                    id,
+                    profile,
+                    workspace,
+                    quarantine_threshold,
+                } => {
+                    let resp = service.procedure_counter_evidence(
+                        profile.as_deref(),
+                        workspace.as_deref(),
+                        id,
+                        *quarantine_threshold,
+                    )?;
+                    print_json(&resp)?;
+                }
+            }
+            Ok(())
+        }
         Command::SyncLocal {
             preview,
             apply,
@@ -1052,33 +1246,102 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Doctor => {
+        Command::Doctor { format } => {
             let service = cli.open_service(None)?;
-            let status = service.status()?;
-            let report = json!({
-                "storage_writable": status.storage.writable,
-                "storage_path": status.storage.path,
-                "fts5": status.features.get("fts5"),
-                "dream_scheduler": status.features.get("dream_scheduler"),
-                "schema_version": status.storage_schema_version,
-                "status": status.status,
-                "degraded_reasons": status.degraded_reasons,
-                "last_dream": status.last_dream,
-                "record_count": service.store.count_records().unwrap_or(-1),
-            });
-            print_json(&report)?;
-            if !status.storage.writable {
+            let report = codex_memoryd::doctor::run(&service)?;
+            let writable = report.storage.writable;
+            match format.as_str().to_ascii_lowercase().as_str() {
+                "json" => print_json(&report)?,
+                "summary" | "human" | "markdown" => {
+                    print_markdown(&codex_memoryd::doctor::render_summary(&report))
+                }
+                other => {
+                    return Err(error::Error::invalid_request(format!(
+                        "invalid --format '{other}'; expected 'json' or 'summary'"
+                    )))
+                }
+            }
+            if !writable {
                 return Err(error::Error::storage("storage is not writable"));
             }
             Ok(())
         }
+        Command::Backup { command } => {
+            let config = cli.load_config(None)?;
+            match command {
+                BackupCommand::Create { dest } => {
+                    let store = Store::open(&config.storage_path)?;
+                    let now = codex_memoryd::ids::now_rfc3339();
+                    let result = codex_memoryd::backup::create_backup(&store, dest, &now)?;
+                    print_json(&json!({
+                        "ok": true,
+                        "database_path": result.database_path,
+                        "manifest_path": result.manifest_path,
+                        "manifest": result.manifest,
+                    }))?;
+                    Ok(())
+                }
+                BackupCommand::Verify { path } => {
+                    let result = codex_memoryd::backup::verify_backup(path)?;
+                    let ok = result.ok;
+                    print_json(&result)?;
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(error::Error::invalid_request(
+                            "backup verification failed".to_string(),
+                        ))
+                    }
+                }
+                BackupCommand::RestorePreview { from, target } => {
+                    let target = target
+                        .clone()
+                        .unwrap_or_else(|| config.storage_path.clone());
+                    let preview = codex_memoryd::backup::restore_preview(from, &target)?;
+                    print_json(&preview)?;
+                    Ok(())
+                }
+                BackupCommand::RestoreApply { from, target } => {
+                    let target = target
+                        .clone()
+                        .unwrap_or_else(|| config.storage_path.clone());
+                    let now = codex_memoryd::ids::now_rfc3339();
+                    let result = codex_memoryd::backup::restore_apply(from, &target, &now)?;
+                    print_json(&result)?;
+                    Ok(())
+                }
+            }
+        }
         Command::Eval { command } => match command {
-            EvalCommand::Substrate { format } => {
+            EvalCommand::Substrate { format, compare } => {
                 let report = eval::run_substrate_eval()?;
-                match format.as_str().to_ascii_lowercase().as_str() {
+                let fmt = format.as_str().to_ascii_lowercase();
+                match fmt.as_str() {
                     "json" => print_json(&report)?,
                     "summary" | "human" | "markdown" => {
                         print_markdown(&eval::render_substrate_summary(&report))
+                    }
+                    other => {
+                        return Err(error::Error::invalid_request(format!(
+                            "invalid --format '{other}'; expected 'json' or 'summary'"
+                        )))
+                    }
+                }
+                if *compare {
+                    let comparison = eval::run_comparative_eval()?;
+                    match fmt.as_str() {
+                        "json" => print_json(&comparison)?,
+                        _ => print_markdown(&eval::render_comparative_summary(&comparison)),
+                    }
+                }
+                Ok(())
+            }
+            EvalCommand::Procedures { format } => {
+                let report = codex_memoryd::proc_eval::run_procedure_eval()?;
+                match format.as_str().to_ascii_lowercase().as_str() {
+                    "json" => print_json(&report)?,
+                    "summary" | "human" | "markdown" => {
+                        print_markdown(&codex_memoryd::proc_eval::render_summary(&report))
                     }
                     other => {
                         return Err(error::Error::invalid_request(format!(

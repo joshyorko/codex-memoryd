@@ -327,9 +327,22 @@ pub struct Procedure {
     pub termination_condition: String,
     pub source_episode_ids: Vec<String>,
     pub confidence: f64,
+    /// Lifecycle state: candidate | active | retired | superseded | quarantined.
     pub state: String,
     pub created_at: String,
     pub retired_at: Option<String>,
+    /// Monotonic version, bumped when a procedure is superseded by a new one.
+    pub version: i64,
+    /// When this procedure (or its lineage) was first observed.
+    pub first_seen: Option<String>,
+    /// When the procedure was last validated by successful reuse/eval.
+    pub last_validated: Option<String>,
+    /// Id of the procedure that supersedes this one (set on the old row).
+    pub superseded_by: Option<String>,
+    /// Count of failed-reuse / contradiction signals against this procedure.
+    pub counter_evidence_count: i64,
+    /// Phrases on which this procedure must NOT activate (false-activation guard).
+    pub negative_examples: Vec<String>,
     pub metadata: Value,
 }
 
