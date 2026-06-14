@@ -1,0 +1,24 @@
+{
+  "scenario": "alias_resolution",
+  "description": "'Al' is an alias for the subject 'Alice'. A preference recorded against the alias must be recallable when asking about Alice. Tests deterministic alias resolution (no fuzzy/embedding matching).",
+  "profile": "personal",
+  "workspace": "semantic-eval",
+  "subjects": [
+    { "id": "alice", "subject_key": "person:alice", "kind": "person", "display_name": "Alice" }
+  ],
+  "aliases": [
+    { "alias_key": "person:al", "subject_id": "alice", "source_evidence": "ep_intro" }
+  ],
+  "episodes": [
+    { "id": "ep_intro", "subject_id": "alice", "summary": "Al is short for Alice; same person.", "status": "success" },
+    { "id": "ep_pref", "subject_id": "alice", "summary": "Al prefers code review before merge.", "status": "success" }
+  ],
+  "relations": [
+    { "from_subject_id": "alice", "relation_type": "prefers", "to_subject_id": "alice", "source_episode_ids": ["ep_pref"], "state": "active", "metadata": { "note": "self-referential preference fact; primary signal is the episode" } }
+  ],
+  "question": "What does Alice prefer for merges?",
+  "expect": {
+    "chained_recall": { "answerable": false, "note": "without alias resolution, a query for 'Alice' may miss facts keyed under 'Al'" },
+    "relation_aware": { "answerable": true, "answer_subject_ids": ["alice"], "max_depth": 1, "note": "alias person:al resolves to subject alice, surfacing ep_pref" }
+  }
+}

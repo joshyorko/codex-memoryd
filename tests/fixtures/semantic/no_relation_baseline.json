@@ -1,0 +1,19 @@
+{
+  "scenario": "no_relation_baseline",
+  "description": "Anti-over-claim guard. A single-hop question that plain chained recall already answers without any relations. Relation-aware recall must NOT regress this (it must still return the answer) and must NOT invent a spurious multi-hop path. Proves relations earn their keep only where genuinely needed.",
+  "profile": "personal",
+  "workspace": "semantic-eval",
+  "subjects": [
+    { "id": "carol", "subject_key": "person:carol", "kind": "person", "display_name": "Carol" }
+  ],
+  "aliases": [],
+  "episodes": [
+    { "id": "ep_pref", "subject_id": "carol", "summary": "Carol prefers rebase over merge commits.", "status": "success" }
+  ],
+  "relations": [],
+  "question": "What does Carol prefer for integrating branches?",
+  "expect": {
+    "chained_recall": { "answerable": true, "note": "single recall on subject carol returns the preference" },
+    "relation_aware": { "answerable": true, "answer_subject_ids": ["carol"], "max_depth": 0, "note": "no relations to traverse; must equal the chained_recall result, proving no regression and no spurious expansion" }
+  }
+}

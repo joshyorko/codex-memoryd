@@ -1,0 +1,40 @@
+{
+  "scenario": "repo_state_change",
+  "description": "Repository default branch renamed from master to main. As-of recall resolves the correct branch fact for each date; default recall returns only the current fact.",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "branch_master",
+      "content": "Default branch is master.",
+      "type": "repo_convention",
+      "temporal_state": "superseded",
+      "valid_from": "2025-09-01T00:00:00Z",
+      "valid_until": "2026-02-01T00:00:00Z",
+      "observed_at": "2025-09-01T00:00:00Z",
+      "superseded_by": "branch_main",
+      "historical_reason": "superseded"
+    },
+    {
+      "id": "branch_main",
+      "content": "Default branch is main.",
+      "type": "repo_convention",
+      "temporal_state": "current",
+      "valid_from": "2026-02-01T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-02-01T00:00:00Z"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-main",
+      "as_of": null,
+      "expect_visible": ["branch_main"],
+      "expect_withheld_reasons": ["temporal_historical"]
+    },
+    {
+      "name": "as-of-2025-master",
+      "as_of": "2025-12-01T00:00:00Z",
+      "expect_visible": ["branch_master"]
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "scenario": "backfill_default_current",
+  "description": "Back-compat regression guard. Records with NO temporal fields (as every pre-#155 row will be after the migration back-fills temporal_state='current' and NULL timestamps) must behave exactly as today: all visible in default recall, unaffected by as-of of the present.",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "legacy_a",
+      "content": "Use cargo test for validation before opening a PR.",
+      "type": "preference"
+    },
+    {
+      "id": "legacy_b",
+      "content": "Prefer bundled SQLite for local durability.",
+      "type": "decision"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-all-visible",
+      "as_of": null,
+      "expect_visible": ["legacy_a", "legacy_b"],
+      "expect_withheld_reasons": []
+    },
+    {
+      "name": "as-of-now-all-visible",
+      "as_of": "2026-06-14T00:00:00Z",
+      "expect_visible": ["legacy_a", "legacy_b"]
+    }
+  ]
+}

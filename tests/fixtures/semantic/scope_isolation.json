@@ -1,0 +1,24 @@
+{
+  "scenario": "scope_isolation",
+  "description": "A relation defined in the work profile must never be traversed when recalling from the personal profile. Proves relation-aware recall respects the profile/workspace boundary (no bleed vector). The same subject_key exists in both profiles but the relation is work-scoped.",
+  "profile": "personal",
+  "workspace": "semantic-eval",
+  "subjects": [
+    { "id": "proj_personal", "profile": "personal", "subject_key": "project:sideproj", "kind": "project", "display_name": "Side project" },
+    { "id": "proj_work", "profile": "work", "subject_key": "project:sideproj", "kind": "project", "display_name": "Side project (work)" },
+    { "id": "secret_dep_work", "profile": "work", "subject_key": "service:internal-vault", "kind": "concept", "display_name": "Internal vault" }
+  ],
+  "aliases": [],
+  "episodes": [
+    { "id": "ep_work_dep", "subject_id": "proj_work", "profile": "work", "summary": "The work side project depends on the internal vault.", "status": "success" }
+  ],
+  "relations": [
+    { "from_subject_id": "proj_work", "profile": "work", "relation_type": "depends_on", "to_subject_id": "secret_dep_work", "source_episode_ids": ["ep_work_dep"], "state": "active" }
+  ],
+  "question": "What does my side project depend on? (asked from the personal profile)",
+  "expect": {
+    "chained_recall": { "answerable": false, "note": "personal profile has no dependency fact" },
+    "relation_aware": { "answerable": false, "answer_subject_ids": [], "max_depth": 2, "note": "the work-scoped depends_on relation must NOT be traversed from personal; internal-vault must never surface" },
+    "must_not_surface_subject_ids": ["secret_dep_work"]
+  }
+}

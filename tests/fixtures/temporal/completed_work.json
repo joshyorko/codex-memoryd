@@ -1,0 +1,39 @@
+{
+  "scenario": "completed_work",
+  "description": "A migration task moves planned -> active -> completed. Completed work must drop out of default current recall (it is no longer live context) but stay inspectable and answerable as-of when it was active.",
+  "now": "2026-06-14T00:00:00Z",
+  "records": [
+    {
+      "id": "task_migrate",
+      "content": "Migrate the store to schema v8 (temporal columns).",
+      "type": "task_checkpoint",
+      "temporal_state": "completed",
+      "valid_from": "2026-05-01T00:00:00Z",
+      "valid_until": "2026-05-20T00:00:00Z",
+      "observed_at": "2026-05-01T00:00:00Z",
+      "historical_reason": "completed"
+    },
+    {
+      "id": "task_current",
+      "content": "Add as-of recall query mode.",
+      "type": "task_checkpoint",
+      "temporal_state": "current",
+      "valid_from": "2026-05-20T00:00:00Z",
+      "valid_until": null,
+      "observed_at": "2026-05-20T00:00:00Z"
+    }
+  ],
+  "queries": [
+    {
+      "name": "default-now-only-active-task",
+      "as_of": null,
+      "expect_visible": ["task_current"],
+      "expect_withheld_reasons": ["temporal_historical"]
+    },
+    {
+      "name": "as-of-may-10-migration-active",
+      "as_of": "2026-05-10T00:00:00Z",
+      "expect_visible": ["task_migrate"]
+    }
+  ]
+}
