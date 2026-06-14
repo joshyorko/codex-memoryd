@@ -22,6 +22,7 @@ Both sides can use these as a shared contract:
 | `sync_local.preview.request.json` | `POST /v1/sync/local-codex-memory` | `SyncRequest` |
 | `sync_local.apply.request.json` | `POST /v1/sync/local-codex-memory` | `SyncRequest` |
 | `hosted_app_adapter.tool_only.json` | hosted app tool-only adapter fixture for `GET /v1/status`, `POST /v1/recall`, and `POST /v1/search` | `StatusResponse`, `RecallRequest`, `SearchRequest` |
+| `retrieval/long_history.json` | `eval retrieval` long-history corpus | retrieval eval fixture |
 
 All request fields are optional / defaulted server-side; these fixtures show the
 fields the Codex runtime actually sends. The daemon infers `kind` from `path`

@@ -370,6 +370,96 @@ fn cli_eval_substrate_emits_deterministic_json_and_summary() {
 }
 
 #[test]
+fn cli_eval_retrieval_emits_long_history_scores_and_summary() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .arg("eval")
+        .arg("retrieval")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .arg("eval")
+        .arg("retrieval")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        first, second,
+        "retrieval eval JSON output should be deterministic"
+    );
+    let report: Value = serde_json::from_slice(&first).expect("retrieval eval report JSON");
+    assert_eq!(report["suite"], "retrieval_quality");
+    assert_eq!(report["status"], "pass");
+    assert_eq!(report["question_count"], 6);
+    assert_eq!(
+        report["fixture_families"],
+        serde_json::json!([
+            "single_hop",
+            "temporal",
+            "contradiction",
+            "preference_drift",
+            "multi_hop",
+            "open_domain"
+        ])
+    );
+    assert!(report["baselines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["name"] == "memoryd_recall"));
+    assert!(report["baselines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["name"] == "verbatim_evidence"));
+    assert!(report["ranking_ablations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["name"] == "all_signals"));
+    assert!(report["regression_fixtures"].as_array().unwrap().len() >= 1);
+    assert!(report["next_recommended_ranking_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r.as_str().unwrap().contains("subject")));
+
+    bin()
+        .arg("--db")
+        .arg(db)
+        .arg("eval")
+        .arg("retrieval")
+        .arg("--format")
+        .arg("summary")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "codex-memoryd retrieval quality eval: pass",
+        ))
+        .stdout(predicate::str::contains("long-history questions: 6"))
+        .stdout(predicate::str::contains("memoryd_recall"))
+        .stdout(predicate::str::contains("verbatim_evidence"))
+        .stdout(predicate::str::contains("next ranking changes"));
+}
+
+#[test]
 fn cli_status_storage_path_failure_is_actionable() {
     let dir = TempDir::new().unwrap();
     let not_a_dir = dir.path().join("not-a-dir");

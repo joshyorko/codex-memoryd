@@ -8,12 +8,38 @@ real service-layer paths rather than a hosted benchmark or model-as-judge flow.
 ## Run
 
 ```bash
+codex-memoryd eval retrieval --format summary
+codex-memoryd eval retrieval --format json
 cargo run -- eval substrate --format summary
 cargo run -- eval substrate --format json
 ```
 
 `--format summary` prints a human-readable report for operators. `--format json`
 prints stable machine-readable output for CI and PR artifacts.
+
+## Retrieval Eval Loop (Issue #153)
+
+`codex-memoryd eval retrieval` is the dedicated command for retrieval quality checks.
+
+```bash
+codex-memoryd eval retrieval --format summary
+codex-memoryd eval retrieval --format json
+```
+
+The long-history fixture is checked in at
+`tests/fixtures/retrieval/long_history.json`. It covers single-hop, temporal,
+contradiction, preference drift, multi-hop-ish, and open-domain questions.
+
+Each retrieval run should include:
+
+- raw chronological, keyword search, full-list, current memoryd recall,
+  context-pack, and verbatim-evidence baselines
+- explicit ablations for recency, type weight, evidence coverage,
+  subject/episode match, procedure/valence, and freshness
+- failed query ids that can become regression fixtures
+
+`eval retrieval` remains deterministic. It reports checked-in fixture scores and
+next ranking recommendations, not hosted-benchmark claims.
 
 ## Current MVP Coverage
 

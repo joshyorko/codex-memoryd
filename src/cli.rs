@@ -375,6 +375,11 @@ pub enum EvalCommand {
         #[arg(long, default_value = "summary")]
         format: String,
     },
+    /// Run long-history retrieval quality evals and ranking ablations.
+    Retrieval {
+        #[arg(long, default_value = "summary")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1370,6 +1375,21 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "summary" | "human" | "markdown" => {
                         print_markdown(&codex_memoryd::proc_eval::render_summary(&report))
                     }
+                    other => {
+                        return Err(error::Error::invalid_request(format!(
+                            "invalid --format '{other}'; expected 'json' or 'summary'"
+                        )))
+                    }
+                }
+                Ok(())
+            }
+            EvalCommand::Retrieval { format } => {
+                let report = codex_memoryd::retrieval_eval::run_retrieval_eval()?;
+                match format.as_str().to_ascii_lowercase().as_str() {
+                    "json" => print_json(&report)?,
+                    "summary" | "human" | "markdown" => print_markdown(
+                        &codex_memoryd::retrieval_eval::render_retrieval_summary(&report),
+                    ),
                     other => {
                         return Err(error::Error::invalid_request(format!(
                             "invalid --format '{other}'; expected 'json' or 'summary'"

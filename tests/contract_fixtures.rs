@@ -70,6 +70,48 @@ fn recall_fixture_deserializes_and_runs() {
 }
 
 #[test]
+fn retrieval_long_history_fixture_covers_required_families() {
+    let raw = read_fixture("retrieval/long_history.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(&raw).expect("retrieval fixture must be valid JSON");
+    let records = fixture["records"].as_array().expect("records array");
+    let questions = fixture["questions"].as_array().expect("questions array");
+    assert!(
+        records.len() >= 12,
+        "long-history fixture should include distractors and evidence records"
+    );
+    assert_eq!(questions.len(), 6);
+
+    let families = questions
+        .iter()
+        .map(|q| q["family"].as_str().expect("question family"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        families,
+        [
+            "contradiction",
+            "multi_hop",
+            "open_domain",
+            "preference_drift",
+            "single_hop",
+            "temporal",
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    for question in questions {
+        assert!(
+            !question["expected_record_ids"]
+                .as_array()
+                .expect("expected ids")
+                .is_empty(),
+            "every question needs gold evidence"
+        );
+    }
+}
+
+#[test]
 fn turns_fixture_deserializes_and_runs() {
     let raw = read_fixture("turns.request.json");
     let req: TurnsRequest = serde_json::from_str(&raw).expect("turns fixture must deserialize");
