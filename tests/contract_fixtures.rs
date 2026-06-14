@@ -145,7 +145,7 @@ fn status_response_fixture_matches_protocol_shape() {
     // Spot-check stable identity fields.
     assert_eq!(live_json["provider_name"], "codex-memoryd");
     assert_eq!(live_json["api_version"], "v1");
-    assert_eq!(live_json["storage_schema_version"], 4);
+    assert_eq!(live_json["storage_schema_version"], 5);
 }
 
 #[test]

@@ -32,13 +32,14 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 4;
+pub const STORAGE_SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
 const MIGRATION_DREAM_RUNS: &str = include_str!("../migrations/0003_dream_runs.sql");
 const MIGRATION_EVIDENCE_LEDGER: &str = include_str!("../migrations/0004_evidence_ledger.sql");
 const MIGRATION_SUBJECTS_EPISODES: &str = include_str!("../migrations/0005_subjects_episodes.sql");
+const MIGRATION_TRUST_QUARANTINE: &str = include_str!("../migrations/0006_trust_quarantine.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -178,6 +179,7 @@ pub struct RecordQuery {
 pub struct RecallOmissionCounts {
     pub archived: usize,
     pub secret_blocked: usize,
+    pub quarantined: usize,
 }
 
 /// A new memory record to upsert. The store computes nothing here except
@@ -316,6 +318,8 @@ impl Store {
         conn.execute_batch(MIGRATION_DREAM_RUNS)?;
         conn.execute_batch(MIGRATION_EVIDENCE_LEDGER)?;
         conn.execute_batch(MIGRATION_SUBJECTS_EPISODES)?;
+        conn.execute_batch(MIGRATION_TRUST_QUARANTINE)?;
+        ensure_trust_columns(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -804,16 +808,19 @@ impl Store {
             return Ok(UpsertOutcome::Skipped(existing.id));
         }
 
-        let now = ids::now_rfc3339();
         let id = ids::new_id("mem");
+        let now = ids::now_rfc3339();
+        let (trust_state, trust_score, quarantine_reason, quarantined_at) =
+            trust_defaults_for_new_record(new, &now);
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO memory_records(
                 id, profile_id, workspace_id, repo_id, subject_id, episode_id,
                 scope, type, content, related_files, tags, sensitivity,
                 portability, confidence, source_ids, content_hash, supersedes,
-                created_at, updated_at, last_used_at, archived, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,NULL,0,?19)",
+                created_at, updated_at, last_used_at, archived, trust_state, trust_score,
+                quarantine_reason, quarantined_at, promoted_at, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,NULL,0,?19,?20,?21,?22,NULL,?23)",
             params![
                 id,
                 new.profile_id,
@@ -833,10 +840,85 @@ impl Store {
                 new.content_hash,
                 serde_json::to_string(&new.supersedes)?,
                 now,
+                trust_state,
+                trust_score,
+                quarantine_reason,
+                quarantined_at,
                 new.metadata.to_string(),
             ],
         )?;
         Ok(UpsertOutcome::Created(id))
+    }
+
+    /// Mark records as quarantined. Quarantined records stay durable and
+    /// inspectable by id, but default query/search/export paths withhold them.
+    pub fn quarantine_records(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_quarantine: &[String],
+        reason: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let now = ids::now_rfc3339();
+        let mut quarantined = Vec::new();
+        let mut not_found = Vec::new();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE memory_records
+                 SET trust_state = 'quarantined', trust_score = 0.0,
+                     quarantine_reason = ?1, quarantined_at = ?2,
+                     promoted_at = NULL, updated_at = ?2
+                 WHERE id = ?3 AND trust_state != 'quarantined'",
+            )?;
+            for id in ids_to_quarantine {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                if stmt.execute(params![reason, now, id])? > 0 {
+                    quarantined.push(id.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((quarantined, not_found))
+    }
+
+    /// Explicitly promote quarantined records back into default recall/export.
+    pub fn promote_quarantined_records(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_promote: &[String],
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let now = ids::now_rfc3339();
+        let mut promoted = Vec::new();
+        let mut not_found = Vec::new();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE memory_records
+                 SET trust_state = 'trusted', trust_score = 1.0,
+                     quarantine_reason = NULL, promoted_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND trust_state = 'quarantined'",
+            )?;
+            for id in ids_to_promote {
+                if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
+                    not_found.push(id.clone());
+                    continue;
+                }
+                if stmt.execute(params![now, id])? > 0 {
+                    promoted.push(id.clone());
+                } else {
+                    not_found.push(id.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((promoted, not_found))
     }
 
     /// Archive records and annotate their metadata with historical/supersession
@@ -1257,6 +1339,7 @@ impl Store {
         }
         // Never surface secret-blocked records in any query (SPEC §6.2/§6.3).
         sql.push_str(" AND sensitivity != 'secret_blocked'");
+        sql.push_str(" AND trust_state != 'quarantined'");
         if let Some(cutoff) = &query.recency_cutoff {
             sql.push_str(" AND updated_at >= ?");
             args.push(Box::new(cutoff.clone()));
@@ -1283,15 +1366,17 @@ impl Store {
         let conn = self.conn()?;
         let archived = count_recall_omission(&conn, query, query_text, "archived")?;
         let secret_blocked = count_recall_omission(&conn, query, query_text, "secret_blocked")?;
+        let quarantined = count_recall_omission(&conn, query, query_text, "quarantined")?;
         Ok(RecallOmissionCounts {
             archived,
             secret_blocked,
+            quarantined,
         })
     }
 
     /// Export rows and the matching `secret_blocked` count from one read
     /// transaction so the omitted count matches the exported snapshot.
-    pub fn export_records(&self, query: &RecordQuery) -> Result<(Vec<MemoryRecord>, usize)> {
+    pub fn export_records(&self, query: &RecordQuery) -> Result<(Vec<MemoryRecord>, usize, usize)> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
@@ -1307,11 +1392,24 @@ impl Store {
             count as usize
         };
 
+        let omitted_quarantined = {
+            let mut sql = "SELECT COUNT(*) FROM memory_records WHERE 1=1".to_string();
+            let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            append_export_scope_filters(&mut sql, &mut args, query);
+            sql.push_str(" AND sensitivity != 'secret_blocked' AND trust_state = 'quarantined'");
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                args.iter().map(|b| b.as_ref()).collect();
+            let count: i64 = tx.query_row(&sql, params_ref.as_slice(), |row| row.get(0))?;
+            count as usize
+        };
+
         let rows = {
             let mut sql = format!("SELECT {RECORD_COLS} FROM memory_records WHERE 1=1");
             let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             append_export_scope_filters(&mut sql, &mut args, query);
             sql.push_str(" AND sensitivity != 'secret_blocked'");
+            sql.push_str(" AND trust_state != 'quarantined'");
             sql.push_str(" ORDER BY updated_at DESC");
             if query.limit > 0 {
                 sql.push_str(&format!(" LIMIT {} OFFSET {}", query.limit, query.offset));
@@ -1327,7 +1425,7 @@ impl Store {
         };
 
         tx.commit()?;
-        Ok((rows, omitted_secret))
+        Ok((rows, omitted_secret, omitted_quarantined))
     }
 
     /// Full-text-ish search. Uses FTS5 when available, otherwise LIKE.
@@ -1972,9 +2070,9 @@ impl Store {
             "INSERT OR IGNORE INTO evidence_ledger(
                 id, event_key, profile_id, workspace_id, repo_id, subject_key,
                 source_kind, source_id, source_path, source_hash, safe_summary,
-                policy_state, created_at, metadata
+                policy_state, created_at, trust_state, trust_score, metadata
              )
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'trusted',1.0,?14)",
             params![
                 id,
                 event_key,
@@ -2048,11 +2146,135 @@ fn ensure_memory_record_ref_columns(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_trust_columns(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "memory_records",
+        "trust_state",
+        "TEXT NOT NULL DEFAULT 'trusted'",
+    )?;
+    ensure_column(
+        conn,
+        "memory_records",
+        "trust_score",
+        "REAL NOT NULL DEFAULT 1.0",
+    )?;
+    ensure_column(conn, "memory_records", "quarantine_reason", "TEXT")?;
+    ensure_column(conn, "memory_records", "quarantined_at", "TEXT")?;
+    ensure_column(conn, "memory_records", "promoted_at", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_trust_state
+         ON memory_records(trust_state)",
+        [],
+    )?;
+
+    ensure_column(
+        conn,
+        "evidence_ledger",
+        "trust_state",
+        "TEXT NOT NULL DEFAULT 'trusted'",
+    )?;
+    ensure_column(
+        conn,
+        "evidence_ledger",
+        "trust_score",
+        "REAL NOT NULL DEFAULT 1.0",
+    )?;
+    ensure_column(conn, "evidence_ledger", "quarantine_reason", "TEXT")?;
+    ensure_column(conn, "evidence_ledger", "quarantined_at", "TEXT")?;
+    ensure_column(conn, "evidence_ledger", "promoted_at", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_ledger_trust_state
+         ON evidence_ledger(trust_state)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn trust_defaults_for_new_record(
+    new: &NewRecord,
+    now: &str,
+) -> (String, f64, Option<String>, Option<String>) {
+    let explicit_state = metadata_text(&new.metadata, "trust_state")
+        .or_else(|| metadata_text(&new.metadata, "promotion_status"))
+        .or_else(|| metadata_text(&new.metadata, "state"))
+        .or_else(|| metadata_text(&new.metadata, "candidate_state"))
+        .map(|value| normalized_trust_value(&value));
+    let source_risk = metadata_text(&new.metadata, "source_risk")
+        .or_else(|| metadata_text(&new.metadata, "risk"))
+        .map(|value| normalized_trust_value(&value));
+
+    let should_quarantine =
+        matches!(
+            explicit_state.as_deref(),
+            Some("quarantined" | "quarantine")
+        ) || matches!(source_risk.as_deref(), Some("high" | "unsafe" | "blocked"));
+
+    if should_quarantine {
+        let reason = metadata_text(&new.metadata, "quarantine_reason")
+            .or_else(|| {
+                source_risk
+                    .as_ref()
+                    .map(|risk| format!("source_risk:{risk}"))
+            })
+            .or_else(|| Some("explicit_quarantine".to_string()));
+        return (
+            "quarantined".to_string(),
+            0.0,
+            reason,
+            Some(now.to_string()),
+        );
+    }
+
+    (
+        "trusted".to_string(),
+        metadata_number(&new.metadata, "trust_score")
+            .map(|score| score.clamp(0.0, 1.0))
+            .unwrap_or(1.0),
+        None,
+        None,
+    )
+}
+
+fn metadata_text(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn metadata_number(metadata: &Value, key: &str) -> Option<f64> {
+    metadata.get(key).and_then(|value| value.as_f64())
+}
+
+fn normalized_trust_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 // ----------------------------------------------------------------------
 // Row mappers and SQL helpers
 // ----------------------------------------------------------------------
 
-const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, metadata";
+const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, metadata";
 const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
 const EPISODE_COLS: &str =
@@ -2103,6 +2325,7 @@ fn append_record_filters(
         sql.push_str(&format!(" AND {} = 0", col("archived")));
     }
     sql.push_str(&format!(" AND {} != 'secret_blocked'", col("sensitivity")));
+    sql.push_str(&format!(" AND {} != 'quarantined'", col("trust_state")));
     if let Some(cutoff) = &filters.recency_cutoff {
         sql.push_str(&format!(" AND {} >= ?", col("updated_at")));
         args.push(Box::new(cutoff.clone()));
@@ -2144,8 +2367,13 @@ fn count_recall_omission(
     }
 
     match reason {
-        "archived" => sql.push_str(" AND archived = 1 AND sensitivity != 'secret_blocked'"),
+        "archived" => sql.push_str(
+            " AND archived = 1 AND sensitivity != 'secret_blocked' AND trust_state != 'quarantined'",
+        ),
         "secret_blocked" => sql.push_str(" AND sensitivity = 'secret_blocked'"),
+        "quarantined" => {
+            sql.push_str(" AND sensitivity != 'secret_blocked' AND trust_state = 'quarantined'")
+        }
         _ => return Ok(0),
     }
 
@@ -2245,7 +2473,12 @@ fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
         updated_at: row.get(18)?,
         last_used_at: row.get(19)?,
         archived: row.get::<_, i64>(20)? != 0,
-        metadata: json_value(&row.get::<_, String>(21)?),
+        trust_state: row.get(21)?,
+        trust_score: row.get(22)?,
+        quarantine_reason: row.get(23)?,
+        quarantined_at: row.get(24)?,
+        promoted_at: row.get(25)?,
+        metadata: json_value(&row.get::<_, String>(26)?),
     })
 }
 

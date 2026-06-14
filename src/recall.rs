@@ -225,6 +225,7 @@ fn pack_template_signals(template: &PackTemplate) -> Vec<String> {
 fn build_withheld(
     archived: usize,
     secret_blocked: usize,
+    quarantined: usize,
     type_filtered: usize,
     pack_withheld: usize,
     policy_withheld: &RecallPolicyWithheldCounts,
@@ -242,6 +243,13 @@ fn build_withheld(
             reason: "secret_blocked".to_string(),
             count: secret_blocked,
             gates: vec!["secret_blocked".to_string()],
+        });
+    }
+    if quarantined > 0 {
+        withheld.push(RecallWithheld {
+            reason: "quarantined".to_string(),
+            count: quarantined,
+            gates: vec!["trust_state".to_string(), "promotion_required".to_string()],
         });
     }
     if type_filtered > 0 {
@@ -459,6 +467,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     let withheld = build_withheld(
         recall_omissions.archived,
         recall_omissions.secret_blocked,
+        recall_omissions.quarantined,
         type_filtered,
         pack_withheld,
         &policy_withheld,
@@ -515,6 +524,10 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
 }
 
 fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason> {
+    if record.trust_state == "quarantined" {
+        return Some(RecallDenyReason::Quarantined);
+    }
+
     let metadata = &record.metadata;
     let state = metadata_string(metadata, "state")
         .or_else(|| metadata_string(metadata, "candidate_state"))
@@ -531,7 +544,9 @@ fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason>
         _ => metadata_string(metadata, "source_risk")
             .map(|value| normalized_policy_value(&value))
             .and_then(|risk| match risk.as_str() {
-                "high" | "unsafe" | "blocked" => Some(RecallDenyReason::HighRisk),
+                "high" | "unsafe" | "blocked" if record.promoted_at.is_none() => {
+                    Some(RecallDenyReason::HighRisk)
+                }
                 _ => None,
             }),
     }
@@ -559,19 +574,22 @@ fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
         episode_id: record.episode_id.clone(),
         source_risk,
         trust_level,
+        trust_score: Some(record.trust_score),
     }
 }
 
 fn recall_source_diagnostics(record: &MemoryRecord) -> (Option<String>, Option<String>) {
-    let source_risk = Some(
-        match record.sensitivity {
-            crate::domain::Sensitivity::Public => "low",
-            crate::domain::Sensitivity::Personal => "medium",
-            crate::domain::Sensitivity::WorkConfidential => "high",
-            crate::domain::Sensitivity::SecretBlocked => "blocked",
-        }
-        .to_string(),
-    );
+    let source_risk = metadata_string(&record.metadata, "source_risk").or_else(|| {
+        Some(
+            match record.sensitivity {
+                crate::domain::Sensitivity::Public => "low",
+                crate::domain::Sensitivity::Personal => "medium",
+                crate::domain::Sensitivity::WorkConfidential => "high",
+                crate::domain::Sensitivity::SecretBlocked => "blocked",
+            }
+            .to_string(),
+        )
+    });
 
     let trust_level = match record
         .metadata

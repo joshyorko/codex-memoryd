@@ -337,7 +337,25 @@ pub struct MemoryRecord {
     pub updated_at: String,
     pub last_used_at: Option<String>,
     pub archived: bool,
+    #[serde(default = "default_trust_state")]
+    pub trust_state: String,
+    #[serde(default = "default_trust_score")]
+    pub trust_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<String>,
     pub metadata: Value,
+}
+
+fn default_trust_state() -> String {
+    "trusted".to_string()
+}
+
+fn default_trust_score() -> f64 {
+    1.0
 }
 
 /// An artifact/event a record was derived from (SPEC §4.1.6).

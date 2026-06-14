@@ -48,6 +48,7 @@ pub struct ExportResult {
     pub content_type: &'static str,
     pub record_count: usize,
     pub omitted_secret: usize,
+    pub omitted_quarantined: usize,
     pub omitted_boundary: usize,
 }
 
@@ -82,7 +83,7 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
         offset: 0,
     };
 
-    let (all, omitted_secret) = store.export_records(&filters)?;
+    let (all, omitted_secret, omitted_quarantined) = store.export_records(&filters)?;
     let mut omitted_boundary = 0usize;
     let mut exported: Vec<MemoryRecord> = Vec::new();
 
@@ -121,6 +122,7 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
         content_type: params.format.content_type(),
         record_count: exported.len(),
         omitted_secret,
+        omitted_quarantined,
         omitted_boundary,
     })
 }
