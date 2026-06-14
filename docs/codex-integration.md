@@ -490,7 +490,12 @@ defaulted server-side; a minimal session is accepted):
   message entry.
 - **sync**: `POST /v1/sync/local-codex-memory` with `{ profile, workspace, repo?,
   source_root, mode, files[ { path, kind?, content, hash?, modified_at?,
-  idempotency_key? } ] }` → envelope wrapping the sync result. The Codex
-  `PortableMemoryFile { path, content, metadata, idempotency_key }` maps onto a
-  file entry (the daemon infers `kind` from `path` when omitted and computes its
-  own `source_hash`, so `hash`/`kind` are optional).
+  idempotency_key?, metadata? } ] }` → envelope wrapping the sync result. The
+  Codex `PortableMemoryFile { path, content, metadata, idempotency_key }` maps
+  onto a file entry (the daemon infers `kind` from `path` when omitted and
+  computes its own `source_hash`, so `hash`/`kind` are optional). For
+  multimodal kinds (`screenshot_image`, `ocr_text_extract`, `log_excerpt`,
+  `document_excerpt`, `git_diff`, `terminal_output_excerpt`), `content` is the
+  extracted text excerpt, not a raw blob. Raw artifacts are referenced by
+  `path`, `hash`, and allowlisted metadata such as `artifact_ref`/`media_type`;
+  secret-like excerpt text is redacted before durable storage.

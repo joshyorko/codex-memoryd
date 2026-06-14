@@ -37,6 +37,12 @@ pub enum ArtifactKind {
     MemoryRegistry,
     RolloutSummary,
     AdHocNote,
+    ScreenshotImage,
+    OcrTextExtract,
+    LogExcerpt,
+    DocumentExcerpt,
+    GitDiff,
+    TerminalOutputExcerpt,
     Unknown,
 }
 
@@ -47,6 +53,12 @@ impl ArtifactKind {
             ArtifactKind::MemoryRegistry => "memory_registry",
             ArtifactKind::RolloutSummary => "rollout_summary",
             ArtifactKind::AdHocNote => "ad_hoc_note",
+            ArtifactKind::ScreenshotImage => "screenshot_image",
+            ArtifactKind::OcrTextExtract => "ocr_text_extract",
+            ArtifactKind::LogExcerpt => "log_excerpt",
+            ArtifactKind::DocumentExcerpt => "document_excerpt",
+            ArtifactKind::GitDiff => "git_diff",
+            ArtifactKind::TerminalOutputExcerpt => "terminal_output_excerpt",
             ArtifactKind::Unknown => "unknown",
         }
     }
@@ -58,6 +70,12 @@ impl ArtifactKind {
             ArtifactKind::MemoryRegistry => "local_memory_registry",
             ArtifactKind::RolloutSummary => "rollout_summary",
             ArtifactKind::AdHocNote => "ad_hoc_note",
+            ArtifactKind::ScreenshotImage => "multimodal_screenshot_image",
+            ArtifactKind::OcrTextExtract => "multimodal_ocr_text_extract",
+            ArtifactKind::LogExcerpt => "multimodal_log_excerpt",
+            ArtifactKind::DocumentExcerpt => "multimodal_document_excerpt",
+            ArtifactKind::GitDiff => "multimodal_git_diff",
+            ArtifactKind::TerminalOutputExcerpt => "multimodal_terminal_output_excerpt",
             ArtifactKind::Unknown => "unknown",
         }
     }
@@ -68,6 +86,14 @@ impl ArtifactKind {
             "memory_registry" => ArtifactKind::MemoryRegistry,
             "rollout_summary" => ArtifactKind::RolloutSummary,
             "ad_hoc_note" => ArtifactKind::AdHocNote,
+            "screenshot_image" | "screenshot" | "image" => ArtifactKind::ScreenshotImage,
+            "ocr_text_extract" | "ocr" | "text_extract" => ArtifactKind::OcrTextExtract,
+            "log_excerpt" | "log" => ArtifactKind::LogExcerpt,
+            "document_excerpt" | "document" | "doc_excerpt" => ArtifactKind::DocumentExcerpt,
+            "git_diff" | "diff" => ArtifactKind::GitDiff,
+            "terminal_output_excerpt" | "terminal_output" | "terminal" => {
+                ArtifactKind::TerminalOutputExcerpt
+            }
             _ => ArtifactKind::Unknown,
         }
     }
@@ -88,9 +114,40 @@ impl ArtifactKind {
             // A markdown file under memories that isn't a known artifact is an
             // ad-hoc note by default.
             ArtifactKind::AdHocNote
+        } else if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+            || lower.ends_with(".gif")
+        {
+            ArtifactKind::ScreenshotImage
+        } else if lower.ends_with(".log") {
+            ArtifactKind::LogExcerpt
+        } else if lower.ends_with(".diff") || lower.ends_with(".patch") {
+            ArtifactKind::GitDiff
+        } else if lower.ends_with(".txt") {
+            ArtifactKind::TerminalOutputExcerpt
+        } else if lower.ends_with(".pdf")
+            || lower.ends_with(".doc")
+            || lower.ends_with(".docx")
+            || lower.ends_with(".odt")
+        {
+            ArtifactKind::DocumentExcerpt
         } else {
             ArtifactKind::Unknown
         }
+    }
+
+    pub fn is_multimodal(self) -> bool {
+        matches!(
+            self,
+            ArtifactKind::ScreenshotImage
+                | ArtifactKind::OcrTextExtract
+                | ArtifactKind::LogExcerpt
+                | ArtifactKind::DocumentExcerpt
+                | ArtifactKind::GitDiff
+                | ArtifactKind::TerminalOutputExcerpt
+        )
     }
 }
 
@@ -221,9 +278,16 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             _ => ArtifactKind::infer_from_path(&file.path),
         };
 
-        // Whole-file secret screen first: a file containing secrets is rejected
-        // wholesale (SPEC §7.7 "filter secrets").
-        let trimmed = file.content.trim();
+        // Whole-file secret screen first: local memory files containing
+        // secrets are rejected wholesale (SPEC §7.7 "filter secrets").
+        // Multimodal files pass extracted text/excerpts, not raw artifacts, so
+        // those excerpts are redacted before any durable text storage.
+        let (screened_content, redacted) = if kind.is_multimodal() {
+            policy::redact_secret_like(&file.content)
+        } else {
+            (file.content.clone(), false)
+        };
+        let trimmed = screened_content.trim();
         if trimmed.is_empty() {
             rejected += 1;
             rejections.push(SyncRejection {
@@ -260,7 +324,11 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             }
             continue;
         }
-        if let Some(label) = policy::detect_secret(trimmed) {
+        if let Some(label) = if kind.is_multimodal() {
+            None
+        } else {
+            policy::detect_secret(trimmed)
+        } {
             rejected += 1;
             rejections.push(SyncRejection {
                 path: file.path.clone(),
@@ -364,7 +432,8 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
         let raw_hash = file
             .hash
             .clone()
-            .filter(|h| !h.trim().is_empty())
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
             .unwrap_or_else(|| {
                 ids::source_hash(profile_str, params.workspace, &file.path, trimmed)
             });
@@ -374,6 +443,14 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             .is_some();
 
         // Build source metadata (provenance).
+        let evidence_metadata = artifact_metadata(
+            file,
+            kind,
+            params.source_root,
+            redacted,
+            "codex-local-memory",
+        );
+
         let source_metadata = json!({
             "origin": "codex-local-memory",
             "artifact_kind": kind.as_str(),
@@ -382,6 +459,7 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             "modified_at": file.modified_at,
             "idempotency_key": file.idempotency_key,
         });
+        let source_metadata = merge_metadata(source_metadata, evidence_metadata.clone());
 
         // Derive candidate chunks regardless of mode (preview needs counts).
         let chunks = derive_chunks(trimmed, kind, params.profile, params.repo_id.is_some());
@@ -425,17 +503,20 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
             source_hash: raw_hash.clone(),
             safe_summary: source_ledger_summary,
             policy_state: "accepted".to_string(),
-            metadata: json!({
-                "artifact_kind": kind.as_str(),
-                "source_root": params.source_root,
-                "source_created": source_created,
-                "already_imported": already_imported,
-                "chunk_count": chunk_count,
-                "created": created,
-                "updated": updated,
-                "skipped": skipped,
-                "rejected": rejected,
-            }),
+            metadata: merge_metadata(
+                json!({
+                    "artifact_kind": kind.as_str(),
+                    "source_root": params.source_root,
+                    "source_created": source_created,
+                    "already_imported": already_imported,
+                    "chunk_count": chunk_count,
+                    "created": created,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "rejected": rejected,
+                }),
+                evidence_metadata,
+            ),
         })?;
 
         if already_imported && !source_created {
@@ -483,6 +564,16 @@ pub fn run_sync(store: &Store, params: &SyncParams) -> Result<SyncResponse> {
                 "local_path": file.path,
                 "source_id": source.id,
             });
+            let metadata = merge_metadata(
+                metadata,
+                artifact_metadata(
+                    file,
+                    kind,
+                    params.source_root,
+                    redacted,
+                    "codex-local-memory",
+                ),
+            );
             let new_record = NewRecord {
                 profile_id: profile_str.to_string(),
                 workspace_id: params.workspace.to_string(),
@@ -571,6 +662,59 @@ fn ledger_hash(parts: &[&str]) -> String {
     ids::sha256_hex(parts.join("\u{1f}").as_bytes())
 }
 
+fn merge_metadata(mut base: Value, extra: Value) -> Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
+}
+
+fn artifact_metadata(
+    file: &SyncFile,
+    kind: ArtifactKind,
+    source_root: &str,
+    redacted: bool,
+    origin: &str,
+) -> Value {
+    let mut metadata = json!({
+        "origin": origin,
+        "artifact_kind": kind.as_str(),
+        "local_path": file.path,
+        "source_root": source_root,
+        "redaction_state": if redacted { "redacted" } else { "clean" },
+        "raw_artifact_stored": false,
+    });
+
+    if let Some(hash) = file
+        .hash
+        .as_ref()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+    {
+        metadata["artifact_hash"] = json!(hash);
+    }
+
+    if let Some(request_metadata) = file.metadata.as_ref().and_then(|v| v.as_object()) {
+        for key in [
+            "artifact_ref",
+            "media_type",
+            "extractor",
+            "ocr_engine",
+            "document_title",
+        ] {
+            if let Some(value) = request_metadata.get(key).and_then(|v| v.as_str()) {
+                if let PolicyDecision::Accept(cleaned) = policy::screen_string_value(value) {
+                    metadata[key] = json!(cleaned);
+                }
+            }
+        }
+    }
+
+    metadata
+}
+
 /// Derive classified candidate chunks from a file's content using the artifact
 /// kind to choose a chunking strategy (SPEC §7.12).
 pub fn derive_chunks(
@@ -586,6 +730,12 @@ pub fn derive_chunks(
         ArtifactKind::RolloutSummary => chunk_markdown(content),
         // Ad-hoc notes: bullets/paragraphs.
         ArtifactKind::AdHocNote | ArtifactKind::Unknown => chunk_markdown(content),
+        ArtifactKind::ScreenshotImage
+        | ArtifactKind::OcrTextExtract
+        | ArtifactKind::LogExcerpt
+        | ArtifactKind::DocumentExcerpt
+        | ArtifactKind::GitDiff
+        | ArtifactKind::TerminalOutputExcerpt => chunk_markdown(content),
     };
 
     raw_chunks

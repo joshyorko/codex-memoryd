@@ -72,6 +72,17 @@ fn ledger_count(db_path: &str) -> usize {
     ledger_rows(db_path).len()
 }
 
+fn record_contents(db_path: &str) -> Vec<String> {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let mut stmt = conn
+        .prepare("SELECT content FROM memory_records ORDER BY created_at, id")
+        .expect("prepare record query");
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("query records")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect records")
+}
+
 #[test]
 fn status_reports_bumped_storage_schema_version() {
     let (svc, _tmp, _db_path) = temp_service();
@@ -305,6 +316,157 @@ fn sync_preview_rejections_do_not_append_ledger_rows() {
 
     assert_eq!(resp.rejected, 1);
     assert_eq!(ledger_count(&db_path), 0);
+}
+
+#[test]
+fn sync_apply_accepts_multimodal_artifact_refs_without_raw_blob_storage() {
+    let (svc, _tmp, db_path) = temp_service();
+    let req = SyncRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        source_root: Some("/workspace".to_string()),
+        mode: Some("apply".to_string()),
+        files: Some(vec![SyncFile {
+            path: "screenshots/settings-panel.png".to_string(),
+            kind: Some("screenshot_image".to_string()),
+            content: "OCR: Settings panel shows Josh prefers cargo test before PRs.".to_string(),
+            hash: Some(
+                "sha256:imagefixture000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            modified_at: None,
+            idempotency_key: Some("screenshot-settings".to_string()),
+            metadata: Some(serde_json::json!({
+                "artifact_ref": "local:screenshots/settings-panel.png",
+                "media_type": "image/png"
+            })),
+        }]),
+        metadata: None,
+    };
+
+    let resp = svc.sync_local(req).expect("multimodal sync");
+
+    assert_eq!(resp.rejected, 0);
+    assert_eq!(resp.created, 1);
+    let row = &ledger_rows(&db_path)[0];
+    assert_eq!(row.source_kind, "sync_local");
+    assert_eq!(row.policy_state, "accepted");
+    assert_eq!(
+        row.source_path.as_deref(),
+        Some("screenshots/settings-panel.png")
+    );
+    assert_eq!(row.metadata["artifact_kind"], "screenshot_image");
+    assert_eq!(
+        row.metadata["artifact_ref"],
+        "local:screenshots/settings-panel.png"
+    );
+    assert_eq!(row.metadata["media_type"], "image/png");
+    assert_eq!(
+        row.source_hash,
+        "sha256:imagefixture000000000000000000000000000000000000000000000000000000000000"
+    );
+    let contents = record_contents(&db_path);
+    assert_eq!(contents.len(), 1);
+    assert!(contents[0].contains("cargo test"));
+    assert!(!contents[0].contains("PNG"));
+}
+
+#[test]
+fn sync_apply_redacts_secret_like_multimodal_excerpts_before_persistence() {
+    let (svc, _tmp, db_path) = temp_service();
+    let req = SyncRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        source_root: Some("/workspace".to_string()),
+        mode: Some("apply".to_string()),
+        files: Some(vec![
+            SyncFile {
+                path: "screenshots/secret-settings.png".to_string(),
+                kind: Some("screenshot_image".to_string()),
+                content: "OCR saw API_KEY=abcdef1234567890 and a note to keep using cargo test.".to_string(),
+                hash: None,
+                modified_at: None,
+                idempotency_key: None,
+                metadata: None,
+            },
+            SyncFile {
+                path: "logs/run.log".to_string(),
+                kind: Some("log_excerpt".to_string()),
+                content: "Build failed after token: ghp_abcdefghijklmnopqrstuvwxyz0123456789 but retry used cargo test.".to_string(),
+                hash: None,
+                modified_at: None,
+                idempotency_key: None,
+                metadata: None,
+            },
+            SyncFile {
+                path: "patches/auth.diff".to_string(),
+                kind: Some("git_diff".to_string()),
+                content: "+ password = hunter2secret\n+ keep using repo-native tests".to_string(),
+                hash: None,
+                modified_at: None,
+                idempotency_key: None,
+                metadata: None,
+            },
+        ]),
+        metadata: None,
+    };
+
+    let resp = svc.sync_local(req).expect("redacted multimodal sync");
+
+    assert_eq!(resp.rejected, 0);
+    assert_eq!(resp.created, 3);
+    let contents = record_contents(&db_path);
+    let joined = contents.join("\n");
+    assert!(joined.contains("[redacted:"));
+    assert!(!joined.contains("abcdef1234567890"));
+    assert!(!joined.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(!joined.contains("hunter2secret"));
+    assert!(ledger_rows(&db_path)
+        .iter()
+        .all(|row| row.metadata["redaction_state"] == "redacted"));
+}
+
+#[test]
+fn sync_apply_dedupes_repeated_multimodal_artifact_hash_across_paths() {
+    let (svc, _tmp, db_path) = temp_service();
+    let shared_hash =
+        "sha256:artifactshared0000000000000000000000000000000000000000000000000000000000";
+    let req = SyncRequest {
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None,
+        source_root: Some("/workspace".to_string()),
+        mode: Some("apply".to_string()),
+        files: Some(vec![
+            SyncFile {
+                path: "logs/first.log".to_string(),
+                kind: Some("log_excerpt".to_string()),
+                content: "cargo test passed for the same captured run".to_string(),
+                hash: Some(shared_hash.to_string()),
+                modified_at: None,
+                idempotency_key: None,
+                metadata: None,
+            },
+            SyncFile {
+                path: "terminal/replay.txt".to_string(),
+                kind: Some("terminal_output_excerpt".to_string()),
+                content: "cargo test passed for the same captured run".to_string(),
+                hash: Some(shared_hash.to_string()),
+                modified_at: None,
+                idempotency_key: None,
+                metadata: None,
+            },
+        ]),
+        metadata: None,
+    };
+
+    let resp = svc.sync_local(req).expect("dedupe sync");
+
+    assert_eq!(resp.created, 1);
+    assert_eq!(resp.skipped, 1);
+    assert_eq!(record_contents(&db_path).len(), 1);
 }
 
 #[test]
