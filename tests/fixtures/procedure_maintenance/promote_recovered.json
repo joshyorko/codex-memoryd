@@ -1,0 +1,35 @@
+{
+  "scenario": "promote_recovered",
+  "description": "A procedure that was quarantined by counter-evidence has since accumulated fresh successful reuse and strong evidence. It becomes a PROMOTE candidate (quarantined -> active), but promote must RE-RUN the unsafe-content guard before it can apply. Preview only.",
+  "now": "2026-06-14T00:00:00Z",
+  "procedures": [
+    {
+      "id": "proc_recovered",
+      "name": "clear the cache then rebuild",
+      "state": "quarantined",
+      "activation_query": "stale build cache",
+      "steps": "clear the build cache; rebuild from scratch; verify tests pass",
+      "negative_examples": ["deleting the production database"],
+      "source_episode_ids": ["ep_r1", "ep_r2", "ep_r3"],
+      "confidence": 0.78,
+      "success_count": 5,
+      "failure_count": 1,
+      "reuse_count": 6,
+      "last_used_at": "2026-06-11T00:00:00Z",
+      "last_validated": "2026-06-11T00:00:00Z"
+    }
+  ],
+  "expect": {
+    "candidate_actions": [
+      {
+        "action": "promote",
+        "procedure_id": "proc_recovered",
+        "reason": "recovered_success_rate_with_evidence",
+        "requires_guard": "unsafe_content_recheck"
+      }
+    ],
+    "must_not": [
+      { "guarantee": "promote_reruns_unsafe_guard", "procedure_id": "proc_recovered" }
+    ]
+  }
+}

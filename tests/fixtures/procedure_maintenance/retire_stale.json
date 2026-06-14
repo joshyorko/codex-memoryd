@@ -1,0 +1,45 @@
+{
+  "scenario": "retire_stale",
+  "description": "A procedure not validated or used in months, with low reuse, becomes a RETIRE candidate. The action is a preview only — maintenance must not auto-retire it. Reuses the existing retire_procedure path on apply.",
+  "now": "2026-06-14T00:00:00Z",
+  "procedures": [
+    {
+      "id": "proc_stale",
+      "name": "use the legacy build script",
+      "state": "active",
+      "activation_query": "legacy build",
+      "steps": "run ./old-build.sh",
+      "negative_examples": [],
+      "source_episode_ids": ["ep_old1", "ep_old2"],
+      "confidence": 0.6,
+      "success_count": 2,
+      "failure_count": 0,
+      "reuse_count": 2,
+      "last_used_at": "2025-12-01T00:00:00Z",
+      "last_validated": "2025-12-01T00:00:00Z"
+    },
+    {
+      "id": "proc_active",
+      "name": "use cargo build",
+      "state": "active",
+      "activation_query": "build the project",
+      "steps": "run cargo build --release",
+      "negative_examples": [],
+      "source_episode_ids": ["ep_new1", "ep_new2"],
+      "confidence": 0.85,
+      "success_count": 7,
+      "failure_count": 0,
+      "reuse_count": 14,
+      "last_used_at": "2026-06-13T00:00:00Z",
+      "last_validated": "2026-06-13T00:00:00Z"
+    }
+  ],
+  "expect": {
+    "candidate_actions": [
+      { "action": "retire", "procedure_id": "proc_stale", "reason": "stale_low_reuse" }
+    ],
+    "must_not": [
+      { "guarantee": "no_auto_apply", "procedure_id": "proc_stale" }
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "scenario": "no_false_resurrection",
+  "description": "Safety regression hook. A retired procedure must never be moved back into default recall by maintenance, no matter how its score reads. Maintenance may surface it for inspection but must never emit a candidate action that resurrects a retired procedure as active. Mirrors the #146/#148 guarantees.",
+  "now": "2026-06-14T00:00:00Z",
+  "procedures": [
+    {
+      "id": "proc_retired",
+      "name": "old deploy workflow",
+      "state": "retired",
+      "activation_query": "deploy via the old pipeline",
+      "steps": "run the deprecated deploy script",
+      "negative_examples": [],
+      "source_episode_ids": ["ep_d1", "ep_d2"],
+      "confidence": 0.9,
+      "success_count": 8,
+      "failure_count": 0,
+      "reuse_count": 12,
+      "last_used_at": "2026-01-01T00:00:00Z",
+      "last_validated": "2026-01-01T00:00:00Z",
+      "retired_at": "2026-02-01T00:00:00Z"
+    }
+  ],
+  "expect": {
+    "candidate_actions": [],
+    "must_not": [
+      { "guarantee": "no_false_resurrection", "procedure_id": "proc_retired" }
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "scenario": "score_ranking",
+  "description": "A frequently-reused, always-successful, recently-validated procedure must score above a stale procedure with failures and no recent reuse. Proves the deterministic score ranks healthy procedures higher.",
+  "now": "2026-06-14T00:00:00Z",
+  "procedures": [
+    {
+      "id": "proc_healthy",
+      "name": "open a pull request",
+      "state": "active",
+      "activation_query": "opening a pull request",
+      "steps": "review the diff; run cargo test; write rollback notes",
+      "negative_examples": ["deploying to production"],
+      "source_episode_ids": ["ep1", "ep2", "ep3"],
+      "confidence": 0.85,
+      "success_count": 6,
+      "failure_count": 0,
+      "reuse_count": 11,
+      "last_used_at": "2026-06-12T00:00:00Z",
+      "last_validated": "2026-06-12T00:00:00Z"
+    },
+    {
+      "id": "proc_stale_failed",
+      "name": "restart the flaky job",
+      "state": "active",
+      "activation_query": "flaky integration job",
+      "steps": "restart once and hope",
+      "negative_examples": [],
+      "source_episode_ids": ["ep9", "ep10"],
+      "confidence": 0.55,
+      "success_count": 1,
+      "failure_count": 3,
+      "reuse_count": 4,
+      "last_used_at": "2026-02-01T00:00:00Z",
+      "last_validated": "2026-02-01T00:00:00Z"
+    }
+  ],
+  "expect": {
+    "score_order": ["proc_healthy", "proc_stale_failed"],
+    "candidate_actions": [],
+    "must_not": []
+  }
+}
