@@ -8,7 +8,7 @@
         "promotion_reason": "expired relative-time content",
         "evidence_count": 1,
         "must_contain": [
-          "As of 2026-06-13, Right now the daemon is failing on startup, planning to patch it tomorrow."
+          "As of 2026-01-10, Right now the daemon is failing on startup, planning to patch it tomorrow."
         ],
         "must_not_contain": []
       },

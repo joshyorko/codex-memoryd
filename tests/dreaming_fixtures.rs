@@ -15,8 +15,10 @@ use codex_memoryd::protocol::DreamRequest;
 use codex_memoryd::protocol::RecallRequest;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::{NewRecord, Store};
+use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tempfile::TempDir;
 
 const PROFILE: &str = "personal";
 const WORKSPACE: &str = "dream-eval";
@@ -140,6 +142,7 @@ struct SeededFixture {
     service: Service,
     repo: Option<RepoIdentity>,
     now: String,
+    _tempdir: TempDir,
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -261,7 +264,9 @@ fn load_sidecar(fixture: &LoadedFixture) -> Sidecar {
 }
 
 fn seed_real_dream_store(fixture: &LoadedFixture) -> SeededFixture {
-    let store = Store::open(":memory:").expect("open in-memory store");
+    let tempdir = TempDir::new().expect("dream fixture tempdir");
+    let db_path = tempdir.path().join("dreaming-fixtures.sqlite");
+    let store = Store::open(&db_path).expect("open fixture store");
     store
         .ensure_workspace(PROFILE, WORKSPACE)
         .expect("workspace");
@@ -286,19 +291,19 @@ fn seed_real_dream_store(fixture: &LoadedFixture) -> SeededFixture {
             }
             "visible_turn" => {
                 let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
-                seed_visible_turn(&store, event, repo_id, &mut session_ids);
+                seed_visible_turn(&store, &db_path, event, repo_id, &mut session_ids);
             }
             "conclusion" => {
                 let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
-                seed_conclusion(&store, event, repo_id);
+                seed_conclusion(&store, &db_path, event, repo_id);
             }
             "checkpoint" => {
                 let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
-                seed_checkpoint(&store, event, repo_id, &mut session_ids);
+                seed_checkpoint(&store, &db_path, event, repo_id, &mut session_ids);
             }
             "memory_record" => {
                 let repo_id = event.repo_id.as_deref().or(repo_id.as_deref());
-                seed_memory_record_event(&store, event, repo_id);
+                seed_memory_record_event(&store, &db_path, event, repo_id);
             }
             other => panic!("missing real Dreamer seed for fixture event kind {other}"),
         }
@@ -322,11 +327,13 @@ fn seed_real_dream_store(fixture: &LoadedFixture) -> SeededFixture {
         service,
         repo,
         now,
+        _tempdir: tempdir,
     }
 }
 
 fn seed_visible_turn(
     store: &Store,
+    db_path: &Path,
     event: &FixtureEvent,
     repo_id: Option<&str>,
     session_ids: &mut std::collections::BTreeMap<Option<String>, String>,
@@ -364,6 +371,7 @@ fn seed_visible_turn(
         .expect("visible_turn");
     seed_corresponding_memory_record(
         store,
+        db_path,
         repo_id,
         content,
         json!({
@@ -371,12 +379,13 @@ fn seed_visible_turn(
             "actor": actor,
             "created_at": event.created_at.clone(),
         }),
+        &event.created_at,
         None,
         vec![],
     );
 }
 
-fn seed_conclusion(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
+fn seed_conclusion(store: &Store, db_path: &Path, event: &FixtureEvent, repo_id: Option<&str>) {
     let content = event.text().expect("conclusion content");
     store
         .insert_conclusion(&codex_memoryd::domain::Conclusion {
@@ -397,6 +406,7 @@ fn seed_conclusion(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
         .expect("conclusion");
     seed_corresponding_memory_record(
         store,
+        db_path,
         repo_id,
         content,
         json!({
@@ -404,6 +414,7 @@ fn seed_conclusion(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
             "target": "user",
             "created_at": event.created_at.clone(),
         }),
+        &event.created_at,
         None,
         vec![],
     );
@@ -411,6 +422,7 @@ fn seed_conclusion(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
 
 fn seed_checkpoint(
     store: &Store,
+    db_path: &Path,
     event: &FixtureEvent,
     repo_id: Option<&str>,
     session_ids: &mut std::collections::BTreeMap<Option<String>, String>,
@@ -452,18 +464,25 @@ fn seed_checkpoint(
         .expect("checkpoint");
     seed_corresponding_memory_record(
         store,
+        db_path,
         repo_id,
         summary,
         json!({
             "origin": "checkpoint",
             "created_at": event.created_at.clone(),
         }),
+        &event.created_at,
         Some(RecordType::TaskCheckpoint),
         vec![],
     );
 }
 
-fn seed_memory_record_event(store: &Store, event: &FixtureEvent, repo_id: Option<&str>) {
+fn seed_memory_record_event(
+    store: &Store,
+    db_path: &Path,
+    event: &FixtureEvent,
+    repo_id: Option<&str>,
+) {
     let content = event.text().expect("memory_record content");
     let mut metadata = json!({
         "origin": "memory_record",
@@ -480,14 +499,25 @@ fn seed_memory_record_event(store: &Store, event: &FixtureEvent, repo_id: Option
         metadata["type"] = Value::String(record_type.to_string());
     }
     let source_ids = event.id.iter().cloned().collect::<Vec<_>>();
-    seed_corresponding_memory_record(store, repo_id, content, metadata, None, source_ids);
+    seed_corresponding_memory_record(
+        store,
+        db_path,
+        repo_id,
+        content,
+        metadata,
+        &event.created_at,
+        None,
+        source_ids,
+    );
 }
 
 fn seed_corresponding_memory_record(
     store: &Store,
+    db_path: &Path,
     repo_id: Option<&str>,
     content: &str,
     metadata: Value,
+    created_at: &str,
     record_type_override: Option<RecordType>,
     source_ids: Vec<String>,
 ) {
@@ -524,7 +554,24 @@ fn seed_corresponding_memory_record(
         supersedes: vec![],
         metadata,
     };
-    store.upsert_record(&new).expect("seed real dream record");
+    let outcome = store.upsert_record(&new).expect("seed real dream record");
+    if outcome.created() {
+        restamp_seeded_memory_record(db_path, outcome.id(), created_at);
+    }
+}
+
+fn restamp_seeded_memory_record(db_path: &Path, record_id: &str, created_at: &str) {
+    let conn = rusqlite::Connection::open(db_path).expect("open fixture db for timestamp update");
+    let updated = conn
+        .execute(
+            "UPDATE memory_records SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![created_at, record_id],
+        )
+        .expect("stamp fixture memory record timestamp");
+    assert_eq!(
+        updated, 1,
+        "seeded fixture memory record timestamp update should affect exactly one row"
+    );
 }
 
 fn recall_text(service: &Service, expectation: &RecallExpectation) -> String {
