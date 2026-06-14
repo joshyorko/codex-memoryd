@@ -434,7 +434,7 @@ fn tool_definitions(read_only: bool) -> Vec<ToolDefinition> {
                     "repoId": { "type": "string" },
                     "query": { "type": "string" },
                     "maxTokens": { "type": "integer", "minimum": 1 },
-                    "packMode": { "type": "string", "enum": ["default", "debugging"] }
+                    "packMode": { "type": "string", "enum": ["default", "debugging", "onboarding"] }
                 },
                 "required": ["query"],
                 "additionalProperties": false,

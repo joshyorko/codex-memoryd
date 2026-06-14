@@ -100,6 +100,16 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
             "memory_checkpoint",
         ]
     );
+    let recall_tool = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"] == "memory_recall")
+        .expect("memory_recall tool");
+    assert_eq!(
+        recall_tool["inputSchema"]["properties"]["packMode"]["enum"],
+        json!(["default", "debugging", "onboarding"])
+    );
 
     assert_eq!(
         responses[2]["result"]["structuredContent"]["provider_name"],

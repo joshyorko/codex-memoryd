@@ -54,6 +54,21 @@ const PACK_TEMPLATES: &[PackTemplate] = &[
         mode: "debugging",
         budget_tokens: 1000,
     },
+    PackTemplate {
+        mode: "onboarding",
+        budget_tokens: 1400,
+    },
+];
+
+const ONBOARDING_CONTENT_TERMS: &[&str] = &[
+    "onboarding",
+    "convention",
+    "setup",
+    "first-run",
+    "first run",
+    "architecture",
+    "current state",
+    "current-state",
 ];
 
 /// Parameters resolved for a recall request.
@@ -94,7 +109,7 @@ fn pack_template(mode: &str) -> Result<&'static PackTemplate> {
         .find(|template| template.mode == mode)
         .ok_or_else(|| {
             crate::error::Error::invalid_request(format!(
-                "unknown pack_mode '{mode}'; use default or debugging"
+                "unknown pack_mode '{mode}'; use default, debugging, or onboarding"
             ))
         })
 }
@@ -517,50 +532,112 @@ fn ranking_signals(
 }
 
 fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
-    if pack_template.mode != "debugging" {
-        return 0.0;
-    }
-    let mut boost = match record.record_type {
-        RecordType::Gotcha => 3.0,
-        RecordType::TaskCheckpoint => 1.5,
-        RecordType::Command => 1.0,
-        RecordType::WorkflowPattern => 0.75,
+    match pack_template.mode {
+        "debugging" => {
+            let mut boost = match record.record_type {
+                RecordType::Gotcha => 3.0,
+                RecordType::TaskCheckpoint => 1.5,
+                RecordType::Command => 1.0,
+                RecordType::WorkflowPattern => 0.75,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if [
+                "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
+            ]
+            .iter()
+            .any(|needle| content.contains(needle))
+            {
+                boost += 0.75;
+            }
+            boost
+        }
+        "onboarding" => {
+            let mut boost = match record.record_type {
+                RecordType::RepoConvention => 2.0,
+                RecordType::Decision => 1.7,
+                RecordType::WorkflowPattern => 1.5,
+                RecordType::TaskCheckpoint => 1.3,
+                RecordType::Preference => 1.1,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if ONBOARDING_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                boost += 1.0;
+            }
+            if content.contains("current state") || content.contains("current-state") {
+                boost += 0.5;
+            }
+            if content.contains("first run") || content.contains("first-run") {
+                boost += 0.25;
+            }
+            boost
+        }
         _ => 0.0,
-    };
-    let content = record.content.to_ascii_lowercase();
-    if [
-        "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
-    ]
-    .iter()
-    .any(|needle| content.contains(needle))
-    {
-        boost += 0.75;
     }
-    boost
 }
 
 fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec<String> {
-    if pack_template.mode != "debugging" {
-        return vec!["pack_mode:default".to_string()];
+    match pack_template.mode {
+        "debugging" => {
+            let mut signals = vec!["pack_mode:debugging".to_string()];
+            match record.record_type {
+                RecordType::Gotcha => signals.push("debugging_gotcha".to_string()),
+                RecordType::TaskCheckpoint => signals.push("debugging_checkpoint".to_string()),
+                RecordType::Command => signals.push("debugging_command".to_string()),
+                RecordType::WorkflowPattern => {
+                    signals.push("debugging_workflow_pattern".to_string())
+                }
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if [
+                "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
+            ]
+            .iter()
+            .any(|needle| content.contains(needle))
+            {
+                signals.push("debugging_terms".to_string());
+            }
+            signals
+        }
+        "onboarding" => {
+            let mut signals = vec!["pack_mode:onboarding".to_string()];
+            match record.record_type {
+                RecordType::Decision => signals.push("onboarding_decision".to_string()),
+                RecordType::RepoConvention => {
+                    signals.push("onboarding_repo_convention".to_string())
+                }
+                RecordType::WorkflowPattern => {
+                    signals.push("onboarding_workflow_pattern".to_string())
+                }
+                RecordType::TaskCheckpoint => signals.push("onboarding_checkpoint".to_string()),
+                RecordType::Preference => signals.push("onboarding_preference".to_string()),
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if ONBOARDING_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                signals.push("onboarding_terms".to_string());
+            }
+            if content.contains("current state") || content.contains("current-state") {
+                signals.push("onboarding_current_state".to_string());
+            }
+            if content.contains("first run") || content.contains("first-run") {
+                signals.push("onboarding_first_run".to_string());
+            }
+            if content.contains("architecture") {
+                signals.push("onboarding_architecture".to_string());
+            }
+            signals
+        }
+        _ => vec!["pack_mode:default".to_string()],
     }
-    let mut signals = vec!["pack_mode:debugging".to_string()];
-    match record.record_type {
-        RecordType::Gotcha => signals.push("debugging_gotcha".to_string()),
-        RecordType::TaskCheckpoint => signals.push("debugging_checkpoint".to_string()),
-        RecordType::Command => signals.push("debugging_command".to_string()),
-        RecordType::WorkflowPattern => signals.push("debugging_workflow_pattern".to_string()),
-        _ => {}
-    }
-    let content = record.content.to_ascii_lowercase();
-    if [
-        "debug", "failure", "failed", "error", "rollback", "recover", "gotcha",
-    ]
-    .iter()
-    .any(|needle| content.contains(needle))
-    {
-        signals.push("debugging_terms".to_string());
-    }
-    signals
 }
 
 fn lexical_overlap(query: &str, content: &str) -> f64 {
