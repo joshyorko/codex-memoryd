@@ -29,6 +29,7 @@ pub mod ids;
 pub mod ingest;
 pub mod mcp;
 pub mod metrics;
+pub mod perf;
 pub mod policy;
 pub mod proc_eval;
 pub mod protocol;

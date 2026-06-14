@@ -209,6 +209,11 @@ pub enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    /// Report fixture-scale performance / cost budgets (records, bytes, tokens).
+    Perf {
+        #[arg(long, default_value = "summary")]
+        format: String,
+    },
     /// Run deterministic eval suites.
     Eval {
         #[command(subcommand)]
@@ -1311,6 +1316,28 @@ fn dispatch(cli: Cli) -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        Command::Perf { format } => {
+            // Real monotonic clock for the CLI; timing is informational only.
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            };
+            let report = codex_memoryd::perf::run_perf_report(clock)?;
+            match format.as_str().to_ascii_lowercase().as_str() {
+                "json" => print_json(&report)?,
+                "summary" | "human" | "markdown" => {
+                    print_markdown(&codex_memoryd::perf::render_summary(&report))
+                }
+                other => {
+                    return Err(error::Error::invalid_request(format!(
+                        "invalid --format '{other}'; expected 'json' or 'summary'"
+                    )))
+                }
+            }
+            Ok(())
         }
         Command::Eval { command } => match command {
             EvalCommand::Substrate { format, compare } => {
