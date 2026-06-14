@@ -19,6 +19,11 @@ RUN mkdir -p src \
 
 # Now copy the real source and build for real.
 COPY src ./src
+# The library embeds a checked-in fixture at compile time
+# (src/retrieval_eval.rs include_str!("../tests/fixtures/retrieval/long_history.json")),
+# so the build context must include it. Copy only tests/fixtures (data, ~268K),
+# not the .rs test files, so the container build matches a host build exactly.
+COPY tests/fixtures ./tests/fixtures
 # Touch sources so cargo rebuilds them (stub timestamps are older).
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release \
