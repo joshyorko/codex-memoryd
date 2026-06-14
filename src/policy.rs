@@ -87,11 +87,15 @@ static SECRET_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b",
             "json web token",
         ),
-        // Generic credential assignments. Includes a bare `token` keyword
-        // (and refresh/id token variants) — a common credential name in OAuth
-        // flows and secret managers that would otherwise slip through.
+        // Generic credential assignments. Bare `token` is handled separately so
+        // GitHub Actions permission text like `id-token: write` does not match
+        // the `token` suffix as a credential.
         (
-            r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|bearer)\b\s*[:=]\s*[^\s]{6,}",
+            r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|refresh[_-]?token|id_token|client[_-]?secret|bearer)\b\s*[:=]\s*[^\s]{6,}",
+            "credential assignment",
+        ),
+        (
+            r"(?im)(^|[^A-Za-z0-9_-])token\s*[:=]\s*[^\s]{6,}",
             "credential assignment",
         ),
         // Connection strings with inline credentials.
@@ -653,6 +657,16 @@ mod tests {
         assert!(detect_secret("token = 0987654321fedcba0987654321fedcba").is_some());
         assert!(detect_secret("TOKEN: abcdef123456").is_some());
         assert!(detect_secret("refresh_token=zzzzzzyyyyyy123").is_some());
+    }
+
+    #[test]
+    fn allows_github_actions_id_token_permission_docs() {
+        assert!(detect_secret("permissions:\n  id-token: write\n  contents: read").is_none());
+        assert!(
+            detect_secret("BASE_IMAGE_REF=ghcr.io/example/image:stable sudo -E build-ghcr")
+                .is_none()
+        );
+        assert!(detect_secret("id_token=zzzzzzyyyyyy123").is_some());
     }
 
     #[test]
