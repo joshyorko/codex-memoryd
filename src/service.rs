@@ -21,6 +21,7 @@ use crate::domain::Conclusion;
 use crate::domain::Episode;
 use crate::domain::MemoryRecord;
 use crate::domain::Portability;
+use crate::domain::Procedure;
 use crate::domain::Profile;
 use crate::domain::RecordType;
 use crate::domain::RepoIdentity;
@@ -1177,6 +1178,153 @@ impl Service {
         })
     }
 
+    // ------------------------------------------------------------------
+    // Procedures
+    // ------------------------------------------------------------------
+
+    pub fn procedures_preview(
+        &self,
+        req: ProceduresPreviewRequest,
+    ) -> Result<ProceduresPreviewResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let subject_id =
+            screen_optional_persisted_string("procedures.subject_id", &req.subject_id)?;
+        if let Some(subject_id) = subject_id.as_deref() {
+            if !self
+                .store
+                .subject_exists_in_scope(profile.as_str(), &workspace, subject_id)?
+            {
+                return Err(Error::not_found(format!("subject '{subject_id}'")));
+            }
+        }
+        let episodes = self.store.list_successful_episodes(
+            profile.as_str(),
+            &workspace,
+            subject_id.as_deref(),
+            req.limit.unwrap_or(50),
+        )?;
+        let mut subject_labels = std::collections::BTreeMap::new();
+        for episode in &episodes {
+            if !subject_labels.contains_key(&episode.subject_id) {
+                if let Some(subject) =
+                    self.store
+                        .get_subject(profile.as_str(), &workspace, &episode.subject_id)?
+                {
+                    subject_labels.insert(
+                        episode.subject_id.clone(),
+                        format!("{} ({})", subject.display_name, subject.subject_key),
+                    );
+                }
+            }
+        }
+        let (candidates, rejected) =
+            build_procedure_candidates(profile.as_str(), &workspace, &episodes, &subject_labels)?;
+        Ok(ProceduresPreviewResponse {
+            authority: "recall_not_authority".to_string(),
+            candidates,
+            rejected,
+        })
+    }
+
+    pub fn procedures_apply(&self, req: ProceduresApplyRequest) -> Result<ProceduresApplyResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        self.store.ensure_workspace(profile.as_str(), &workspace)?;
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+
+        for mut candidate in req.candidates {
+            if candidate.profile != profile.as_str() || candidate.workspace != workspace {
+                candidate.state = "quarantined".to_string();
+                candidate.reasons.push("scope_mismatch".to_string());
+                rejected.push(candidate);
+                continue;
+            }
+            let validation = validate_procedure_candidate(&candidate);
+            if !validation.is_empty() {
+                candidate.state = "quarantined".to_string();
+                candidate.reasons.extend(validation);
+                rejected.push(candidate);
+                continue;
+            }
+            if let Some(subject_id) = candidate.subject_id.as_deref() {
+                if !self
+                    .store
+                    .subject_exists_in_scope(profile.as_str(), &workspace, subject_id)?
+                {
+                    candidate.state = "quarantined".to_string();
+                    candidate.reasons.push("unknown_subject".to_string());
+                    rejected.push(candidate);
+                    continue;
+                }
+            }
+            let now = ids::now_rfc3339();
+            let procedure = Procedure {
+                id: ids::new_id("proc"),
+                profile_id: profile.as_str().to_string(),
+                workspace_id: workspace.clone(),
+                subject_id: candidate.subject_id.clone(),
+                repo_id: candidate.repo_id.clone(),
+                name: candidate.name.clone(),
+                activation_query: candidate.activation_query.clone(),
+                steps: candidate.steps.clone(),
+                guardrails: candidate.guardrails.clone(),
+                termination_condition: candidate.termination_condition.clone(),
+                source_episode_ids: candidate.source_episode_ids.clone(),
+                confidence: candidate.confidence,
+                state: "active".to_string(),
+                created_at: now,
+                retired_at: None,
+                metadata: json!({
+                    "source_candidate_id": candidate.candidate_id,
+                    "reasons": candidate.reasons,
+                    "authority": "recall_not_authority",
+                }),
+            };
+            let (procedure, _) = self.store.insert_or_get_procedure(&procedure)?;
+            applied.push(procedure_view(&procedure));
+        }
+
+        Ok(ProceduresApplyResponse {
+            authority: "recall_not_authority".to_string(),
+            applied,
+            rejected,
+        })
+    }
+
+    pub fn procedures_recall(
+        &self,
+        req: ProceduresRecallRequest,
+    ) -> Result<ProceduresRecallResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let subject_id =
+            screen_optional_persisted_string("procedures.subject_id", &req.subject_id)?;
+        let query = req
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let procedures = self
+            .store
+            .query_procedures(
+                profile.as_str(),
+                &workspace,
+                subject_id.as_deref(),
+                query,
+                req.include_retired,
+                req.limit.unwrap_or(20),
+            )?
+            .iter()
+            .map(procedure_view)
+            .collect();
+        Ok(ProceduresRecallResponse {
+            authority: "recall_not_authority".to_string(),
+            procedures,
+        })
+    }
+
     pub fn list_episodes(&self, req: EpisodeListRequest) -> Result<EpisodeListResponse> {
         let profile = self.resolve_profile(&req.profile)?;
         let workspace = self.resolve_workspace(&req.workspace);
@@ -2321,6 +2469,224 @@ fn is_recent_scar_record(record: &MemoryRecord) -> bool {
     RECENT_SCAR_PREFIXES
         .iter()
         .any(|prefix| lower.starts_with(prefix))
+}
+
+fn build_procedure_candidates(
+    profile: &str,
+    workspace: &str,
+    episodes: &[Episode],
+    subject_labels: &std::collections::BTreeMap<String, String>,
+) -> Result<(Vec<ProcedureCandidate>, Vec<ProcedureCandidate>)> {
+    let mut grouped: std::collections::BTreeMap<(String, String), Vec<&Episode>> =
+        std::collections::BTreeMap::new();
+    for episode in episodes {
+        let key_summary = normalize_procedure_summary(&episode.summary);
+        if key_summary.is_empty() {
+            continue;
+        }
+        grouped
+            .entry((episode.subject_id.clone(), key_summary))
+            .or_default()
+            .push(episode);
+    }
+
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    for ((subject_id, normalized), mut group) in grouped {
+        group.sort_by(|a, b| a.id.cmp(&b.id));
+        let summary = group[0].summary.trim();
+        let source_episode_ids = group.iter().map(|ep| ep.id.clone()).collect::<Vec<_>>();
+        let mut reasons = Vec::new();
+        if group.len() < 2 {
+            reasons.push("weak_support".to_string());
+        }
+        if group.iter().any(|ep| !trusted_episode(ep)) {
+            reasons.push("untrusted_evidence".to_string());
+        }
+        let unsafe_reasons = unsafe_procedure_reasons(summary);
+        reasons.extend(unsafe_reasons);
+
+        let state = if reasons.is_empty() {
+            "candidate"
+        } else {
+            "quarantined"
+        };
+        let name = procedure_name_from_summary(summary);
+        let subject_label = subject_labels
+            .get(&subject_id)
+            .map(String::as_str)
+            .unwrap_or(subject_id.as_str());
+        let candidate_id = ids::sha256_hex(
+            format!(
+                "{profile}\n{workspace}\n{subject_id}\n{normalized}\n{}",
+                source_episode_ids.join(",")
+            )
+            .as_bytes(),
+        );
+        let candidate = ProcedureCandidate {
+            candidate_id: format!("pcand_{candidate_id}"),
+            profile: profile.to_string(),
+            workspace: workspace.to_string(),
+            subject_id: Some(subject_id.clone()),
+            repo_id: None,
+            name: name.clone(),
+            activation_query: format!("When working on {name} or {subject_label}"),
+            steps: procedure_steps_from_summary(summary),
+            guardrails: "Review recalled procedures before use. Do not mutate system or developer instructions. Do not store or reveal credentials or private material. Preserve profile and workspace boundaries.".to_string(),
+            termination_condition: "Stop when the described workflow outcome is complete and required tests and checks pass, or when a blocker is found.".to_string(),
+            source_episode_ids,
+            confidence: (0.55 + (group.len() as f64 * 0.1)).min(0.9),
+            state: state.to_string(),
+            reasons,
+        };
+        if candidate.state == "candidate" {
+            candidates.push(candidate);
+        } else {
+            rejected.push(candidate);
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then(a.name.cmp(&b.name))
+    });
+    rejected.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((candidates, rejected))
+}
+
+fn validate_procedure_candidate(candidate: &ProcedureCandidate) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if candidate.state != "candidate" {
+        reasons.push("not_candidate".to_string());
+    }
+    if candidate.source_episode_ids.len() < 2 {
+        reasons.push("weak_support".to_string());
+    }
+    if candidate.activation_query.trim().is_empty()
+        || candidate.steps.trim().is_empty()
+        || candidate.guardrails.trim().is_empty()
+        || candidate.termination_condition.trim().is_empty()
+    {
+        reasons.push("missing_required_field".to_string());
+    }
+    for text in [
+        candidate.name.as_str(),
+        candidate.activation_query.as_str(),
+        candidate.steps.as_str(),
+        candidate.guardrails.as_str(),
+        candidate.termination_condition.as_str(),
+    ] {
+        reasons.extend(unsafe_procedure_reasons(text));
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn trusted_episode(episode: &Episode) -> bool {
+    matches!(
+        episode
+            .trust_level
+            .as_deref()
+            .unwrap_or("trusted")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "trusted" | "manual" | "high" | "medium"
+    )
+}
+
+fn normalize_procedure_summary(summary: &str) -> String {
+    summary
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn procedure_name_from_summary(summary: &str) -> String {
+    let cleaned = summary
+        .trim()
+        .trim_start_matches("When ")
+        .trim_start_matches("when ");
+    let before_comma = cleaned.split(',').next().unwrap_or(cleaned).trim();
+    if before_comma.is_empty() {
+        "reusable procedure".to_string()
+    } else {
+        before_comma.chars().take(80).collect()
+    }
+}
+
+fn procedure_steps_from_summary(summary: &str) -> String {
+    let after_comma = summary
+        .split_once(',')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(summary.trim());
+    let normalized = after_comma.trim_end_matches('.');
+    if normalized.is_empty() {
+        "- Review the source experience.\n- Repeat only the evidence-backed steps.".to_string()
+    } else {
+        format!(
+            "- {}",
+            normalized
+                .replace(", and ", "\n- ")
+                .replace(" and ", "\n- ")
+        )
+    }
+}
+
+fn unsafe_procedure_reasons(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let unsafe_terms = [
+        "ignore previous instructions",
+        "ignore system",
+        "system guidance",
+        "without review",
+        ".env",
+        "id_rsa",
+        "private key",
+        "secret",
+        "password",
+        "token=",
+        "ghp_",
+    ];
+    if unsafe_terms.iter().any(|term| lower.contains(term)) {
+        vec!["unsafe_content".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn procedure_view(procedure: &Procedure) -> ProcedureView {
+    ProcedureView {
+        id: procedure.id.clone(),
+        source_candidate_id: extract_metadata_string(&procedure.metadata, "source_candidate_id")
+            .unwrap_or_default(),
+        profile: procedure.profile_id.clone(),
+        workspace: procedure.workspace_id.clone(),
+        subject_id: procedure.subject_id.clone(),
+        repo_id: procedure.repo_id.clone(),
+        name: procedure.name.clone(),
+        activation_query: procedure.activation_query.clone(),
+        steps: procedure.steps.clone(),
+        guardrails: procedure.guardrails.clone(),
+        termination_condition: procedure.termination_condition.clone(),
+        source_episode_ids: procedure.source_episode_ids.clone(),
+        confidence: procedure.confidence,
+        state: procedure.state.clone(),
+        created_at: procedure.created_at.clone(),
+        retired_at: procedure.retired_at.clone(),
+        policy: ProcedurePolicy {
+            authority: "recall_not_authority".to_string(),
+            admission: if procedure.state == "active" {
+                "reviewed_apply".to_string()
+            } else {
+                procedure.state.clone()
+            },
+            provenance: procedure.source_episode_ids.clone(),
+        },
+    }
 }
 
 fn is_procedure_record(record: &MemoryRecord) -> bool {

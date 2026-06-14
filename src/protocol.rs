@@ -393,6 +393,116 @@ pub struct CardShowResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Procedures (reviewable procedural memory substrate)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProceduresPreviewRequest {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcedureCandidate {
+    pub candidate_id: String,
+    pub profile: String,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    pub name: String,
+    pub activation_query: String,
+    pub steps: String,
+    pub guardrails: String,
+    pub termination_condition: String,
+    pub source_episode_ids: Vec<String>,
+    pub confidence: f64,
+    pub state: String,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProceduresPreviewResponse {
+    pub authority: String,
+    pub candidates: Vec<ProcedureCandidate>,
+    pub rejected: Vec<ProcedureCandidate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProceduresApplyRequest {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub candidates: Vec<ProcedureCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcedurePolicy {
+    pub authority: String,
+    pub admission: String,
+    pub provenance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcedureView {
+    pub id: String,
+    pub source_candidate_id: String,
+    pub profile: String,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    pub name: String,
+    pub activation_query: String,
+    pub steps: String,
+    pub guardrails: String,
+    pub termination_condition: String,
+    pub source_episode_ids: Vec<String>,
+    pub confidence: f64,
+    pub state: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
+    pub policy: ProcedurePolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProceduresApplyResponse {
+    pub authority: String,
+    pub applied: Vec<ProcedureView>,
+    pub rejected: Vec<ProcedureCandidate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProceduresRecallRequest {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_retired: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProceduresRecallResponse {
+    pub authority: String,
+    pub procedures: Vec<ProcedureView>,
+}
+
+// ---------------------------------------------------------------------------
 // Adapter generated views
 // ---------------------------------------------------------------------------
 

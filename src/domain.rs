@@ -312,6 +312,27 @@ pub struct Episode {
     pub metadata: Value,
 }
 
+/// Reviewable reusable procedure derived from repeated successful experience.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Procedure {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub subject_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub name: String,
+    pub activation_query: String,
+    pub steps: String,
+    pub guardrails: String,
+    pub termination_condition: String,
+    pub source_episode_ids: Vec<String>,
+    pub confidence: f64,
+    pub state: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub metadata: Value,
+}
+
 /// The primary durable memory unit (SPEC §4.1.7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {

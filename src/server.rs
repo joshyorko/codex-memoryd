@@ -68,6 +68,9 @@ pub fn router(service: Service) -> Router {
             post(episode_create_handler).get(episode_list_handler),
         )
         .route("/v1/episodes/get", get(episode_get_handler))
+        .route("/v1/procedures/preview", post(procedures_preview_handler))
+        .route("/v1/procedures/apply", post(procedures_apply_handler))
+        .route("/v1/procedures/recall", post(procedures_recall_handler))
         .route("/v1/checkpoints", post(checkpoints_handler))
         .route("/v1/dream", post(dream_handler))
         .route("/v1/sync/local-codex-memory", post(sync_handler))
@@ -263,6 +266,48 @@ async fn episode_get_handler(
     Query(query): Query<EpisodeGetRequest>,
 ) -> Response {
     match state.service.get_episode(query) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn procedures_preview_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.procedures_preview(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn procedures_apply_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.procedures_apply(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn procedures_recall_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.procedures_recall(req) {
         Ok(data) => ok_envelope(data, vec![]),
         Err(e) => err_envelope(e),
     }
