@@ -39,6 +39,15 @@ fn run_mcp(db: &PathBuf, extra_args: &[&str], requests: &[Value]) -> Vec<Value> 
         .collect()
 }
 
+fn tool_names(response: &Value) -> Vec<&str> {
+    response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect()
+}
+
 #[test]
 fn mcp_stdio_initializes_lists_tools_and_status() {
     let dir = TempDir::new().unwrap();
@@ -84,21 +93,9 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
     );
     assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
-    let tool_names: Vec<_> = responses[1]["result"]["tools"]
-        .as_array()
-        .expect("tools array")
-        .iter()
-        .map(|tool| tool["name"].as_str().expect("tool name"))
-        .collect();
     assert_eq!(
-        tool_names,
-        vec![
-            "memory_status",
-            "memory_recall",
-            "memory_search",
-            "memory_conclude",
-            "memory_checkpoint",
-        ]
+        tool_names(&responses[1]),
+        vec!["memory_status", "memory_recall", "memory_search"]
     );
     let recall_tool = responses[1]["result"]["tools"]
         .as_array()
@@ -132,7 +129,7 @@ fn mcp_stdio_conclude_roundtrip_surfaces_in_recall() {
 
     let responses = run_mcp(
         &db,
-        &[],
+        &["--write-tools"],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -275,13 +272,13 @@ fn mcp_stdio_accepts_tool_call_meta() {
 }
 
 #[test]
-fn mcp_stdio_read_only_lists_read_tools_and_rejects_writes() {
+fn mcp_stdio_defaults_to_read_only_tools_and_rejects_writes() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
 
     let responses = run_mcp(
         &db,
-        &["--read-only"],
+        &[],
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -326,14 +323,8 @@ fn mcp_stdio_read_only_lists_read_tools_and_rejects_writes() {
 
     assert_eq!(responses.len(), 4);
 
-    let tool_names: Vec<_> = responses[1]["result"]["tools"]
-        .as_array()
-        .expect("tools array")
-        .iter()
-        .map(|tool| tool["name"].as_str().expect("tool name"))
-        .collect();
     assert_eq!(
-        tool_names,
+        tool_names(&responses[1]),
         vec!["memory_status", "memory_recall", "memory_search"]
     );
 
@@ -346,4 +337,206 @@ fn mcp_stdio_read_only_lists_read_tools_and_rejects_writes() {
         .as_str()
         .expect("error message")
         .contains("read-only mode"));
+}
+
+#[test]
+fn mcp_stdio_write_tools_are_explicit_opt_in_and_policy_gated() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let responses = run_mcp(
+        &db,
+        &["--write-tools"],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_create",
+                    "arguments": {
+                        "profile": "personal",
+                        "workspace": "mcp-write",
+                        "content": "Decision: MCP write tools require explicit opt in"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_create",
+                    "arguments": {
+                        "profile": "personal",
+                        "workspace": "mcp-write",
+                        "content": "OPENAI_API_KEY=sk-test-1234567890abcdefghijklmnop"
+                    }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 4);
+    assert_eq!(
+        tool_names(&responses[1]),
+        vec![
+            "memory_status",
+            "memory_recall",
+            "memory_search",
+            "memory_create",
+            "memory_conclude",
+            "memory_checkpoint",
+            "memory_import_preview",
+            "memory_import_apply",
+        ]
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["record_ids"]
+            .as_array()
+            .expect("record ids")
+            .len(),
+        1
+    );
+    let rejected = responses[3]["result"]["structuredContent"]["rejected"]
+        .as_array()
+        .expect("rejections");
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0]["reason"]
+        .as_str()
+        .expect("rejection reason")
+        .contains("secret"));
+}
+
+#[test]
+fn mcp_stdio_import_preview_and_apply_use_existing_sync_policy() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let file = json!({
+        "path": "MEMORY.md",
+        "kind": "memory_registry",
+        "content": "- Prefer MCP schema snapshots for adapter reviews."
+    });
+    let args = json!({
+        "profile": "personal",
+        "workspace": "mcp-import",
+        "sourceRoot": "/tmp/codex-memoryd-mcp-import",
+        "files": [file]
+    });
+
+    let responses = run_mcp(
+        &db,
+        &["--write-tools"],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_import_preview",
+                    "arguments": args
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_import_apply",
+                    "arguments": args
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "profile": "personal",
+                        "workspace": "mcp-import",
+                        "query": "schema snapshots",
+                        "limit": 3
+                    }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["mode"],
+        "preview"
+    );
+    assert_eq!(responses[1]["result"]["structuredContent"]["created"], 0);
+    assert_eq!(responses[2]["result"]["structuredContent"]["mode"], "apply");
+    assert_eq!(responses[2]["result"]["structuredContent"]["created"], 1);
+    assert!(responses[3]["result"]["structuredContent"]["matches"]
+        .as_array()
+        .expect("search matches")
+        .iter()
+        .any(|item| item["content"]
+            .as_str()
+            .expect("item content")
+            .contains("schema snapshots")));
+}
+
+#[test]
+fn mcp_stdio_tool_schema_snapshot_matches_fixture() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let responses = run_mcp(
+        &db,
+        &["--write-tools"],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+        ],
+    );
+
+    let actual = &responses[1]["result"]["tools"];
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/mcp_tools.write.json")).unwrap();
+    assert_eq!(actual, &expected);
 }

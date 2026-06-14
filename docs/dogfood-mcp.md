@@ -13,7 +13,9 @@ safe enough to support `memoryd-canonical` mode, see
 - MCP test database: `.dogfood/mcp-sandbox-memory.db`.
 - Transport: local stdio only.
 - Codex-facing tools: `memory_status`, `memory_recall`, and `memory_search` only.
-- Write tools are not exposed to Codex in this config, and stdio now enforces `--read-only` server-side.
+- Write tools are not exposed to Codex in this config, and stdio defaults to
+  read-only server-side. The `--read-only` flag is kept in the config as an
+  explicit adapter safety marker.
 - Recall is `recall_not_authority`; user instructions, repo files, and tests override memory.
 - No automatic memory writes, hidden reasoning storage, secret storage, prompt injection, or Dreamer auto-apply.
 
@@ -149,10 +151,12 @@ Regression:
 cargo test --test mcp_stdio
 ```
 
-Observed: `5 passed`.
+Observed: `8 passed`.
 
 ## Known Limits
 
-- Keep `--read-only` enabled for stdio dogfood so the server itself gates hidden write tools.
+- Keep `--read-only` enabled for stdio dogfood configs as a visible safety
+  marker, even though read-only is now the default. Never add `--write-tools`
+  to the Codex sandbox dogfood server.
 - Search quality depends on terms. `safe dogfood`, `dogfood`, and `Dreamer` returned matches; `codex-memoryd` alone did not.
 - The real dogfood daemon continues to run separately against `.dogfood/memory.db` on `127.0.0.1:8787`.

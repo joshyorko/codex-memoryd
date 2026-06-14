@@ -218,7 +218,9 @@ to active memory records on its own.
 
 ### MCP read-only dogfood
 
-The Codex-facing MCP runbook is intentionally read-only.
+The Codex-facing MCP runbook is intentionally read-only. `mcp stdio` defaults
+to the read-only tool tier; `--read-only` is still accepted for explicit
+adapter configs.
 
 ```bash
 target/release/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio --read-only
@@ -227,6 +229,19 @@ target/release/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio --rea
 The server exposes only `memory_status`, `memory_recall`, and `memory_search`.
 See [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md) for the exact
 `~/.codex/config.toml` snippet and smoke checks.
+
+The write-capable tier is intentionally opt-in:
+
+```bash
+target/release/codex-memoryd --db ~/.codex-memoryd/memory.db mcp stdio --write-tools
+```
+
+That tier adds `memory_create`, `memory_conclude`, `memory_checkpoint`,
+`memory_import_preview`, and `memory_import_apply`. These tools still pass
+through the same write policy, secret detection, import preview/apply, and
+provenance paths as the HTTP and CLI surfaces. Do not expose `--write-tools` to
+a Codex sandbox or remote client unless an adapter capability review has
+explicitly allowed that client to write.
 
 ## Memory Model
 

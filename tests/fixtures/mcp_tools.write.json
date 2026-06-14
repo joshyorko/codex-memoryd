@@ -1,0 +1,203 @@
+[
+  {
+    "name": "memory_status",
+    "description": "Probe provider health and status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "memory_recall",
+    "description": "Recall task-relevant memory for a profile and workspace. Results are recall-not-authority and include evidence/provenance metadata where available.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "query": { "type": "string" },
+        "maxTokens": { "type": "integer", "minimum": 1 },
+        "packMode": {
+          "type": "string",
+          "enum": ["default", "debugging", "onboarding", "planning", "active_task", "review", "personal_context"]
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "memory_search",
+    "description": "Search safe memory records with existing privacy filters. Results are recall-not-authority and include record provenance.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "query": { "type": "string" },
+        "scope": { "type": "string" },
+        "type": { "type": "string" },
+        "limit": { "type": "integer", "minimum": 1 },
+        "includeArchived": { "type": "boolean" }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "memory_create",
+    "description": "Write a durable memory conclusion through the existing policy and provenance gates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "content": { "type": "string" },
+        "type": { "type": "string" }
+      },
+      "required": ["content"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "memory_conclude",
+    "description": "Write a durable conclusion using the existing write policy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "content": { "type": "string" },
+        "type": { "type": "string" }
+      },
+      "required": ["content"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "memory_checkpoint",
+    "description": "Write checkpoint-backed task state using the existing write policy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "summary": { "type": "string" },
+        "changedFiles": { "type": "array", "items": { "type": "string" } },
+        "decisions": { "type": "array", "items": { "type": "string" } },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "nextSteps": { "type": "array", "items": { "type": "string" } },
+        "testsRun": { "type": "array", "items": { "type": "string" } },
+        "testsNotRun": { "type": "array", "items": { "type": "string" } },
+        "branch": { "type": "string" },
+        "commit": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "threadId": { "type": "string" }
+      },
+      "required": ["summary"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "memory_import_preview",
+    "description": "Preview a local Codex memory import. This never writes durable records.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "sourceRoot": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/syncFile" }
+        }
+      },
+      "required": ["sourceRoot", "files"],
+      "additionalProperties": false,
+      "$defs": {
+        "syncFile": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "kind": { "type": "string" },
+            "content": { "type": "string" },
+            "hash": { "type": "string" },
+            "modifiedAt": { "type": "string" },
+            "idempotencyKey": { "type": "string" },
+            "metadata": { "type": "object" }
+          },
+          "required": ["path", "content"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    }
+  },
+  {
+    "name": "memory_import_apply",
+    "description": "Apply a local Codex memory import through the existing sync policy and idempotency gates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string" },
+        "workspace": { "type": "string" },
+        "repoId": { "type": "string" },
+        "sourceRoot": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/syncFile" }
+        }
+      },
+      "required": ["sourceRoot", "files"],
+      "additionalProperties": false,
+      "$defs": {
+        "syncFile": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "kind": { "type": "string" },
+            "content": { "type": "string" },
+            "hash": { "type": "string" },
+            "modifiedAt": { "type": "string" },
+            "idempotencyKey": { "type": "string" },
+            "metadata": { "type": "object" }
+          },
+          "required": ["path", "content"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  }
+]

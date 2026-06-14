@@ -511,6 +511,7 @@ fn seed_memory_record_event(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_corresponding_memory_record(
     store: &Store,
     db_path: &Path,

@@ -972,13 +972,14 @@ fn has_assistant_adoption(evidence: &[&MemoryRecord]) -> bool {
     for record in evidence {
         match evidence_class(record) {
             EvidenceClass::AssistantVisibleTurn => saw_assistant = true,
-            EvidenceClass::UserVisibleTurn if saw_assistant => {
-                if contains_any(
-                    &record.content.to_ascii_lowercase(),
-                    &["yes", "do that", "use that", "adopt", "ship it", "go with"],
-                ) {
-                    return true;
-                }
+            EvidenceClass::UserVisibleTurn
+                if saw_assistant
+                    && contains_any(
+                        &record.content.to_ascii_lowercase(),
+                        &["yes", "do that", "use that", "adopt", "ship it", "go with"],
+                    ) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -1017,6 +1018,7 @@ fn distinct_days(evidence: &[&MemoryRecord]) -> usize {
         .len()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_candidate(
     candidates: &mut Vec<DreamCandidate>,
     rejected: &mut Vec<DreamRejection>,
@@ -1562,11 +1564,6 @@ fn state_for(content: &str) -> String {
         ],
     ) {
         "planned".to_string()
-    } else if contains_any(
-        &lower,
-        &["currently", "right now", "in progress", "working on"],
-    ) {
-        "active".to_string()
     } else {
         "active".to_string()
     }
