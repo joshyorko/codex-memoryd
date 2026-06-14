@@ -18,7 +18,8 @@ overrides current instructions, repository state, or policy.
 - refs fixture import for JSON and JSONL exports
 - subject / episode substrate
 - current-state cards: `workspace_summary`, `subject_summary`,
-  `active_preferences`, `open_questions`, `recent_scars`
+  `active_preferences`, `open_questions`, `recent_scars`,
+  `procedures_index`
 - adapter exports for `agents-md`, `claude-code`, `copilot`,
   `github-instructions`, `markdown`, and `mcp-pack`
 - adapter context packs for `agents-md`, `claude-code`, `copilot`, and
@@ -211,7 +212,8 @@ GitHub API.
 ## Memory Shapes
 
 - `Card`: a compact summary surface for `workspace_summary`,
-  `subject_summary`, `active_preferences`, `open_questions`, or `recent_scars`
+  `subject_summary`, `active_preferences`, `open_questions`, `recent_scars`,
+  or `procedures_index`
 - `Pack`: the recall envelope, including ranking, policy, citations, and truncation
 - `Adapter`: a downstream export view such as `agents-md` or `mcp-pack`
 - `Recall policy`: ranking and admission metadata that keeps recall contextual and safe

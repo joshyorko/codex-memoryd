@@ -1829,6 +1829,309 @@ fn cli_card_recent_scars_markdown_renders() {
 }
 
 #[test]
+fn cli_card_procedures_index_json_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::WorkflowPattern,
+        "Workflow pattern: keep the workspace index in sync before review.",
+        "2026-06-13T11:00:00Z",
+        false,
+        vec!["src_workflow_pattern".to_string()],
+        vec!["workflow_pattern".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke",
+            "marker_kind": "workflow_pattern"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Command,
+        "Command: run cargo test cli_card_procedures_index_json_is_deterministic",
+        "2026-06-13T12:00:00Z",
+        false,
+        vec!["src_command".to_string()],
+        vec!["procedure".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Command,
+        "Command: cargo test is useful but not a procedure without a marker.",
+        "2026-06-13T12:30:00Z",
+        false,
+        vec!["src_unmarked_command".to_string()],
+        vec![],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Reusable procedure: refresh the card cache before a release.",
+        "2026-06-13T13:00:00Z",
+        false,
+        vec!["src_tagged_procedure".to_string()],
+        vec!["procedure".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Workflow pattern: restart the daemon after config changes.",
+        "2026-06-13T14:00:00Z",
+        false,
+        vec!["src_metadata_procedure".to_string()],
+        vec![],
+        serde_json::json!({
+            "origin": "cli_smoke",
+            "marker_kind": "procedure"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Procedure: text alone should not opt in.",
+        "2026-06-13T15:00:00Z",
+        false,
+        vec!["src_text_only".to_string()],
+        vec![],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Command,
+        "Command: archived procedures should not show.",
+        "2026-06-13T16:00:00Z",
+        true,
+        vec!["src_archived".to_string()],
+        vec!["procedure".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "other-workspace",
+        RecordType::WorkflowPattern,
+        "Workflow pattern: other workspace should stay out.",
+        "2026-06-13T17:00:00Z",
+        false,
+        vec!["src_other_workspace".to_string()],
+        vec!["workflow_pattern".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke",
+            "marker_kind": "workflow_pattern"
+        }),
+    );
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "procedures_index",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "procedures_index",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(first["card_type"], "procedures_index");
+    assert_eq!(first["scope"], "workspace");
+    assert_eq!(first["profile"], "work");
+    assert_eq!(first["workspace"], "team-workspace");
+    assert_eq!(first["authority"], "recall_not_authority");
+    assert_eq!(first["build_spec_version"], "card-summary-v1");
+    assert_eq!(first["content_hash"], second["content_hash"]);
+    assert_eq!(first, second);
+    assert_eq!(first["records"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        first["records"][0]["source_ids"],
+        serde_json::json!(["src_metadata_procedure"])
+    );
+    assert_eq!(
+        first["records"][1]["source_ids"],
+        serde_json::json!(["src_tagged_procedure"])
+    );
+    assert_eq!(
+        first["records"][2]["source_ids"],
+        serde_json::json!(["src_command"])
+    );
+    assert_eq!(
+        first["records"][3]["source_ids"],
+        serde_json::json!(["src_workflow_pattern"])
+    );
+    assert!(first
+        .to_string()
+        .contains("Workflow pattern: restart the daemon after config changes."));
+    assert!(first
+        .to_string()
+        .contains("Reusable procedure: refresh the card cache before a release."));
+    assert!(first
+        .to_string()
+        .contains("Command: run cargo test cli_card_procedures_index_json_is_deterministic"));
+    assert!(!first
+        .to_string()
+        .contains("Command: cargo test is useful but not a procedure without a marker."));
+    assert!(first
+        .to_string()
+        .contains("Workflow pattern: keep the workspace index in sync before review."));
+    assert!(!first
+        .to_string()
+        .contains("Procedure: text alone should not opt in."));
+    assert!(!first
+        .to_string()
+        .contains("Command: archived procedures should not show."));
+    assert!(!first
+        .to_string()
+        .contains("Workflow pattern: other workspace should stay out."));
+}
+
+#[test]
+fn cli_card_procedures_index_markdown_renders() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Command,
+        "Command: restore the procedure index from the latest records.",
+        "2026-06-13T12:00:00Z",
+        false,
+        vec!["src_command".to_string()],
+        vec!["procedure".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Workflow pattern: this text-only procedure should be ignored.",
+        "2026-06-13T13:00:00Z",
+        false,
+        vec!["src_text_only".to_string()],
+        vec![],
+        serde_json::json!({
+            "origin": "cli_smoke"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::WorkflowPattern,
+        "Workflow pattern: index reusable procedures by workspace.",
+        "2026-06-13T14:00:00Z",
+        false,
+        vec!["src_workflow_pattern".to_string()],
+        vec!["workflow_pattern".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke",
+            "marker_kind": "workflow_pattern"
+        }),
+    );
+    seed_record_with_details(
+        &db,
+        "work",
+        "team-workspace",
+        RecordType::Other,
+        "Reusable procedure: keep this archived procedure out.",
+        "2026-06-13T15:00:00Z",
+        true,
+        vec!["src_archived".to_string()],
+        vec!["procedure".to_string()],
+        serde_json::json!({
+            "origin": "cli_smoke",
+            "marker_kind": "procedure"
+        }),
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "procedures_index",
+            "--profile",
+            "work",
+            "--workspace",
+            "team-workspace",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Card summary: procedures_index"));
+    assert!(stdout.contains("Authority: recall_not_authority"));
+    assert!(stdout.contains("Command: restore the procedure index from the latest records."));
+    assert!(stdout.contains("Workflow pattern: index reusable procedures by workspace."));
+    assert!(!stdout.contains("Workflow pattern: this text-only procedure should be ignored."));
+    assert!(!stdout.contains("Reusable procedure: keep this archived procedure out."));
+}
+
+#[test]
 fn cli_card_show_rejects_invalid_format() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
