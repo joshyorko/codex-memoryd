@@ -156,6 +156,41 @@ fn insert_test_record(
     svc.store.upsert_record(&record).unwrap().id().to_string()
 }
 
+fn insert_test_record_with_metadata(
+    svc: &Service,
+    record_type: RecordType,
+    content: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let record = NewRecord {
+        profile_id: "personal".to_string(),
+        workspace_id: "ws".to_string(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type,
+        content: content.to_string(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.8,
+        source_ids: vec!["src_test".to_string()],
+        content_hash: ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            record_type.as_str(),
+            "workspace",
+            content,
+        ),
+        supersedes: vec![],
+        metadata,
+    };
+    svc.store.upsert_record(&record).unwrap().id().to_string()
+}
+
 #[test]
 fn status_reports_local_only_and_schema() {
     let svc = service();
@@ -632,6 +667,94 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
         .policy
         .ranking_signals
         .contains(&"stale_deprioritized".to_string()));
+}
+
+#[test]
+fn recall_applies_operational_valence_as_ranking_signal_only() {
+    let svc = service();
+    insert_test_record_with_metadata(
+        &svc,
+        RecordType::Other,
+        "Cache warmup note: cache warmup exists but has no operational marker.",
+        json!({}),
+    );
+    let marker_id = insert_test_record_with_metadata(
+        &svc,
+        RecordType::Other,
+        "Cache warmup comfort path: cache warmup is the known-good setup path.",
+        json!({
+            "marker": {
+                "marker_kind": "comfort_path",
+                "marker_type": "operational_valence",
+                "operational_valence": "positive",
+                "intensity": 0.7,
+                "decayed_intensity": 0.7,
+                "decay_half_life_days": 45.0
+            }
+        }),
+    );
+
+    let recall = svc
+        .recall(recall_req("personal", "ws", "cache warmup setup path"))
+        .unwrap();
+
+    assert_eq!(recall.authority, "recall_not_authority");
+    assert_eq!(recall.facts[0].id, marker_id);
+    assert_eq!(recall.facts[0].policy.admission.decision, "admitted");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"operational_valence:positive".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"valence_ranking_only".to_string()));
+}
+
+#[test]
+fn recall_prevents_stale_battle_scar_from_dominating_new_evidence() {
+    let svc = service();
+    let scar_id = insert_test_record_with_metadata(
+        &svc,
+        RecordType::Gotcha,
+        "Cache warmup battle scar: avoid cache warmup because it failed before.",
+        json!({
+            "marker": {
+                "marker_kind": "battle_scar",
+                "marker_type": "operational_valence",
+                "operational_valence": "negative",
+                "intensity": 0.9,
+                "decayed_intensity": 0.03,
+                "decay_half_life_days": 30.0
+            }
+        }),
+    );
+    let fresh_id = insert_test_record_with_metadata(
+        &svc,
+        RecordType::Decision,
+        "Cache warmup decision: cache warmup is safe after the current fix.",
+        json!({}),
+    );
+
+    let recall = svc
+        .recall(recall_req("personal", "ws", "cache warmup"))
+        .unwrap();
+
+    assert_eq!(recall.facts[0].id, fresh_id);
+    let scar = recall
+        .facts
+        .iter()
+        .find(|fact| fact.id == scar_id)
+        .expect("scar remains recallable");
+    assert!(scar
+        .policy
+        .ranking_signals
+        .contains(&"operational_valence:negative".to_string()));
+    assert!(scar
+        .policy
+        .ranking_signals
+        .contains(&"valence_decay_low".to_string()));
+    assert_eq!(scar.policy.admission.decision, "admitted");
 }
 
 #[test]

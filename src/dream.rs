@@ -183,6 +183,57 @@ struct EvidenceScore {
     apply_eligible: bool,
 }
 
+#[derive(Debug, Clone)]
+struct MarkerValence {
+    marker_type: &'static str,
+    operational_valence: &'static str,
+    intensity: f64,
+    confidence_delta: f64,
+    decay_half_life_days: f64,
+}
+
+impl MarkerValence {
+    fn for_kind(kind: MarkerKind) -> Self {
+        match kind {
+            MarkerKind::BattleScar => Self {
+                marker_type: "operational_valence",
+                operational_valence: "negative",
+                intensity: 0.9,
+                confidence_delta: -0.2,
+                decay_half_life_days: 30.0,
+            },
+            MarkerKind::ComfortPath => Self {
+                marker_type: "operational_valence",
+                operational_valence: "positive",
+                intensity: 0.7,
+                confidence_delta: 0.15,
+                decay_half_life_days: 45.0,
+            },
+            MarkerKind::Surprise => Self {
+                marker_type: "operational_valence",
+                operational_valence: "mixed",
+                intensity: 0.5,
+                confidence_delta: 0.0,
+                decay_half_life_days: 30.0,
+            },
+            MarkerKind::RecoveryPattern => Self {
+                marker_type: "operational_valence",
+                operational_valence: "positive",
+                intensity: 0.6,
+                confidence_delta: 0.1,
+                decay_half_life_days: 45.0,
+            },
+            MarkerKind::ConfidenceDelta => Self {
+                marker_type: "operational_valence",
+                operational_valence: "mixed",
+                intensity: 0.4,
+                confidence_delta: 0.05,
+                decay_half_life_days: 30.0,
+            },
+        }
+    }
+}
+
 pub struct DreamParams<'a> {
     pub profile: Profile,
     pub workspace: &'a str,
@@ -294,6 +345,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         push_threshold_candidates(&records, &mut candidates, &mut rejected);
     }
 
+    attach_counter_evidence_retires(&records, &mut candidates);
     dedupe_candidates(&mut candidates);
     let mut max_candidates_hit = false;
     if let Some(max) = params.max_candidates {
@@ -316,7 +368,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             if !candidate.apply_eligible {
                 continue;
             }
-            let marker = marker_from_candidate(candidate);
+            let marker = marker_from_candidate(candidate, params.now);
             let content = match policy::screen_content(&candidate.content, policy::MAX_RECORD_CHARS)
             {
                 PolicyDecision::Accept(clean) => clean,
@@ -470,13 +522,22 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                     .historical_reason
                     .as_deref()
                     .unwrap_or("superseded by newer Dreamer evidence");
-                let (mut newly_archived, _) = store.archive_records_with_metadata(
+                let archive_state = if marker
+                    .as_ref()
+                    .is_some_and(|marker| !marker.counter_evidence_refs.is_empty())
+                {
+                    "counter_evidence"
+                } else {
+                    "superseded"
+                };
+                let (mut newly_archived, _) = store.archive_records_with_metadata_at(
                     params.profile.as_str(),
                     Some(params.workspace),
                     &candidate.supersedes,
-                    "superseded",
+                    archive_state,
                     reason,
                     params.patch_run_id,
+                    params.now,
                 )?;
                 archived.append(&mut newly_archived);
             }
@@ -487,7 +548,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         created.dedup();
     }
     let observations = observations_from_candidates(&candidates);
-    let markers = markers_from_candidates(&candidates);
+    let markers = markers_from_candidates(&candidates, params.now);
 
     Ok((
         DreamResponse {
@@ -1195,10 +1256,10 @@ fn observations_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObser
     candidates.iter().map(observation_from_candidate).collect()
 }
 
-fn markers_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObservation> {
+fn markers_from_candidates(candidates: &[DreamCandidate], as_of: &str) -> Vec<DreamObservation> {
     candidates
         .iter()
-        .filter_map(marker_from_candidate)
+        .filter_map(|candidate| marker_from_candidate(candidate, as_of))
         .collect()
 }
 
@@ -1209,6 +1270,12 @@ fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
         key: id,
         kind: "dream_observation".to_string(),
         marker_kind: None,
+        marker_type: None,
+        operational_valence: None,
+        intensity: None,
+        decayed_intensity: None,
+        confidence_delta: None,
+        decay_half_life_days: None,
         category: candidate.candidate_state.clone(),
         subject_key: candidate.subject_key.clone(),
         summary: ledger_safe_summary(&candidate.content),
@@ -1216,11 +1283,16 @@ fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
         confidence: candidate.confidence,
         state: candidate.state.clone(),
         trigger: None,
+        trigger_json: None,
         outcome: None,
+        outcome_json: None,
         recovery: None,
+        recovery_json: None,
         future_guidance: None,
         evidence_refs: candidate.evidence_refs.clone(),
         retires: candidate.supersedes.clone(),
+        counter_evidence_refs: Vec::new(),
+        retired_at: None,
         first_seen_at: candidate.first_seen_at.clone(),
         last_seen_at: candidate.last_seen_at.clone(),
         authority: "recall_not_authority".to_string(),
@@ -1229,15 +1301,33 @@ fn observation_from_candidate(candidate: &DreamCandidate) -> DreamObservation {
     }
 }
 
-fn marker_from_candidate(candidate: &DreamCandidate) -> Option<DreamObservation> {
+fn marker_from_candidate(candidate: &DreamCandidate, as_of: &str) -> Option<DreamObservation> {
     let marker_kind = marker_kind_for_candidate(candidate)?;
     let id = stable_marker_id(candidate, marker_kind);
     let (trigger, outcome, recovery, future_guidance) = marker_details(marker_kind, candidate);
+    let valence = MarkerValence::for_kind(marker_kind);
+    let decayed_intensity = decayed_intensity(
+        valence.intensity,
+        valence.decay_half_life_days,
+        &candidate.first_seen_at,
+        as_of,
+    );
+    let counter_evidence_refs = if valence.operational_valence == "positive" {
+        candidate.retires.clone()
+    } else {
+        Vec::new()
+    };
     Some(DreamObservation {
         id: id.clone(),
         key: id,
         kind: "dream_observation".to_string(),
         marker_kind: Some(marker_kind.as_str().to_string()),
+        marker_type: Some(valence.marker_type.to_string()),
+        operational_valence: Some(valence.operational_valence.to_string()),
+        intensity: Some(valence.intensity),
+        decayed_intensity: Some(decayed_intensity),
+        confidence_delta: Some(valence.confidence_delta),
+        decay_half_life_days: Some(valence.decay_half_life_days),
         category: candidate.candidate_state.clone(),
         subject_key: candidate.subject_key.clone(),
         summary: ledger_safe_summary(&trigger),
@@ -1245,17 +1335,54 @@ fn marker_from_candidate(candidate: &DreamCandidate) -> Option<DreamObservation>
         confidence: candidate.confidence,
         state: candidate.state.clone(),
         trigger: Some(trigger),
+        trigger_json: Some(json!({
+            "summary": ledger_safe_summary(&candidate.content),
+            "subject_key": candidate.subject_key,
+            "evidence_count": candidate.evidence_count,
+        })),
         outcome: Some(outcome),
+        outcome_json: Some(json!({
+            "state": candidate.state,
+            "candidate_state": candidate.candidate_state,
+            "confidence": candidate.confidence,
+        })),
         recovery: Some(recovery),
+        recovery_json: Some(json!({
+            "historical_reason": candidate.historical_reason,
+            "promotion_reason": candidate.promotion_reason,
+        })),
         future_guidance: Some(future_guidance),
         evidence_refs: candidate.evidence_refs.clone(),
         retires: candidate.retires.clone(),
+        counter_evidence_refs,
+        retired_at: None,
         first_seen_at: candidate.first_seen_at.clone(),
         last_seen_at: candidate.last_seen_at.clone(),
         authority: "recall_not_authority".to_string(),
         policy: candidate.policy.clone(),
         apply_eligible: candidate.apply_eligible,
     })
+}
+
+fn decayed_intensity(
+    intensity: f64,
+    half_life_days: f64,
+    first_seen_at: &str,
+    last_seen_at: &str,
+) -> f64 {
+    let elapsed_days = match (
+        OffsetDateTime::parse(first_seen_at, &Rfc3339),
+        OffsetDateTime::parse(last_seen_at, &Rfc3339),
+    ) {
+        (Ok(first), Ok(last)) => (last - first).whole_days().max(0) as f64,
+        _ => 0.0,
+    };
+    let decayed = if half_life_days > 0.0 {
+        intensity * 0.5_f64.powf(elapsed_days / half_life_days)
+    } else {
+        intensity
+    };
+    (decayed * 1000.0).round() / 1000.0
 }
 
 fn stable_observation_id(candidate: &DreamCandidate) -> String {
@@ -1481,10 +1608,21 @@ fn observation_metadata_json(
     });
     if let Some(marker) = marker {
         value["marker_kind"] = json!(marker.marker_kind);
+        value["marker_type"] = json!(marker.marker_type);
+        value["operational_valence"] = json!(marker.operational_valence);
+        value["intensity"] = json!(marker.intensity);
+        value["decayed_intensity"] = json!(marker.decayed_intensity);
+        value["confidence_delta"] = json!(marker.confidence_delta);
+        value["decay_half_life_days"] = json!(marker.decay_half_life_days);
         value["trigger"] = json!(marker.trigger);
+        value["trigger_json"] = json!(marker.trigger_json);
         value["outcome"] = json!(marker.outcome);
+        value["outcome_json"] = json!(marker.outcome_json);
         value["recovery"] = json!(marker.recovery);
+        value["recovery_json"] = json!(marker.recovery_json);
         value["future_guidance"] = json!(marker.future_guidance);
+        value["counter_evidence_refs"] = json!(marker.counter_evidence_refs);
+        value["retired_at"] = json!(marker.retired_at);
     }
     value
 }
@@ -1527,6 +1665,79 @@ fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
         let key = format!("{}:{}:{:?}", c.action, normalize(&c.content), c.supersedes);
         seen.insert(key)
     });
+}
+
+fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [DreamCandidate]) {
+    for candidate in candidates {
+        let Some(kind) = marker_kind_for_candidate(candidate) else {
+            continue;
+        };
+        let valence = MarkerValence::for_kind(kind);
+        if valence.operational_valence != "positive" {
+            continue;
+        }
+        for record in records {
+            if candidate.supersedes.contains(&record.id) {
+                continue;
+            }
+            if marker_operational_valence(record) != Some("negative") {
+                continue;
+            }
+            if marker_retired(record) {
+                continue;
+            }
+            if same_counter_evidence_subject(candidate, record) {
+                candidate.supersedes.push(record.id.clone());
+                candidate.retires.push(record.id.clone());
+            }
+        }
+        candidate.supersedes.sort();
+        candidate.supersedes.dedup();
+        candidate.retires.sort();
+        candidate.retires.dedup();
+    }
+}
+
+fn marker_operational_valence(record: &MemoryRecord) -> Option<&str> {
+    record
+        .metadata
+        .get("marker")
+        .and_then(|marker| marker.get("operational_valence"))
+        .and_then(Value::as_str)
+}
+
+fn marker_retired(record: &MemoryRecord) -> bool {
+    record
+        .metadata
+        .get("marker")
+        .and_then(|marker| marker.get("retired_at"))
+        .is_some_and(|value| !value.is_null())
+}
+
+fn same_counter_evidence_subject(candidate: &DreamCandidate, record: &MemoryRecord) -> bool {
+    let record_subject = record
+        .metadata
+        .get("subject_key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| subject_key_for_record(record));
+    candidate.subject_key == record_subject
+        || token_overlap(&candidate.subject_key, &record_subject) >= 2
+        || token_overlap(&candidate.content, &record.content) >= 2
+}
+
+fn token_overlap(left: &str, right: &str) -> usize {
+    let left = normalized_subject_tokens(left);
+    let right = normalized_subject_tokens(right);
+    left.intersection(&right).count()
+}
+
+fn normalized_subject_tokens(value: &str) -> BTreeSet<String> {
+    normalize(value)
+        .split_whitespace()
+        .filter(|token| token.len() > 2 && !SUBJECT_NOISE_WORDS.contains(token))
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn is_drift_prone(content: &str) -> bool {

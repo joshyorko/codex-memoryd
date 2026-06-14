@@ -411,6 +411,17 @@ fn preview_and_apply_emit_experience_markers_with_required_fields() {
     for marker in &preview.markers {
         assert_eq!(marker.authority, "recall_not_authority");
         assert!(marker.marker_kind.is_some());
+        assert_eq!(marker.marker_type.as_deref(), Some("operational_valence"));
+        assert!(marker.operational_valence.is_some());
+        assert!(marker.intensity.unwrap() > 0.0);
+        assert!(marker.decayed_intensity.unwrap() > 0.0);
+        assert!(marker.decay_half_life_days.unwrap() > 0.0);
+        assert!(marker.trigger_json.is_some());
+        assert!(marker.outcome_json.is_some());
+        assert!(marker.recovery_json.is_some());
+        assert!(marker.confidence_delta.is_some());
+        assert!(marker.retired_at.is_none());
+        assert!(marker.counter_evidence_refs.is_empty());
         assert!(!marker.trigger.as_deref().unwrap().is_empty());
         assert!(!marker.outcome.as_deref().unwrap().is_empty());
         assert!(!marker.recovery.as_deref().unwrap().is_empty());
@@ -453,8 +464,30 @@ fn apply_persists_marker_provenance_for_created_records() {
         json!("battle_scar")
     );
     assert_eq!(
+        created.metadata["marker"]["marker_type"],
+        json!("operational_valence")
+    );
+    assert_eq!(
+        created.metadata["marker"]["operational_valence"],
+        json!("negative")
+    );
+    assert_eq!(
+        created.metadata["marker"]["decay_half_life_days"],
+        json!(30.0)
+    );
+    assert!(
+        created.metadata["marker"]["decayed_intensity"]
+            .as_f64()
+            .unwrap()
+            < created.metadata["marker"]["intensity"].as_f64().unwrap()
+    );
+    assert_eq!(
         created.metadata["observation"]["marker_kind"],
         json!("battle_scar")
+    );
+    assert_eq!(
+        created.metadata["observation"]["marker_type"],
+        json!("operational_valence")
     );
     assert_eq!(
         created.metadata["observation"]["authority"],
@@ -468,6 +501,81 @@ fn apply_persists_marker_provenance_for_created_records() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn operational_valence_decay_is_deterministic() {
+    let svc = service();
+    conclude(
+        &svc,
+        "Battle scar: the flaky cache failed twice, but recovered by switching to local fallback.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-07-14T00:00:00Z");
+    let scar = preview
+        .markers
+        .iter()
+        .find(|marker| marker.marker_kind.as_deref() == Some("battle_scar"))
+        .expect("battle scar marker");
+
+    assert_eq!(scar.operational_valence.as_deref(), Some("negative"));
+    assert_eq!(scar.intensity, Some(0.9));
+    assert_eq!(scar.decay_half_life_days, Some(30.0));
+    let decayed = scar.decayed_intensity.unwrap();
+    assert!(
+        (0.4..=0.5).contains(&decayed),
+        "expected roughly one half-life of decay, got {decayed}"
+    );
+}
+
+#[test]
+fn counter_evidence_can_retire_and_invert_markers_through_preview_apply() {
+    let svc = service();
+    let old_id = insert_direct_record(
+        &svc,
+        "Battle scar: avoid cache warmup because it failed before; recovered with fallback.",
+        json!({
+            "origin": "dreamer",
+            "subject_key": "cache-warmup",
+            "marker": {
+                "marker_kind": "battle_scar",
+                "marker_type": "operational_valence",
+                "operational_valence": "negative",
+                "intensity": 0.9,
+                "decay_half_life_days": 30.0,
+                "evidence_ids": ["old-scar"]
+            }
+        }),
+    );
+    conclude(
+        &svc,
+        "Comfort path: cache warmup is now the known-good path after two clean runs; it counters the old scar.",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    let inverted = preview
+        .markers
+        .iter()
+        .find(|marker| marker.marker_kind.as_deref() == Some("comfort_path"))
+        .expect("comfort path marker");
+    assert!(inverted.retires.contains(&old_id));
+    assert!(inverted
+        .counter_evidence_refs
+        .iter()
+        .any(|id| id == &old_id));
+    assert_eq!(inverted.operational_valence.as_deref(), Some("positive"));
+
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    assert!(applied.archived.contains(&old_id));
+    let retired = svc.store.get_record(&old_id).unwrap().unwrap();
+    assert_eq!(
+        retired.metadata["marker"]["retired_at"],
+        json!("2026-06-09T00:00:00Z")
+    );
+    assert_eq!(
+        retired.metadata["marker"]["retirement_reason"],
+        json!("counter_evidence")
+    );
 }
 
 #[test]

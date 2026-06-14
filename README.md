@@ -252,6 +252,11 @@ explicitly allowed that client to write.
 - `Pack`: budgeted recall bundle for a specific adapter or mode.
 - `Adapter export`: downstream rendering such as `AGENTS.md`, `CLAUDE.md`, `mcp-json`, or `markdown-wiki`.
 - `Recall policy metadata`: admission, ranking, provenance, and `recall_not_authority`.
+- `Operational valence marker`: audited Dreamer metadata for `battle_scar`,
+  `comfort_path`, `surprise`, `recovery_pattern`, and `confidence_delta`.
+  Markers carry trigger/outcome/recovery JSON, intensity, half-life decay,
+  counter-evidence refs, and optional retirement state. They are ranking and
+  explanation signals only; they never become authority or automatic commands.
 
 This substrate is intentionally not a graph engine, CRM, scheduler, or agent
 harness. Subjects and episodes are internal anchors, not a standalone exported
@@ -269,6 +274,7 @@ that the product is done:
 | `#55` | recall policy | admission gates now withhold quarantined/high-risk/unsafe/superseded records by default; remaining work depends on broader eval/review lanes |
 | `#56` | adapter context packs | closeable by this implementation: deterministic recall packs, adapter-specific pack names, budget/truncation reporting, and regression coverage are present |
 | `#57` | git import | landed for local trailers and refs fixtures covering commits, PRs, issues, and review comments |
+| `#67` | operational valence | landed marker v2 fields, deterministic decay, counter-evidence retirement, and ranking-only recall signals |
 | `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |
 
 ## Related Docs

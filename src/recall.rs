@@ -667,6 +667,8 @@ fn score_record(
 
     score += pack_mode_boost(record, pack_template);
 
+    score += operational_valence_boost(record);
+
     score
 }
 
@@ -722,8 +724,70 @@ fn ranking_signals(
     }
 
     signals.extend(pack_mode_signals(record, pack_template));
+    signals.extend(operational_valence_signals(record));
 
     signals
+}
+
+fn operational_valence_boost(record: &MemoryRecord) -> f64 {
+    let Some(valence) = marker_operational_valence(record) else {
+        return 0.0;
+    };
+    let intensity = marker_decayed_intensity(record)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    match valence {
+        "positive" => intensity * 0.8,
+        "negative" => {
+            if intensity < 0.1 {
+                0.0
+            } else {
+                intensity * 0.4
+            }
+        }
+        "mixed" => intensity * 0.2,
+        _ => 0.0,
+    }
+}
+
+fn operational_valence_signals(record: &MemoryRecord) -> Vec<String> {
+    let mut signals = Vec::new();
+    let Some(valence) = marker_operational_valence(record) else {
+        return signals;
+    };
+    signals.push(format!("operational_valence:{valence}"));
+    signals.push("valence_ranking_only".to_string());
+    if marker_decayed_intensity(record).is_some_and(|intensity| intensity < 0.1) {
+        signals.push("valence_decay_low".to_string());
+    }
+    if marker_retired(record) {
+        signals.push("valence_retired".to_string());
+    }
+    signals
+}
+
+fn marker_operational_valence(record: &MemoryRecord) -> Option<&str> {
+    record
+        .metadata
+        .get("marker")
+        .and_then(|marker| marker.get("operational_valence"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn marker_decayed_intensity(record: &MemoryRecord) -> Option<f64> {
+    record
+        .metadata
+        .get("marker")
+        .and_then(|marker| marker.get("decayed_intensity"))
+        .and_then(serde_json::Value::as_f64)
+}
+
+fn marker_retired(record: &MemoryRecord) -> bool {
+    record
+        .metadata
+        .get("marker")
+        .and_then(|marker| marker.get("retired_at"))
+        .is_some_and(|value| !value.is_null())
 }
 
 fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {

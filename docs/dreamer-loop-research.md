@@ -229,6 +229,33 @@ Required record metadata for Dreamer apply is additive (no migration —
 `supersedes` already exists as a first-class field on `MemoryRecord`; the
 metadata mirror is for cases recorded only during a dream run.
 
+Experience markers add a nested `metadata.marker` object when Dreamer can
+classify the candidate as `battle_scar`, `comfort_path`, `surprise`,
+`recovery_pattern`, or `confidence_delta`. The marker taxonomy is explicit:
+
+```json
+{
+  "marker_kind": "battle_scar",
+  "marker_type": "operational_valence",
+  "operational_valence": "negative",
+  "intensity": 0.9,
+  "decayed_intensity": 0.45,
+  "confidence_delta": -0.2,
+  "decay_half_life_days": 30.0,
+  "trigger_json": { "summary": "...", "subject_key": "..." },
+  "outcome_json": { "state": "completed", "confidence": 0.85 },
+  "recovery_json": { "historical_reason": "..." },
+  "counter_evidence_refs": [],
+  "retired_at": null
+}
+```
+
+Operational valence is not policy mutation. Recall may use active marker
+intensity as a bounded ranking/explanation signal and must continue to emit
+`recall_not_authority`. Positive counter-evidence can retire an active negative
+marker through Dreamer preview/apply; retirement archives the old marker and
+sets `retired_at` inside `metadata.marker`.
+
 ### 4.6 What synthesis backend is acceptable?
 
 Options considered:
