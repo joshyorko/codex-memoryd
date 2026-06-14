@@ -19,6 +19,51 @@ For connecting current Codex to this service through MCP stdio, see [`dogfood-mc
 
 The Docker Compose path is useful for ordinary local smoke tests, but it binds `0.0.0.0` inside the container and therefore reports `auth_missing`. For this stricter dogfood run, use the native daemon so status reports `local_only`.
 
+The canonical operator path is:
+
+```bash
+scripts/codex-memoryd-local-runtime.sh start
+scripts/codex-memoryd-local-runtime.sh status
+scripts/codex-memoryd-local-runtime.sh smoke
+scripts/codex-memoryd-local-runtime.sh restart-survival
+scripts/codex-memoryd-local-runtime.sh stop
+```
+
+The helper writes runtime state under `.dogfood/`, uses
+`.dogfood/memory.db`, and keeps the host bind at `127.0.0.1:8787` by default.
+For systemd user-service dogfood, render the unit first and inspect it before
+installing:
+
+```bash
+scripts/codex-memoryd-local-runtime.sh systemd-unit > .dogfood/codex-memoryd.service
+systemctl --user link "$PWD/.dogfood/codex-memoryd.service"
+systemctl --user enable --now codex-memoryd.service
+systemctl --user status codex-memoryd.service
+curl -fsS http://127.0.0.1:8787/v1/status | jq
+```
+
+For self-hosting, keep the daemon behind a normal authenticated HTTPS front
+door. Non-loopback binds are rejected by the helper unless
+`CODEX_MEMORYD_ALLOW_NON_LOOPBACK=1` is set intentionally; the local default
+must remain `http://127.0.0.1:8787`.
+
+Adapter examples should use the same deployment vocabulary everywhere:
+
+```toml
+[memory_provider.codex_memoryd]
+base_url = "http://127.0.0.1:8787"
+profile = "personal"
+workspace = "josh-personal"
+credential_env = "CODEX_MEMORYD_TOKEN"
+```
+
+For local loopback dogfood, omit `credential_env` unless an adapter requires a
+placeholder. For self-hosted HTTPS, store the credential in the client runtime's
+secret manager or environment; do not write it into repo docs or checked-in
+config.
+
+The manual equivalent is still useful when debugging the exact process command:
+
 ```bash
 cargo build --bin codex-memoryd
 mkdir -p .dogfood/logs .dogfood/exports
