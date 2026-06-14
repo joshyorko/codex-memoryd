@@ -19,8 +19,9 @@ This is the landed MVP surface today:
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
 | Recall policy metadata | landed | `recall_not_authority`, ranking, admission, and provenance metadata travel with recall. |
 | Current-state cards | landed MVP | `workspace_summary`, `subject_summary`, `active_preferences`, `open_questions`, `recent_scars`, `procedures_index`. |
-| Context packs | landed | `default`, `debugging`, `onboarding`, and `planning` pack modes are supported. |
+| Context packs | landed MVP | `default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and `personal_context` pack modes are supported. |
 | Adapter exports | landed | `agents-md`, `claude-code`, `copilot`, `github-instructions`, `markdown`, and `mcp-pack`. |
+| Adapter conformance | landed | `conformance adapters` emits a deterministic report for adapter authority, provenance, and budget behavior. |
 | Git import | landed | Imports commit trailers plus refs fixtures for JSON and JSONL exports. |
 | MCP dogfood | landed read-only | Exposes `memory_status`, `memory_recall`, and `memory_search` only. |
 | Dreamer patch lifecycle | landed MVP | Preview/apply exists for reviewable consolidation; broader procedural automation is still roadmap work. |
@@ -105,7 +106,19 @@ target/release/codex-memoryd sync-local --apply ~/.codex/memories \
 ### Recall and search
 
 Recall is contextual evidence, not authority. Pack modes currently accept
-`default`, `debugging`, `onboarding`, and `planning`.
+`default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and
+`personal_context`. Hyphenated CLI input such as `active-task` is normalized to
+the wire value `active_task`.
+
+| Mode | Bias |
+| --- | --- |
+| `default` | balanced recall |
+| `debugging` | gotchas, failures, rollback/recovery, commands |
+| `onboarding` | conventions, architecture, setup, current state |
+| `planning` | checkpoints, decisions, blockers, open questions, next steps |
+| `active_task` | current handoff, blockers, next steps, commands |
+| `review` | PR/review risk, verification, regressions, rollback notes |
+| `personal_context` | user preferences and operating workflow defaults |
 
 ```bash
 target/release/codex-memoryd recall --profile personal --workspace josh-personal \
@@ -126,6 +139,7 @@ target/release/codex-memoryd adapter export --target agents-md \
   --profile personal --workspace josh-personal > AGENTS.memory.md
 target/release/codex-memoryd adapter export --target mcp-pack \
   --profile personal --workspace josh-personal > mcp-pack.json
+target/release/codex-memoryd conformance adapters --format json
 ```
 
 ### Git evidence import
@@ -181,9 +195,9 @@ that the product is done:
 | `#50` | current-state cards | landed MVP surface; follow-on coverage and polish remain |
 | `#53` | eval suite | open; still validating capability gates, recall, and context-pack behavior |
 | `#55` | recall policy | landed metadata plus `recall_not_authority`; hardening remains |
-| `#56` | adapter context packs | landed for `agents-md`, `claude-code`, `copilot`, and `mcp-pack`; cleanup remains |
-| `#57` | git import | landed for local trailers and refs fixtures; more cases remain |
-| `#70` | adapter conformance | open validation lane |
+| `#56` | adapter context packs | landed MVP modes and adapter targets; card-first composition and memory-curse fixtures remain |
+| `#57` | git import | landed for local trailers and refs fixtures covering commits, PRs, issues, and review comments |
+| `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |
 
 ## Related Docs
 

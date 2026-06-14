@@ -898,6 +898,169 @@ fn recall_planning_pack_mode_reports_metadata_and_prioritizes_planning_records()
 }
 
 #[test]
+fn recall_active_task_pack_mode_reports_metadata_and_prioritizes_current_work() {
+    let svc = onboarding_service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: server architecture should stay boring and stable.",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::TaskCheckpoint,
+        "Task checkpoint: active task on the server is blocked; next step is to update the handoff status.",
+        Sensitivity::Personal,
+    );
+
+    let mut req = recall_req("personal", "ws", "server");
+    req.pack_mode = Some("active-task".to_string());
+    req.max_tokens = Some(2_000);
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "active_task");
+    assert_eq!(recall.pack.template, "active_task");
+    assert_eq!(recall.pack.template_budget_tokens, 900);
+    assert_eq!(recall.pack.max_tokens, 900);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:active_task".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:active_task".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:900".to_string()));
+    assert_eq!(recall.facts[0].record_type, "task_checkpoint");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"active_task_checkpoint".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"active_task_terms".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"active_task_blocker".to_string()));
+}
+
+#[test]
+fn recall_review_pack_mode_reports_metadata_and_prioritizes_review_risk() {
+    let svc = onboarding_service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: server release plan should stay stable.",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Gotcha,
+        "Gotcha: server PR review found regression risk; verification tests need a rollback note.",
+        Sensitivity::Personal,
+    );
+
+    let mut req = recall_req("personal", "ws", "server");
+    req.pack_mode = Some("review".to_string());
+    req.max_tokens = Some(2_000);
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "review");
+    assert_eq!(recall.pack.template, "review");
+    assert_eq!(recall.pack.template_budget_tokens, 1_100);
+    assert_eq!(recall.pack.max_tokens, 1_100);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:review".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:review".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:1100".to_string()));
+    assert_eq!(recall.facts[0].record_type, "gotcha");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"review_gotcha".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"review_terms".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"review_verification".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"review_risk".to_string()));
+}
+
+#[test]
+fn recall_personal_context_pack_mode_reports_metadata_and_prioritizes_preferences() {
+    let svc = onboarding_service();
+    svc.store.ensure_workspace("personal", "ws").unwrap();
+    insert_test_record(
+        &svc,
+        RecordType::Decision,
+        "Decision: workflow can use the default server path.",
+        Sensitivity::Personal,
+    );
+    insert_test_record(
+        &svc,
+        RecordType::Preference,
+        "Preference: prefer personal workflow defaults that keep review output concise.",
+        Sensitivity::Personal,
+    );
+
+    let mut req = recall_req("personal", "ws", "workflow");
+    req.pack_mode = Some("personal-context".to_string());
+    req.max_tokens = Some(2_000);
+    let recall = svc.recall(req).unwrap();
+
+    assert_eq!(recall.pack.mode, "personal_context");
+    assert_eq!(recall.pack.template, "personal_context");
+    assert_eq!(recall.pack.template_budget_tokens, 900);
+    assert_eq!(recall.pack.max_tokens, 900);
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_mode:personal_context".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_template:personal_context".to_string()));
+    assert!(recall
+        .policy
+        .ranking_signals
+        .contains(&"pack_budget:900".to_string()));
+    assert_eq!(recall.facts[0].record_type, "preference");
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"personal_context_preference".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"personal_context_terms".to_string()));
+    assert!(recall.facts[0]
+        .policy
+        .ranking_signals
+        .contains(&"personal_context_preference_terms".to_string()));
+}
+
+#[test]
 fn recall_reports_withheld_policy_diagnostics_without_leaking_content() {
     let svc = service();
     svc.store.ensure_workspace("personal", "ws").unwrap();

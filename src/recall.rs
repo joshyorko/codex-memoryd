@@ -62,7 +62,22 @@ const PACK_TEMPLATES: &[PackTemplate] = &[
         mode: "planning",
         budget_tokens: 1300,
     },
+    PackTemplate {
+        mode: "active_task",
+        budget_tokens: 900,
+    },
+    PackTemplate {
+        mode: "review",
+        budget_tokens: 1100,
+    },
+    PackTemplate {
+        mode: "personal_context",
+        budget_tokens: 900,
+    },
 ];
+
+const PACK_MODE_LIST: &str =
+    "default, debugging, onboarding, planning, active_task, review, or personal_context";
 
 const ONBOARDING_CONTENT_TERMS: &[&str] = &[
     "onboarding",
@@ -91,6 +106,43 @@ const PLANNING_CONTENT_TERMS: &[&str] = &[
     "questions",
     "open question",
     "open questions",
+];
+
+const ACTIVE_TASK_CONTENT_TERMS: &[&str] = &[
+    "active task",
+    "current task",
+    "in progress",
+    "next step",
+    "next steps",
+    "blocker",
+    "blocked",
+    "todo",
+    "handoff",
+    "status",
+];
+
+const REVIEW_CONTENT_TERMS: &[&str] = &[
+    "review",
+    "pr",
+    "pull request",
+    "diff",
+    "tests",
+    "verification",
+    "regression",
+    "risk",
+    "rollback",
+    "evidence",
+];
+
+const PERSONAL_CONTEXT_CONTENT_TERMS: &[&str] = &[
+    "preference",
+    "prefer",
+    "personal",
+    "default",
+    "workflow",
+    "working style",
+    "operating preference",
+    "remember",
 ];
 
 /// Parameters resolved for a recall request.
@@ -131,7 +183,7 @@ fn pack_template(mode: &str) -> Result<&'static PackTemplate> {
         .find(|template| template.mode == mode)
         .ok_or_else(|| {
             crate::error::Error::invalid_request(format!(
-                "unknown pack_mode '{mode}'; use default, debugging, onboarding, or planning"
+                "unknown pack_mode '{mode}'; use {PACK_MODE_LIST}"
             ))
         })
 }
@@ -625,6 +677,73 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
             }
             boost
         }
+        "active_task" => {
+            let mut boost = match record.record_type {
+                RecordType::TaskCheckpoint => 2.5,
+                RecordType::Decision => 1.4,
+                RecordType::Command => 1.2,
+                RecordType::WorkflowPattern => 1.0,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if ACTIVE_TASK_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                boost += 1.0;
+            }
+            if content.contains("blocked") || content.contains("blocker") {
+                boost += 0.5;
+            }
+            if content.contains("next step") || content.contains("next steps") {
+                boost += 0.5;
+            }
+            boost
+        }
+        "review" => {
+            let mut boost = match record.record_type {
+                RecordType::Gotcha => 2.2,
+                RecordType::Decision => 1.8,
+                RecordType::TaskCheckpoint => 1.6,
+                RecordType::Command => 1.3,
+                RecordType::RepoConvention => 1.0,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if REVIEW_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                boost += 1.0;
+            }
+            if content.contains("test") || content.contains("verification") {
+                boost += 0.5;
+            }
+            if content.contains("risk") || content.contains("rollback") {
+                boost += 0.5;
+            }
+            boost
+        }
+        "personal_context" => {
+            let mut boost = match record.record_type {
+                RecordType::Preference => 2.6,
+                RecordType::WorkflowPattern => 1.7,
+                RecordType::RepoConvention => 1.2,
+                RecordType::Decision => 0.8,
+                _ => 0.0,
+            };
+            let content = record.content.to_ascii_lowercase();
+            if PERSONAL_CONTEXT_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                boost += 1.0;
+            }
+            if content.contains("prefer") || content.contains("preference") {
+                boost += 0.5;
+            }
+            boost
+        }
         _ => 0.0,
     }
 }
@@ -712,6 +831,82 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
             }
             if content.contains("architecture") {
                 signals.push("onboarding_architecture".to_string());
+            }
+            signals
+        }
+        "active_task" => {
+            let mut signals = vec!["pack_mode:active_task".to_string()];
+            match record.record_type {
+                RecordType::TaskCheckpoint => signals.push("active_task_checkpoint".to_string()),
+                RecordType::Decision => signals.push("active_task_decision".to_string()),
+                RecordType::Command => signals.push("active_task_command".to_string()),
+                RecordType::WorkflowPattern => {
+                    signals.push("active_task_workflow_pattern".to_string())
+                }
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if ACTIVE_TASK_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                signals.push("active_task_terms".to_string());
+            }
+            if content.contains("blocked") || content.contains("blocker") {
+                signals.push("active_task_blocker".to_string());
+            }
+            if content.contains("next step") || content.contains("next steps") {
+                signals.push("active_task_next_step".to_string());
+            }
+            signals
+        }
+        "review" => {
+            let mut signals = vec!["pack_mode:review".to_string()];
+            match record.record_type {
+                RecordType::Gotcha => signals.push("review_gotcha".to_string()),
+                RecordType::Decision => signals.push("review_decision".to_string()),
+                RecordType::TaskCheckpoint => signals.push("review_checkpoint".to_string()),
+                RecordType::Command => signals.push("review_command".to_string()),
+                RecordType::RepoConvention => signals.push("review_repo_convention".to_string()),
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if REVIEW_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                signals.push("review_terms".to_string());
+            }
+            if content.contains("test") || content.contains("verification") {
+                signals.push("review_verification".to_string());
+            }
+            if content.contains("risk") || content.contains("rollback") {
+                signals.push("review_risk".to_string());
+            }
+            signals
+        }
+        "personal_context" => {
+            let mut signals = vec!["pack_mode:personal_context".to_string()];
+            match record.record_type {
+                RecordType::Preference => signals.push("personal_context_preference".to_string()),
+                RecordType::WorkflowPattern => {
+                    signals.push("personal_context_workflow_pattern".to_string())
+                }
+                RecordType::RepoConvention => {
+                    signals.push("personal_context_repo_convention".to_string())
+                }
+                RecordType::Decision => signals.push("personal_context_decision".to_string()),
+                _ => {}
+            }
+            let content = record.content.to_ascii_lowercase();
+            if PERSONAL_CONTEXT_CONTENT_TERMS
+                .iter()
+                .any(|needle| content.contains(needle))
+            {
+                signals.push("personal_context_terms".to_string());
+            }
+            if content.contains("prefer") || content.contains("preference") {
+                signals.push("personal_context_preference_terms".to_string());
             }
             signals
         }
