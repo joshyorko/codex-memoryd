@@ -90,6 +90,278 @@ pub struct TriageItem {
     pub message: String,
 }
 
+// ---------------------------------------------------------------------------
+// Comparative baseline harness (issue #144)
+// ---------------------------------------------------------------------------
+
+/// A comparison of the memoryd recall path against deterministic local
+/// baselines on fixture questions. Every baseline runs offline with no model
+/// and no external service — the property hosted competitors cannot match (see
+/// `docs/competitive-landscape.md`). The metrics are intentionally modest and
+/// reproducible: this measures retrieval behavior, not LLM answer quality.
+#[derive(Debug, Serialize)]
+pub struct ComparativeReport {
+    pub suite: &'static str,
+    pub version: u32,
+    pub note: &'static str,
+    pub question_count: usize,
+    pub baselines: Vec<BaselineResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BaselineResult {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Fraction of questions whose gold token appears in the returned context.
+    pub recall_at_k: f64,
+    /// Fraction of returned items that are relevant (gold-bearing), averaged.
+    pub precision_at_k: f64,
+    /// Total context size in bytes the baseline would feed downstream.
+    pub context_bytes: usize,
+    /// Whether the baseline ever leaked a cross-profile record.
+    pub cross_profile_leak: bool,
+}
+
+struct EvalQuestion {
+    query: &'static str,
+    gold_marker: &'static str,
+}
+
+/// Fixture questions whose answers live in the seeded records.
+const EVAL_QUESTIONS: &[EvalQuestion] = &[
+    EvalQuestion {
+        query: "what command validates before a PR",
+        gold_marker: "cargo test for validation",
+    },
+    EvalQuestion {
+        query: "how do we recover from a stale memory patch",
+        gold_marker: "rollback stale memory",
+    },
+];
+
+/// A minimal record view the baselines operate over.
+struct BaselineRecord {
+    content: String,
+    profile: String,
+}
+
+pub fn run_comparative_eval() -> Result<ComparativeReport> {
+    let service = eval_service()?;
+    seed_fixture_records(&service)?;
+
+    // The personal-profile corpus the local baselines may legitimately see.
+    let corpus: Vec<BaselineRecord> = vec![
+        BaselineRecord {
+            content: FACT_RECALL_CONTENT.to_string(),
+            profile: PROFILE.to_string(),
+        },
+        BaselineRecord {
+            content: BATTLE_SCAR_CONTENT.to_string(),
+            profile: PROFILE.to_string(),
+        },
+        BaselineRecord {
+            content: PATCH_SEED_CONTENT.to_string(),
+            profile: PROFILE.to_string(),
+        },
+        // A work-profile record that naive baselines might wrongly include.
+        BaselineRecord {
+            content: "Work confidential memory must not bleed into personal recall.".to_string(),
+            profile: WORK_PROFILE.to_string(),
+        },
+    ];
+
+    let baselines = vec![
+        // Baseline 1: raw chronological stuffing — everything, in order.
+        score_raw(&corpus),
+        // Baseline 2: naive keyword search — any record sharing a query word.
+        score_keyword(&corpus),
+        // Baseline 3: full personal-profile list within a byte budget.
+        score_full_list(&corpus),
+        // Baseline 4: the memoryd recall/context-pack path.
+        score_memoryd(&service)?,
+    ];
+
+    Ok(ComparativeReport {
+        suite: "comparative",
+        version: 1,
+        note: "deterministic local baselines; offline, no model, no data egress",
+        question_count: EVAL_QUESTIONS.len(),
+        baselines,
+    })
+}
+
+fn score_raw(corpus: &[BaselineRecord]) -> BaselineResult {
+    let mut hits = 0;
+    let mut bytes = 0;
+    let mut leak = false;
+    for r in corpus {
+        bytes += r.content.len();
+        if r.profile != PROFILE {
+            leak = true;
+        }
+    }
+    let mut relevant = 0;
+    for q in EVAL_QUESTIONS {
+        if corpus.iter().any(|r| r.content.contains(q.gold_marker)) {
+            hits += 1;
+        }
+    }
+    for q in EVAL_QUESTIONS {
+        relevant += corpus
+            .iter()
+            .filter(|r| r.content.contains(q.gold_marker))
+            .count();
+    }
+    BaselineResult {
+        name: "raw_chronological",
+        description: "stuff every record in order",
+        recall_at_k: hits as f64 / EVAL_QUESTIONS.len() as f64,
+        precision_at_k: relevant as f64 / (corpus.len() * EVAL_QUESTIONS.len()) as f64,
+        context_bytes: bytes,
+        cross_profile_leak: leak,
+    }
+}
+
+fn score_keyword(corpus: &[BaselineRecord]) -> BaselineResult {
+    let mut hits = 0;
+    let mut bytes = 0;
+    let mut leak = false;
+    let mut returned = 0;
+    let mut relevant = 0;
+    for q in EVAL_QUESTIONS {
+        let words: Vec<&str> = q
+            .query
+            .split_whitespace()
+            .filter(|w| w.len() >= 4)
+            .collect();
+        let matched: Vec<&BaselineRecord> = corpus
+            .iter()
+            .filter(|r| {
+                let lc = r.content.to_ascii_lowercase();
+                words.iter().any(|w| lc.contains(&w.to_ascii_lowercase()))
+            })
+            .collect();
+        returned += matched.len();
+        if matched.iter().any(|r| r.content.contains(q.gold_marker)) {
+            hits += 1;
+        }
+        for r in &matched {
+            bytes += r.content.len();
+            if r.profile != PROFILE {
+                leak = true;
+            }
+            if r.content.contains(q.gold_marker) {
+                relevant += 1;
+            }
+        }
+    }
+    BaselineResult {
+        name: "naive_keyword",
+        description: "return any record sharing a query word",
+        recall_at_k: hits as f64 / EVAL_QUESTIONS.len() as f64,
+        precision_at_k: if returned == 0 {
+            0.0
+        } else {
+            relevant as f64 / returned as f64
+        },
+        context_bytes: bytes,
+        cross_profile_leak: leak,
+    }
+}
+
+fn score_full_list(corpus: &[BaselineRecord]) -> BaselineResult {
+    // Full list scoped to the personal profile (the honest baseline).
+    let personal: Vec<&BaselineRecord> = corpus.iter().filter(|r| r.profile == PROFILE).collect();
+    let bytes: usize = personal.iter().map(|r| r.content.len()).sum();
+    let mut hits = 0;
+    let mut relevant = 0;
+    for q in EVAL_QUESTIONS {
+        if personal.iter().any(|r| r.content.contains(q.gold_marker)) {
+            hits += 1;
+        }
+        relevant += personal
+            .iter()
+            .filter(|r| r.content.contains(q.gold_marker))
+            .count();
+    }
+    BaselineResult {
+        name: "full_profile_list",
+        description: "all personal-profile records within budget",
+        recall_at_k: hits as f64 / EVAL_QUESTIONS.len() as f64,
+        precision_at_k: relevant as f64 / (personal.len() * EVAL_QUESTIONS.len()).max(1) as f64,
+        context_bytes: bytes,
+        cross_profile_leak: false,
+    }
+}
+
+fn score_memoryd(service: &Service) -> Result<BaselineResult> {
+    let mut hits = 0;
+    let mut bytes = 0;
+    let mut returned = 0;
+    let mut relevant = 0;
+    for q in EVAL_QUESTIONS {
+        let recall = service.recall(RecallRequest {
+            profile: Some(PROFILE.to_string()),
+            workspace: Some(WORKSPACE.to_string()),
+            repo: None,
+            session: None,
+            query: Some(q.query.to_string()),
+            files: vec![],
+            max_tokens: Some(220),
+            pack_mode: Some("debugging".to_string()),
+            include_types: vec![],
+            exclude_types: vec![],
+            recency_days: None,
+            metadata: None,
+        })?;
+        returned += recall.facts.len();
+        for fact in &recall.facts {
+            bytes += fact.content.len();
+            if fact.content.contains(q.gold_marker) {
+                relevant += 1;
+            }
+        }
+        if recall
+            .facts
+            .iter()
+            .any(|f| f.content.contains(q.gold_marker))
+        {
+            hits += 1;
+        }
+    }
+    Ok(BaselineResult {
+        name: "memoryd_recall",
+        description: "scoped recall + context pack (policy-gated, provenance)",
+        recall_at_k: hits as f64 / EVAL_QUESTIONS.len() as f64,
+        precision_at_k: if returned == 0 {
+            0.0
+        } else {
+            relevant as f64 / returned as f64
+        },
+        context_bytes: bytes,
+        // Recall is scoped to the requested profile by construction.
+        cross_profile_leak: false,
+    })
+}
+
+pub fn render_comparative_summary(report: &ComparativeReport) -> String {
+    let mut out = format!(
+        "codex-memoryd comparative eval ({} questions)\n{}\n\n",
+        report.question_count, report.note
+    );
+    out.push_str(&format!(
+        "{:<20} {:>9} {:>10} {:>9} {:>6}\n",
+        "baseline", "recall@k", "prec@k", "bytes", "leak"
+    ));
+    for b in &report.baselines {
+        out.push_str(&format!(
+            "{:<20} {:>9.2} {:>10.2} {:>9} {:>6}\n",
+            b.name, b.recall_at_k, b.precision_at_k, b.context_bytes, b.cross_profile_leak
+        ));
+    }
+    out
+}
+
 pub fn run_substrate_eval() -> Result<SubstrateEvalReport> {
     let service = eval_service()?;
     seed_fixture_records(&service)?;

@@ -4,7 +4,7 @@
     "provider_name": "codex-memoryd",
     "provider_version": "0.1.0",
     "api_version": "v1",
-    "storage_schema_version": 6,
+    "storage_schema_version": 7,
     "status": "local_only",
     "storage": {
       "kind": "sqlite",

@@ -425,6 +425,9 @@ pub struct ProcedureCandidate {
     pub confidence: f64,
     pub state: String,
     pub reasons: Vec<String>,
+    /// Phrases on which this procedure must NOT activate (false-activation guard).
+    #[serde(default)]
+    pub negative_examples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -471,6 +474,17 @@ pub struct ProcedureView {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
+    /// Monotonic version (bumped on supersession).
+    pub version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_validated: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    pub counter_evidence_count: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub negative_examples: Vec<String>,
     pub policy: ProcedurePolicy,
 }
 

@@ -1,0 +1,8 @@
+-- Procedure lifecycle hardening (storage_schema_version = 7).
+--
+-- Adds versioning, validation timestamps, supersession links, counter-evidence
+-- counters, and negative activation examples to procedures. Column additions
+-- and their indexes are performed idempotently in
+-- store::ensure_procedure_lifecycle_columns because this project replays
+-- migrations on every open. This file is intentionally a no-op marker, mirroring
+-- 0006_trust_quarantine.sql.

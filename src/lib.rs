@@ -14,8 +14,11 @@
 //! - [`metrics`] — counters
 //! - [`error`] / [`ids`] — error model + identifiers
 
+pub mod activation;
+pub mod backup;
 pub mod config;
 pub mod conformance;
+pub mod doctor;
 pub mod domain;
 pub mod dream;
 pub mod error;
@@ -27,6 +30,7 @@ pub mod ingest;
 pub mod mcp;
 pub mod metrics;
 pub mod policy;
+pub mod proc_eval;
 pub mod protocol;
 pub mod recall;
 pub mod server;

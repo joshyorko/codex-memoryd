@@ -10,7 +10,9 @@ use crate::protocol::SyncRequest;
 use crate::service::Service;
 use crate::store::Store;
 
-const ADAPTER_TARGETS: &[&str] = &[
+/// Adapter export targets validated by the conformance report. Public so
+/// diagnostics and contract tests reference the same registry.
+pub const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
     "claude-code",
     "copilot",

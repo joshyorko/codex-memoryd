@@ -22,8 +22,11 @@ use crate::PROVIDER_VERSION;
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const TOOL_TEXT_TYPE: &str = "text";
-const READ_ONLY_TOOL_NAMES: &[&str] = &["memory_status", "memory_recall", "memory_search"];
-const WRITE_TOOL_NAMES: &[&str] = &[
+/// Read-only MCP tools, exposed by default. Public so diagnostics and contract
+/// tests reference the same source of truth as the dispatcher.
+pub const READ_ONLY_TOOL_NAMES: &[&str] = &["memory_status", "memory_recall", "memory_search"];
+/// Write-capable MCP tools, exposed only with `--write_tools`.
+pub const WRITE_TOOL_NAMES: &[&str] = &[
     "memory_create",
     "memory_conclude",
     "memory_checkpoint",

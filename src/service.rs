@@ -1274,8 +1274,17 @@ impl Service {
                 source_episode_ids: candidate.source_episode_ids.clone(),
                 confidence: candidate.confidence,
                 state: "active".to_string(),
-                created_at: now,
+                created_at: now.clone(),
                 retired_at: None,
+                // Applying a candidate is a reviewed event: version 1, seen and
+                // validated now. Negative examples (false-activation guards)
+                // carry through from the candidate.
+                version: 1,
+                first_seen: Some(now.clone()),
+                last_validated: Some(now.clone()),
+                superseded_by: None,
+                counter_evidence_count: 0,
+                negative_examples: candidate.negative_examples.clone(),
                 metadata: json!({
                     "source_candidate_id": candidate.candidate_id,
                     "reasons": candidate.reasons,
@@ -1306,23 +1315,96 @@ impl Service {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let procedures = self
-            .store
-            .query_procedures(
-                profile.as_str(),
-                &workspace,
-                subject_id.as_deref(),
-                query,
-                req.include_retired,
-                req.limit.unwrap_or(20),
-            )?
+        // Retrieve the scope-level candidate set. When a query is present we do
+        // NOT pre-filter with SQL LIKE (it would drop on-point phrasings that
+        // don't appear verbatim); instead the activation matcher is the
+        // authority on the fire-vs-abstain decision (issue #145), including the
+        // negative-example veto. Without a query, recall is a scoped listing.
+        let matched = self.store.query_procedures(
+            profile.as_str(),
+            &workspace,
+            subject_id.as_deref(),
+            None,
+            req.include_retired,
+            req.limit.unwrap_or(20),
+        )?;
+        let procedures = matched
             .iter()
+            .filter(|procedure| match query {
+                Some(q) => crate::activation::evaluate(procedure, q).activate,
+                None => true,
+            })
             .map(procedure_view)
             .collect();
         Ok(ProceduresRecallResponse {
             authority: "recall_not_authority".to_string(),
             procedures,
         })
+    }
+
+    /// Retire a procedure (issue #146). Returns the updated view or NotFound.
+    pub fn procedure_retire(
+        &self,
+        profile: Option<&str>,
+        workspace: Option<&str>,
+        id: &str,
+    ) -> Result<ProcedureView> {
+        let profile = self.resolve_profile(&profile.map(str::to_string))?;
+        let workspace = self.resolve_workspace(&workspace.map(str::to_string));
+        let now = ids::now_rfc3339();
+        match self
+            .store
+            .retire_procedure(profile.as_str(), &workspace, id, &now)?
+        {
+            Some(p) => Ok(procedure_view(&p)),
+            None => Err(Error::not_found(format!("procedure '{id}'"))),
+        }
+    }
+
+    /// Supersede `old_id` with `new_id` (issue #146).
+    pub fn procedure_supersede(
+        &self,
+        profile: Option<&str>,
+        workspace: Option<&str>,
+        old_id: &str,
+        new_id: &str,
+    ) -> Result<ProcedureView> {
+        let profile = self.resolve_profile(&profile.map(str::to_string))?;
+        let workspace = self.resolve_workspace(&workspace.map(str::to_string));
+        let now = ids::now_rfc3339();
+        match self
+            .store
+            .supersede_procedure(profile.as_str(), &workspace, old_id, new_id, &now)?
+        {
+            Some(p) => Ok(procedure_view(&p)),
+            None => Err(Error::not_found(format!(
+                "procedure '{old_id}' or '{new_id}'"
+            ))),
+        }
+    }
+
+    /// Record counter-evidence against a procedure (issue #146). Quarantines it
+    /// once the threshold is reached.
+    pub fn procedure_counter_evidence(
+        &self,
+        profile: Option<&str>,
+        workspace: Option<&str>,
+        id: &str,
+        quarantine_threshold: i64,
+    ) -> Result<ProcedureView> {
+        let profile = self.resolve_profile(&profile.map(str::to_string))?;
+        let workspace = self.resolve_workspace(&workspace.map(str::to_string));
+        let now = ids::now_rfc3339();
+        match self.store.record_procedure_counter_evidence(
+            profile.as_str(),
+            &workspace,
+            id,
+            quarantine_threshold,
+            &now,
+        )? {
+            Some(p) => Ok(procedure_view(&p)),
+            None => Err(Error::not_found(format!("procedure '{id}'"))),
+        }
     }
 
     pub fn list_episodes(&self, req: EpisodeListRequest) -> Result<EpisodeListResponse> {
@@ -2538,6 +2620,7 @@ fn build_procedure_candidates(
             confidence: (0.55 + (group.len() as f64 * 0.1)).min(0.9),
             state: state.to_string(),
             reasons,
+            negative_examples: Vec::new(),
         };
         if candidate.state == "candidate" {
             candidates.push(candidate);
@@ -2677,6 +2760,12 @@ fn procedure_view(procedure: &Procedure) -> ProcedureView {
         state: procedure.state.clone(),
         created_at: procedure.created_at.clone(),
         retired_at: procedure.retired_at.clone(),
+        version: procedure.version,
+        first_seen: procedure.first_seen.clone(),
+        last_validated: procedure.last_validated.clone(),
+        superseded_by: procedure.superseded_by.clone(),
+        counter_evidence_count: procedure.counter_evidence_count,
+        negative_examples: procedure.negative_examples.clone(),
         policy: ProcedurePolicy {
             authority: "recall_not_authority".to_string(),
             admission: if procedure.state == "active" {
