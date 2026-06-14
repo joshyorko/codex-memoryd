@@ -66,13 +66,16 @@ const AGENTS_MD_CONTEXT_PACK_TEMPLATE: &str = "agents-md-v1";
 const CLAUDE_CODE_CONTEXT_PACK_TEMPLATE: &str = "claude-code-v1";
 const COPILOT_CONTEXT_PACK_TEMPLATE: &str = "copilot-v1";
 const MCP_CONTEXT_PACK_TEMPLATE: &str = "mcp-json-v1";
+const MARKDOWN_WIKI_CONTEXT_PACK_TEMPLATE: &str = "markdown-wiki-v1";
 const ADAPTER_TARGETS: &[&str] = &[
     "agents-md",
     "claude-code",
     "copilot",
     "github-instructions",
+    "mcp-json",
     "mcp-pack",
     "markdown",
+    "markdown-wiki",
 ];
 const RECENT_SCAR_PREFIXES: &[&str] = &["battle scar:", "scar:"];
 
@@ -82,8 +85,10 @@ enum AdapterTarget {
     ClaudeCode,
     Copilot,
     GitHubInstructions,
+    McpJson,
     McpPack,
     Markdown,
+    MarkdownWiki,
 }
 
 impl AdapterTarget {
@@ -94,8 +99,10 @@ impl AdapterTarget {
             "claude-code" => Ok(Self::ClaudeCode),
             "copilot" => Ok(Self::Copilot),
             "github-instructions" => Ok(Self::GitHubInstructions),
+            "mcp-json" => Ok(Self::McpJson),
             "mcp-pack" => Ok(Self::McpPack),
             "markdown" => Ok(Self::Markdown),
+            "markdown-wiki" => Ok(Self::MarkdownWiki),
             _ => Err(Error::invalid_request(format!(
                 "unknown adapter target '{target}'; use {}",
                 ADAPTER_TARGETS.join(" or ")
@@ -109,8 +116,10 @@ impl AdapterTarget {
             Self::ClaudeCode => "claude-code",
             Self::Copilot => "copilot",
             Self::GitHubInstructions => "github-instructions",
+            Self::McpJson => "mcp-json",
             Self::McpPack => "mcp-pack",
             Self::Markdown => "markdown",
+            Self::MarkdownWiki => "markdown-wiki",
         }
     }
 }
@@ -428,63 +437,67 @@ impl Service {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let (markdown, rendered_bytes, truncated, context_pack) = if target
-            == AdapterTarget::McpPack
-        {
-            let rendered = render_mcp_pack_adapter_view(target, &card, &source_ids, req.max_bytes)?;
-            (
-                rendered.markdown,
-                rendered.rendered_bytes,
-                rendered.truncated,
-                Some(rendered.context_pack),
-            )
-        } else if matches!(
-            target,
-            AdapterTarget::AgentsMd | AdapterTarget::ClaudeCode | AdapterTarget::Copilot
-        ) {
-            let markdown = render_adapter_view(target, &card)?;
-            let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
-            let rendered_bytes = markdown.len();
-            let budget = AdapterContextPackBudget {
-                max_bytes: req.max_bytes,
-                rendered_bytes,
-                truncated,
-            };
-            let source_ids = if truncated {
-                Vec::new()
+        let (markdown, rendered_bytes, truncated, context_pack) =
+            if matches!(target, AdapterTarget::McpJson | AdapterTarget::McpPack) {
+                let rendered =
+                    render_mcp_pack_adapter_view(target, &card, &source_ids, req.max_bytes)?;
+                (
+                    rendered.markdown,
+                    rendered.rendered_bytes,
+                    rendered.truncated,
+                    Some(rendered.context_pack),
+                )
+            } else if matches!(
+                target,
+                AdapterTarget::AgentsMd
+                    | AdapterTarget::ClaudeCode
+                    | AdapterTarget::Copilot
+                    | AdapterTarget::MarkdownWiki
+            ) {
+                let markdown = render_adapter_view(target, &card)?;
+                let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
+                let rendered_bytes = markdown.len();
+                let budget = AdapterContextPackBudget {
+                    max_bytes: req.max_bytes,
+                    rendered_bytes,
+                    truncated,
+                };
+                let source_ids = if truncated {
+                    Vec::new()
+                } else {
+                    source_ids.clone()
+                };
+                let records = if truncated {
+                    Vec::new()
+                } else {
+                    adapter_context_pack_records(&card)
+                };
+                let template = match target {
+                    AdapterTarget::AgentsMd => AGENTS_MD_CONTEXT_PACK_TEMPLATE,
+                    AdapterTarget::ClaudeCode => CLAUDE_CODE_CONTEXT_PACK_TEMPLATE,
+                    AdapterTarget::Copilot => COPILOT_CONTEXT_PACK_TEMPLATE,
+                    AdapterTarget::MarkdownWiki => MARKDOWN_WIKI_CONTEXT_PACK_TEMPLATE,
+                    _ => unreachable!("only markdown adapter targets reach this branch"),
+                };
+                (
+                    markdown,
+                    rendered_bytes,
+                    truncated,
+                    Some(build_adapter_context_pack(
+                        target,
+                        template,
+                        &card,
+                        &source_ids,
+                        budget,
+                        &records,
+                    )),
+                )
             } else {
-                source_ids.clone()
+                let markdown = render_adapter_view(target, &card)?;
+                let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
+                let rendered_bytes = markdown.len();
+                (markdown, rendered_bytes, truncated, None)
             };
-            let records = if truncated {
-                Vec::new()
-            } else {
-                adapter_context_pack_records(&card)
-            };
-            let template = match target {
-                AdapterTarget::AgentsMd => AGENTS_MD_CONTEXT_PACK_TEMPLATE,
-                AdapterTarget::ClaudeCode => CLAUDE_CODE_CONTEXT_PACK_TEMPLATE,
-                AdapterTarget::Copilot => COPILOT_CONTEXT_PACK_TEMPLATE,
-                _ => unreachable!("only markdown adapter targets reach this branch"),
-            };
-            (
-                markdown,
-                rendered_bytes,
-                truncated,
-                Some(build_adapter_context_pack(
-                    target,
-                    template,
-                    &card,
-                    &source_ids,
-                    budget,
-                    &records,
-                )),
-            )
-        } else {
-            let markdown = render_adapter_view(target, &card)?;
-            let (markdown, truncated) = apply_byte_budget(markdown, req.max_bytes);
-            let rendered_bytes = markdown.len();
-            (markdown, rendered_bytes, truncated, None)
-        };
         let mut digest_target = serde_json::json!({
             "target": target.as_str(),
             "adapter_version": ADAPTER_VIEW_VERSION,
@@ -497,10 +510,10 @@ impl Service {
         });
         // Markdown adapter context packs are additive metadata; keep the legacy
         // markdown/source digest stable for existing adapter consumers.
-        if target == AdapterTarget::McpPack {
+        if matches!(target, AdapterTarget::McpJson | AdapterTarget::McpPack) {
             let context_pack = context_pack
                 .as_ref()
-                .expect("mcp-pack always builds a context pack");
+                .expect("MCP JSON targets always build a context pack");
             let context_pack = serde_json::to_value(context_pack).map_err(|err| {
                 Error::internal(format!("failed to serialize MCP context pack: {err}"))
             })?;
@@ -2398,9 +2411,13 @@ fn render_adapter_view(target: AdapterTarget, card: &CardShowResponse) -> Result
             "github-instructions",
             card,
         ),
+        AdapterTarget::McpJson => unreachable!("mcp-json uses render_mcp_pack_adapter_view"),
         AdapterTarget::McpPack => unreachable!("mcp-pack uses render_mcp_pack_adapter_view"),
         AdapterTarget::Markdown => {
             render_memory_markdown_view("Markdown Memory View", "markdown", card)
+        }
+        AdapterTarget::MarkdownWiki => {
+            render_memory_markdown_view("Markdown Wiki Memory View", "markdown-wiki", card)
         }
     };
     Ok(markdown)

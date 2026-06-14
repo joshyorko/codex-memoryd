@@ -483,6 +483,9 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
 
     // Touch recalled records' last_used_at (best-effort).
     let _ = store.touch_records(&touched);
+    let candidate_count = scored.len();
+    let admitted_count = facts.len();
+    let withheld_count = pack_withheld;
 
     Ok(RecallResponse {
         summary,
@@ -502,6 +505,10 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             template: template.mode.to_string(),
             template_budget_tokens: template.budget_tokens,
             max_tokens: effective_max_tokens,
+            used_tokens,
+            candidate_count,
+            admitted_count,
+            withheld_count,
             truncated,
         },
     })
@@ -774,7 +781,8 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
             boost
         }
         "active_task" => {
-            let mut boost = match record.record_type {
+            let mut boost = pack_layer_boost(record);
+            boost += match record.record_type {
                 RecordType::TaskCheckpoint => 2.5,
                 RecordType::Decision => 1.4,
                 RecordType::Command => 1.2,
@@ -797,7 +805,8 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
             boost
         }
         "review" => {
-            let mut boost = match record.record_type {
+            let mut boost = pack_layer_boost(record);
+            boost += match record.record_type {
                 RecordType::Gotcha => 2.2,
                 RecordType::Decision => 1.8,
                 RecordType::TaskCheckpoint => 1.6,
@@ -822,6 +831,7 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
         }
         "personal_context" => {
             let mut boost = match record.record_type {
+                RecordType::Identity => 3.0,
                 RecordType::Preference => 2.6,
                 RecordType::WorkflowPattern => 1.7,
                 RecordType::RepoConvention => 1.2,
@@ -841,6 +851,20 @@ fn pack_mode_boost(record: &MemoryRecord, pack_template: &PackTemplate) -> f64 {
             boost
         }
         _ => 0.0,
+    }
+}
+
+fn pack_layer_boost(record: &MemoryRecord) -> f64 {
+    match record.record_type {
+        RecordType::TaskCheckpoint => 3.0,
+        RecordType::Decision
+        | RecordType::Preference
+        | RecordType::RepoConvention
+        | RecordType::WorkflowPattern
+        | RecordType::Identity => 2.0,
+        RecordType::Gotcha | RecordType::Command => 1.2,
+        RecordType::Landmark => 0.8,
+        RecordType::Other => -1.0,
     }
 }
 
@@ -932,9 +956,11 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
         }
         "active_task" => {
             let mut signals = vec!["pack_mode:active_task".to_string()];
+            signals.push(pack_layer_signal(record).to_string());
             match record.record_type {
                 RecordType::TaskCheckpoint => signals.push("active_task_checkpoint".to_string()),
                 RecordType::Decision => signals.push("active_task_decision".to_string()),
+                RecordType::Gotcha => signals.push("active_task_gotcha".to_string()),
                 RecordType::Command => signals.push("active_task_command".to_string()),
                 RecordType::WorkflowPattern => {
                     signals.push("active_task_workflow_pattern".to_string())
@@ -958,6 +984,7 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
         }
         "review" => {
             let mut signals = vec!["pack_mode:review".to_string()];
+            signals.push(pack_layer_signal(record).to_string());
             match record.record_type {
                 RecordType::Gotcha => signals.push("review_gotcha".to_string()),
                 RecordType::Decision => signals.push("review_decision".to_string()),
@@ -984,6 +1011,7 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
         "personal_context" => {
             let mut signals = vec!["pack_mode:personal_context".to_string()];
             match record.record_type {
+                RecordType::Identity => signals.push("personal_context_identity".to_string()),
                 RecordType::Preference => signals.push("personal_context_preference".to_string()),
                 RecordType::WorkflowPattern => {
                     signals.push("personal_context_workflow_pattern".to_string())
@@ -1007,6 +1035,20 @@ fn pack_mode_signals(record: &MemoryRecord, pack_template: &PackTemplate) -> Vec
             signals
         }
         _ => vec!["pack_mode:default".to_string()],
+    }
+}
+
+fn pack_layer_signal(record: &MemoryRecord) -> &'static str {
+    match record.record_type {
+        RecordType::TaskCheckpoint => "pack_layer:cards",
+        RecordType::Decision
+        | RecordType::Preference
+        | RecordType::RepoConvention
+        | RecordType::WorkflowPattern
+        | RecordType::Identity => "pack_layer:observations",
+        RecordType::Gotcha | RecordType::Command => "pack_layer:experiences",
+        RecordType::Landmark => "pack_layer:procedures",
+        RecordType::Other => "pack_layer:evidence_excerpts",
     }
 }
 

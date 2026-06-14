@@ -269,6 +269,57 @@ fn export_enforces_boundary_and_redacts_private_surfaces() {
 }
 
 #[test]
+fn adapter_context_pack_aliases_use_issue_template_names() {
+    let svc = service();
+    let store = &svc.store;
+    store.ensure_workspace("personal", "ws").expect("workspace");
+    insert_record(
+        store,
+        "personal",
+        "ws",
+        "Decision: adapter context packs should use issue-required target names.",
+        RecordType::Decision,
+        Sensitivity::Personal,
+        Portability::Portable,
+        0.95,
+        Some("turn:adapter-alias"),
+        Some("memory/adapter-alias.md"),
+    );
+
+    let mcp = svc
+        .adapter_export(AdapterExportRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            subject_id: None,
+            target: "mcp-json".to_string(),
+            max_bytes: None,
+        })
+        .expect("mcp-json export");
+    assert_eq!(mcp.target, "mcp-json");
+    let mcp_pack = mcp.context_pack.expect("mcp-json context pack");
+    assert_eq!(mcp_pack.target, "mcp-json");
+    assert_eq!(mcp_pack.template, "mcp-json-v1");
+    assert_eq!(mcp_pack.authority, "recall_not_authority");
+    assert_eq!(mcp_pack.source_ids, vec!["turn:adapter-alias"]);
+
+    let wiki = svc
+        .adapter_export(AdapterExportRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            subject_id: None,
+            target: "markdown-wiki".to_string(),
+            max_bytes: None,
+        })
+        .expect("markdown-wiki export");
+    assert_eq!(wiki.target, "markdown-wiki");
+    let wiki_pack = wiki.context_pack.expect("markdown-wiki context pack");
+    assert_eq!(wiki_pack.target, "markdown-wiki");
+    assert_eq!(wiki_pack.template, "markdown-wiki-v1");
+    assert_eq!(wiki_pack.authority, "recall_not_authority");
+    assert!(wiki.markdown.contains("# Markdown Wiki Memory View"));
+}
+
+#[test]
 fn patch_preview_apply_stays_reviewable() {
     let (svc, _tmpdir, db_path) = temp_service();
     let _original_id = seed_patch_turn(&svc, &db_path);
