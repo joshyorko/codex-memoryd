@@ -15,6 +15,7 @@ This is the landed MVP surface today:
 | Local loopback server | landed | Native daemon binds `127.0.0.1:8787` with persistent SQLite storage. |
 | Docker Compose dogfood | landed | Uses `.dogfood/memory.db` as the real daemon DB and keeps host publish loopback-only. |
 | Compose heartbeat | landed | `scripts/dogfood-compose-heartbeat.sh` rebuilds, restarts, and smoke-checks the stack. |
+| Fixture substrate demo | landed | `scripts/demo-substrate.sh` runs a one-command end-to-end demo against a temporary fixture DB. |
 | Codex memory import | landed | `sync-local --preview` / `--apply` import local Codex memories. |
 | Native memory migration plan | documented | Phases native Codex memory from import/fallback toward optional `memoryd-canonical` mode. |
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
@@ -116,6 +117,18 @@ curl -fsS http://127.0.0.1:8787/v1/status | jq
 scripts/dogfood-compose-heartbeat.sh
 docker compose down
 ```
+
+### Fixture substrate demo
+
+For a reviewer-safe end-to-end walkthrough that uses only synthetic fixture
+data and a temporary SQLite database:
+
+```bash
+scripts/demo-substrate.sh
+```
+
+See [`docs/demo-substrate.md`](./docs/demo-substrate.md) for the exact demo
+steps and safety guarantees.
 
 ## Operator Flows
 
