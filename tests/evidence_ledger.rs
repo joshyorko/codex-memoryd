@@ -87,7 +87,7 @@ fn record_contents(db_path: &str) -> Vec<String> {
 fn status_reports_bumped_storage_schema_version() {
     let (svc, _tmp, _db_path) = temp_service();
     let status = svc.status().expect("status");
-    assert_eq!(status.storage_schema_version, 5);
+    assert_eq!(status.storage_schema_version, 6);
 }
 
 #[test]

@@ -21,6 +21,7 @@ use crate::domain::Episode;
 use crate::domain::MemoryRecord;
 use crate::domain::MemorySource;
 use crate::domain::Portability;
+use crate::domain::Procedure;
 use crate::domain::RecordType;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
@@ -32,7 +33,7 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 5;
+pub const STORAGE_SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -40,6 +41,7 @@ const MIGRATION_DREAM_RUNS: &str = include_str!("../migrations/0003_dream_runs.s
 const MIGRATION_EVIDENCE_LEDGER: &str = include_str!("../migrations/0004_evidence_ledger.sql");
 const MIGRATION_SUBJECTS_EPISODES: &str = include_str!("../migrations/0005_subjects_episodes.sql");
 const MIGRATION_TRUST_QUARANTINE: &str = include_str!("../migrations/0006_trust_quarantine.sql");
+const MIGRATION_PROCEDURES: &str = include_str!("../migrations/0007_procedures.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -320,6 +322,7 @@ impl Store {
         conn.execute_batch(MIGRATION_SUBJECTS_EPISODES)?;
         conn.execute_batch(MIGRATION_TRUST_QUARANTINE)?;
         ensure_trust_columns(&conn)?;
+        conn.execute_batch(MIGRATION_PROCEDURES)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -635,6 +638,135 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn list_successful_episodes(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        subject_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Episode>> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 200) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, subject_id, source_kind, source_ref,
+                    started_at, ended_at, status, summary, trust_level, source_metadata,
+                    created_at, updated_at, metadata
+             FROM episodes
+             WHERE profile_id = ?1 AND workspace_id = ?2
+               AND (?3 IS NULL OR subject_id = ?3)
+               AND lower(coalesce(status, '')) IN ('success', 'succeeded', 'completed', 'passed')
+             ORDER BY coalesce(ended_at, created_at) DESC, id DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![profile_id, workspace_id, subject_id, limit],
+                row_to_episode,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_or_get_procedure(&self, procedure: &Procedure) -> Result<(Procedure, bool)> {
+        let conn = self.conn()?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO procedures(
+                id, profile_id, workspace_id, subject_id, repo_id, name, activation_query,
+                steps, guardrails, termination_condition, source_episode_ids, confidence,
+                state, created_at, retired_at, metadata
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                procedure.id,
+                procedure.profile_id,
+                procedure.workspace_id,
+                procedure.subject_id,
+                procedure.repo_id,
+                procedure.name,
+                procedure.activation_query,
+                procedure.steps,
+                procedure.guardrails,
+                procedure.termination_condition,
+                serde_json::to_string(&procedure.source_episode_ids)
+                    .unwrap_or_else(|_| "[]".to_string()),
+                procedure.confidence,
+                procedure.state,
+                procedure.created_at,
+                procedure.retired_at,
+                serde_json::to_string(&procedure.metadata).unwrap_or_else(|_| "{}".to_string())
+            ],
+        )?;
+        if inserted == 1 {
+            Ok((procedure.clone(), true))
+        } else {
+            let existing = conn
+                .query_row(
+                    "SELECT id, profile_id, workspace_id, subject_id, repo_id, name,
+                            activation_query, steps, guardrails, termination_condition,
+                            source_episode_ids, confidence, state, created_at, retired_at, metadata
+                     FROM procedures
+                     WHERE profile_id = ?1 AND workspace_id = ?2
+                       AND ((subject_id IS NULL AND ?3 IS NULL) OR subject_id = ?3)
+                       AND activation_query = ?4 AND steps = ?5 AND retired_at IS NULL",
+                    params![
+                        procedure.profile_id,
+                        procedure.workspace_id,
+                        procedure.subject_id,
+                        procedure.activation_query,
+                        procedure.steps
+                    ],
+                    row_to_procedure,
+                )
+                .optional()?
+                .ok_or_else(|| Error::storage("procedure dedupe lookup missed existing row"))?;
+            Ok((existing, false))
+        }
+    }
+
+    pub fn query_procedures(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        subject_id: Option<&str>,
+        query: Option<&str>,
+        include_retired: bool,
+        limit: usize,
+    ) -> Result<Vec<Procedure>> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 100) as i64;
+        let pattern = query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(|q| format!("%{q}%"));
+        let include_retired = if include_retired { 1 } else { 0 };
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, subject_id, repo_id, name,
+                    activation_query, steps, guardrails, termination_condition,
+                    source_episode_ids, confidence, state, created_at, retired_at, metadata
+             FROM procedures
+             WHERE profile_id = ?1 AND workspace_id = ?2
+               AND (?3 IS NULL OR subject_id = ?3)
+               AND (?4 = 1 OR (state != 'retired' AND retired_at IS NULL))
+               AND (?5 IS NULL OR lower(name) LIKE lower(?5)
+                    OR lower(activation_query) LIKE lower(?5)
+                    OR lower(steps) LIKE lower(?5))
+             ORDER BY confidence DESC, created_at DESC, id DESC LIMIT ?6",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    profile_id,
+                    workspace_id,
+                    subject_id,
+                    include_retired,
+                    pattern,
+                    limit
+                ],
+                row_to_procedure,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn find_episode_by_source(
@@ -2548,6 +2680,27 @@ fn row_to_episode(row: &Row) -> rusqlite::Result<Episode> {
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
         metadata: json_value(&row.get::<_, String>(14)?),
+    })
+}
+
+fn row_to_procedure(row: &Row) -> rusqlite::Result<Procedure> {
+    Ok(Procedure {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        subject_id: row.get(3)?,
+        repo_id: row.get(4)?,
+        name: row.get(5)?,
+        activation_query: row.get(6)?,
+        steps: row.get(7)?,
+        guardrails: row.get(8)?,
+        termination_condition: row.get(9)?,
+        source_episode_ids: json_str_list(&row.get::<_, String>(10)?),
+        confidence: row.get(11)?,
+        state: row.get(12)?,
+        created_at: row.get(13)?,
+        retired_at: row.get(14)?,
+        metadata: json_value(&row.get::<_, String>(15)?),
     })
 }
 
