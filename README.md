@@ -76,6 +76,25 @@ target/release/codex-memoryd card show --profile personal --workspace josh-perso
 Fail-open note: if `codex-memoryd` is unavailable, Codex provider or hybrid
 mode should skip provider recall and continue the turn instead of blocking work.
 
+### Canonical local runtime helper
+
+For day-to-day native dogfood, use the checked-in runtime helper instead of
+copying process-management snippets by hand:
+
+```bash
+scripts/codex-memoryd-local-runtime.sh start
+scripts/codex-memoryd-local-runtime.sh status
+scripts/codex-memoryd-local-runtime.sh smoke
+scripts/codex-memoryd-local-runtime.sh restart-survival
+scripts/codex-memoryd-local-runtime.sh stop
+```
+
+The helper defaults to `CODEX_MEMORYD_BIND=127.0.0.1:8787`,
+`CODEX_MEMORYD_DB=$PWD/.dogfood/memory.db`, `CODEX_MEMORYD_PROFILE=personal`,
+and `CODEX_MEMORYD_WORKSPACE=josh-personal`. It refuses non-loopback binds
+unless `CODEX_MEMORYD_ALLOW_NON_LOOPBACK=1` is set for an explicitly
+self-hosted deployment behind HTTPS authentication.
+
 ### Compose smoke and heartbeat
 
 Compose is useful for reproducible smoke checks, but it is not the primary

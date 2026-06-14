@@ -3416,7 +3416,11 @@ fn readme_keeps_first_run_path_documented() {
     let readme = include_str!("../README.md");
     for required in [
         "First-run path (source build)",
+        "Canonical local runtime helper",
+        "scripts/codex-memoryd-local-runtime.sh smoke",
         "CODEX_MEMORYD_DB",
+        "CODEX_MEMORYD_BIND=127.0.0.1:8787",
+        "CODEX_MEMORYD_ALLOW_NON_LOOPBACK=1",
         "codex-memoryd doctor",
         "curl -fsS http://127.0.0.1:8787/v1/status",
         "codex-memoryd sync-local --preview",
@@ -3426,5 +3430,38 @@ fn readme_keeps_first_run_path_documented() {
         "Fail-open note",
     ] {
         assert!(readme.contains(required), "README missing {required:?}");
+    }
+}
+
+#[test]
+fn local_runtime_helper_documents_safe_runtime_contract() {
+    let helper = include_str!("../scripts/codex-memoryd-local-runtime.sh");
+    let runbook = include_str!("../docs/dogfood-local.md");
+    for required in [
+        "CODEX_MEMORYD_BIND",
+        "127.0.0.1:8787",
+        "CODEX_MEMORYD_DB",
+        "CODEX_MEMORYD_PROFILE",
+        "CODEX_MEMORYD_WORKSPACE",
+        "CODEX_MEMORYD_ALLOW_NON_LOOPBACK",
+        "systemd-unit",
+        "restart-survival",
+        "smoke=pass",
+        "refusing non-loopback bind",
+        "sync-local --preview",
+        "recall",
+        "export",
+    ] {
+        assert!(
+            helper.contains(required),
+            "runtime helper missing {required:?}"
+        );
+    }
+
+    for required in ["base_url", "profile", "workspace", "credential_env"] {
+        assert!(
+            runbook.contains(required),
+            "local runbook missing adapter config field {required:?}"
+        );
     }
 }
