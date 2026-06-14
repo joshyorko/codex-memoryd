@@ -512,7 +512,7 @@ fn explicit_promotion_restores_quarantined_record_to_default_surfaces() {
         .expect("query");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].trust_state, "trusted");
-    assert_eq!(visible[0].promoted_at.is_some(), true);
+    assert!(visible[0].promoted_at.is_some());
 }
 
 #[test]

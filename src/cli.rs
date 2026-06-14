@@ -606,7 +606,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             profile,
             workspace,
             repo,
-            preview,
+            preview: _,
             apply,
             scheduled,
             now,
@@ -619,7 +619,6 @@ fn dispatch(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let mode = if *apply { "apply" } else { "preview" };
-            let _ = preview;
             let resp = service.dream(DreamRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),

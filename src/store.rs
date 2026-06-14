@@ -933,6 +933,28 @@ impl Store {
         archived_by_patch_run_id: Option<&str>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         let now = ids::now_rfc3339();
+        self.archive_records_with_metadata_at(
+            profile_id,
+            workspace_id,
+            ids_to_archive,
+            state,
+            historical_reason,
+            archived_by_patch_run_id,
+            &now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn archive_records_with_metadata_at(
+        &self,
+        profile_id: &str,
+        workspace_id: Option<&str>,
+        ids_to_archive: &[String],
+        state: &str,
+        historical_reason: &str,
+        archived_by_patch_run_id: Option<&str>,
+        now: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let mut archived = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
@@ -964,7 +986,20 @@ impl Store {
                         "historical_reason".to_string(),
                         Value::String(historical_reason.to_string()),
                     );
-                    obj.insert("archived_at".to_string(), Value::String(now.clone()));
+                    obj.insert("archived_at".to_string(), Value::String(now.to_string()));
+                    if state == "counter_evidence" {
+                        if let Some(marker) = obj.get_mut("marker").and_then(Value::as_object_mut) {
+                            marker.insert("retired_at".to_string(), Value::String(now.to_string()));
+                            marker.insert(
+                                "retirement_reason".to_string(),
+                                Value::String("counter_evidence".to_string()),
+                            );
+                            marker.insert(
+                                "retirement_historical_reason".to_string(),
+                                Value::String(historical_reason.to_string()),
+                            );
+                        }
+                    }
                     if let Some(run_id) = archived_by_patch_run_id {
                         obj.insert(
                             "archived_by_patch_run_id".to_string(),

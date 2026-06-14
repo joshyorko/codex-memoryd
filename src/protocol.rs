@@ -911,6 +911,18 @@ pub struct DreamObservation {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_valence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decayed_intensity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_delta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decay_half_life_days: Option<f64>,
     pub category: String,
     pub subject_key: String,
     pub summary: String,
@@ -920,15 +932,25 @@ pub struct DreamObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_json: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub future_guidance: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<DreamEvidenceSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retires: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub counter_evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub first_seen_at: String,
     pub last_seen_at: String,
     pub authority: String,
