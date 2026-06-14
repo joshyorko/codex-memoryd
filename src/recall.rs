@@ -243,6 +243,10 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         } else {
             "admitted_ranked"
         };
+        let mut admission_gates = admission_gates.clone();
+        if stale {
+            admission_gates.push("freshness_stale_deprioritized".to_string());
+        }
         for signal in &entry.ranking_signals {
             top_level_ranking_signals.push(signal.clone());
         }
@@ -263,7 +267,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
                 admission: RecallAdmission {
                     decision: "admitted".to_string(),
                     reason: admission_reason.to_string(),
-                    gates: admission_gates.clone(),
+                    gates: admission_gates,
                 },
                 ranking_signals: entry.ranking_signals.clone(),
             },
@@ -716,6 +720,9 @@ mod tests {
     use crate::domain::Sensitivity;
     use crate::ids;
     use crate::store::NewRecord;
+    use rusqlite::params;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
 
     fn store_with(records: &[(&str, RecordType, Option<&str>, Vec<&str>)]) -> Store {
         let s = Store::open(":memory:").unwrap();
@@ -753,6 +760,74 @@ mod tests {
         s
     }
 
+    fn insert_record(
+        store: &Store,
+        content: &str,
+        repo_id: Option<&str>,
+        related_files: Vec<&str>,
+    ) -> String {
+        let related_files = related_files
+            .into_iter()
+            .map(|file| file.to_string())
+            .collect();
+        let rec = NewRecord {
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: repo_id.map(|repo| repo.to_string()),
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Repo,
+            record_type: RecordType::Decision,
+            content: content.to_string(),
+            related_files,
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: 0.8,
+            source_ids: vec!["src:test".to_string()],
+            content_hash: ids::content_hash(
+                "personal",
+                "ws",
+                repo_id,
+                RecordType::Decision.as_str(),
+                "repo",
+                content,
+            ),
+            supersedes: vec![],
+            metadata: serde_json::Value::Null,
+        };
+        store.upsert_record(&rec).unwrap().id().to_string()
+    }
+
+    fn store_with_fresh_and_stale_records() -> (Store, TempDir, String, String) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("memory.db");
+        let store = Store::open(&db_path).unwrap();
+        store.ensure_workspace("personal", "ws").unwrap();
+
+        let fresh_id = insert_record(
+            &store,
+            "Decision: use tower for server routing",
+            Some("git:repoA"),
+            vec!["server.rs"],
+        );
+        let stale_id = insert_record(
+            &store,
+            "Decision: use axum for server routing",
+            Some("git:repoA"),
+            vec!["server.rs"],
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE memory_records SET updated_at = ?1 WHERE id = ?2",
+            params!["2025-01-01T00:00:00Z", stale_id],
+        )
+        .unwrap();
+
+        (store, dir, fresh_id, stale_id)
+    }
+
     #[test]
     fn recall_prioritizes_repo_and_file_matches() {
         let s = store_with(&[
@@ -788,6 +863,57 @@ mod tests {
             "repo+file match should rank first"
         );
         assert_eq!(resp.authority, "recall_not_authority");
+    }
+
+    #[test]
+    fn recall_exposes_stale_admission_metadata() {
+        let (store, _dir, fresh_id, stale_id) = store_with_fresh_and_stale_records();
+        let repo = RepoIdentity {
+            repo_id: "git:repoA".to_string(),
+            ..Default::default()
+        };
+        let files = vec!["server.rs".to_string()];
+        let params = RecallParams {
+            profile: Profile::Personal,
+            workspace: "ws",
+            repo: Some(&repo),
+            query: "server routing",
+            files: &files,
+            max_tokens: 1000,
+            pack_mode: "default",
+            include_types: &[],
+            exclude_types: &[],
+            recency_days: None,
+        };
+        let resp = recall(&store, &params).unwrap();
+
+        assert_eq!(resp.authority, "recall_not_authority");
+        assert!(resp.withheld.is_empty());
+        assert_eq!(resp.facts.len(), 2);
+        assert_eq!(resp.facts[0].id, fresh_id);
+        assert!(!resp.facts[0].policy.freshness.stale);
+        assert_eq!(resp.facts[0].policy.admission.reason, "admitted_ranked");
+        assert_eq!(
+            resp.facts[0].policy.admission.gates,
+            vec!["profile_workspace".to_string()]
+        );
+        assert_eq!(resp.facts[1].id, stale_id);
+        assert!(resp.facts[1].policy.freshness.stale);
+        assert_eq!(resp.facts[1].policy.admission.decision, "admitted");
+        assert_eq!(
+            resp.facts[1].policy.admission.reason,
+            "admitted_stale_deprioritized"
+        );
+        assert!(resp.facts[1]
+            .policy
+            .admission
+            .gates
+            .contains(&"profile_workspace".to_string()));
+        assert!(resp.facts[1]
+            .policy
+            .admission
+            .gates
+            .contains(&"freshness_stale_deprioritized".to_string()));
     }
 
     #[test]
