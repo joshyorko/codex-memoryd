@@ -1,0 +1,52 @@
+{
+  "scenario": "merge_candidate",
+  "description": "Two near-identical active procedures in the same subject (same activation intent and steps) yield a single merge candidate. The merged result must UNION both parents' negative_examples and source_episode_ids, and supersede the lower-scored one (history preserved). Preview only.",
+  "now": "2026-06-14T00:00:00Z",
+  "procedures": [
+    {
+      "id": "proc_pr_a",
+      "name": "open a pull request",
+      "state": "active",
+      "activation_query": "opening a pull request",
+      "steps": "review the diff; run cargo test",
+      "negative_examples": ["deploying to production"],
+      "source_episode_ids": ["ep1", "ep2"],
+      "confidence": 0.8,
+      "success_count": 5,
+      "failure_count": 0,
+      "reuse_count": 10,
+      "last_used_at": "2026-06-12T00:00:00Z",
+      "last_validated": "2026-06-12T00:00:00Z"
+    },
+    {
+      "id": "proc_pr_b",
+      "name": "open a PR",
+      "state": "active",
+      "activation_query": "opening a PR",
+      "steps": "review the diff; run cargo test",
+      "negative_examples": ["releasing a hotfix"],
+      "source_episode_ids": ["ep3"],
+      "confidence": 0.6,
+      "success_count": 1,
+      "failure_count": 0,
+      "reuse_count": 2,
+      "last_used_at": "2026-05-01T00:00:00Z",
+      "last_validated": "2026-05-01T00:00:00Z"
+    }
+  ],
+  "expect": {
+    "candidate_actions": [
+      {
+        "action": "merge",
+        "keep_procedure_id": "proc_pr_a",
+        "supersede_procedure_id": "proc_pr_b",
+        "reason": "near_identical_activation_and_steps",
+        "merged_negative_examples": ["deploying to production", "releasing a hotfix"],
+        "merged_source_episode_ids": ["ep1", "ep2", "ep3"]
+      }
+    ],
+    "must_not": [
+      { "guarantee": "merge_preserves_negative_examples", "procedure_id": "proc_pr_a" }
+    ]
+  }
+}
