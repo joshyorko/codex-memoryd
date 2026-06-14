@@ -16,6 +16,7 @@ This is the landed MVP surface today:
 | Docker Compose dogfood | landed | Uses `.dogfood/memory.db` as the real daemon DB and keeps host publish loopback-only. |
 | Compose heartbeat | landed | `scripts/dogfood-compose-heartbeat.sh` rebuilds, restarts, and smoke-checks the stack. |
 | Fixture substrate demo | landed | `scripts/demo-substrate.sh` runs a one-command end-to-end demo against a temporary fixture DB. |
+| Dogfood write sandbox | landed | `scripts/dogfood-write-sandbox.sh` refreshes a sandbox from the real DB, runs write canaries only there, and emits content-free diffs. |
 | Codex memory import | landed | `sync-local --preview` / `--apply` import local Codex memories. |
 | Native memory migration plan | documented | Phases native Codex memory from import/fallback toward optional `memoryd-canonical` mode. |
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
@@ -129,6 +130,18 @@ scripts/demo-substrate.sh
 
 See [`docs/demo-substrate.md`](./docs/demo-substrate.md) for the exact demo
 steps and safety guarantees.
+
+### Dogfood write sandbox
+
+For write-capable dogfood checks, keep the real DB read-only and run the
+sandbox lane:
+
+```bash
+scripts/dogfood-write-sandbox.sh run
+```
+
+See [`docs/dogfood-write-sandbox.md`](./docs/dogfood-write-sandbox.md) for the
+content-free diff report and manual promotion workflow.
 
 ## Operator Flows
 

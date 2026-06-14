@@ -3,6 +3,8 @@
 This runbook brings `codex-memoryd` up as a safe local dogfood memory service for Josh. It keeps memory local-first, loopback-only, manually operated, and explicitly non-authoritative.
 
 For connecting current Codex to this service through MCP stdio, see [`dogfood-mcp.md`](./dogfood-mcp.md).
+For write-capable dogfood tests, use the sandbox-only lane in
+[`dogfood-write-sandbox.md`](./dogfood-write-sandbox.md).
 For the native Codex memory migration phases, canaries, duplicate-loop risks,
 and `memoryd-canonical` prerequisites, see
 [`native-codex-memory-migration.md`](./native-codex-memory-migration.md).
@@ -13,6 +15,8 @@ and `memoryd-canonical` prerequisites, see
 - Use a persistent SQLite database.
 - Import existing Codex memories with `sync-local --preview` before `--apply`.
 - Use manual `conclude`, `checkpoint`, `recall`, and `export` only.
+- Use `scripts/dogfood-write-sandbox.sh` for write-capable MCP/CLI tests; do
+  not point write tools at the real dogfood DB.
 - Keep Dreamer scheduler disabled and never run Dreamer auto-apply.
 - Do not configure automatic prompt injection.
 - Do not store secrets, auth tokens, `.env` dumps, hidden reasoning, raw confidential logs, or instructions that override current user, repo, system, or developer policy.
@@ -103,6 +107,16 @@ This heartbeat rebuilds and relaunches Compose from current checkout, checks
 health/status/doctor, runs `sync-local` preview/apply/apply, refreshes
 `.dogfood/mcp-sandbox-memory.db` from `.dogfood/memory.db`, verifies localhost-only
 publish on `127.0.0.1:8787`, and runs a raw MCP stdio canary in `--read-only` mode.
+
+Write-capable dogfood uses a separate sandbox lane:
+
+```bash
+scripts/dogfood-write-sandbox.sh run
+```
+
+That lane refreshes `.dogfood/write-sandbox-memory.db` with
+`codex-memoryd backup create`, runs CLI and MCP writes only against the
+sandbox, and emits content-free diff and manual-promotion artifacts.
 
 ## Manual Dogfood Flow
 

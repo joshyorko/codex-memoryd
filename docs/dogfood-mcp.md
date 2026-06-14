@@ -5,6 +5,8 @@ This runbook connects current Codex to `codex-memoryd` through MCP stdio in safe
 For the larger native Codex memory migration plan, including when MCP recall is
 safe enough to support `memoryd-canonical` mode, see
 [`native-codex-memory-migration.md`](./native-codex-memory-migration.md).
+For write-capable MCP testing, use the separate sandbox lane in
+[`dogfood-write-sandbox.md`](./dogfood-write-sandbox.md).
 
 ## Safety Posture
 
@@ -16,6 +18,9 @@ safe enough to support `memoryd-canonical` mode, see
 - Write tools are not exposed to Codex in this config, and stdio defaults to
   read-only server-side. The `--read-only` flag is kept in the config as an
   explicit adapter safety marker.
+- Write-capable MCP belongs only to `.dogfood/write-sandbox-memory.db` through
+  `scripts/dogfood-write-sandbox.sh`; never add `--write-tools` to the real
+  dogfood MCP config.
 - Recall is `recall_not_authority`; user instructions, repo files, and tests override memory.
 - No automatic memory writes, hidden reasoning storage, secret storage, prompt injection, or Dreamer auto-apply.
 
@@ -95,6 +100,19 @@ These MCP canaries are necessary but not sufficient for native memory migration.
 Run the native-memory parity canaries from
 [`native-codex-memory-migration.md`](./native-codex-memory-migration.md) before
 changing any real dogfood write posture.
+
+## Write-Capable Sandbox
+
+Use the dedicated lane when a test needs MCP `--write-tools`:
+
+```bash
+scripts/dogfood-write-sandbox.sh run
+```
+
+It refreshes the sandbox with `codex-memoryd backup create`, runs write canaries
+only against `.dogfood/write-sandbox-memory.db`, writes a content-free diff
+report, and produces a manual promotion preview. The script does not promote
+anything to `.dogfood/memory.db`.
 
 ## Current Codex Verification
 
