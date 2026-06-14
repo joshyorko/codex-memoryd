@@ -35,6 +35,13 @@ This is the landed MVP surface today:
 - No automatic prompt injection.
 - Secrets, tokens, `.env` dumps, hidden reasoning, private keys, auth files, and raw confidential logs are rejected before durable write.
 - Profile and workspace boundaries are enforced.
+- Recall admits only the requested profile/workspace by default. Metadata-marked
+  `quarantined`, `high`/`unsafe` risk, `unsafe`/`rejected`/`blocked`, and
+  `superseded` records are withheld unless a future explicit review path changes
+  the state.
+- Stale records may still be returned, but they are marked stale and
+  deprioritized. Archived/superseded records remain explainable through withheld
+  counts rather than raw recalled content.
 - Provider failure fails open instead of blocking Codex turns.
 - The read-only MCP path exposes no write tools.
 
@@ -220,7 +227,7 @@ that the product is done:
 | --- | --- | --- |
 | `#50` | current-state cards | landed deterministic cards with stale metadata and fixture-backed rendering coverage |
 | `#53` | eval suite | open; still validating capability gates, recall, and context-pack behavior |
-| `#55` | recall policy | landed metadata plus `recall_not_authority`; hardening remains |
+| `#55` | recall policy | admission gates now withhold quarantined/high-risk/unsafe/superseded records by default; remaining work depends on broader eval/review lanes |
 | `#56` | adapter context packs | landed MVP modes and adapter targets; card-first composition and memory-curse fixtures remain |
 | `#57` | git import | landed for local trailers and refs fixtures covering commits, PRs, issues, and review comments |
 | `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |

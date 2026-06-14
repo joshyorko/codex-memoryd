@@ -178,6 +178,10 @@ Response `data`:
   "citations": [ { "memory_id": "mem_…", "source_id": "src_…", "source_path": "memory_summary.md" } ],
   "withheld": [
     { "reason": "secret_blocked", "count": 1, "gates": ["secret_blocked"] },
+    { "reason": "policy_quarantined", "count": 1, "gates": ["admission_policy", "quarantine"] },
+    { "reason": "policy_high_risk", "count": 1, "gates": ["admission_policy", "source_risk"] },
+    { "reason": "policy_unsafe", "count": 1, "gates": ["admission_policy", "unsafe"] },
+    { "reason": "policy_superseded", "count": 1, "gates": ["admission_policy", "supersession"] },
     { "reason": "pack_truncated", "count": 2, "gates": ["max_tokens", "result_limit"] }
   ],
   "truncated": false
@@ -189,6 +193,11 @@ For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citation
 `facts[].policy.admission` explains why an emitted item was admitted. `withheld`
 is optional and reports deterministic counts by gate only; it never includes raw
 withheld content.
+Default recall withholds records whose metadata marks them quarantined,
+high-risk/unsafe, rejected/blocked, or superseded. Stale active records remain
+admissible but carry stale/deprioritized admission metadata. Cross-profile recall
+is default-deny: a personal recall request does not return work records, and vice
+versa, without an explicit future policy exception.
 
 Ranking (SPEC §8.3): same profile/workspace → same repo → exact related-file
 match → high-confidence decisions/gotchas/commands → recent checkpoints → stable
