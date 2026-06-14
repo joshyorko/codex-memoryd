@@ -28,7 +28,11 @@ const AUTH_MISSING_REASON: &str =
 pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result<StatusResponse> {
     let writable = store.writable();
     let mut degraded_reasons: Vec<String> = store.degraded_reasons().to_vec();
-    let loopback_only = config.bind_is_loopback();
+    // Treat an operator-declared loopback-only publish (e.g. Docker
+    // 127.0.0.1:8787->8787) the same as a direct loopback bind for exposure
+    // reporting. The process may bind 0.0.0.0 inside a container, but the
+    // reachable boundary is loopback. Opt-in via declare_loopback_publish.
+    let loopback_only = config.effective_loopback_only();
 
     let active_profiles = store.active_profiles().unwrap_or_default();
     let active_workspaces = store.active_workspaces().unwrap_or_default();

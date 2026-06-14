@@ -101,6 +101,13 @@ pub struct Config {
     pub dream_scheduler: DreamSchedulerConfig,
     pub log_level: String,
     pub log_format: String,
+    /// Operator declaration that a non-loopback *process* bind is nonetheless
+    /// only reachable over loopback because it sits behind a loopback-only
+    /// publish/front door (e.g. Docker `127.0.0.1:8787->8787`). This does NOT
+    /// change what the daemon binds; it only lets status report `local_only`
+    /// instead of `auth_missing` when the operator has asserted the network
+    /// boundary out-of-band. Opt-in, default false.
+    pub declare_loopback_publish: bool,
 }
 
 impl Default for Config {
@@ -126,6 +133,7 @@ impl Default for Config {
             },
             log_level: "info".to_string(),
             log_format: "text".to_string(),
+            declare_loopback_publish: false,
         }
     }
 }
@@ -216,6 +224,13 @@ impl Config {
             if !level.trim().is_empty() {
                 config.log_level = level;
             }
+        }
+        // Opt-in operator declaration that a non-loopback process bind is fronted
+        // by a loopback-only publish (e.g. Docker `127.0.0.1:8787->8787`). Accepts
+        // 1/true/yes. Default off — only honored when explicitly set.
+        if let Ok(v) = std::env::var("CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH") {
+            config.declare_loopback_publish =
+                matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
 
         // 3. CLI overrides (highest precedence).
@@ -333,6 +348,15 @@ impl Config {
             host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
         })
     }
+
+    /// Whether the daemon's `/v1` surface is effectively reachable only over
+    /// loopback: either the process binds loopback directly, or the operator
+    /// has explicitly declared a loopback-only publish/front door
+    /// (`declare_loopback_publish`, the Docker `127.0.0.1:8787->8787` case).
+    /// Used by status to decide `local_only` vs `auth_missing`.
+    pub fn effective_loopback_only(&self) -> bool {
+        self.bind_is_loopback() || self.declare_loopback_publish
+    }
 }
 
 fn bind_host(bind: &str) -> Option<String> {
@@ -395,5 +419,30 @@ mod tests {
 
         cfg.bind = "not-a-bind".to_string();
         assert!(!cfg.bind_is_loopback());
+    }
+
+    #[test]
+    fn declare_loopback_publish_only_affects_effective_loopback() {
+        let mut cfg = Config::default();
+        // Loopback bind: effectively loopback regardless of the declaration.
+        assert!(cfg.bind_is_loopback());
+        assert!(cfg.effective_loopback_only());
+
+        // Non-loopback process bind (the Docker 0.0.0.0 case), no declaration:
+        // still reported as not-loopback (auth_missing).
+        cfg.bind = "0.0.0.0:8787".to_string();
+        assert!(!cfg.bind_is_loopback());
+        assert!(!cfg.effective_loopback_only());
+
+        // Operator declares a loopback-only publish/front door: effective
+        // loopback flips true, but the raw process bind detection is unchanged
+        // (so the HTTP /v1 transport gate, which uses bind_is_loopback, is NOT
+        // loosened).
+        cfg.declare_loopback_publish = true;
+        assert!(!cfg.bind_is_loopback(), "raw bind detection unchanged");
+        assert!(
+            cfg.effective_loopback_only(),
+            "declaration makes it effective"
+        );
     }
 }

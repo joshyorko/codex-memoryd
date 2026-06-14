@@ -25,6 +25,12 @@ services:
       # Inside the container the daemon binds all interfaces; the published
       # port restricts external reachability.
       CODEX_MEMORYD_BIND: "0.0.0.0:8787"
+      # The `ports:` mapping below publishes only on 127.0.0.1, so the reachable
+      # boundary IS loopback even though the process binds 0.0.0.0. Declare that
+      # so status reports `local_only` instead of `auth_missing`. This is a
+      # reporting-only flag; it does NOT loosen the HTTP /v1 transport gate,
+      # which still keys off the raw (non-loopback) process bind.
+      CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH: "1"
       CODEX_MEMORYD_DB: "/data/memory.db"
       CODEX_MEMORYD_PROFILE: "personal"
       CODEX_MEMORYD_WORKSPACE: "josh-personal"
