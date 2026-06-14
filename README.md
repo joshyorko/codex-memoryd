@@ -211,6 +211,8 @@ compile the same substrate into downstream file formats.
 ```bash
 target/release/codex-memoryd card show --profile personal --workspace josh-personal \
   --type subject_summary
+target/release/codex-memoryd eval retrieval --format summary
+target/release/codex-memoryd eval retrieval --format json
 target/release/codex-memoryd adapter export --target agents-md \
   --profile personal --workspace josh-personal > AGENTS.memory.md
 target/release/codex-memoryd adapter export --target mcp-pack \
@@ -231,7 +233,9 @@ card smoke suite includes a fixture-backed markdown snapshot for this contract.
 
 `eval substrate` is the deterministic, model-free review gate for substrate
 correctness, safety, procedure memory, patch rollback, and adapter/context-pack
-economics. See
+economics. `eval retrieval` is the deterministic, fixture-backed retrieval
+quality loop for issue #153, including long-history baselines and ablations.
+See
 [`docs/eval-substrate.md`](./docs/eval-substrate.md).
 
 ### Adapter packages
