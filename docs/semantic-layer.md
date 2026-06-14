@@ -1,12 +1,11 @@
 # Semantic layer: entity resolution and relation graph — decision (#154)
 
-> **Status: DECISION DOC + FIXTURES — nothing here is implemented yet.** There
-> are no `subject_aliases` or `relations` tables, no relation preview/apply, and
-> no relation-aware recall in the code today. The schema blocks below are
-> *proposals*; the multi-hop fixtures in `tests/fixtures/semantic/` are the
-> instrument for deciding whether to build Option B at all, and are not wired
-> into any test yet. Implementation lands **only after root review** approves an
-> option.
+> **Status: MVP IMPLEMENTED (relation substrate + eval slice).**
+> `subject_aliases` and `relations` are live in the storage schema (v8), with
+> explicit store apply methods, scoped reads, and relation-expanded retrieval in
+> the deterministic eval path. This is an incremental slice, not the full
+> end-to-end #154 delivery: user-facing relation preview/apply UX and default
+> `/recall` integration are still pending.
 
 This document compares three approaches for adding a semantic layer (entity
 aliases + relations) to `codex-memoryd`, makes a recommendation, and specifies

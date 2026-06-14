@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::Config;
-use crate::domain::{Portability, RecordType, RepoIdentity, Scope, Sensitivity};
+use crate::domain::{
+    Portability, RecordType, Relation, RepoIdentity, Scope, Sensitivity, Subject, SubjectAlias,
+    SubjectKind,
+};
 use crate::error::{Error, Result};
 use crate::ids;
 use crate::protocol::{AdapterExportRequest, RecallRequest};
@@ -25,6 +28,10 @@ const TOP_K: usize = 5;
 struct RetrievalFixture {
     version: u32,
     records: Vec<FixtureRecord>,
+    #[serde(default)]
+    aliases: Vec<FixtureAlias>,
+    #[serde(default)]
+    relations: Vec<FixtureRelation>,
     questions: Vec<FixtureQuestion>,
 }
 
@@ -62,6 +69,27 @@ struct FixtureRecord {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct FixtureAlias {
+    alias_key: String,
+    subject_key: String,
+    #[serde(default)]
+    source_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureRelation {
+    from_subject_key: String,
+    relation_type: String,
+    to_subject_key: String,
+    #[serde(default)]
+    source_record_ids: Vec<String>,
+    #[serde(default)]
+    source_evidence: Option<String>,
+    #[serde(default = "default_relation_state")]
+    state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct FixtureQuestion {
     id: String,
     family: String,
@@ -89,6 +117,7 @@ pub struct RetrievalEvalReport {
     pub fixture_families: Vec<String>,
     pub question_count: usize,
     pub baselines: Vec<RetrievalBaselineResult>,
+    pub retrieval_improvements: Vec<RetrievalImprovement>,
     pub ranking_ablations: Vec<RankingAblationResult>,
     pub regression_fixtures: Vec<RegressionFixture>,
     pub next_recommended_ranking_changes: Vec<String>,
@@ -107,6 +136,16 @@ pub struct RetrievalBaselineResult {
     pub latency_estimate_units: usize,
     pub cross_profile_leak: bool,
     pub failed_queries: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetrievalImprovement {
+    pub query_id: String,
+    pub family: String,
+    pub before: &'static str,
+    pub after: &'static str,
+    pub relation_evidence_refs: Vec<String>,
+    pub returned_evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,10 +168,18 @@ pub struct RegressionFixture {
     pub expected_record_ids: Vec<String>,
 }
 
+#[derive(Clone)]
 struct RetrievedItem {
     fixture_id: Option<String>,
     content: String,
     profile: String,
+    evidence_refs: Vec<String>,
+}
+
+struct RelationAwareScores {
+    baseline: RetrievalBaselineResult,
+    by_question: BTreeMap<String, Vec<RetrievedItem>>,
+    relation_evidence_by_question: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -160,12 +207,21 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
     let fixture = load_fixture()?;
     let service = eval_service(&fixture)?;
     seed_fixture_records(&service, &fixture)?;
+    seed_fixture_semantic_layer(&service, &fixture)?;
 
+    let (memoryd_baseline, memoryd_by_question) =
+        score_memoryd_recall_with_items(&service, &fixture)?;
+    let RelationAwareScores {
+        baseline: relation_aware_baseline,
+        by_question: relation_aware_by_question,
+        relation_evidence_by_question,
+    } = score_relation_aware_recall(&service, &fixture)?;
     let baselines = vec![
         score_raw_chronological(&fixture),
         score_keyword(&fixture),
         score_full_list(&fixture),
-        score_memoryd_recall(&service, &fixture)?,
+        memoryd_baseline,
+        relation_aware_baseline,
         score_context_pack(&service, &fixture)?,
         score_verbatim_evidence(&fixture),
     ];
@@ -247,6 +303,13 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
     ));
 
     let regression_fixtures = regression_fixtures(&fixture, &baselines, &ranking_ablations);
+    let retrieval_improvements = retrieval_improvements(
+        &fixture,
+        &baselines,
+        &memoryd_by_question,
+        &relation_aware_by_question,
+        &relation_evidence_by_question,
+    );
     let next_recommended_ranking_changes =
         next_recommended_ranking_changes(&baselines, &ranking_ablations);
 
@@ -258,6 +321,7 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
         fixture_families: fixture_families(&fixture),
         question_count: fixture.questions.len(),
         baselines,
+        retrieval_improvements,
         ranking_ablations,
         regression_fixtures,
         next_recommended_ranking_changes,
@@ -288,6 +352,20 @@ pub fn render_retrieval_summary(report: &RetrievalEvalReport) -> String {
             baseline.estimated_tokens,
             baseline.failed_queries.len()
         ));
+    }
+    out.push_str("\nretrieval improvements\n");
+    if report.retrieval_improvements.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for improvement in &report.retrieval_improvements {
+            out.push_str(&format!(
+                "- {}: {} -> {} with {} returned evidence refs\n",
+                improvement.query_id,
+                improvement.before,
+                improvement.after,
+                improvement.returned_evidence_refs.len()
+            ));
+        }
     }
     out.push_str("\nranking ablations\n");
     for ablation in &report.ranking_ablations {
@@ -337,6 +415,18 @@ fn seed_fixture_records(service: &Service, fixture: &RetrievalFixture) -> Result
     }
 
     for record in &fixture.records {
+        let subject_id = match &record.subject_key {
+            Some(subject_key) => Some(
+                ensure_subject(
+                    &service.store,
+                    &record.profile,
+                    &record.workspace,
+                    subject_key,
+                )?
+                .id,
+            ),
+            None => None,
+        };
         let record_type = RecordType::parse(&record.record_type).ok_or_else(|| {
             Error::invalid_request(format!(
                 "retrieval fixture record {} has unknown type {}",
@@ -360,7 +450,7 @@ fn seed_fixture_records(service: &Service, fixture: &RetrievalFixture) -> Result
             profile_id: record.profile.clone(),
             workspace_id: record.workspace.clone(),
             repo_id: record.repo.clone(),
-            subject_id: None,
+            subject_id,
             episode_id: None,
             scope,
             record_type,
@@ -391,6 +481,102 @@ fn seed_fixture_records(service: &Service, fixture: &RetrievalFixture) -> Result
                 "marker_intensity": record.marker_intensity,
                 "origin": "retrieval_eval_fixture"
             }),
+        })?;
+    }
+    Ok(())
+}
+
+fn seed_fixture_semantic_layer(service: &Service, fixture: &RetrievalFixture) -> Result<()> {
+    for alias in &fixture.aliases {
+        let (profile, workspace, alias_subject_key) =
+            subject_owning_key(fixture, &alias.subject_key).ok_or_else(|| {
+                Error::invalid_request(format!(
+                    "retrieval fixture alias {} refers to unknown subject {}",
+                    alias.alias_key, alias.subject_key
+                ))
+            })?;
+        if alias.source_record_ids.is_empty() {
+            return Err(Error::invalid_request(format!(
+                "retrieval fixture alias {} is missing source record ids",
+                alias.alias_key
+            )));
+        }
+        let source_evidence = alias
+            .source_record_ids
+            .iter()
+            .map(|id| format!("fixture:{id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let subject = ensure_subject(&service.store, &profile, &workspace, &alias_subject_key)?;
+        service.store.insert_or_get_subject_alias(&SubjectAlias {
+            id: format!(
+                "fixture_alias_{}_{}_{}_{}",
+                profile, workspace, alias_subject_key, alias.alias_key
+            ),
+            profile_id: profile,
+            workspace_id: workspace,
+            subject_id: subject.id,
+            alias_key: alias.alias_key.clone(),
+            source_evidence,
+            created_at: ids::now_rfc3339(),
+            metadata: json!({"origin":"retrieval_eval_fixture"}),
+        })?;
+    }
+
+    for relation in &fixture.relations {
+        let (from_profile, from_workspace, from_subject_key) =
+            subject_owning_key(fixture, &relation.from_subject_key).ok_or_else(|| {
+                Error::invalid_request(format!(
+                    "retrieval fixture relation has unknown from_subject {}",
+                    relation.from_subject_key
+                ))
+            })?;
+        let (to_profile, to_workspace, to_subject_key) =
+            subject_owning_key(fixture, &relation.to_subject_key).ok_or_else(|| {
+                Error::invalid_request(format!(
+                    "retrieval fixture relation has unknown to_subject {}",
+                    relation.to_subject_key
+                ))
+            })?;
+        let from_subject = ensure_subject(
+            &service.store,
+            &from_profile,
+            &from_workspace,
+            &from_subject_key,
+        )?;
+        let to_subject =
+            ensure_subject(&service.store, &to_profile, &to_workspace, &to_subject_key)?;
+        let source_episode_ids = relation
+            .source_record_ids
+            .iter()
+            .map(|id| format!("fixture:{id}"))
+            .collect::<Vec<_>>();
+        service.store.insert_or_get_relation(&Relation {
+            id: format!(
+                "fixture_relation_{}_{}_{}_to_{}",
+                relation.from_subject_key,
+                from_subject.workspace_id,
+                relation.relation_type,
+                relation.to_subject_key
+            ),
+            profile_id: from_subject.profile_id,
+            workspace_id: from_subject.workspace_id,
+            from_subject_id: from_subject.id,
+            relation_type: relation.relation_type.clone(),
+            to_subject_id: to_subject.id,
+            confidence: 0.95,
+            state: relation.state.clone(),
+            source_episode_ids,
+            source_evidence: relation.source_evidence.clone().or_else(|| {
+                if relation.source_record_ids.is_empty() {
+                    None
+                } else {
+                    Some(format!("fixture:{}", relation.source_record_ids[0]))
+                }
+            }),
+            created_at: ids::now_rfc3339(),
+            retired_at: None,
+            metadata: json!({"origin":"retrieval_eval_fixture"}),
         })?;
     }
     Ok(())
@@ -462,10 +648,13 @@ fn score_full_list(fixture: &RetrievalFixture) -> RetrievalBaselineResult {
     )
 }
 
-fn score_memoryd_recall(
+fn score_memoryd_recall_with_items(
     service: &Service,
     fixture: &RetrievalFixture,
-) -> Result<RetrievalBaselineResult> {
+) -> Result<(
+    RetrievalBaselineResult,
+    BTreeMap<String, Vec<RetrievedItem>>,
+)> {
     let mut by_question = BTreeMap::new();
     for question in &fixture.questions {
         let recall = service.recall(RecallRequest {
@@ -497,17 +686,90 @@ fn score_memoryd_recall(
                     fixture_id,
                     content: fact.content,
                     profile: fact.policy.provenance.profile_id,
+                    evidence_refs: fact.policy.provenance.evidence_refs,
                 }
             })
             .collect::<Vec<_>>();
         by_question.insert(question.id.clone(), items);
     }
-    Ok(score_precomputed(
+    let baseline = score_precomputed(
         "memoryd_recall",
         "current scoped recall ranking and policy gates",
         fixture,
+        by_question.clone(),
+    );
+    Ok((baseline, by_question))
+}
+
+fn score_relation_aware_recall(
+    service: &Service,
+    fixture: &RetrievalFixture,
+) -> Result<RelationAwareScores> {
+    let mut by_question = BTreeMap::new();
+    let mut relation_evidence_by_question = BTreeMap::new();
+
+    for question in &fixture.questions {
+        let mut items = Vec::new();
+        let mut relation_evidence_refs = Vec::new();
+        let mut subject_ids = Vec::new();
+
+        if let Some(subject_key) = question.subject_key.as_deref() {
+            if let Some(seed_subject_id) = resolve_subject_for_key(
+                &service.store,
+                &question.profile,
+                &question.workspace,
+                subject_key,
+            )? {
+                subject_ids.push(seed_subject_id.clone());
+                let expanded = service.store.relation_expanded_subjects(
+                    &question.profile,
+                    &question.workspace,
+                    &[seed_subject_id],
+                    2,
+                )?;
+                for expansion in expanded {
+                    if !subject_ids.contains(&expansion.subject_id) {
+                        subject_ids.push(expansion.subject_id.clone());
+                    }
+                    relation_evidence_refs.extend(expansion.evidence_refs);
+                }
+
+                let records = service.store.records_for_subjects(
+                    &question.profile,
+                    &question.workspace,
+                    &subject_ids,
+                    TOP_K,
+                )?;
+                items = records
+                    .into_iter()
+                    .map(|record| RetrievedItem {
+                        fixture_id: record
+                            .source_ids
+                            .iter()
+                            .find_map(|id| id.strip_prefix("fixture:").map(str::to_string)),
+                        content: record.content,
+                        profile: record.profile_id,
+                        evidence_refs: record.source_ids,
+                    })
+                    .collect::<Vec<_>>();
+            }
+        }
+        by_question.insert(question.id.clone(), items);
+        relation_evidence_by_question
+            .insert(question.id.clone(), dedupe_strings(relation_evidence_refs));
+    }
+
+    let baseline = score_precomputed(
+        "relation_aware_recall",
+        "subject/alias-aware relation expansion before exact subject record fetch",
+        fixture,
+        by_question.clone(),
+    );
+    Ok(RelationAwareScores {
+        baseline,
         by_question,
-    ))
+        relation_evidence_by_question,
+    })
 }
 
 fn score_context_pack(
@@ -536,15 +798,17 @@ fn score_context_pack(
                             fixture_id: fixture_id_for_content(fixture, &record.content),
                             content: record.content,
                             profile: question.profile.clone(),
+                            evidence_refs: Vec::new(),
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             cache.insert(key.clone(), items);
         }
+        let empty: Vec<RetrievedItem> = Vec::new();
         by_question.insert(
             question.id.clone(),
-            clone_items(cache.get(&key).unwrap_or(&Vec::new())),
+            clone_items(cache.get(&key).unwrap_or(&empty)),
         );
     }
     Ok(score_precomputed(
@@ -669,6 +933,150 @@ fn score_precomputed(
     }
 }
 
+fn retrieval_improvements(
+    fixture: &RetrievalFixture,
+    baselines: &[RetrievalBaselineResult],
+    memoryd_by_question: &BTreeMap<String, Vec<RetrievedItem>>,
+    relation_by_question: &BTreeMap<String, Vec<RetrievedItem>>,
+    relation_evidence_by_question: &BTreeMap<String, Vec<String>>,
+) -> Vec<RetrievalImprovement> {
+    if !baselines
+        .iter()
+        .any(|baseline| baseline.name == "memoryd_recall")
+        || !baselines
+            .iter()
+            .any(|baseline| baseline.name == "relation_aware_recall")
+    {
+        return Vec::new();
+    }
+
+    fixture
+        .questions
+        .iter()
+        .filter_map(|question| {
+            let empty: Vec<RetrievedItem> = Vec::new();
+            let memoryd_items = memoryd_by_question.get(&question.id).unwrap_or(&empty);
+            let relation_items = relation_by_question.get(&question.id).unwrap_or(&empty);
+            if !question_is_answered(question, memoryd_items)
+                && question_is_answered(question, relation_items)
+            {
+                Some(RetrievalImprovement {
+                    query_id: question.id.clone(),
+                    family: question.family.clone(),
+                    before: "memoryd_recall",
+                    after: "relation_aware_recall",
+                    relation_evidence_refs: relation_evidence_by_question
+                        .get(&question.id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    returned_evidence_refs: dedupe_strings(
+                        relation_items
+                            .iter()
+                            .flat_map(|item| item.evidence_refs.iter().cloned())
+                            .collect(),
+                    ),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn question_is_answered(question: &FixtureQuestion, items: &[RetrievedItem]) -> bool {
+    let ids = items
+        .iter()
+        .filter_map(|item| item.fixture_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let relevant = question
+        .expected_record_ids
+        .iter()
+        .filter(|id| ids.contains(id.as_str()))
+        .count();
+    let marker_hits = question
+        .answer_markers
+        .iter()
+        .filter(|marker| {
+            items
+                .iter()
+                .any(|item| item.content.contains(marker.as_str()))
+        })
+        .count();
+    relevant == question.expected_record_ids.len() || marker_hits == question.answer_markers.len()
+}
+
+fn ensure_subject(
+    store: &Store,
+    profile: &str,
+    workspace: &str,
+    subject_key: &str,
+) -> Result<Subject> {
+    if let Some(subject) = store.find_subject_by_key(profile, workspace, subject_key)? {
+        return Ok(subject);
+    }
+
+    let now = ids::now_rfc3339();
+    let subject = Subject {
+        id: format!("fixture_subject_{profile}_{workspace}_{subject_key}"),
+        profile_id: profile.to_string(),
+        workspace_id: workspace.to_string(),
+        subject_key: subject_key.to_string(),
+        kind: SubjectKind::Project,
+        display_name: subject_key.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({"origin":"retrieval_eval_fixture"}),
+    };
+    let (subject, _) = store.insert_or_get_subject(&subject)?;
+    Ok(subject)
+}
+
+fn subject_owning_key(
+    fixture: &RetrievalFixture,
+    subject_key: &str,
+) -> Option<(String, String, String)> {
+    fixture
+        .records
+        .iter()
+        .find(|record| record.subject_key.as_deref() == Some(subject_key))
+        .map(|record| {
+            (
+                record.profile.clone(),
+                record.workspace.clone(),
+                record
+                    .subject_key
+                    .clone()
+                    .unwrap_or_else(|| subject_key.to_string()),
+            )
+        })
+}
+
+fn resolve_subject_for_key(
+    store: &Store,
+    profile: &str,
+    workspace: &str,
+    subject_key: &str,
+) -> Result<Option<String>> {
+    if let Some(alias_subject) = store.resolve_subject_alias(profile, workspace, subject_key)? {
+        return Ok(Some(alias_subject.id));
+    }
+    Ok(store
+        .find_subject_by_key(profile, workspace, subject_key)?
+        .map(|subject| subject.id))
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter_map(|value| seen.insert(value.clone()).then_some(value))
+        .collect()
+}
+
+fn default_relation_state() -> String {
+    "active".to_string()
+}
+
 fn score_ablation(
     name: &'static str,
     disabled_signals: Vec<&'static str>,
@@ -787,6 +1195,7 @@ fn record_item(record: &FixtureRecord) -> RetrievedItem {
         fixture_id: Some(record.id.clone()),
         content: record.content.clone(),
         profile: record.profile.clone(),
+        evidence_refs: Vec::new(),
     }
 }
 
@@ -805,6 +1214,7 @@ fn clone_items(items: &[RetrievedItem]) -> Vec<RetrievedItem> {
             fixture_id: item.fixture_id.clone(),
             content: item.content.clone(),
             profile: item.profile.clone(),
+            evidence_refs: item.evidence_refs.clone(),
         })
         .collect()
 }

@@ -147,6 +147,44 @@ fn seed_evidence(conn: &Connection, id: &str) {
     .expect("seed evidence");
 }
 
+fn seed_v7_schema(conn: &Connection) {
+    conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+        .expect("seed v7 schema base tables");
+    conn.execute_batch(include_str!("../migrations/0002_fts.sql"))
+        .expect("seed v7 fts");
+    conn.execute_batch(include_str!("../migrations/0003_dream_runs.sql"))
+        .expect("seed v7 dream schema");
+    conn.execute_batch(include_str!("../migrations/0004_evidence_ledger.sql"))
+        .expect("seed v7 evidence schema");
+    conn.execute_batch(include_str!("../migrations/0005_subjects_episodes.sql"))
+        .expect("seed v7 subject/episode schema");
+    conn.execute_batch(include_str!("../migrations/0006_trust_quarantine.sql"))
+        .expect("seed v7 trust/quarantine marker");
+    conn.execute_batch(include_str!("../migrations/0007_procedures.sql"))
+        .expect("seed v7 procedure schema");
+    conn.execute_batch(include_str!("../migrations/0008_procedure_lifecycle.sql"))
+        .expect("seed v7 lifecycle marker");
+    conn.execute_batch(
+        "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO schema_meta(key, value) VALUES ('schema_version','7');",
+    )
+    .expect("seed v7 schema version");
+}
+
+fn seed_v7_procedure(conn: &Connection, id: &str, subject_id: &str) {
+    conn.execute(
+        "INSERT INTO procedures(
+            id, profile_id, workspace_id, subject_id, name,
+            activation_query, steps, guardrails, termination_condition, state, created_at
+         )
+         VALUES (?1,'personal','default',?2,'v7 seed procedure',
+                 'When evaluating relation upgrades', '[\"check migration slices\"]',
+                 'reviewed only', 'stop when done', 'active', ?3)",
+        params![id, subject_id, now()],
+    )
+    .expect("seed v7 procedure");
+}
+
 /// Build a raw SQLite file with the given SQL, returning its path inside `dir`.
 fn build_old_db(dir: &TempDir, name: &str, build: impl FnOnce(&Connection)) -> std::path::PathBuf {
     let path = dir.path().join(name);
@@ -326,6 +364,72 @@ fn upgrades_v6_procedures_adding_lifecycle_columns() {
         .map(|t| t.rows)
         .unwrap();
     assert_eq!(proc_rows, 1, "procedure preserved across v6->v7 upgrade");
+}
+
+#[test]
+fn upgrades_v7_database_preserves_legacy_records_and_creates_semantic_tables() {
+    let dir = TempDir::new().unwrap();
+    let path = build_old_db(&dir, "v7.db", |conn| {
+        seed_v7_schema(conn);
+        seed_v1_record(
+            conn,
+            "mem_1",
+            "Relation migration should not alter existing memories.",
+            "hash-v7-1",
+        );
+        seed_v1_record(
+            conn,
+            "mem_2",
+            "Legacy subject/episode facts should remain accessible.",
+            "hash-v7-2",
+        );
+        seed_subject(conn, "subj_1", "person:alice");
+        seed_episode(
+            conn,
+            "ep_1",
+            "subj_1",
+            "Alice introduced a relation for billing.",
+        );
+        seed_evidence(conn, "ev_1");
+        seed_v7_procedure(conn, "proc_v7", "subj_1");
+    });
+
+    let store = upgrade(&path);
+
+    assert_eq!(store.count_records().unwrap(), 2);
+    let subjects = store.list_subjects("personal", "default", None).unwrap();
+    assert_eq!(subjects.len(), 1, "subject preserved across v7->v8");
+    let episodes = store
+        .list_successful_episodes("personal", "default", Some("subj_1"), 50)
+        .unwrap();
+    assert_eq!(episodes.len(), 1, "episodes preserved across v7->v8");
+
+    let proc = store
+        .get_procedure("personal", "default", "proc_v7")
+        .expect("get_procedure after v7 upgrade")
+        .expect("legacy v7 procedure preserved");
+    assert_eq!(proc.name, "v7 seed procedure");
+
+    let report = store.schema_report().unwrap();
+    assert_eq!(report.recorded_version, Some(STORAGE_SCHEMA_VERSION));
+    assert!(
+        report.up_to_date,
+        "schema should be current after v7 upgrade"
+    );
+    let alias_rows = report
+        .tables
+        .iter()
+        .find(|t| t.table == "subject_aliases")
+        .expect("subject_aliases table exists after migration")
+        .rows;
+    assert_eq!(alias_rows, 0, "subject_aliases should exist at v8");
+    let relation_rows = report
+        .tables
+        .iter()
+        .find(|t| t.table == "relations")
+        .expect("relations table exists after migration")
+        .rows;
+    assert_eq!(relation_rows, 0, "relations should exist at v8");
 }
 
 #[test]

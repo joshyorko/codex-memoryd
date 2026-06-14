@@ -5,6 +5,8 @@
 //! The store is intentionally free of policy logic: callers (ingest, server)
 //! screen content via [`crate::policy`] before persisting.
 
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -23,9 +25,12 @@ use crate::domain::MemorySource;
 use crate::domain::Portability;
 use crate::domain::Procedure;
 use crate::domain::RecordType;
+use crate::domain::Relation;
+use crate::domain::RelationExpansion;
 use crate::domain::Scope;
 use crate::domain::Sensitivity;
 use crate::domain::Subject;
+use crate::domain::SubjectAlias;
 use crate::domain::SubjectKind;
 use crate::domain::VisibleTurn;
 use crate::error::Error;
@@ -33,7 +38,7 @@ use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 7;
+pub const STORAGE_SCHEMA_VERSION: i64 = 8;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -44,6 +49,8 @@ const MIGRATION_TRUST_QUARANTINE: &str = include_str!("../migrations/0006_trust_
 const MIGRATION_PROCEDURES: &str = include_str!("../migrations/0007_procedures.sql");
 const MIGRATION_PROCEDURE_LIFECYCLE: &str =
     include_str!("../migrations/0008_procedure_lifecycle.sql");
+const MIGRATION_SEMANTIC_RELATIONS: &str =
+    include_str!("../migrations/0009_semantic_relations.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -327,6 +334,7 @@ impl Store {
         conn.execute_batch(MIGRATION_PROCEDURES)?;
         conn.execute_batch(MIGRATION_PROCEDURE_LIFECYCLE)?;
         ensure_procedure_lifecycle_columns(&conn)?;
+        conn.execute_batch(MIGRATION_SEMANTIC_RELATIONS)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -696,6 +704,293 @@ impl Store {
                 row_to_episode,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ------------------------------------------------------------------
+    // Subject aliases & relations
+    // ------------------------------------------------------------------
+
+    /// Explicitly apply a subject alias. This is the write path for aliases:
+    /// callers must review/decide before calling it; no recall path creates
+    /// aliases silently.
+    pub fn insert_or_get_subject_alias(
+        &self,
+        alias: &SubjectAlias,
+    ) -> Result<(SubjectAlias, bool)> {
+        if alias.alias_key.trim().is_empty() {
+            return Err(Error::invalid_request("subject alias_key is required"));
+        }
+        if alias.source_evidence.trim().is_empty() {
+            return Err(Error::invalid_request(
+                "subject alias source_evidence is required",
+            ));
+        }
+        if !self.subject_exists_in_scope(
+            &alias.profile_id,
+            &alias.workspace_id,
+            &alias.subject_id,
+        )? {
+            return Err(Error::profile_boundary(
+                "subject alias endpoint is outside the profile/workspace scope",
+            ));
+        }
+
+        let conn = self.conn()?;
+        let inserted = conn.execute(
+            "INSERT INTO subject_aliases(
+                id, profile_id, workspace_id, subject_id, alias_key,
+                source_evidence, created_at, metadata
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(profile_id, workspace_id, alias_key) DO NOTHING",
+            params![
+                alias.id,
+                alias.profile_id,
+                alias.workspace_id,
+                alias.subject_id,
+                alias.alias_key,
+                alias.source_evidence,
+                alias.created_at,
+                alias.metadata.to_string()
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok((alias.clone(), true));
+        }
+
+        let existing = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_ALIAS_COLS} FROM subject_aliases
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND alias_key = ?3"
+                ),
+                params![alias.profile_id, alias.workspace_id, alias.alias_key],
+                row_to_subject_alias,
+            )
+            .optional()?
+            .ok_or_else(|| Error::storage("subject alias conflict without visible row"))?;
+        if existing.subject_id != alias.subject_id {
+            return Err(Error::profile_boundary(
+                "subject alias already resolves to a different scoped subject",
+            ));
+        }
+        Ok((existing, false))
+    }
+
+    pub fn resolve_subject_alias(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        alias_key: &str,
+    ) -> Result<Option<Subject>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_COLS_S}
+                     FROM subject_aliases a
+                     JOIN subjects s
+                       ON s.id = a.subject_id
+                      AND s.profile_id = a.profile_id
+                      AND s.workspace_id = a.workspace_id
+                     WHERE a.profile_id = ?1 AND a.workspace_id = ?2
+                       AND a.alias_key = ?3"
+                ),
+                params![profile_id, workspace_id, alias_key],
+                row_to_subject,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Explicitly apply an evidence-backed relation. Scope and evidence are
+    /// checked before persistence; relation-aware recall only reads active rows.
+    pub fn insert_or_get_relation(&self, relation: &Relation) -> Result<(Relation, bool)> {
+        validate_relation(relation)?;
+        if !self.subject_exists_in_scope(
+            &relation.profile_id,
+            &relation.workspace_id,
+            &relation.from_subject_id,
+        )? || !self.subject_exists_in_scope(
+            &relation.profile_id,
+            &relation.workspace_id,
+            &relation.to_subject_id,
+        )? {
+            return Err(Error::profile_boundary(
+                "relation endpoints must both be inside the same profile/workspace scope",
+            ));
+        }
+
+        let conn = self.conn()?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO relations(
+                id, profile_id, workspace_id, from_subject_id, relation_type,
+                to_subject_id, confidence, state, source_episode_ids,
+                source_evidence, created_at, retired_at, metadata
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                relation.id,
+                relation.profile_id,
+                relation.workspace_id,
+                relation.from_subject_id,
+                relation.relation_type,
+                relation.to_subject_id,
+                relation.confidence,
+                relation.state,
+                serde_json::to_string(&relation.source_episode_ids)?,
+                relation.source_evidence,
+                relation.created_at,
+                relation.retired_at,
+                relation.metadata.to_string()
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok((relation.clone(), true));
+        }
+
+        let existing = conn
+            .query_row(
+                &format!(
+                    "SELECT {RELATION_COLS} FROM relations
+                     WHERE profile_id = ?1 AND workspace_id = ?2
+                       AND from_subject_id = ?3 AND relation_type = ?4
+                       AND to_subject_id = ?5
+                       AND retired_at IS NULL AND state != 'retired'"
+                ),
+                params![
+                    relation.profile_id,
+                    relation.workspace_id,
+                    relation.from_subject_id,
+                    relation.relation_type,
+                    relation.to_subject_id
+                ],
+                row_to_relation,
+            )
+            .optional()?
+            .ok_or_else(|| Error::storage("relation conflict without visible row"))?;
+        Ok((existing, false))
+    }
+
+    /// Traverse active outgoing relations within one profile/workspace. The
+    /// target subject join is scope-filtered, so a malformed cross-scope row
+    /// still cannot expand across the boundary.
+    pub fn relation_expanded_subjects(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        seed_subject_ids: &[String],
+        max_depth: usize,
+    ) -> Result<Vec<RelationExpansion>> {
+        let max_depth = max_depth.clamp(1, 3);
+        let conn = self.conn()?;
+        let mut seen = seed_subject_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let mut queue = VecDeque::new();
+        for subject_id in seed_subject_ids {
+            queue.push_back((
+                subject_id.clone(),
+                0usize,
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ));
+        }
+
+        let mut expansions = Vec::new();
+        while let Some((subject_id, depth, via, evidence)) = queue.pop_front() {
+            if depth >= max_depth || expansions.len() >= 64 {
+                continue;
+            }
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RELATION_COLS_R}
+                     FROM relations r
+                     JOIN subjects target
+                       ON target.id = r.to_subject_id
+                      AND target.profile_id = r.profile_id
+                      AND target.workspace_id = r.workspace_id
+                     WHERE r.profile_id = ?1 AND r.workspace_id = ?2
+                       AND r.from_subject_id = ?3
+                       AND r.state = 'active' AND r.retired_at IS NULL
+                     ORDER BY r.confidence DESC, r.created_at DESC, r.id ASC"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![profile_id, workspace_id, subject_id],
+                    row_to_relation,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for relation in rows {
+                if !seen.insert(relation.to_subject_id.clone()) {
+                    continue;
+                }
+                let mut via_relation_ids = via.clone();
+                via_relation_ids.push(relation.id.clone());
+                let mut evidence_refs = evidence.clone();
+                evidence_refs.extend(relation.source_episode_ids.clone());
+                if let Some(source_evidence) = &relation.source_evidence {
+                    evidence_refs.push(source_evidence.clone());
+                }
+                evidence_refs = dedupe_strings(evidence_refs);
+                expansions.push(RelationExpansion {
+                    subject_id: relation.to_subject_id.clone(),
+                    depth: depth + 1,
+                    via_relation_ids: via_relation_ids.clone(),
+                    evidence_refs: evidence_refs.clone(),
+                });
+                queue.push_back((
+                    relation.to_subject_id,
+                    depth + 1,
+                    via_relation_ids,
+                    evidence_refs,
+                ));
+            }
+        }
+        Ok(expansions)
+    }
+
+    pub fn records_for_subjects(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        subject_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>> {
+        if subject_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let mut seen = BTreeSet::new();
+        let mut rows = Vec::new();
+        for subject_id in subject_ids {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RECORD_COLS} FROM memory_records
+                 WHERE profile_id = ?1 AND workspace_id = ?2
+                   AND subject_id = ?3
+                   AND archived = 0
+                   AND sensitivity != 'secret_blocked'
+                   AND trust_state != 'quarantined'
+                 ORDER BY updated_at DESC, confidence DESC, id ASC"
+            ))?;
+            for row in
+                stmt.query_map(params![profile_id, workspace_id, subject_id], row_to_record)?
+            {
+                let record = row?;
+                if seen.insert(record.id.clone()) {
+                    rows.push(record);
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        rows.truncate(limit);
         Ok(rows)
     }
 
@@ -2549,6 +2844,8 @@ pub const DURABLE_TABLES: &[&str] = &[
     "checkpoints",
     "subjects",
     "episodes",
+    "subject_aliases",
+    "relations",
     "evidence_ledger",
     "procedures",
     "memory_sources",
@@ -2793,8 +3090,14 @@ fn ensure_column(
 const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, metadata";
 const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
+const SUBJECT_COLS_S: &str =
+    "s.id, s.profile_id, s.workspace_id, s.subject_key, s.kind, s.display_name, s.created_at, s.updated_at, s.metadata";
 const EPISODE_COLS: &str =
     "id, profile_id, workspace_id, subject_id, source_kind, source_ref, started_at, ended_at, status, summary, trust_level, source_metadata, created_at, updated_at, metadata";
+const SUBJECT_ALIAS_COLS: &str =
+    "id, profile_id, workspace_id, subject_id, alias_key, source_evidence, created_at, metadata";
+const RELATION_COLS: &str = "id, profile_id, workspace_id, from_subject_id, relation_type, to_subject_id, confidence, state, source_episode_ids, source_evidence, created_at, retired_at, metadata";
+const RELATION_COLS_R: &str = "r.id, r.profile_id, r.workspace_id, r.from_subject_id, r.relation_type, r.to_subject_id, r.confidence, r.state, r.source_episode_ids, r.source_evidence, r.created_at, r.retired_at, r.metadata";
 const PROCEDURE_COLS: &str = "id, profile_id, workspace_id, subject_id, repo_id, name, activation_query, steps, guardrails, termination_condition, source_episode_ids, confidence, state, created_at, retired_at, version, first_seen, last_validated, superseded_by, counter_evidence_count, negative_examples, metadata";
 
 fn record_cols_prefixed(prefix: &str) -> String {
@@ -2965,6 +3268,52 @@ fn json_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
 }
 
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn validate_relation(relation: &Relation) -> Result<()> {
+    if relation.from_subject_id.trim().is_empty() || relation.to_subject_id.trim().is_empty() {
+        return Err(Error::invalid_request("relation endpoints are required"));
+    }
+    if relation.relation_type.trim().is_empty() {
+        return Err(Error::invalid_request("relation_type is required"));
+    }
+    if !matches!(
+        relation.relation_type.as_str(),
+        "uses" | "owns" | "prefers" | "works_on" | "depends_on" | "supersedes" | "blocked_by"
+    ) {
+        return Err(Error::invalid_request(format!(
+            "unknown relation_type '{}'",
+            relation.relation_type
+        )));
+    }
+    if !matches!(relation.state.as_str(), "candidate" | "active" | "retired") {
+        return Err(Error::invalid_request(format!(
+            "unknown relation state '{}'",
+            relation.state
+        )));
+    }
+    if relation.source_episode_ids.is_empty()
+        && relation
+            .source_evidence
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::invalid_request(
+            "relation evidence is required via source_episode_ids or source_evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
     Ok(MemoryRecord {
         id: row.get(0)?,
@@ -3030,6 +3379,37 @@ fn row_to_episode(row: &Row) -> rusqlite::Result<Episode> {
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
         metadata: json_value(&row.get::<_, String>(14)?),
+    })
+}
+
+fn row_to_subject_alias(row: &Row) -> rusqlite::Result<SubjectAlias> {
+    Ok(SubjectAlias {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        subject_id: row.get(3)?,
+        alias_key: row.get(4)?,
+        source_evidence: row.get(5)?,
+        created_at: row.get(6)?,
+        metadata: json_value(&row.get::<_, String>(7)?),
+    })
+}
+
+fn row_to_relation(row: &Row) -> rusqlite::Result<Relation> {
+    Ok(Relation {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        from_subject_id: row.get(3)?,
+        relation_type: row.get(4)?,
+        to_subject_id: row.get(5)?,
+        confidence: row.get(6)?,
+        state: row.get(7)?,
+        source_episode_ids: json_str_list(&row.get::<_, String>(8)?),
+        source_evidence: row.get(9)?,
+        created_at: row.get(10)?,
+        retired_at: row.get(11)?,
+        metadata: json_value(&row.get::<_, String>(12)?),
     })
 }
 

@@ -424,6 +424,39 @@ fn cli_eval_retrieval_emits_long_history_scores_and_summary() {
         .unwrap()
         .iter()
         .any(|b| b["name"] == "memoryd_recall"));
+    let memoryd = report["baselines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "memoryd_recall")
+        .expect("memoryd baseline");
+    assert!(memoryd["failed_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|q| q == "q_multihop_evidence"));
+    let relation_aware = report["baselines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "relation_aware_recall")
+        .expect("relation-aware baseline");
+    assert!(!relation_aware["failed_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|q| q == "q_multihop_evidence"));
+    assert_eq!(relation_aware["cross_profile_leak"], false);
+    assert!(
+        relation_aware["recall_at_k"].as_f64().unwrap() > memoryd["recall_at_k"].as_f64().unwrap()
+    );
+    assert!(report["retrieval_improvements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["query_id"] == "q_multihop_evidence"
+            && item["before"] == "memoryd_recall"
+            && item["after"] == "relation_aware_recall"));
     assert!(report["baselines"]
         .as_array()
         .unwrap()
@@ -455,7 +488,9 @@ fn cli_eval_retrieval_emits_long_history_scores_and_summary() {
         ))
         .stdout(predicate::str::contains("long-history questions: 6"))
         .stdout(predicate::str::contains("memoryd_recall"))
+        .stdout(predicate::str::contains("relation_aware_recall"))
         .stdout(predicate::str::contains("verbatim_evidence"))
+        .stdout(predicate::str::contains("retrieval improvements"))
         .stdout(predicate::str::contains("next ranking changes"));
 }
 
