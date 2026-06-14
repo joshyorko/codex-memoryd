@@ -2512,12 +2512,22 @@ impl Store {
         let recorded_version = recorded.as_deref().and_then(|v| v.parse::<i64>().ok());
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
+        // Count inline on this connection. Do NOT call count_table_rows() here:
+        // it would check out a second connection and deadlock the single-
+        // connection in-memory pool.
         let mut tables = Vec::new();
         for table in DURABLE_TABLES {
-            tables.push(TableCount {
-                table,
-                rows: self.count_table_rows(table)?,
-            });
+            let exists: bool = conn
+                .prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                )?
+                .exists(params![table])?;
+            let rows = if exists {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?
+            } else {
+                0
+            };
+            tables.push(TableCount { table, rows });
         }
 
         Ok(SchemaReport {
