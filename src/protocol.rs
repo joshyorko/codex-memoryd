@@ -355,6 +355,7 @@ pub struct CardRecordView {
     pub content: String,
     pub confidence: f64,
     pub updated_at: String,
+    pub freshness: RecallFreshness,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub related_files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

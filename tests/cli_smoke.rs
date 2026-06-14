@@ -19,6 +19,8 @@ use rusqlite::params;
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 fn bin() -> Command {
     Command::cargo_bin("codex-memoryd").expect("binary built")
@@ -26,6 +28,31 @@ fn bin() -> Command {
 
 fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("memory.db")
+}
+
+fn normalize_card_markdown_snapshot(markdown: &str) -> String {
+    markdown
+        .trim_end()
+        .lines()
+        .map(|line| {
+            if line.starts_with("Content hash: ") {
+                "Content hash: <sha256>".to_string()
+            } else if line.starts_with("Generated at: ") {
+                "Generated at: <fresh-timestamp>".to_string()
+            } else if line.starts_with("- mem_") {
+                "- <record_id> [decision] workspace (0.9)".to_string()
+            } else if line.starts_with("  - updated_at: ") && !line.contains("2025-01-01") {
+                "  - updated_at: <fresh-timestamp>".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc().format(&Rfc3339).unwrap()
 }
 
 fn count_table(db: &PathBuf, table: &str) -> i64 {
@@ -1351,6 +1378,121 @@ fn cli_card_workspace_summary_markdown_renders() {
     assert!(stdout.contains("Profile: personal"));
     assert!(stdout.contains("Authority: recall_not_authority"));
     assert!(stdout.contains("Content hash: "));
+}
+
+#[test]
+fn cli_card_workspace_summary_json_marks_stale_records() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let fresh_updated_at = now_rfc3339();
+
+    seed_record(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Decision,
+        "Decision: stale issue #50 card facts must be labeled.",
+        "2025-01-01T00:00:00Z",
+        false,
+        vec!["src_stale_card".to_string()],
+    );
+    seed_record(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Decision,
+        "Decision: fresh issue #50 card facts stay active.",
+        &fresh_updated_at,
+        false,
+        vec!["src_fresh_card".to_string()],
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let card: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(card["freshness"], "contains_stale_records");
+    let records = card["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0]["content"],
+        "Decision: fresh issue #50 card facts stay active."
+    );
+    assert_eq!(records[0]["freshness"]["stale"], false);
+    assert!(records[0]["freshness"]["age_days"].as_i64().unwrap() < 120);
+    assert_eq!(
+        records[1]["content"],
+        "Decision: stale issue #50 card facts must be labeled."
+    );
+    assert_eq!(records[1]["freshness"]["stale"], true);
+    assert!(records[1]["freshness"]["age_days"].as_i64().unwrap() > 120);
+}
+
+#[test]
+fn cli_card_workspace_summary_markdown_matches_fixture() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let fresh_updated_at = now_rfc3339();
+
+    seed_record(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Decision,
+        "Decision: stale issue #50 card facts must be labeled.",
+        "2025-01-01T00:00:00Z",
+        false,
+        vec!["src_stale_card".to_string()],
+    );
+    seed_record(
+        &db,
+        "personal",
+        "josh-personal",
+        RecordType::Decision,
+        "Decision: fresh issue #50 card facts stay active.",
+        &fresh_updated_at,
+        false,
+        vec!["src_fresh_card".to_string()],
+    );
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "card",
+            "show",
+            "--type",
+            "workspace_summary",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let actual = normalize_card_markdown_snapshot(&String::from_utf8_lossy(&output.stdout));
+    let expected = include_str!("fixtures/card_workspace_summary.expected.md").trim_end();
+    assert_eq!(actual, expected);
 }
 
 #[test]
