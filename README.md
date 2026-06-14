@@ -17,6 +17,7 @@ This is the landed MVP surface today:
 | Compose heartbeat | landed | `scripts/dogfood-compose-heartbeat.sh` rebuilds, restarts, and smoke-checks the stack. |
 | Fixture substrate demo | landed | `scripts/demo-substrate.sh` runs a one-command end-to-end demo against a temporary fixture DB. |
 | Dogfood write sandbox | landed | `scripts/dogfood-write-sandbox.sh` refreshes a sandbox from the real DB, runs write canaries only there, and emits content-free diffs. |
+| v0.1 release gate | landed | `scripts/v0.1-release-gate.sh` runs the local release-quality gate and records artifacts under `target/release-gate/`. |
 | Codex memory import | landed | `sync-local --preview` / `--apply` import local Codex memories. |
 | Native memory migration plan | documented | Phases native Codex memory from import/fallback toward optional `memoryd-canonical` mode. |
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
@@ -142,6 +143,23 @@ scripts/dogfood-write-sandbox.sh run
 
 See [`docs/dogfood-write-sandbox.md`](./docs/dogfood-write-sandbox.md) for the
 content-free diff report and manual promotion workflow.
+
+### v0.1 release gate
+
+Before tagging, run:
+
+```bash
+scripts/v0.1-release-gate.sh
+```
+
+For the live dogfood lane, rerun from the dogfood checkout with:
+
+```bash
+scripts/v0.1-release-gate.sh --include-dogfood
+```
+
+See [`docs/release/v0.1-hardening.md`](./docs/release/v0.1-hardening.md) for
+the checklist, caveats, and issue coverage map.
 
 ## Operator Flows
 
