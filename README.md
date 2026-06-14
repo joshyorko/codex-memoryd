@@ -16,6 +16,7 @@ This is the landed MVP surface today:
 | Docker Compose dogfood | landed | Uses `.dogfood/memory.db` as the real daemon DB and keeps host publish loopback-only. |
 | Compose heartbeat | landed | `scripts/dogfood-compose-heartbeat.sh` rebuilds, restarts, and smoke-checks the stack. |
 | Codex memory import | landed | `sync-local --preview` / `--apply` import local Codex memories. |
+| Native memory migration plan | documented | Phases native Codex memory from import/fallback toward optional `memoryd-canonical` mode. |
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
 | Recall policy metadata | landed | `recall_not_authority`, ranking, admission, and provenance metadata travel with recall. |
 | Current-state cards | landed MVP | `workspace_summary`, `subject_summary`, `active_preferences`, `open_questions`, `recent_scars`, `procedures_index`. |
@@ -129,6 +130,10 @@ target/release/codex-memoryd sync-local --apply ~/.codex/memories \
   --profile personal --workspace josh-personal
 ```
 
+For the native Codex memory migration phases, parity canaries, duplicate-loop
+risks, and canonical-mode checklist, see
+[`docs/native-codex-memory-migration.md`](./docs/native-codex-memory-migration.md).
+
 ### Recall and search
 
 Recall is contextual evidence, not authority. Pack modes currently accept
@@ -238,6 +243,7 @@ that the product is done:
 - [`docs/codex-integration.md`](./docs/codex-integration.md)
 - [`docs/dogfood-local.md`](./docs/dogfood-local.md)
 - [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md)
+- [`docs/native-codex-memory-migration.md`](./docs/native-codex-memory-migration.md)
 - [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)
 - [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md)
 - [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)

@@ -2,6 +2,10 @@
 
 This runbook connects current Codex to `codex-memoryd` through MCP stdio in safe dogfood mode. It uses manual tool access only; it does not enable prompt injection, Dreamer apply, scheduler apply, remote MCP, or the tap-release memory provider path.
 
+For the larger native Codex memory migration plan, including when MCP recall is
+safe enough to support `memoryd-canonical` mode, see
+[`native-codex-memory-migration.md`](./native-codex-memory-migration.md).
+
 ## Safety Posture
 
 - Keep the real dogfood daemon and database untouched.
@@ -84,6 +88,11 @@ Observed direct results in read-only mode:
 - `memory_search`, `safe dogfood`: returned 5 matches
 - `memory_search`, `dogfood`: returned 2 matches
 - `memory_search`, `Dreamer`: returned 5 matches
+
+These MCP canaries are necessary but not sufficient for native memory migration.
+Run the native-memory parity canaries from
+[`native-codex-memory-migration.md`](./native-codex-memory-migration.md) before
+changing any real dogfood write posture.
 
 ## Current Codex Verification
 

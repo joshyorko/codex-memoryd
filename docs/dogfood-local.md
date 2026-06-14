@@ -3,6 +3,9 @@
 This runbook brings `codex-memoryd` up as a safe local dogfood memory service for Josh. It keeps memory local-first, loopback-only, manually operated, and explicitly non-authoritative.
 
 For connecting current Codex to this service through MCP stdio, see [`dogfood-mcp.md`](./dogfood-mcp.md).
+For the native Codex memory migration phases, canaries, duplicate-loop risks,
+and `memoryd-canonical` prerequisites, see
+[`native-codex-memory-migration.md`](./native-codex-memory-migration.md).
 
 ## Safety Posture
 
@@ -144,6 +147,10 @@ target/debug/codex-memoryd sync-local --apply \
   --workspace "$DOGFOOD_WORKSPACE" \
   ~/.codex/memories > .dogfood/sync-apply-second.json
 ```
+
+Before treating this daemon as the preferred memory surface, compare the
+preview/apply/apply counts and run the parity canaries in
+[`native-codex-memory-migration.md`](./native-codex-memory-migration.md).
 
 Write manual dogfood memory:
 
