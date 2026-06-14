@@ -15,6 +15,7 @@ use codex_memoryd::conformance;
 use codex_memoryd::domain;
 use codex_memoryd::error;
 use codex_memoryd::error::Result;
+use codex_memoryd::eval;
 use codex_memoryd::git_import;
 use codex_memoryd::git_import::GitImportMode;
 use codex_memoryd::git_import::GitImportParams;
@@ -194,6 +195,11 @@ pub enum Command {
     },
     /// Run self-checks (storage writable, FTS5, schema).
     Doctor,
+    /// Run deterministic eval suites.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
     /// Run MCP transport entrypoints.
     Mcp {
         #[command(subcommand)]
@@ -235,6 +241,15 @@ pub enum McpCommand {
         /// Opt in to write-capable MCP tools. The default stdio surface is read-only.
         #[arg(long, conflicts_with = "read_only")]
         write_tools: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EvalCommand {
+    /// Run the agent-agnostic substrate eval suite.
+    Substrate {
+        #[arg(long, default_value = "summary")]
+        format: String,
     },
 }
 
@@ -1057,6 +1072,23 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Eval { command } => match command {
+            EvalCommand::Substrate { format } => {
+                let report = eval::run_substrate_eval()?;
+                match format.as_str().to_ascii_lowercase().as_str() {
+                    "json" => print_json(&report)?,
+                    "summary" | "human" | "markdown" => {
+                        print_markdown(&eval::render_substrate_summary(&report))
+                    }
+                    other => {
+                        return Err(error::Error::invalid_request(format!(
+                            "invalid --format '{other}'; expected 'json' or 'summary'"
+                        )))
+                    }
+                }
+                Ok(())
+            }
+        },
         Command::Mcp { command } => match command {
             McpCommand::Stdio {
                 read_only: _,
