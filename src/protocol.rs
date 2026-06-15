@@ -143,7 +143,7 @@ pub struct ScheduledDreamStatus {
 // Recall (SPEC §6.2)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RecallRequest {
     pub profile: Option<String>,
     pub workspace: Option<String>,
@@ -294,7 +294,7 @@ pub struct RecallResponse {
 // Search (SPEC §6.3)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchRequest {
     pub profile: Option<String>,
     #[serde(default)]
@@ -520,7 +520,7 @@ pub struct ProceduresRecallResponse {
 // Adapter generated views
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AdapterExportRequest {
     pub profile: Option<String>,
     #[serde(default)]
@@ -532,7 +532,7 @@ pub struct AdapterExportRequest {
     pub max_bytes: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
@@ -540,7 +540,7 @@ pub struct AdapterBudget {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterContextPackBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
@@ -548,7 +548,7 @@ pub struct AdapterContextPackBudget {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterContextPackRecord {
     #[serde(rename = "type")]
     pub record_type: String,
@@ -558,7 +558,7 @@ pub struct AdapterContextPackRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterContextPack {
     pub target: String,
     pub template: String,
@@ -576,7 +576,7 @@ pub struct AdapterContextPack {
     pub records: Vec<AdapterContextPackRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterExportResponse {
     pub target: String,
     pub adapter_version: String,
@@ -653,7 +653,7 @@ pub struct TurnsResponse {
 // Conclusions (SPEC §6.5)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConclusionsRequest {
     pub profile: Option<String>,
     pub workspace: Option<String>,
@@ -821,7 +821,7 @@ pub struct CheckpointResponse {
 // Dreamer loop (preview/apply)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DreamRequest {
     pub profile: Option<String>,
     pub workspace: Option<String>,
@@ -1135,7 +1135,7 @@ pub struct ScheduledDreamResponse {
 // Local Codex memory sync (SPEC §6.6)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncFile {
     pub path: String,
     #[serde(default)]
@@ -1152,7 +1152,7 @@ pub struct SyncFile {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncRequest {
     pub profile: Option<String>,
     pub workspace: Option<String>,

@@ -154,12 +154,22 @@ fn home_dir() -> PathBuf {
 
 /// `~/.codex-memoryd/config.toml`
 pub fn default_config_path() -> PathBuf {
-    home_dir().join(".codex-memoryd").join("config.toml")
+    default_home_dir().join("config.toml")
 }
 
 /// `~/.codex-memoryd/memory.db`
 pub fn default_storage_path() -> PathBuf {
-    home_dir().join(".codex-memoryd").join("memory.db")
+    default_home_dir().join("memory.db")
+}
+
+/// Runtime home for product CLI mode. Defaults to `~/.codex-memoryd`, with
+/// `CODEX_MEMORYD_HOME` as the operator-level override.
+pub fn default_home_dir() -> PathBuf {
+    std::env::var("CODEX_MEMORYD_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| expand_path(&v))
+        .unwrap_or_else(|| home_dir().join(".codex-memoryd"))
 }
 
 /// Expand a leading `~` and environment references in a path string.

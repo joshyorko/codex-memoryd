@@ -26,6 +26,29 @@ fn bin() -> Command {
     Command::cargo_bin("codex-memoryd").expect("binary built")
 }
 
+fn unused_loopback_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+fn wait_for_health(url: &str) {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .unwrap();
+    for _ in 0..40 {
+        if http
+            .get(format!("{url}/healthz"))
+            .send()
+            .is_ok_and(|resp| resp.status().is_success())
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {url}/healthz");
+}
+
 fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("memory.db")
 }
@@ -3618,6 +3641,11 @@ fn cli_help_lists_all_commands() {
         .arg("--help")
         .assert()
         .success()
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("up"))
+        .stdout(predicate::str::contains("down"))
+        .stdout(predicate::str::contains("logs"))
+        .stdout(predicate::str::contains("upgrade"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("recall"))
@@ -3628,6 +3656,199 @@ fn cli_help_lists_all_commands() {
         .stdout(predicate::str::contains("export"))
         .stdout(predicate::str::contains("forget"))
         .stdout(predicate::str::contains("doctor"));
+}
+
+#[test]
+fn cli_container_status_reports_managed_runtime_shape_without_compose() {
+    let dir = TempDir::new().unwrap();
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", dir.path().join("memoryd-home"))
+        .args(["--runtime", "container", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"runtime\": \"container\""))
+        .stdout(predicate::str::contains("127.0.0.1:8787 -> container:8787"));
+}
+
+#[test]
+fn cli_url_client_mode_routes_daily_commands_to_daemon() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let bind = unused_loopback_addr();
+    let url = format!("http://{bind}");
+    let mut child = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["serve", "--bind", &bind])
+        .spawn()
+        .expect("spawn daemon");
+    wait_for_health(&url);
+
+    let result = std::panic::catch_unwind(|| {
+        bin()
+            .arg("--url")
+            .arg(&url)
+            .args([
+                "conclude",
+                "--profile",
+                "personal",
+                "--workspace",
+                "josh-personal",
+                "--content",
+                "Decision: URL client mode routes CLI commands to the daemon",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"ok\":true"));
+
+        bin()
+            .arg("--url")
+            .arg(&url)
+            .args([
+                "recall",
+                "--profile",
+                "personal",
+                "--workspace",
+                "josh-personal",
+                "--query",
+                "URL client mode daemon",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"ok\":true"))
+            .stdout(predicate::str::contains("URL client mode"));
+
+        bin()
+            .arg("--url")
+            .arg(&url)
+            .args([
+                "adapter",
+                "export",
+                "--profile",
+                "personal",
+                "--workspace",
+                "josh-personal",
+                "--target",
+                "agents-md",
+                "--max-bytes",
+                "4000",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("recall_not_authority"));
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
+    }
+}
+
+#[test]
+fn cli_init_is_idempotent_for_product_runtime_home() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"created\""))
+        .stdout(predicate::str::contains("config.toml"))
+        .stdout(predicate::str::contains("runtime.env"));
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"reused\""))
+        .stdout(predicate::str::contains("config.toml"))
+        .stdout(predicate::str::contains("runtime.env"));
+
+    assert!(home.join("config.toml").exists());
+    assert!(home.join("runtime.env").exists());
+    assert!(home.join("memory.db").exists());
+    assert!(home.join("logs").is_dir());
+    assert!(home.join("backups").is_dir());
+    assert!(home.join("exports").is_dir());
+}
+
+#[test]
+fn cli_init_dogfood_creates_repo_local_layout() {
+    let dir = TempDir::new().unwrap();
+
+    bin()
+        .current_dir(dir.path())
+        .args(["init", "--dogfood"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".dogfood"))
+        .stdout(predicate::str::contains("memory.db"));
+
+    assert!(dir.path().join(".dogfood/config.toml").exists());
+    assert!(dir.path().join(".dogfood/runtime.env").exists());
+    assert!(dir.path().join(".dogfood/memory.db").exists());
+}
+
+#[test]
+fn cli_config_show_resolved_reports_runtime_and_daemon_values() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["config", "show", "--resolved"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"registry\""))
+        .stdout(predicate::str::contains("\"owner\""))
+        .stdout(predicate::str::contains("\"source\""))
+        .stdout(predicate::str::contains("\"restart_required\""))
+        .stdout(predicate::str::contains("\"client\""))
+        .stdout(predicate::str::contains("\"runtime\""))
+        .stdout(predicate::str::contains("\"daemon\""))
+        .stdout(predicate::str::contains("127.0.0.1:8787"));
+}
+
+#[test]
+fn cli_dream_enable_disable_status_mutates_config_file() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+
+    bin()
+        .arg("--config")
+        .arg(&config)
+        .args(["dream", "enable"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"dream_scheduler_enabled\": true",
+        ));
+
+    bin()
+        .arg("--config")
+        .arg(&config)
+        .args(["dream", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"enabled\": true"));
+
+    bin()
+        .arg("--config")
+        .arg(&config)
+        .args(["dream", "disable"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"dream_scheduler_enabled\": false",
+        ));
+
+    let raw = std::fs::read_to_string(config).unwrap();
+    assert!(raw.contains("scheduler_enabled = false"));
 }
 
 #[test]

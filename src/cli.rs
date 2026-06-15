@@ -21,6 +21,10 @@ use codex_memoryd::git_import::GitImportMode;
 use codex_memoryd::git_import::GitImportParams;
 use codex_memoryd::ingest::ArtifactKind;
 use codex_memoryd::mcp;
+use codex_memoryd::native_runtime;
+use codex_memoryd::native_runtime::InitMode;
+use codex_memoryd::native_runtime::RuntimeKind;
+use codex_memoryd::native_runtime::RuntimeOptions;
 use codex_memoryd::protocol::*;
 use codex_memoryd::server;
 use codex_memoryd::service::Service;
@@ -45,12 +49,43 @@ pub struct Cli {
     #[arg(long, global = true, env = "CODEX_MEMORYD_LOG")]
     pub log: Option<String>,
 
+    /// Force direct in-process SQLite mode for admin/recovery/offline work.
+    #[arg(long, global = true)]
+    pub local: bool,
+
+    /// Daemon endpoint for client mode.
+    #[arg(long, global = true, value_name = "URL", env = "CODEX_MEMORYD_URL")]
+    pub url: Option<String>,
+
+    /// Managed runtime kind for lifecycle commands.
+    #[arg(long, global = true, value_enum, env = "CODEX_MEMORYD_RUNTIME")]
+    pub runtime: Option<RuntimeKind>,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Initialize product runtime config and directories.
+    Init {
+        /// Initialize repo-local .dogfood layout for development.
+        #[arg(long)]
+        dogfood: bool,
+    },
+    /// Start the managed daemon runtime.
+    Up,
+    /// Stop the managed daemon runtime.
+    Down,
+    /// Print managed daemon logs.
+    Logs {
+        #[arg(long, default_value_t = 80)]
+        lines: usize,
+    },
+    /// Restart the managed daemon runtime.
+    Restart,
+    /// Upgrade the managed runtime.
+    Upgrade,
     /// Run the HTTP daemon.
     Serve {
         /// Bind address, e.g. 127.0.0.1:8787.
@@ -176,6 +211,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AdapterCommand,
     },
+    /// Inspect resolved runtime/config values.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Run local conformance reports.
     Conformance {
         #[command(subcommand)]
@@ -231,6 +271,8 @@ pub enum Command {
     },
     /// Run the Dreamer loop in preview or apply mode.
     Dream {
+        #[arg(value_enum)]
+        action: Option<DreamAction>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -248,6 +290,26 @@ pub enum Command {
         #[arg(long)]
         since: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DreamAction {
+    Enable,
+    Disable,
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Show resolved configuration values.
+    Show {
+        #[arg(long)]
+        resolved: bool,
+    },
+    /// Print shell env for the resolved runtime.
+    Env,
+    /// Validate the resolved config.
+    Doctor,
 }
 
 #[derive(Subcommand, Debug)]
@@ -611,6 +673,22 @@ impl Cli {
         let store = Store::open(&config.storage_path)?;
         Ok(Service::new(store, config))
     }
+
+    fn runtime_options(&self) -> RuntimeOptions {
+        RuntimeOptions::resolve(self.runtime, self.url.clone(), self.db.clone())
+    }
+
+    fn use_client_mode(&self) -> bool {
+        !self.local && self.db.is_none()
+    }
+
+    fn client_endpoint(&self, path: &str) -> String {
+        format!(
+            "{}{}",
+            self.runtime_options().url.trim_end_matches('/'),
+            path
+        )
+    }
 }
 
 /// Run the CLI. Returns process exit code.
@@ -632,7 +710,60 @@ pub fn run(cli: Cli) -> i32 {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    if cli.url.is_some()
+        && cli.db.is_some()
+        && !cli.local
+        && !matches!(
+            cli.command,
+            Command::Serve { .. }
+                | Command::Init { .. }
+                | Command::Up
+                | Command::Down
+                | Command::Logs { .. }
+                | Command::Restart
+                | Command::Upgrade
+        )
+    {
+        return Err(error::Error::invalid_request(
+            "--url and --db conflict unless --local makes direct SQLite mode explicit",
+        ));
+    }
+
     match &cli.command {
+        Command::Init { dogfood } => {
+            let mode = if *dogfood {
+                InitMode::Dogfood
+            } else {
+                InitMode::Product
+            };
+            let report = native_runtime::init(&cli.runtime_options(), mode)?;
+            print_json(&report)?;
+            Ok(())
+        }
+        Command::Up => {
+            let report = native_runtime::up(&cli.runtime_options())?;
+            print_json(&report)?;
+            Ok(())
+        }
+        Command::Down => {
+            let report = native_runtime::down(&cli.runtime_options())?;
+            print_json(&report)?;
+            Ok(())
+        }
+        Command::Logs { lines } => {
+            print!("{}", native_runtime::logs(&cli.runtime_options(), *lines)?);
+            Ok(())
+        }
+        Command::Restart => {
+            let report = native_runtime::restart(&cli.runtime_options())?;
+            print_json(&report)?;
+            Ok(())
+        }
+        Command::Upgrade => {
+            let report = native_runtime::upgrade(&cli.runtime_options())?;
+            print_json(&report)?;
+            Ok(())
+        }
         Command::Serve { bind } => {
             let service = cli.open_service(bind.clone())?;
             let bind_addr = service.config.bind.clone();
@@ -644,9 +775,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Status => {
-            let service = cli.open_service(None)?;
-            let status = service.status()?;
-            print_json(&status)?;
+            if cli.local || cli.db.is_some() {
+                let service = cli.open_service(None)?;
+                let status = service.status()?;
+                print_json(&status)?;
+            } else if let Ok(body) = native_runtime::http_get(&format!(
+                "{}/v1/status",
+                cli.runtime_options().url.trim_end_matches('/')
+            )) {
+                print!("{body}");
+            } else {
+                let report = native_runtime::status(&cli.runtime_options());
+                print_json(&report)?;
+            }
             Ok(())
         }
         Command::Patch { command } => {
@@ -747,6 +888,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Dream {
+            action,
             profile,
             workspace,
             repo,
@@ -756,14 +898,58 @@ fn dispatch(cli: Cli) -> Result<()> {
             now,
             since,
         } => {
-            let service = cli.open_service(None)?;
+            if let Some(action) = action {
+                match action {
+                    DreamAction::Enable => {
+                        let path = cli
+                            .config
+                            .clone()
+                            .unwrap_or_else(codex_memoryd::config::default_config_path);
+                        set_dream_scheduler_enabled(&path, true)?;
+                        print_json(&json!({
+                            "ok": true,
+                            "config_file": path,
+                            "dream_scheduler_enabled": true,
+                            "restart_required": true,
+                        }))?;
+                    }
+                    DreamAction::Disable => {
+                        let path = cli
+                            .config
+                            .clone()
+                            .unwrap_or_else(codex_memoryd::config::default_config_path);
+                        set_dream_scheduler_enabled(&path, false)?;
+                        print_json(&json!({
+                            "ok": true,
+                            "config_file": path,
+                            "dream_scheduler_enabled": false,
+                            "restart_required": true,
+                        }))?;
+                    }
+                    DreamAction::Status => {
+                        let config = cli.load_config(None)?;
+                        print_json(&json!({
+                            "enabled": config.dream_scheduler.enabled,
+                            "interval_seconds": config.dream_scheduler.interval_seconds,
+                            "idle_window_seconds": config.dream_scheduler.idle_window_seconds,
+                            "min_session_age_seconds": config.dream_scheduler.min_session_age_seconds,
+                            "min_turn_count": config.dream_scheduler.min_turn_count,
+                            "max_batch_size": config.dream_scheduler.max_batch_size,
+                            "max_candidates": config.dream_scheduler.max_candidates,
+                            "max_runtime_seconds": config.dream_scheduler.max_runtime_seconds,
+                        }))?;
+                    }
+                }
+                return Ok(());
+            }
             if *scheduled {
+                let service = cli.open_service(None)?;
                 let resp = service.scheduled_dream(now.clone())?;
                 print_json(&resp)?;
                 return Ok(());
             }
             let mode = if *apply { "apply" } else { "preview" };
-            let resp = service.dream(DreamRequest {
+            let req = DreamRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
                 repo: repo.clone().map(|repo_id| domain::RepoIdentity {
@@ -773,8 +959,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                 mode: Some(mode.to_string()),
                 now: now.clone(),
                 since: since.clone(),
-            })?;
-            print_json(&resp)?;
+            };
+            if cli.use_client_mode() {
+                let body = serde_json::to_string(&req)?;
+                print!(
+                    "{}",
+                    native_runtime::http_post_json(&cli.client_endpoint("/v1/dream"), &body)?
+                );
+            } else {
+                let service = cli.open_service(None)?;
+                let resp = service.dream(req)?;
+                print_json(&resp)?;
+            }
             Ok(())
         }
         Command::Recall {
@@ -785,7 +981,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             max_tokens,
             pack_mode,
         } => {
-            let service = cli.open_service(None)?;
             let req = RecallRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
@@ -803,8 +998,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 recency_days: None,
                 metadata: None,
             };
-            let resp = service.recall(req)?;
-            print_json(&resp)?;
+            if cli.use_client_mode() {
+                let body = serde_json::to_string(&req)?;
+                print!(
+                    "{}",
+                    native_runtime::http_post_json(&cli.client_endpoint("/v1/recall"), &body)?
+                );
+            } else {
+                let service = cli.open_service(None)?;
+                let resp = service.recall(req)?;
+                print_json(&resp)?;
+            }
             Ok(())
         }
         Command::Search {
@@ -815,7 +1019,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             limit,
             include_archived,
         } => {
-            let service = cli.open_service(None)?;
             let req = SearchRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
@@ -827,8 +1030,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 include_archived: *include_archived,
                 cursor: None,
             };
-            let resp = service.search(req)?;
-            print_json(&resp)?;
+            if cli.use_client_mode() {
+                let body = serde_json::to_string(&req)?;
+                print!(
+                    "{}",
+                    native_runtime::http_post_json(&cli.client_endpoint("/v1/search"), &body)?
+                );
+            } else {
+                let service = cli.open_service(None)?;
+                let resp = service.search(req)?;
+                print_json(&resp)?;
+            }
             Ok(())
         }
         Command::Conclude {
@@ -836,7 +1048,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             content,
         } => {
-            let service = cli.open_service(None)?;
             let req = ConclusionsRequest {
                 profile: profile.clone(),
                 workspace: workspace.clone(),
@@ -846,8 +1057,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 metadata: None,
                 record_type: None,
             };
-            let resp = service.conclusions(req)?;
-            print_json(&resp)?;
+            if cli.use_client_mode() {
+                let body = serde_json::to_string(&req)?;
+                print!(
+                    "{}",
+                    native_runtime::http_post_json(&cli.client_endpoint("/v1/conclusions"), &body)?
+                );
+            } else {
+                let service = cli.open_service(None)?;
+                let resp = service.conclusions(req)?;
+                print_json(&resp)?;
+            }
             Ok(())
         }
         Command::Subject { command } => {
@@ -1037,7 +1257,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             source_root,
         } => {
-            let service = cli.open_service(None)?;
             let mode = if *apply { "apply" } else { "preview" };
             let _ = preview; // preview is the default; flag is for clarity
             let files = read_local_memory_files(source_root)?;
@@ -1050,8 +1269,20 @@ fn dispatch(cli: Cli) -> Result<()> {
                 files: Some(files),
                 metadata: None,
             };
-            let resp = service.sync_local(req)?;
-            print_json(&resp)?;
+            if cli.use_client_mode() {
+                let body = serde_json::to_string(&req)?;
+                print!(
+                    "{}",
+                    native_runtime::http_post_json(
+                        &cli.client_endpoint("/v1/sync/local-codex-memory"),
+                        &body
+                    )?
+                );
+            } else {
+                let service = cli.open_service(None)?;
+                let resp = service.sync_local(req)?;
+                print_json(&resp)?;
+            }
             Ok(())
         }
         Command::GitImport {
@@ -1145,7 +1376,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Adapter { command } => {
-            let service = cli.open_service(None)?;
             match command {
                 AdapterCommand::Export {
                     profile,
@@ -1155,13 +1385,30 @@ fn dispatch(cli: Cli) -> Result<()> {
                     max_bytes,
                     format,
                 } => {
-                    let resp = service.adapter_export(AdapterExportRequest {
+                    let req = AdapterExportRequest {
                         profile: profile.clone(),
                         workspace: workspace.clone(),
                         target: target.clone(),
                         subject_id: subject_id.clone(),
                         max_bytes: *max_bytes,
-                    })?;
+                    };
+                    let resp = if cli.use_client_mode() {
+                        let body = serde_json::to_string(&req)?;
+                        let envelope: serde_json::Value =
+                            serde_json::from_str(&native_runtime::http_post_json(
+                                &cli.client_endpoint("/v1/adapter/export"),
+                                &body,
+                            )?)?;
+                        serde_json::from_value(
+                            envelope
+                                .get("data")
+                                .cloned()
+                                .ok_or_else(|| error::Error::internal("missing adapter data"))?,
+                        )?
+                    } else {
+                        let service = cli.open_service(None)?;
+                        service.adapter_export(req)?
+                    };
                     let format = format.as_str().to_ascii_lowercase();
                     match format.as_str() {
                         "markdown" => print_markdown(&resp.markdown),
@@ -1177,6 +1424,102 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Show { resolved } => {
+                let config = cli.load_config(None)?;
+                let runtime = cli.runtime_options();
+                print_json(&json!({
+                    "resolved": *resolved,
+                    "config_file": cli.config.clone().unwrap_or_else(codex_memoryd::config::default_config_path),
+                    "registry": config_registry(&cli, &config, &runtime),
+                    "client": {
+                        "url": runtime.url,
+                        "local": cli.local,
+                    },
+                    "runtime": {
+                        "kind": format!("{:?}", runtime.runtime).to_ascii_lowercase(),
+                        "home": runtime.home,
+                        "host": runtime.host,
+                        "port": runtime.port,
+                        "pid_file": runtime.pid_file,
+                        "log_file": runtime.log_file,
+                        "image": runtime.image,
+                        "container_name": runtime.container_name,
+                        "container_runtime": runtime.container_runtime,
+                        "codex_memories_dir": runtime.codex_memories_dir,
+                        "uid": runtime.uid,
+                        "gid": runtime.gid,
+                    },
+                    "daemon": {
+                        "bind": config.bind,
+                        "storage_kind": config.storage_kind,
+                        "storage_path": config.storage_path,
+                        "default_profile": config.default_profile,
+                        "default_workspace": config.default_workspace,
+                        "log_level": config.log_level,
+                        "declare_loopback_publish": config.declare_loopback_publish,
+                    },
+                    "dream": {
+                        "scheduler_enabled": config.dream_scheduler.enabled,
+                        "scheduler_interval_seconds": config.dream_scheduler.interval_seconds,
+                        "idle_window_seconds": config.dream_scheduler.idle_window_seconds,
+                        "min_session_age_seconds": config.dream_scheduler.min_session_age_seconds,
+                        "min_turn_count": config.dream_scheduler.min_turn_count,
+                        "max_batch_size": config.dream_scheduler.max_batch_size,
+                        "max_candidates": config.dream_scheduler.max_candidates,
+                        "max_runtime_seconds": config.dream_scheduler.max_runtime_seconds,
+                    }
+                }))?;
+                Ok(())
+            }
+            ConfigCommand::Env => {
+                let runtime = cli.runtime_options();
+                println!("CODEX_MEMORYD_RUNTIME={:?}", runtime.runtime);
+                println!("CODEX_MEMORYD_HOME={}", runtime.home.display());
+                println!("CODEX_MEMORYD_RUNTIME_DIR={}", runtime.home.display());
+                println!("CODEX_MEMORYD_URL={}", runtime.url);
+                println!("CODEX_MEMORYD_HOST={}", runtime.host);
+                println!("CODEX_MEMORYD_PORT={}", runtime.port);
+                println!("CODEX_MEMORYD_BIND={}", runtime.bind);
+                println!("CODEX_MEMORYD_DB={}", runtime.db.display());
+                println!("CODEX_MEMORYD_PID_FILE={}", runtime.pid_file.display());
+                println!("CODEX_MEMORYD_LOG_FILE={}", runtime.log_file.display());
+                println!("CODEX_MEMORYD_PROFILE={}", runtime.profile);
+                println!("CODEX_MEMORYD_WORKSPACE={}", runtime.workspace);
+                println!("CODEX_MEMORYD_LOG={}", runtime.log_level);
+                println!("CODEX_MEMORYD_IMAGE={}", runtime.image);
+                println!("CODEX_MEMORYD_CONTAINER_NAME={}", runtime.container_name);
+                println!(
+                    "CODEX_MEMORYD_CONTAINER_RUNTIME={}",
+                    runtime
+                        .container_runtime
+                        .clone()
+                        .unwrap_or_else(|| "auto".to_string())
+                );
+                if let Some(uid) = &runtime.uid {
+                    println!("CODEX_MEMORYD_UID={uid}");
+                }
+                if let Some(gid) = &runtime.gid {
+                    println!("CODEX_MEMORYD_GID={gid}");
+                }
+                println!(
+                    "CODEX_MEMORYD_CODEX_MEMORIES_DIR={}",
+                    runtime.codex_memories_dir.display()
+                );
+                Ok(())
+            }
+            ConfigCommand::Doctor => {
+                let config = cli.load_config(None)?;
+                print_json(&json!({
+                    "ok": true,
+                    "config_file": cli.config.clone().unwrap_or_else(codex_memoryd::config::default_config_path),
+                    "storage_path": config.storage_path,
+                    "bind": config.bind,
+                    "loopback_only": config.bind_is_loopback(),
+                }))?;
+                Ok(())
+            }
+        },
         Command::Conformance { command } => match command {
             ConformanceCommand::Adapters { format } => {
                 let report = conformance::run_adapter_conformance()?;
@@ -1485,6 +1828,431 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 fn print_markdown(text: &str) {
     println!("{text}");
+}
+
+fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(error::Error::from)?;
+    }
+    let value = if enabled { "true" } else { "false" };
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut in_dream = false;
+    let mut saw_dream = false;
+    let mut wrote_key = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_dream && !wrote_key {
+                out.push(format!("scheduler_enabled = {value}"));
+                wrote_key = true;
+            }
+            in_dream = trimmed == "[dream]";
+            saw_dream |= in_dream;
+        }
+        if in_dream && trimmed.starts_with("scheduler_enabled") {
+            out.push(format!("scheduler_enabled = {value}"));
+            wrote_key = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+
+    if saw_dream {
+        if in_dream && !wrote_key {
+            out.push(format!("scheduler_enabled = {value}"));
+        }
+    } else {
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push("[dream]".to_string());
+        out.push(format!("scheduler_enabled = {value}"));
+    }
+
+    std::fs::write(path, format!("{}\n", out.join("\n"))).map_err(error::Error::from)
+}
+
+fn config_registry(cli: &Cli, config: &Config, runtime: &RuntimeOptions) -> serde_json::Value {
+    let entry = |key: &str,
+                 owner: &str,
+                 source: &str,
+                 value: serde_json::Value,
+                 persisted_by_init: bool,
+                 restart_required: bool,
+                 passed_to_container: bool,
+                 safe_to_commit: bool,
+                 may_contain_secrets: bool| {
+        json!({
+            "key": key,
+            "owner": owner,
+            "source": source,
+            "value": value,
+            "persisted_by_init": persisted_by_init,
+            "restart_required": restart_required,
+            "passed_to_container": passed_to_container,
+            "safe_to_commit": safe_to_commit,
+            "may_contain_secrets": may_contain_secrets,
+        })
+    };
+    json!([
+        entry(
+            "CODEX_MEMORYD_URL",
+            "client",
+            source_for(cli.url.is_some(), "CODEX_MEMORYD_URL"),
+            json!(runtime.url),
+            true,
+            false,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_RUNTIME",
+            "native-runtime/container-runtime",
+            source_for(cli.runtime.is_some(), "CODEX_MEMORYD_RUNTIME"),
+            json!(format!("{:?}", runtime.runtime).to_ascii_lowercase()),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_HOME",
+            "native-runtime/container-runtime",
+            env_source("CODEX_MEMORYD_HOME", "default"),
+            json!(runtime.home),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_RUNTIME_DIR",
+            "native-runtime",
+            env_source("CODEX_MEMORYD_RUNTIME_DIR", "compat-default"),
+            json!(runtime.home),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_HOST",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_HOST", "default"),
+            json!(runtime.host),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_PORT",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_PORT", "default"),
+            json!(runtime.port),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_BIND",
+            "daemon",
+            env_source("CODEX_MEMORYD_BIND", "derived-default"),
+            json!(config.bind),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DB",
+            "daemon/admin-recovery",
+            source_for(cli.db.is_some(), "CODEX_MEMORYD_DB"),
+            json!(config.storage_path),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_PROFILE",
+            "daemon",
+            env_source("CODEX_MEMORYD_PROFILE", "default"),
+            json!(config.default_profile),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_WORKSPACE",
+            "daemon",
+            env_source("CODEX_MEMORYD_WORKSPACE", "default"),
+            json!(config.default_workspace),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_LOG",
+            "daemon",
+            source_for(cli.log.is_some(), "CODEX_MEMORYD_LOG"),
+            json!(config.log_level),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH",
+            "daemon/container-runtime",
+            env_source("CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH", "default"),
+            json!(config.declare_loopback_publish),
+            false,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_BIN",
+            "native-runtime",
+            env_source("CODEX_MEMORYD_BIN", "current_exe"),
+            json!(runtime.binary),
+            false,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_PID_FILE",
+            "native-runtime",
+            env_source("CODEX_MEMORYD_PID_FILE", "default"),
+            json!(runtime.pid_file),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_LOG_FILE",
+            "native-runtime",
+            env_source("CODEX_MEMORYD_LOG_FILE", "default"),
+            json!(runtime.log_file),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_ALLOW_NON_LOOPBACK",
+            "native-runtime",
+            env_source("CODEX_MEMORYD_ALLOW_NON_LOOPBACK", "default"),
+            json!(runtime.allow_non_loopback),
+            false,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_IMAGE",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_IMAGE", "default"),
+            json!(runtime.image),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_CONTAINER_NAME",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_CONTAINER_NAME", "default"),
+            json!(runtime.container_name),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_CONTAINER_RUNTIME",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_CONTAINER_RUNTIME", "auto"),
+            json!(runtime.container_runtime),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_UID",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_UID", "current-user"),
+            json!(runtime.uid),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_GID",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_GID", "current-user"),
+            json!(runtime.gid),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_CODEX_MEMORIES_DIR",
+            "container-runtime",
+            env_source("CODEX_MEMORYD_CODEX_MEMORIES_DIR", "default"),
+            json!(runtime.codex_memories_dir),
+            true,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED", "config/default"),
+            json!(config.dream_scheduler.enabled),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
+            "daemon",
+            env_source(
+                "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
+                "config/default"
+            ),
+            json!(config.dream_scheduler.interval_seconds),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS", "config/default"),
+            json!(config.dream_scheduler.idle_window_seconds),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS",
+            "daemon",
+            env_source(
+                "CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS",
+                "config/default"
+            ),
+            json!(config.dream_scheduler.min_session_age_seconds),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_MIN_TURN_COUNT",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_MIN_TURN_COUNT", "config/default"),
+            json!(config.dream_scheduler.min_turn_count),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE", "config/default"),
+            json!(config.dream_scheduler.max_batch_size),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_MAX_CANDIDATES",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_MAX_CANDIDATES", "config/default"),
+            json!(config.dream_scheduler.max_candidates),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS",
+            "daemon",
+            env_source("CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS", "config/default"),
+            json!(config.dream_scheduler.max_runtime_seconds),
+            true,
+            true,
+            true,
+            true,
+            false
+        ),
+    ])
+}
+
+fn source_for(cli_present: bool, env_key: &str) -> &'static str {
+    if cli_present {
+        "cli"
+    } else {
+        env_source(env_key, "config/default")
+    }
+}
+
+fn env_source(env_key: &str, fallback: &'static str) -> &'static str {
+    if std::env::var(env_key)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "env"
+    } else {
+        fallback
+    }
 }
 
 fn render_card_markdown(card: &CardShowResponse) -> String {

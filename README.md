@@ -52,9 +52,60 @@ This is the landed MVP surface today:
 
 ## First Run
 
+### First-run path (CLI-first product mode)
+
+An installed `codex-memoryd` binary can initialize and manage a local native
+daemon without Docker, Podman, Compose, or a repo checkout:
+
+```bash
+codex-memoryd init
+codex-memoryd up
+codex-memoryd status
+codex-memoryd sync-local --preview ~/.codex/memories
+codex-memoryd sync-local --apply ~/.codex/memories
+codex-memoryd recall --query "safe dogfood mode"
+codex-memoryd dream status
+```
+
+The product default is `~/.codex-memoryd` with a loopback daemon at
+`http://127.0.0.1:8787`. Direct SQLite/admin mode remains explicit:
+
+```bash
+codex-memoryd --local --db ~/.codex-memoryd/memory.db doctor
+codex-memoryd --local --db ~/.codex-memoryd/memory.db backup create \
+  --dest ~/.codex-memoryd/backups/pre-change.db
+```
+
+Runtime choices are explicit:
+
+```bash
+codex-memoryd init --runtime native
+codex-memoryd init --runtime container
+codex-memoryd init --dogfood
+```
+
+Native is the default and requires no container runtime. Managed container
+runtime is the optional no-Compose path. Compose remains for development and
+debugging.
+
+Inspect the resolved client/runtime/daemon registry with:
+
+```bash
+codex-memoryd config show --resolved
+codex-memoryd config env
+codex-memoryd config doctor
+```
+
+The resolved registry reports each setting's owner, source, restart behavior,
+container pass-through, commit safety, and secret posture. In managed container
+mode, `sync-local --preview ~/.codex/memories` and `sync-local --apply
+~/.codex/memories` still use the host path; the CLI packages host files for the
+daemon so users do not need to know container mount paths.
+
 ### First-run path (source build)
 
-This is the safest local run.
+For source checkouts, the same product commands work against the built binary.
+Manual `serve` is still useful for debugging:
 
 ```bash
 cargo build --release
