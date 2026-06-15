@@ -120,6 +120,25 @@ scripts/dogfood-compose-heartbeat.sh
 docker compose down
 ```
 
+To run the Compose daemon with the background Dreamer scheduler enabled, use a
+single environment flag. No config override file is required:
+
+```bash
+CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED=1 docker compose up -d --build
+curl -fsS http://127.0.0.1:8787/v1/status | jq '.data.features.dream_scheduler'
+```
+
+For day-to-day CLI work against the same `.dogfood/memory.db`, use the local
+front door instead of `docker compose exec`:
+
+```bash
+scripts/memd status | jq
+scripts/memd doctor --format json | jq
+scripts/memd dream --preview
+scripts/memd dream --apply
+scripts/memd recall --query "safe dogfood mode"
+```
+
 ### Fixture substrate demo
 
 For a reviewer-safe end-to-end walkthrough that uses only synthetic fixture
@@ -169,10 +188,8 @@ the checklist, caveats, and issue coverage map.
 preview first, then apply.
 
 ```bash
-target/release/codex-memoryd sync-local --preview ~/.codex/memories \
-  --profile personal --workspace josh-personal
-target/release/codex-memoryd sync-local --apply ~/.codex/memories \
-  --profile personal --workspace josh-personal
+scripts/memd sync-local --preview ~/.codex/memories
+scripts/memd sync-local --apply ~/.codex/memories
 ```
 
 For the native Codex memory migration phases, parity canaries, duplicate-loop
