@@ -15,6 +15,14 @@
 # Environment overrides:
 #   CODEX_MEMORYD_BIND, CODEX_MEMORYD_DB, CODEX_MEMORYD_PROFILE,
 #   CODEX_MEMORYD_WORKSPACE, CODEX_MEMORYD_LOG
+#   CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED,
+#   CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS,
+#   CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS,
+#   CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS,
+#   CODEX_MEMORYD_DREAM_MIN_TURN_COUNT,
+#   CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE,
+#   CODEX_MEMORYD_DREAM_MAX_CANDIDATES,
+#   CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS
 
 [server]
 # Loopback-only by default. For Docker, bind 0.0.0.0 inside the container only
@@ -41,6 +49,18 @@ cross_profile_policy = "default_deny"
 max_tokens = 1200
 # Maximum characters stored per memory record; longer content is truncated.
 max_record_chars = 8000
+
+[dream]
+# Off by default. For Docker Compose dogfood, set
+# CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED=1 before `docker compose up`.
+scheduler_enabled = false
+scheduler_interval_seconds = 900
+idle_window_seconds = 300
+min_session_age_seconds = 60
+min_turn_count = 2
+max_batch_size = 500
+max_candidates = 50
+max_runtime_seconds = 30
 
 [log]
 # error | warn | info | debug | trace

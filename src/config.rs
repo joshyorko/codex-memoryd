@@ -174,7 +174,7 @@ impl Config {
     ///   default location (which is optional: a missing default file is fine).
     /// * env vars: `CODEX_MEMORYD_BIND`, `CODEX_MEMORYD_DB`,
     ///   `CODEX_MEMORYD_PROFILE`, `CODEX_MEMORYD_WORKSPACE`,
-    ///   `CODEX_MEMORYD_LOG`.
+    ///   `CODEX_MEMORYD_LOG`, and `CODEX_MEMORYD_DREAM_*` scheduler controls.
     /// * `overrides` — explicit CLI flags.
     pub fn load(config_path: Option<&Path>, overrides: &CliOverrides) -> Result<Config> {
         let mut config = Config::default();
@@ -225,6 +225,7 @@ impl Config {
                 config.log_level = level;
             }
         }
+        apply_dream_env(&mut config)?;
         // Opt-in operator declaration that a non-loopback process bind is fronted
         // by a loopback-only publish (e.g. Docker `127.0.0.1:8787->8787`). Accepts
         // 1/true/yes. Default off — only honored when explicitly set.
@@ -359,6 +360,119 @@ impl Config {
     }
 }
 
+fn clean_env_value(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().and_then(clean_env_value)
+}
+
+fn parse_bool_value(key: &str, value: Option<String>) -> Result<Option<bool>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(Error::invalid_request(format!(
+            "{key} must be one of 1/0/true/false/yes/no/on/off"
+        ))),
+    }
+}
+
+fn parse_u64_value(key: &str, value: Option<String>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value.parse::<u64>().map(Some).map_err(|_| {
+        Error::invalid_request(format!("{key} must be an unsigned integer, got '{value}'"))
+    })
+}
+
+fn parse_i64_value(key: &str, value: Option<String>) -> Result<Option<i64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| Error::invalid_request(format!("{key} must be an integer, got '{value}'")))
+}
+
+fn parse_usize_value(key: &str, value: Option<String>) -> Result<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value.parse::<usize>().map(Some).map_err(|_| {
+        Error::invalid_request(format!("{key} must be an unsigned integer, got '{value}'"))
+    })
+}
+
+fn apply_dream_env(config: &mut Config) -> Result<()> {
+    apply_dream_env_from(config, env_value)
+}
+
+fn apply_dream_env_from<F>(config: &mut Config, get: F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(enabled) = parse_bool_value(
+        "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED",
+        get("CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.enabled = enabled;
+    }
+    if let Some(seconds) = parse_u64_value(
+        "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
+        get("CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.interval_seconds = seconds;
+    }
+    if let Some(seconds) = parse_i64_value(
+        "CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS",
+        get("CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.idle_window_seconds = seconds;
+    }
+    if let Some(seconds) = parse_i64_value(
+        "CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS",
+        get("CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.min_session_age_seconds = seconds;
+    }
+    if let Some(count) = parse_usize_value(
+        "CODEX_MEMORYD_DREAM_MIN_TURN_COUNT",
+        get("CODEX_MEMORYD_DREAM_MIN_TURN_COUNT").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.min_turn_count = count;
+    }
+    if let Some(size) = parse_usize_value(
+        "CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE",
+        get("CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.max_batch_size = size;
+    }
+    if let Some(count) = parse_usize_value(
+        "CODEX_MEMORYD_DREAM_MAX_CANDIDATES",
+        get("CODEX_MEMORYD_DREAM_MAX_CANDIDATES").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.max_candidates = count;
+    }
+    if let Some(seconds) = parse_u64_value(
+        "CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS",
+        get("CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.max_runtime_seconds = seconds;
+    }
+    Ok(())
+}
+
 fn bind_host(bind: &str) -> Option<String> {
     if let Ok(addr) = bind.parse::<SocketAddr>() {
         return Some(match addr {
@@ -444,5 +558,48 @@ mod tests {
             cfg.effective_loopback_only(),
             "declaration makes it effective"
         );
+    }
+
+    #[test]
+    fn env_can_enable_dream_scheduler_for_compose() {
+        let mut cfg = Config::default();
+        apply_dream_env_from(&mut cfg, |key| {
+            Some(
+                match key {
+                    "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED" => "1",
+                    "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS" => "120",
+                    "CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS" => "30",
+                    "CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS" => "15",
+                    "CODEX_MEMORYD_DREAM_MIN_TURN_COUNT" => "3",
+                    "CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE" => "25",
+                    "CODEX_MEMORYD_DREAM_MAX_CANDIDATES" => "7",
+                    "CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS" => "9",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        })
+        .expect("apply dream env");
+
+        assert!(cfg.dream_scheduler.enabled);
+        assert_eq!(cfg.dream_scheduler.interval_seconds, 120);
+        assert_eq!(cfg.dream_scheduler.idle_window_seconds, 30);
+        assert_eq!(cfg.dream_scheduler.min_session_age_seconds, 15);
+        assert_eq!(cfg.dream_scheduler.min_turn_count, 3);
+        assert_eq!(cfg.dream_scheduler.max_batch_size, 25);
+        assert_eq!(cfg.dream_scheduler.max_candidates, 7);
+        assert_eq!(cfg.dream_scheduler.max_runtime_seconds, 9);
+    }
+
+    #[test]
+    fn invalid_dream_env_value_is_rejected() {
+        let mut cfg = Config::default();
+        let err = apply_dream_env_from(&mut cfg, |key| {
+            (key == "CODEX_MEMORYD_DREAM_MAX_CANDIDATES").then(|| "many".to_string())
+        })
+        .expect_err("invalid env");
+        assert!(err
+            .to_string()
+            .contains("CODEX_MEMORYD_DREAM_MAX_CANDIDATES"));
     }
 }

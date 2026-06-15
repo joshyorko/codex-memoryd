@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${CODEX_MEMORYD_BIN:-}"
+DB="${CODEX_MEMORYD_DB:-$ROOT/.dogfood/memory.db}"
+PROFILE="${CODEX_MEMORYD_PROFILE:-personal}"
+WORKSPACE="${CODEX_MEMORYD_WORKSPACE:-josh-personal}"
+DRY_RUN=0
+
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+  shift
+fi
+
+if [ -z "$BIN" ]; then
+  if [ -x "$ROOT/target/debug/codex-memoryd" ]; then
+    BIN="$ROOT/target/debug/codex-memoryd"
+  elif [ -x "$ROOT/target/release/codex-memoryd" ]; then
+    BIN="$ROOT/target/release/codex-memoryd"
+  else
+    BIN="$ROOT/target/debug/codex-memoryd"
+  fi
+fi
+
+usage() {
+  cat <<EOF
+Usage: scripts/memd [--dry-run] <codex-memoryd command> [args...]
+
+Runs the local codex-memoryd CLI against the repo dogfood database without
+\`docker compose exec\`.
+
+Defaults:
+  CODEX_MEMORYD_BIN=$BIN
+  CODEX_MEMORYD_DB=$DB
+  CODEX_MEMORYD_PROFILE=$PROFILE
+  CODEX_MEMORYD_WORKSPACE=$WORKSPACE
+
+Examples:
+  scripts/memd status | jq
+  scripts/memd doctor --format json | jq
+  scripts/memd dream --preview
+  scripts/memd dream --apply
+  scripts/memd recall --query "safe dogfood mode"
+EOF
+}
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  printf 'CODEX_MEMORYD_DB=%q CODEX_MEMORYD_PROFILE=%q CODEX_MEMORYD_WORKSPACE=%q %q' \
+    "$DB" "$PROFILE" "$WORKSPACE" "$BIN"
+  printf ' %q' "$@"
+  printf '\n'
+  exit 0
+fi
+
+if [ ! -x "$BIN" ]; then
+  cat >&2 <<EOF
+scripts/memd: missing executable $BIN
+
+Build it once with:
+  cargo build --bin codex-memoryd
+
+Or point CODEX_MEMORYD_BIN at a built binary.
+EOF
+  exit 2
+fi
+
+mkdir -p "$(dirname "$DB")"
+
+exec env \
+  CODEX_MEMORYD_DB="$DB" \
+  CODEX_MEMORYD_PROFILE="$PROFILE" \
+  CODEX_MEMORYD_WORKSPACE="$WORKSPACE" \
+  "$BIN" "$@"

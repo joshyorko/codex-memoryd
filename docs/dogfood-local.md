@@ -108,6 +108,24 @@ health/status/doctor, runs `sync-local` preview/apply/apply, refreshes
 `.dogfood/mcp-sandbox-memory.db` from `.dogfood/memory.db`, verifies localhost-only
 publish on `127.0.0.1:8787`, and runs a raw MCP stdio canary in `--read-only` mode.
 
+Enable the scheduled Dreamer in Compose with one environment flag:
+
+```bash
+CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED=1 docker compose up -d --build
+curl -fsS http://127.0.0.1:8787/v1/status | jq '.data.features.dream_scheduler'
+```
+
+For normal operator CLI work against the same `.dogfood/memory.db`, prefer the
+local front door over `docker compose exec`:
+
+```bash
+scripts/memd status | jq
+scripts/memd sync-local --preview ~/.codex/memories
+scripts/memd sync-local --apply ~/.codex/memories
+scripts/memd dream --preview
+scripts/memd dream --apply
+```
+
 Write-capable dogfood uses a separate sandbox lane:
 
 ```bash
