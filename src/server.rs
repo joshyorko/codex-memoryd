@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::error::{Error, ErrorCode};
 use crate::ids;
+use crate::protocol::AdapterExportRequest;
 use crate::protocol::Envelope;
 use crate::protocol::EpisodeGetRequest;
 use crate::protocol::EpisodeListRequest;
@@ -74,6 +75,7 @@ pub fn router(service: Service) -> Router {
         .route("/v1/checkpoints", post(checkpoints_handler))
         .route("/v1/dream", post(dream_handler))
         .route("/v1/sync/local-codex-memory", post(sync_handler))
+        .route("/v1/adapter/export", post(adapter_export_handler))
         .route("/v1/forget", post(forget_handler))
         .route("/v1/export", get(export_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -363,6 +365,20 @@ async fn forget_handler(State(state): State<Arc<AppState>>, body: axum::body::By
     }
 }
 
+async fn adapter_export_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body::<AdapterExportRequest>(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.adapter_export(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
 async fn export_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ExportQuery>,
@@ -408,7 +424,7 @@ async fn v1_transport_gate(
 }
 
 fn enforce_v1_transport_gate(state: &AppState) -> Result<(), Error> {
-    if state.service.config.bind_is_loopback() {
+    if state.service.config.effective_loopback_only() {
         Ok(())
     } else {
         Err(Error::new(

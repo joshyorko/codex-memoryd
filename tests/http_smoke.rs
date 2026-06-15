@@ -464,6 +464,39 @@ fn auth_missing_blocks_v1_routes_except_status() {
 }
 
 #[test]
+fn declared_loopback_publish_allows_v1_routes_for_managed_container_shape() {
+    let (base, _handle) = boot_with_config(Config {
+        bind: "0.0.0.0:0".to_string(),
+        default_workspace: "josh-personal".to_string(),
+        declare_loopback_publish: true,
+        ..Default::default()
+    });
+    let http = client();
+
+    let status: Value = http
+        .get(format!("{base}/v1/status"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(status["data"]["status"], json!("local_only"));
+
+    let resp = http
+        .post(format!("{base}/v1/conclusions"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "target": "user",
+            "conclusions": ["Declared loopback publish permits protected v1 routes"]
+        }))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["ok"], json!(true));
+}
+
+#[test]
 fn http_error_bodies_are_bounded_and_do_not_echo_rejected_content() {
     let (base, _handle) = boot();
     let http = client();
@@ -574,6 +607,40 @@ fn http_export_streams_jsonl() {
     assert!(count >= 1);
     let body = resp.text().unwrap();
     assert!(body.contains("concise commit messages"));
+}
+
+#[test]
+fn http_adapter_export_returns_enveloped_generated_view() {
+    let (base, _handle) = boot();
+    let http = client();
+    http.post(format!("{base}/v1/conclusions"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "target": "user",
+            "conclusions": ["Decision: keep adapter export available over HTTP client mode"]
+        }))
+        .send()
+        .unwrap();
+
+    let resp = http
+        .post(format!("{base}/v1/adapter/export"))
+        .json(&json!({
+            "profile": "personal",
+            "workspace": "josh-personal",
+            "target": "agents-md",
+            "max_bytes": 4000
+        }))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["data"]["target"], json!("agents-md"));
+    assert!(body["data"]["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("recall_not_authority"));
 }
 
 #[test]
