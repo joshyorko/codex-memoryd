@@ -3,10 +3,14 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde::Serialize;
 
@@ -58,9 +62,20 @@ pub struct RuntimeOptions {
 pub struct RuntimeInitReport {
     pub runtime: String,
     pub home: String,
+    pub db: String,
+    pub bind: String,
+    pub url: String,
+    pub host: String,
+    pub port: u16,
+    pub image: String,
     pub created: Vec<String>,
     pub reused: Vec<String>,
+    pub updated: Vec<String>,
     pub skipped: Vec<String>,
+    pub message: String,
+    pub next_command: String,
+    pub container_note: Option<String>,
+    pub local_image_command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,76 +95,127 @@ impl RuntimeOptions {
         runtime: Option<RuntimeKind>,
         url: Option<String>,
         db_override: Option<PathBuf>,
+        host_override: Option<String>,
+        port_override: Option<u16>,
+        bind_override: Option<String>,
     ) -> RuntimeOptions {
-        let runtime = runtime
-            .or_else(|| env_runtime("CODEX_MEMORYD_RUNTIME"))
-            .unwrap_or(RuntimeKind::Native);
         let home = env_path("CODEX_MEMORYD_HOME")
             .or_else(|| env_path("CODEX_MEMORYD_RUNTIME_DIR"))
             .unwrap_or_else(config::default_home_dir);
-        let host = std::env::var("CODEX_MEMORYD_HOST")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
+        let runtime_env = read_runtime_env(&home.join("runtime.env"));
+        let endpoint_overridden =
+            host_override.is_some() || port_override.is_some() || bind_override.is_some();
+        let runtime = runtime
+            .or_else(|| env_runtime("CODEX_MEMORYD_RUNTIME"))
+            .or_else(|| runtime_env_runtime(&runtime_env, "CODEX_MEMORYD_RUNTIME"))
+            .unwrap_or(RuntimeKind::Native);
+
+        let bind_candidate = bind_override
+            .clone()
+            .or_else(|| {
+                std::env::var("CODEX_MEMORYD_BIND")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BIND"));
+        let parsed_bind = bind_candidate.as_deref().and_then(parse_bind_host_port);
+
+        let host = host_override
+            .or_else(|| {
+                std::env::var("CODEX_MEMORYD_HOST")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_HOST"))
+            .or_else(|| parsed_bind.as_ref().map(|(host, _)| host.clone()))
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = std::env::var("CODEX_MEMORYD_PORT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u16>().ok())
+        let port = port_override
+            .or_else(|| {
+                std::env::var("CODEX_MEMORYD_PORT")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u16>().ok())
+            })
+            .or_else(|| {
+                runtime_env_value(&runtime_env, "CODEX_MEMORYD_PORT")
+                    .and_then(|v| v.trim().parse::<u16>().ok())
+            })
+            .or_else(|| parsed_bind.as_ref().map(|(_, port)| *port))
             .unwrap_or(8787);
-        let bind = std::env::var("CODEX_MEMORYD_BIND")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| format!("{host}:{port}"));
+        let bind = bind_candidate.unwrap_or_else(|| format!("{host}:{port}"));
         let db = db_override
             .or_else(|| env_path("CODEX_MEMORYD_DB"))
+            .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_DB"))
             .unwrap_or_else(|| home.join("memory.db"));
-        let pid_file =
-            env_path("CODEX_MEMORYD_PID_FILE").unwrap_or_else(|| home.join("codex-memoryd.pid"));
+        let pid_file = env_path("CODEX_MEMORYD_PID_FILE")
+            .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_PID_FILE"))
+            .unwrap_or_else(|| home.join("codex-memoryd.pid"));
         let log_file = env_path("CODEX_MEMORYD_LOG_FILE")
+            .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_LOG_FILE"))
             .unwrap_or_else(|| home.join("logs").join("codex-memoryd.log"));
         let profile = std::env::var("CODEX_MEMORYD_PROFILE")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_PROFILE"))
             .unwrap_or_else(|| "personal".to_string());
         let workspace = std::env::var("CODEX_MEMORYD_WORKSPACE")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_WORKSPACE"))
             .unwrap_or_else(|| "default".to_string());
         let log_level = std::env::var("CODEX_MEMORYD_LOG")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_LOG"))
             .unwrap_or_else(|| "info".to_string());
         let binary = env_path("CODEX_MEMORYD_BIN")
+            .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_BIN"))
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| PathBuf::from("codex-memoryd"));
         let allow_non_loopback = std::env::var("CODEX_MEMORYD_ALLOW_NON_LOOPBACK")
             .ok()
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_ALLOW_NON_LOOPBACK"))
             .is_some_and(|v| {
                 matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
             });
         let image = std::env::var("CODEX_MEMORYD_IMAGE")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_IMAGE"))
             .unwrap_or_else(|| "ghcr.io/joshyorko/codex-memoryd:latest".to_string());
         let container_name = std::env::var("CODEX_MEMORYD_CONTAINER_NAME")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_CONTAINER_NAME"))
             .unwrap_or_else(|| "codex-memoryd".to_string());
         let container_runtime = std::env::var("CODEX_MEMORYD_CONTAINER_RUNTIME")
             .ok()
-            .filter(|v| !v.trim().is_empty());
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_CONTAINER_RUNTIME"));
         let codex_memories_dir = env_path("CODEX_MEMORYD_CODEX_MEMORIES_DIR")
+            .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_CODEX_MEMORIES_DIR"))
             .unwrap_or_else(|| config::expand_path("~/.codex/memories"));
         let uid = std::env::var("CODEX_MEMORYD_UID")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_UID"))
             .or_else(|| command_output("id", &["-u"]));
         let gid = std::env::var("CODEX_MEMORYD_GID")
             .ok()
             .filter(|v| !v.trim().is_empty())
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_GID"))
             .or_else(|| command_output("id", &["-g"]));
         let url = url
-            .or_else(|| std::env::var("CODEX_MEMORYD_URL").ok())
-            .or_else(|| std::env::var("CODEX_MEMORYD_BASE_URL").ok())
+            .or_else(|| {
+                if endpoint_overridden {
+                    None
+                } else {
+                    std::env::var("CODEX_MEMORYD_URL")
+                        .ok()
+                        .or_else(|| std::env::var("CODEX_MEMORYD_BASE_URL").ok())
+                        .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_URL"))
+                        .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BASE_URL"))
+                }
+            })
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| format!("http://{host}:{port}"));
 
@@ -190,6 +256,7 @@ pub fn init(opts: &RuntimeOptions, mode: InitMode) -> Result<RuntimeInitReport> 
 
     let mut created = Vec::new();
     let mut reused = Vec::new();
+    let mut updated = Vec::new();
     let skipped = Vec::new();
 
     ensure_dir(&opts.home, &mut created, &mut reused)?;
@@ -202,20 +269,22 @@ pub fn init(opts: &RuntimeOptions, mode: InitMode) -> Result<RuntimeInitReport> 
     }
 
     let config_path = opts.home.join("config.toml");
-    if config_path.exists() {
-        reused.push(config_path.display().to_string());
-    } else {
-        fs::write(&config_path, render_config(&opts)).map_err(Error::from)?;
-        created.push(config_path.display().to_string());
-    }
+    write_or_update(
+        &config_path,
+        &render_config(&opts),
+        &mut created,
+        &mut reused,
+        &mut updated,
+    )?;
 
     let env_path = opts.home.join("runtime.env");
-    if env_path.exists() {
-        reused.push(env_path.display().to_string());
-    } else {
-        fs::write(&env_path, render_runtime_env(&opts)).map_err(Error::from)?;
-        created.push(env_path.display().to_string());
-    }
+    write_or_update(
+        &env_path,
+        &render_runtime_env(&opts),
+        &mut created,
+        &mut reused,
+        &mut updated,
+    )?;
 
     if opts.db.exists() {
         reused.push(opts.db.display().to_string());
@@ -227,9 +296,27 @@ pub fn init(opts: &RuntimeOptions, mode: InitMode) -> Result<RuntimeInitReport> 
     Ok(RuntimeInitReport {
         runtime: runtime_name(opts.runtime).to_string(),
         home: opts.home.display().to_string(),
+        db: opts.db.display().to_string(),
+        bind: opts.bind.clone(),
+        url: opts.url.clone(),
+        host: opts.host.clone(),
+        port: opts.port,
+        image: opts.image.clone(),
         created,
         reused,
+        updated,
         skipped,
+        message: "init seeds config/runtime only; next command: codex-memoryd up"
+            .to_string(),
+        next_command: "codex-memoryd up".to_string(),
+        container_note: (opts.runtime == RuntimeKind::Container).then(|| {
+            format!(
+                "container mode pulls/runs {}; override CODEX_MEMORYD_IMAGE or build a local image first",
+                opts.image
+            )
+        }),
+        local_image_command: (opts.runtime == RuntimeKind::Container)
+            .then(|| "codex-memoryd image build --tag codex-memoryd:local".to_string()),
     })
 }
 
@@ -330,6 +417,27 @@ pub fn logs(opts: &RuntimeOptions, lines: usize) -> Result<String> {
     Ok(format!("{}\n", out.join("\n")))
 }
 
+pub fn build_image(opts: &RuntimeOptions, tag: &str, context: &Path) -> Result<serde_json::Value> {
+    let runtime = container_runtime(opts)?;
+    let status = Command::new(&runtime)
+        .args(["build", "-t", tag])
+        .arg(context)
+        .status()
+        .map_err(Error::from)?;
+    if !status.success() {
+        return Err(Error::storage(format!(
+            "{runtime} build -t {tag} {} failed with status {status}; verify Docker/Podman can build this repo or set CODEX_MEMORYD_IMAGE to a pullable image",
+            context.display()
+        )));
+    }
+    Ok(serde_json::json!({
+        "runtime": runtime,
+        "tag": tag,
+        "context": context,
+        "next_command": format!("CODEX_MEMORYD_IMAGE={tag} codex-memoryd --runtime container up"),
+    }))
+}
+
 pub fn http_get(url: &str) -> Result<String> {
     http_request("GET", url, None)
 }
@@ -343,10 +451,10 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String> {
     let mut stream = TcpStream::connect_timeout(&parsed.addr, Duration::from_millis(500))
         .map_err(|e| Error::storage(format!("connect {url}: {e}")))?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(Error::from)?;
     stream
-        .set_write_timeout(Some(Duration::from_millis(1000)))
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(Error::from)?;
     let req = if let Some(body) = body {
         format!(
@@ -384,13 +492,15 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     fs::create_dir_all(opts.db.parent().unwrap_or_else(|| Path::new("."))).map_err(Error::from)?;
 
     if running_pid(&opts.pid_file).is_none() {
+        ensure_bind_available(opts)?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&opts.log_file)
             .map_err(Error::from)?;
         let log_err = log.try_clone().map_err(Error::from)?;
-        let child = Command::new(&opts.binary)
+        let mut command = Command::new(&opts.binary);
+        command
             .arg("serve")
             .env("CODEX_MEMORYD_DB", &opts.db)
             .env("CODEX_MEMORYD_BIND", &opts.bind)
@@ -399,7 +509,10 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             .env("CODEX_MEMORYD_LOG", &opts.log_level)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err))
+            .stderr(Stdio::from(log_err));
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command
             .spawn()
             .map_err(|e| Error::storage(format!("start {}: {e}", opts.binary.display())))?;
         fs::write(&opts.pid_file, child.id().to_string()).map_err(Error::from)?;
@@ -417,8 +530,12 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     }
 
     if container_exists(&runtime, &opts.container_name)? {
+        if !container_running(&runtime, &opts.container_name)? {
+            ensure_bind_available(opts)?;
+        }
         run_status(&runtime, &["start", &opts.container_name])?;
     } else {
+        ensure_bind_available(opts)?;
         let mut args = vec![
             "run".to_string(),
             "-d".to_string(),
@@ -453,10 +570,32 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             format!("CODEX_MEMORYD_WORKSPACE={}", opts.workspace),
             "--env".to_string(),
             format!("CODEX_MEMORYD_LOG={}", opts.log_level),
-            opts.image.clone(),
         ]);
+        for key in [
+            "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED",
+            "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
+            "CODEX_MEMORYD_DREAM_IDLE_WINDOW_SECONDS",
+            "CODEX_MEMORYD_DREAM_MIN_SESSION_AGE_SECONDS",
+            "CODEX_MEMORYD_DREAM_MIN_TURN_COUNT",
+            "CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE",
+            "CODEX_MEMORYD_DREAM_MAX_CANDIDATES",
+            "CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                args.push("--env".to_string());
+                args.push(format!("{key}={value}"));
+            }
+        }
+        args.push(opts.image.clone());
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_status(&runtime, &arg_refs)?;
+        run_status_with_hint(
+            &runtime,
+            &arg_refs,
+            &format!(
+                "container runtime could not run image {}; build a local image with `codex-memoryd image build --tag codex-memoryd:local` or set CODEX_MEMORYD_IMAGE",
+                opts.image
+            ),
+        )?;
     }
 
     wait_for_ready(opts)?;
@@ -576,12 +715,16 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
 
 fn container_runtime(opts: &RuntimeOptions) -> Result<String> {
     if let Some(runtime) = &opts.container_runtime {
-        if command_exists(runtime) {
-            return Ok(runtime.clone());
+        if runtime.trim().eq_ignore_ascii_case("auto") {
+            // Fall through to discovery below.
+        } else {
+            if command_exists(runtime) {
+                return Ok(runtime.clone());
+            }
+            return Err(Error::invalid_request(format!(
+                "configured container runtime not found: {runtime}"
+            )));
         }
-        return Err(Error::invalid_request(format!(
-            "configured container runtime not found: {runtime}"
-        )));
     }
     for runtime in ["docker", "podman"] {
         if command_exists(runtime) {
@@ -594,9 +737,13 @@ fn container_runtime(opts: &RuntimeOptions) -> Result<String> {
 }
 
 fn container_runtime_name(opts: &RuntimeOptions) -> String {
-    opts.container_runtime
-        .clone()
-        .unwrap_or_else(|| "docker|podman".to_string())
+    if let Some(runtime) = &opts.container_runtime {
+        if runtime.trim().eq_ignore_ascii_case("auto") {
+            return "docker|podman".to_string();
+        }
+        return runtime.clone();
+    }
+    "docker|podman".to_string()
 }
 
 fn command_exists(name: &str) -> bool {
@@ -656,6 +803,21 @@ fn run_status(runtime: &str, args: &[&str]) -> Result<()> {
     }
 }
 
+fn run_status_with_hint(runtime: &str, args: &[&str], hint: &str) -> Result<()> {
+    let status = Command::new(runtime)
+        .args(args)
+        .status()
+        .map_err(Error::from)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::storage(format!(
+            "{runtime} {} failed with status {status}; {hint}",
+            args.join(" ")
+        )))
+    }
+}
+
 fn ensure_dir(path: &Path, created: &mut Vec<String>, reused: &mut Vec<String>) -> Result<()> {
     if path.exists() {
         reused.push(path.display().to_string());
@@ -664,6 +826,41 @@ fn ensure_dir(path: &Path, created: &mut Vec<String>, reused: &mut Vec<String>) 
         created.push(path.display().to_string());
     }
     Ok(())
+}
+
+fn write_or_update(
+    path: &Path,
+    body: &str,
+    created: &mut Vec<String>,
+    reused: &mut Vec<String>,
+    updated: &mut Vec<String>,
+) -> Result<()> {
+    if path.exists() {
+        let existing = fs::read_to_string(path).map_err(Error::from)?;
+        if existing == body {
+            reused.push(path.display().to_string());
+        } else {
+            fs::write(path, body).map_err(Error::from)?;
+            updated.push(path.display().to_string());
+        }
+    } else {
+        fs::write(path, body).map_err(Error::from)?;
+        created.push(path.display().to_string());
+    }
+    Ok(())
+}
+
+fn ensure_bind_available(opts: &RuntimeOptions) -> Result<()> {
+    match TcpListener::bind(&opts.bind) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) => Err(Error::storage(format!(
+            "cannot bind {}; port {} is busy or unavailable ({e}). Stop the process using it or set another port with CODEX_MEMORYD_PORT=<port> / `codex-memoryd init --port <port>`",
+            opts.bind, opts.port
+        ))),
+    }
 }
 
 fn render_config(opts: &RuntimeOptions) -> String {
@@ -759,6 +956,64 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(|v| config::expand_path(&v))
+}
+
+fn runtime_env_path(entries: &[(String, String)], key: &str) -> Option<PathBuf> {
+    runtime_env_value(entries, key).map(|v| config::expand_path(&v))
+}
+
+fn runtime_env_value(entries: &[(String, String)], key: &str) -> Option<String> {
+    entries
+        .iter()
+        .find_map(|(entry_key, value)| (entry_key == key).then(|| value.clone()))
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn runtime_env_runtime(entries: &[(String, String)], key: &str) -> Option<RuntimeKind> {
+    match runtime_env_value(entries, key)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "native" => Some(RuntimeKind::Native),
+        "container" => Some(RuntimeKind::Container),
+        "auto" => Some(RuntimeKind::Auto),
+        "compose-dev" | "compose_dev" | "compose" => Some(RuntimeKind::ComposeDev),
+        _ => None,
+    }
+}
+
+fn read_runtime_env(path: &Path) -> Vec<(String, String)> {
+    let Ok(body) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            Some((
+                key.trim().to_string(),
+                value.trim().trim_matches('"').to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn parse_bind_host_port(bind: &str) -> Option<(String, u16)> {
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return Some((addr.ip().to_string(), addr.port()));
+    }
+    if bind.starts_with('[') {
+        let end = bind.find(']')?;
+        let host = bind[1..end].to_string();
+        let port = bind[end + 1..].strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = bind.rsplit_once(':')?;
+    Some((host.to_string(), port.parse::<u16>().ok()?))
 }
 
 fn env_runtime(key: &str) -> Option<RuntimeKind> {

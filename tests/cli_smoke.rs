@@ -3778,6 +3778,44 @@ fn cli_init_is_idempotent_for_product_runtime_home() {
 }
 
 #[test]
+fn cli_init_port_persists_runtime_env_for_later_commands() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["init", "--port", "8989"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"next_command\": \"codex-memoryd up\"",
+        ))
+        .stdout(predicate::str::contains("seeds config/runtime only"))
+        .stdout(predicate::str::contains("next command: codex-memoryd up"))
+        .stdout(predicate::str::contains("127.0.0.1:8989"));
+
+    let runtime_env = std::fs::read_to_string(home.join("runtime.env")).unwrap();
+    assert!(runtime_env.contains("CODEX_MEMORYD_URL=http://127.0.0.1:8989"));
+    assert!(runtime_env.contains("CODEX_MEMORYD_HOST=127.0.0.1"));
+    assert!(runtime_env.contains("CODEX_MEMORYD_PORT=8989"));
+    assert!(runtime_env.contains("CODEX_MEMORYD_BIND=127.0.0.1:8989"));
+
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(config.contains("bind = \"127.0.0.1:8989\""));
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["config", "show", "--resolved"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"url\": \"http://127.0.0.1:8989\"",
+        ))
+        .stdout(predicate::str::contains("\"host\": \"127.0.0.1\""))
+        .stdout(predicate::str::contains("\"port\": 8989"));
+}
+
+#[test]
 fn cli_init_dogfood_creates_repo_local_layout() {
     let dir = TempDir::new().unwrap();
 
@@ -3792,6 +3830,16 @@ fn cli_init_dogfood_creates_repo_local_layout() {
     assert!(dir.path().join(".dogfood/config.toml").exists());
     assert!(dir.path().join(".dogfood/runtime.env").exists());
     assert!(dir.path().join(".dogfood/memory.db").exists());
+}
+
+#[test]
+fn cli_image_build_help_documents_local_tag_path() {
+    bin()
+        .args(["image", "build", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--tag"))
+        .stdout(predicate::str::contains("codex-memoryd:local"));
 }
 
 #[test]
@@ -3811,6 +3859,7 @@ fn cli_config_show_resolved_reports_runtime_and_daemon_values() {
         .stdout(predicate::str::contains("\"client\""))
         .stdout(predicate::str::contains("\"runtime\""))
         .stdout(predicate::str::contains("\"daemon\""))
+        .stdout(predicate::str::contains("\"decision\": \"native\""))
         .stdout(predicate::str::contains("127.0.0.1:8787"));
 }
 

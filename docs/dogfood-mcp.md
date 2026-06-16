@@ -177,4 +177,4 @@ Observed: `8 passed`.
   marker, even though read-only is now the default. Never add `--write-tools`
   to the Codex sandbox dogfood server.
 - Search quality depends on terms. `safe dogfood`, `dogfood`, and `Dreamer` returned matches; `codex-memoryd` alone did not.
-- The real dogfood daemon continues to run separately against `.dogfood/memory.db` on `127.0.0.1:8787`.
+- The real dogfood daemon continues to run separately against `.dogfood/memory.db` on `127.0.0.1:8989`.
