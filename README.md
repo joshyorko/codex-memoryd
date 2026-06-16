@@ -55,10 +55,11 @@ This is the landed MVP surface today:
 ### First-run path (CLI-first product mode)
 
 An installed `codex-memoryd` binary can initialize and manage a local native
-daemon without Docker, Podman, Compose, or a repo checkout:
+daemon without Docker, Podman, Compose, or a repo checkout. Josh's active
+dogfood path uses `127.0.0.1:8989` because Headroom owns `127.0.0.1:8787`:
 
 ```bash
-codex-memoryd init
+codex-memoryd init --port 8989
 codex-memoryd up
 codex-memoryd status
 codex-memoryd sync-local --preview ~/.codex/memories
@@ -67,8 +68,11 @@ codex-memoryd recall --query "safe dogfood mode"
 codex-memoryd dream status
 ```
 
-The product default is `~/.codex-memoryd` with a loopback daemon at
-`http://127.0.0.1:8787`. Direct SQLite/admin mode remains explicit:
+`init` seeds config/runtime state only and prints `codex-memoryd up` as the next
+command. `up`, `status`, `recall`, and `sync-local` use the resolved
+`CODEX_MEMORYD_URL`, host, and port from runtime config/env. Product fallback
+remains `~/.codex-memoryd` on loopback `http://127.0.0.1:8787` when no port is
+configured. Direct SQLite/admin mode remains explicit:
 
 ```bash
 codex-memoryd --local --db ~/.codex-memoryd/memory.db doctor
@@ -79,14 +83,18 @@ codex-memoryd --local --db ~/.codex-memoryd/memory.db backup create \
 Runtime choices are explicit:
 
 ```bash
-codex-memoryd init --runtime native
-codex-memoryd init --runtime container
+codex-memoryd init --runtime native --port 8989
+codex-memoryd init --runtime container --port 8989
+codex-memoryd image build --tag codex-memoryd:local
 codex-memoryd init --dogfood
 ```
 
 Native is the default and requires no container runtime. Managed container
-runtime is the optional no-Compose path. Compose remains for development and
-debugging.
+runtime is the optional no-Compose path. It pulls/runs `CODEX_MEMORYD_IMAGE`
+directly with Docker/Podman; for a local image, build with `codex-memoryd image
+build --tag codex-memoryd:local`, then run
+`CODEX_MEMORYD_IMAGE=codex-memoryd:local codex-memoryd --runtime container up`.
+Compose remains for development and debugging.
 
 Inspect the resolved client/runtime/daemon registry with:
 
@@ -112,7 +120,7 @@ cargo build --release
 mkdir -p .dogfood/logs .dogfood/exports
 
 CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" \
-CODEX_MEMORYD_BIND="127.0.0.1:8787" \
+CODEX_MEMORYD_BIND="127.0.0.1:8989" \
 CODEX_MEMORYD_PROFILE="personal" \
 CODEX_MEMORYD_WORKSPACE="josh-personal" \
 target/release/codex-memoryd serve
@@ -121,8 +129,8 @@ target/release/codex-memoryd serve
 In another shell:
 
 ```bash
-curl -fsS http://127.0.0.1:8787/healthz
-curl -fsS http://127.0.0.1:8787/v1/status | jq
+curl -fsS http://127.0.0.1:8989/healthz
+curl -fsS http://127.0.0.1:8989/v1/status | jq
 target/release/codex-memoryd doctor
 target/release/codex-memoryd sync-local --preview ~/.codex/memories \
   --profile personal --workspace josh-personal

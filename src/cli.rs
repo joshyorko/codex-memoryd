@@ -72,6 +72,15 @@ pub enum Command {
         /// Initialize repo-local .dogfood layout for development.
         #[arg(long)]
         dogfood: bool,
+        /// Host for generated runtime URL/bind.
+        #[arg(long)]
+        host: Option<String>,
+        /// Port for generated runtime URL/bind.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Full bind address for generated runtime config, e.g. 127.0.0.1:8989.
+        #[arg(long)]
+        bind: Option<String>,
     },
     /// Start the managed daemon runtime.
     Up,
@@ -86,6 +95,11 @@ pub enum Command {
     Restart,
     /// Upgrade the managed runtime.
     Upgrade,
+    /// Build local runtime images.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// Run the HTTP daemon.
     Serve {
         /// Bind address, e.g. 127.0.0.1:8787.
@@ -310,6 +324,19 @@ pub enum ConfigCommand {
     Env,
     /// Validate the resolved config.
     Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImageCommand {
+    /// Build a local container image from this repo.
+    Build {
+        #[arg(long, default_value = "codex-memoryd:local")]
+        tag: String,
+        #[arg(long, default_value = ".")]
+        context: PathBuf,
+        #[arg(long)]
+        container_runtime: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -675,7 +702,23 @@ impl Cli {
     }
 
     fn runtime_options(&self) -> RuntimeOptions {
-        RuntimeOptions::resolve(self.runtime, self.url.clone(), self.db.clone())
+        self.runtime_options_with_endpoint(None, None, None)
+    }
+
+    fn runtime_options_with_endpoint(
+        &self,
+        host: Option<String>,
+        port: Option<u16>,
+        bind: Option<String>,
+    ) -> RuntimeOptions {
+        RuntimeOptions::resolve(
+            self.runtime,
+            self.url.clone(),
+            self.db.clone(),
+            host,
+            port,
+            bind,
+        )
     }
 
     fn use_client_mode(&self) -> bool {
@@ -730,13 +773,26 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 
     match &cli.command {
-        Command::Init { dogfood } => {
+        Command::Init {
+            dogfood,
+            host,
+            port,
+            bind,
+        } => {
+            if cli.url.is_some() && (host.is_some() || port.is_some() || bind.is_some()) {
+                return Err(error::Error::invalid_request(
+                    "--url conflicts with init --host/--port/--bind; choose one endpoint form",
+                ));
+            }
             let mode = if *dogfood {
                 InitMode::Dogfood
             } else {
                 InitMode::Product
             };
-            let report = native_runtime::init(&cli.runtime_options(), mode)?;
+            let report = native_runtime::init(
+                &cli.runtime_options_with_endpoint(host.clone(), *port, bind.clone()),
+                mode,
+            )?;
             print_json(&report)?;
             Ok(())
         }
@@ -762,6 +818,23 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Upgrade => {
             let report = native_runtime::upgrade(&cli.runtime_options())?;
             print_json(&report)?;
+            Ok(())
+        }
+        Command::Image { command } => {
+            match command {
+                ImageCommand::Build {
+                    tag,
+                    context,
+                    container_runtime,
+                } => {
+                    let mut opts = cli.runtime_options();
+                    if let Some(runtime) = container_runtime {
+                        opts.container_runtime = Some(runtime.clone());
+                    }
+                    let report = native_runtime::build_image(&opts, tag, context)?;
+                    print_json(&report)?;
+                }
+            }
             Ok(())
         }
         Command::Serve { bind } => {
@@ -1429,47 +1502,53 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let config = cli.load_config(None)?;
                 let runtime = cli.runtime_options();
                 print_json(&json!({
-                    "resolved": *resolved,
-                    "config_file": cli.config.clone().unwrap_or_else(codex_memoryd::config::default_config_path),
-                    "registry": config_registry(&cli, &config, &runtime),
-                    "client": {
-                        "url": runtime.url,
-                        "local": cli.local,
-                    },
-                    "runtime": {
-                        "kind": format!("{:?}", runtime.runtime).to_ascii_lowercase(),
-                        "home": runtime.home,
-                        "host": runtime.host,
-                        "port": runtime.port,
-                        "pid_file": runtime.pid_file,
-                        "log_file": runtime.log_file,
-                        "image": runtime.image,
-                        "container_name": runtime.container_name,
-                        "container_runtime": runtime.container_runtime,
-                        "codex_memories_dir": runtime.codex_memories_dir,
-                        "uid": runtime.uid,
-                        "gid": runtime.gid,
-                    },
-                    "daemon": {
-                        "bind": config.bind,
-                        "storage_kind": config.storage_kind,
-                        "storage_path": config.storage_path,
-                        "default_profile": config.default_profile,
-                        "default_workspace": config.default_workspace,
-                        "log_level": config.log_level,
-                        "declare_loopback_publish": config.declare_loopback_publish,
-                    },
-                    "dream": {
-                        "scheduler_enabled": config.dream_scheduler.enabled,
-                        "scheduler_interval_seconds": config.dream_scheduler.interval_seconds,
-                        "idle_window_seconds": config.dream_scheduler.idle_window_seconds,
-                        "min_session_age_seconds": config.dream_scheduler.min_session_age_seconds,
-                        "min_turn_count": config.dream_scheduler.min_turn_count,
-                        "max_batch_size": config.dream_scheduler.max_batch_size,
-                        "max_candidates": config.dream_scheduler.max_candidates,
-                        "max_runtime_seconds": config.dream_scheduler.max_runtime_seconds,
-                    }
-                }))?;
+                            "resolved": *resolved,
+                            "config_file": cli.config.clone().unwrap_or_else(codex_memoryd::config::default_config_path),
+                            "registry": config_registry(&cli, &config, &runtime),
+                            "client": {
+                                "url": runtime.url,
+                                "local": cli.local,
+                            },
+                            "runtime": {
+                                "kind": format!("{:?}", runtime.runtime).to_ascii_lowercase(),
+                "home": runtime.home,
+                "db": runtime.db,
+                "bind": runtime.bind,
+                "url": runtime.url,
+                "host": runtime.host,
+                "port": runtime.port,
+                "profile": runtime.profile,
+                "workspace": runtime.workspace,
+                "decision": runtime_decision(runtime.runtime),
+                "pid_file": runtime.pid_file,
+                                "log_file": runtime.log_file,
+                                "image": runtime.image,
+                                "container_name": runtime.container_name,
+                                "container_runtime": runtime.container_runtime,
+                                "codex_memories_dir": runtime.codex_memories_dir,
+                                "uid": runtime.uid,
+                                "gid": runtime.gid,
+                            },
+                            "daemon": {
+                                "bind": config.bind,
+                                "storage_kind": config.storage_kind,
+                                "storage_path": config.storage_path,
+                                "default_profile": config.default_profile,
+                                "default_workspace": config.default_workspace,
+                                "log_level": config.log_level,
+                                "declare_loopback_publish": config.declare_loopback_publish,
+                            },
+                            "dream": {
+                                "scheduler_enabled": config.dream_scheduler.enabled,
+                                "scheduler_interval_seconds": config.dream_scheduler.interval_seconds,
+                                "idle_window_seconds": config.dream_scheduler.idle_window_seconds,
+                                "min_session_age_seconds": config.dream_scheduler.min_session_age_seconds,
+                                "min_turn_count": config.dream_scheduler.min_turn_count,
+                                "max_batch_size": config.dream_scheduler.max_batch_size,
+                                "max_candidates": config.dream_scheduler.max_candidates,
+                                "max_runtime_seconds": config.dream_scheduler.max_runtime_seconds,
+                            }
+                        }))?;
                 Ok(())
             }
             ConfigCommand::Env => {
@@ -1872,6 +1951,14 @@ fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<
     }
 
     std::fs::write(path, format!("{}\n", out.join("\n"))).map_err(error::Error::from)
+}
+
+fn runtime_decision(runtime: RuntimeKind) -> &'static str {
+    match runtime {
+        RuntimeKind::Native | RuntimeKind::Auto => "native",
+        RuntimeKind::Container => "container",
+        RuntimeKind::ComposeDev => "compose-dev",
+    }
 }
 
 fn config_registry(cli: &Cli, config: &Config, runtime: &RuntimeOptions) -> serde_json::Value {

@@ -11,7 +11,8 @@ and `memoryd-canonical` prerequisites, see
 
 ## Safety Posture
 
-- Bind only `127.0.0.1:8787` on the host.
+- Bind only `127.0.0.1:8989` on the host for Josh's active dogfood path because
+  Headroom owns `127.0.0.1:8787`.
 - Use a persistent SQLite database.
 - Import existing Codex memories with `sync-local --preview` before `--apply`.
 - Use manual `conclude`, `checkpoint`, `recall`, and `export` only.
@@ -24,9 +25,28 @@ and `memoryd-canonical` prerequisites, see
 
 ## Native Loopback Service
 
-The Docker Compose path is useful for ordinary local smoke tests, but it binds `0.0.0.0` inside the container and therefore reports `auth_missing`. For this stricter dogfood run, use the native daemon so status reports `local_only`.
+The product dogfood path is the installed binary managing a native loopback
+daemon. Docker Compose remains a repo development/debug path, not product
+bootstrap.
 
 The canonical operator path is:
+
+```bash
+codex-memoryd init --port 8989
+codex-memoryd up
+codex-memoryd status
+codex-memoryd sync-local --preview ~/.codex/memories
+codex-memoryd sync-local --apply ~/.codex/memories
+codex-memoryd recall --query "safe dogfood mode"
+```
+
+`init` writes product runtime state under `~/.codex-memoryd/`, including
+`runtime.env` with `CODEX_MEMORYD_URL=http://127.0.0.1:8989`,
+`CODEX_MEMORYD_HOST=127.0.0.1`, and `CODEX_MEMORYD_PORT=8989`. `up`, `status`,
+`sync-local`, and `recall` use that resolved URL/port without manual env
+spelunking.
+
+The legacy helper remains useful for repo-local debugging:
 
 ```bash
 scripts/codex-memoryd-local-runtime.sh start
@@ -36,8 +56,8 @@ scripts/codex-memoryd-local-runtime.sh restart-survival
 scripts/codex-memoryd-local-runtime.sh stop
 ```
 
-The helper writes runtime state under `.dogfood/`, uses
-`.dogfood/memory.db`, and keeps the host bind at `127.0.0.1:8787` by default.
+The helper writes runtime state under `.dogfood/`, uses `.dogfood/memory.db`, and
+keeps its own host bind default unless overridden.
 For systemd user-service dogfood, render the unit first and inspect it before
 installing:
 
@@ -46,19 +66,19 @@ scripts/codex-memoryd-local-runtime.sh systemd-unit > .dogfood/codex-memoryd.ser
 systemctl --user link "$PWD/.dogfood/codex-memoryd.service"
 systemctl --user enable --now codex-memoryd.service
 systemctl --user status codex-memoryd.service
-curl -fsS http://127.0.0.1:8787/v1/status | jq
+curl -fsS http://127.0.0.1:8989/v1/status | jq
 ```
 
 For self-hosting, keep the daemon behind a normal authenticated HTTPS front
 door. Non-loopback binds are rejected by the helper unless
 `CODEX_MEMORYD_ALLOW_NON_LOOPBACK=1` is set intentionally; the local default
-must remain `http://127.0.0.1:8787`.
+must remain `http://127.0.0.1:8989`.
 
 Adapter examples should use the same deployment vocabulary everywhere:
 
 ```toml
 [memory_provider.codex_memoryd]
-base_url = "http://127.0.0.1:8787"
+base_url = "http://127.0.0.1:8989"
 profile = "personal"
 workspace = "josh-personal"
 credential_env = "CODEX_MEMORYD_TOKEN"
@@ -77,7 +97,7 @@ mkdir -p .dogfood/logs .dogfood/exports
 
 setsid -f env \
   CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" \
-  CODEX_MEMORYD_BIND="127.0.0.1:8787" \
+  CODEX_MEMORYD_BIND="127.0.0.1:8989" \
   CODEX_MEMORYD_PROFILE="personal" \
   CODEX_MEMORYD_WORKSPACE="josh-personal" \
   CODEX_MEMORYD_LOG="info" \
@@ -85,8 +105,8 @@ setsid -f env \
 
 pgrep -n -f 'target/debug/codex-memoryd serve' > .dogfood/codex-memoryd.pid
 pgrep -af 'target/debug/codex-memoryd serve'
-curl -fsS http://127.0.0.1:8787/healthz
-curl -fsS http://127.0.0.1:8787/v1/status | jq
+curl -fsS http://127.0.0.1:8989/healthz
+curl -fsS http://127.0.0.1:8989/v1/status | jq
 ```
 
 Stop it with:
@@ -106,13 +126,13 @@ scripts/dogfood-compose-heartbeat.sh
 This heartbeat rebuilds and relaunches Compose from current checkout, checks
 health/status/doctor, runs `sync-local` preview/apply/apply, refreshes
 `.dogfood/mcp-sandbox-memory.db` from `.dogfood/memory.db`, verifies localhost-only
-publish on `127.0.0.1:8787`, and runs a raw MCP stdio canary in `--read-only` mode.
+publish on `127.0.0.1:8989`, and runs a raw MCP stdio canary in `--read-only` mode.
 
 Enable the scheduled Dreamer in Compose with one environment flag:
 
 ```bash
 CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED=1 docker compose up -d --build
-curl -fsS http://127.0.0.1:8787/v1/status | jq '.data.features.dream_scheduler'
+curl -fsS http://127.0.0.1:8989/v1/status | jq '.data.features.dream_scheduler'
 ```
 
 For normal operator CLI work against the same `.dogfood/memory.db`, prefer the
@@ -215,7 +235,7 @@ cat > .dogfood/checkpoint.json <<'JSON'
     "Export before and after imports."
   ],
   "tests_run": [
-    "curl -fsS http://127.0.0.1:8787/healthz",
+    "curl -fsS http://127.0.0.1:8989/healthz",
     "target/debug/codex-memoryd doctor"
   ],
   "tests_not_run": [],
@@ -224,7 +244,7 @@ cat > .dogfood/checkpoint.json <<'JSON'
 }
 JSON
 
-curl -fsS -X POST http://127.0.0.1:8787/v1/checkpoints \
+curl -fsS -X POST http://127.0.0.1:8989/v1/checkpoints \
   -H 'content-type: application/json' \
   --data @.dogfood/checkpoint.json | jq
 ```
@@ -259,9 +279,9 @@ Restart survival check:
 
 ```bash
 kill "$(cat .dogfood/codex-memoryd.pid)"
-setsid -f env CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" CODEX_MEMORYD_BIND="127.0.0.1:8787" target/debug/codex-memoryd serve >> .dogfood/logs/codex-memoryd.log 2>&1
+setsid -f env CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" CODEX_MEMORYD_BIND="127.0.0.1:8989" target/debug/codex-memoryd serve >> .dogfood/logs/codex-memoryd.log 2>&1
 pgrep -n -f 'target/debug/codex-memoryd serve' > .dogfood/codex-memoryd.pid
-curl -fsS http://127.0.0.1:8787/v1/status | jq
+curl -fsS http://127.0.0.1:8989/v1/status | jq
 target/debug/codex-memoryd recall --profile personal --workspace josh-personal --query "What is the safe dogfood mode?" --max-tokens 800 | jq
 ```
 
@@ -270,7 +290,7 @@ target/debug/codex-memoryd recall --profile personal --workspace josh-personal -
 - Branch: `patchraptor/codex-memoryd-dogfood-local`
 - Code commit tested: `07934e9`
 - Service: native `target/debug/codex-memoryd serve`
-- Bind: `127.0.0.1:8787`
+- Bind: `127.0.0.1:8989`
 - Storage: `.dogfood/memory.db`
 - Health: `/healthz` returned `{"ok":true}`
 - Status: `local_only`, schema `3`, writable SQLite, no warnings

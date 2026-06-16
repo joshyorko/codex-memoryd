@@ -378,7 +378,7 @@ Final `[memories]` shape (canonical target):
 [memories]
 backend = "provider"              # local | provider | hybrid
 provider = "codex_memoryd"        # honcho | codex_memoryd  (when backend != local)
-provider_url = "http://127.0.0.1:8787"
+provider_url = "http://127.0.0.1:8989"
 profile = "personal"
 workspace = "josh-personal"
 local_import_policy = "prompt"    # prompt | manual | startup_preview | startup_apply
@@ -414,14 +414,14 @@ CODEX_BIN=/tmp/codex-tap-release/codex-rs/target/debug/codex \
   scripts/codex-tap-release-smoke.sh
 ```
 
-The script starts `codex-memoryd` on `http://127.0.0.1:8787`, isolates
+For Josh's dogfood setup, start `codex-memoryd` on `http://127.0.0.1:8989` and isolate
 `CODEX_HOME` under a temporary directory, configures Codex with:
 
 ```toml
 [memories]
 backend = "provider"              # then repeated with "hybrid"
 provider = "codex_memoryd"
-provider_url = "http://127.0.0.1:8787"
+provider_url = "http://127.0.0.1:8989"
 write_policy = "visible_turns"
 local_import_policy = "manual"
 ```

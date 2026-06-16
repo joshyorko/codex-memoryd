@@ -219,6 +219,89 @@ fn recall_withholds_quarantined_unsafe_and_superseded_metadata_by_default() {
 }
 
 #[test]
+fn default_recall_hides_archived_stale_superseded_records_but_returns_newer_fact() {
+    let store = store();
+    let old_id = insert_record_with_metadata(
+        &store,
+        "Old safe dogfood mode uses port 8787.",
+        serde_json::json!({
+            "state": "superseded",
+            "historical_reason": "superseded",
+        }),
+    );
+    let archived_stale_id = insert_record_with_metadata(
+        &store,
+        "Stale safe dogfood mode note should stay historical.",
+        serde_json::json!({
+            "state": "historical",
+            "historical_reason": "stale",
+        }),
+    );
+    let (archived, not_found) = store
+        .archive_records(
+            "personal",
+            Some("ws"),
+            &[old_id.clone(), archived_stale_id.clone()],
+        )
+        .expect("archive stale records");
+    assert_eq!(archived.len(), 2);
+    assert!(not_found.is_empty());
+
+    let current_id = insert_record_with_metadata(
+        &store,
+        "Current safe dogfood mode uses port 8989.",
+        serde_json::json!({
+            "state": "active",
+            "supersedes": [old_id],
+        }),
+    );
+    let params = RecallParams {
+        profile: Profile::Personal,
+        workspace: "ws",
+        repo: None,
+        query: "safe dogfood mode",
+        files: &[],
+        max_tokens: 1000,
+        pack_mode: "default",
+        include_types: &[],
+        exclude_types: &[],
+        recency_days: None,
+    };
+
+    let resp = recall::recall(&store, &params).expect("recall");
+    assert_eq!(resp.facts.len(), 1);
+    assert_eq!(resp.facts[0].id, current_id);
+    let serialized = serde_json::to_string(&resp).unwrap();
+    assert!(serialized.contains("port 8989"));
+    assert!(!serialized.contains("port 8787"));
+    assert!(!serialized.contains("stay historical"));
+    assert!(resp
+        .withheld
+        .iter()
+        .any(|withheld| withheld.reason == "archived" && withheld.count >= 2));
+
+    let search = recall::search(
+        &store,
+        &SearchParams {
+            profile: Profile::Personal,
+            workspace: Some("ws"),
+            repo_id: None,
+            query: "safe dogfood mode",
+            scope: None,
+            record_type: None,
+            include_archived: true,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .expect("recover archived records");
+    assert!(search
+        .matches
+        .iter()
+        .any(|m| m.id == archived_stale_id && m.archived));
+}
+
+#[test]
 fn high_risk_source_starts_quarantined_requires_promotion_and_exposes_trust_score() {
     let store = store();
     let id = insert_record_with_metadata(
