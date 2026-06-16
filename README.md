@@ -428,6 +428,7 @@ operator polish rather than reopen the old stale snapshot.
 - [`docs/eval-substrate.md`](./docs/eval-substrate.md)
 - [`docs/native-codex-memory-migration.md`](./docs/native-codex-memory-migration.md)
 - [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)
+- [`docs/semantic-layer.md`](./docs/semantic-layer.md)
 - [`docs/dreamer-loop-design.md`](./docs/dreamer-loop-design.md)
 - [`docs/dreamer-loop-research.md`](./docs/dreamer-loop-research.md)
 

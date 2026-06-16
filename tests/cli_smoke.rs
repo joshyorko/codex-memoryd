@@ -882,6 +882,122 @@ fn cli_subject_episode_roundtrip() {
 }
 
 #[test]
+fn semantic_preview_and_apply_json_import() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    let alice_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "semantic-ws",
+            "--key",
+            "alice",
+            "--kind",
+            "person",
+            "--display-name",
+            "Alice",
+        ])
+        .output()
+        .unwrap();
+    assert!(alice_output.status.success());
+    let alice: Value = serde_json::from_slice(&alice_output.stdout).unwrap();
+    let alice_id = alice["subject"]["id"].as_str().unwrap().to_string();
+
+    let billing_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "subject",
+            "create",
+            "--profile",
+            "personal",
+            "--workspace",
+            "semantic-ws",
+            "--key",
+            "billing",
+            "--kind",
+            "project",
+            "--display-name",
+            "Billing",
+        ])
+        .output()
+        .unwrap();
+    assert!(billing_output.status.success());
+    let billing: Value = serde_json::from_slice(&billing_output.stdout).unwrap();
+    let billing_id = billing["subject"]["id"].as_str().unwrap().to_string();
+
+    let import_path = dir.path().join("semantic.json");
+    std::fs::write(
+        &import_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "profile_id": "personal",
+            "workspace_id": "semantic-ws",
+            "aliases": [{
+                "subject_id": alice_id,
+                "alias_key": "al",
+                "source_evidence": "episode:ep_alias"
+            }],
+            "relations": [{
+                "from_subject_id": alice["subject"]["id"],
+                "relation_type": "owns",
+                "to_subject_id": billing_id,
+                "confidence": 0.92,
+                "source_episode_ids": ["episode:ep_owns"],
+                "source_evidence": "episode:ep_owns"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let preview_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["semantic", "preview", "--file"])
+        .arg(&import_path)
+        .output()
+        .unwrap();
+    assert!(preview_output.status.success());
+    let preview: Value = serde_json::from_slice(&preview_output.stdout).unwrap();
+    assert_eq!(preview["counts"]["would_apply"], 2);
+    assert_eq!(preview["counts"]["rejected"], 0);
+    assert_eq!(preview["counts"]["applied_aliases"], 0);
+    assert_eq!(preview["counts"]["applied_relations"], 0);
+
+    let apply_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["semantic", "apply", "--file"])
+        .arg(&import_path)
+        .output()
+        .unwrap();
+    assert!(apply_output.status.success());
+    let applied: Value = serde_json::from_slice(&apply_output.stdout).unwrap();
+    assert_eq!(applied["counts"]["applied_aliases"], 1);
+    assert_eq!(applied["counts"]["applied_relations"], 1);
+    assert_eq!(applied["counts"]["rejected"], 0);
+
+    let second_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["semantic", "apply", "--file"])
+        .arg(&import_path)
+        .output()
+        .unwrap();
+    assert!(second_output.status.success());
+    let second: Value = serde_json::from_slice(&second_output.stdout).unwrap();
+    assert_eq!(second["counts"]["already_present"], 2);
+    assert_eq!(second["counts"]["applied_aliases"], 0);
+    assert_eq!(second["counts"]["applied_relations"], 0);
+}
+
+#[test]
 fn cli_patch_preview_renders_markdown() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

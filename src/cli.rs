@@ -26,6 +26,8 @@ use codex_memoryd::native_runtime::InitMode;
 use codex_memoryd::native_runtime::RuntimeKind;
 use codex_memoryd::native_runtime::RuntimeOptions;
 use codex_memoryd::protocol::*;
+use codex_memoryd::semantic_import;
+use codex_memoryd::semantic_import::SemanticImportRequest;
 use codex_memoryd::server;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
@@ -161,6 +163,11 @@ pub enum Command {
     Procedure {
         #[command(subcommand)]
         command: ProcedureCommand,
+    },
+    /// Preview or apply reviewed semantic aliases and relations.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticCommand,
     },
     /// Import local Codex memory from a directory (provider local-ingest mode).
     SyncLocal {
@@ -412,6 +419,20 @@ pub enum ProcedureCommand {
         /// Counter-evidence count at which the procedure is quarantined.
         #[arg(long, default_value_t = 2)]
         quarantine_threshold: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SemanticCommand {
+    /// Validate semantic import JSON without writing.
+    Preview {
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Apply reviewed semantic import JSON.
+    Apply {
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
     },
 }
 
@@ -1323,6 +1344,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Semantic { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                SemanticCommand::Preview { file } => {
+                    let req = read_semantic_import_file(file)?;
+                    let report = semantic_import::preview_semantic_import(&service.store, &req)?;
+                    print_json(&report)?;
+                }
+                SemanticCommand::Apply { file } => {
+                    let req = read_semantic_import_file(file)?;
+                    let report = semantic_import::apply_semantic_import(&service.store, &req)?;
+                    print_json(&report)?;
+                }
+            }
+            Ok(())
+        }
         Command::SyncLocal {
             preview,
             apply,
@@ -1897,6 +1934,21 @@ fn read_local_memory_files(root: &PathBuf) -> Result<Vec<SyncFile>> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+fn read_semantic_import_file(path: &PathBuf) -> Result<SemanticImportRequest> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        error::Error::invalid_request(format!(
+            "failed to read semantic import file {}: {e}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&raw).map_err(|e| {
+        error::Error::invalid_request(format!(
+            "failed to parse semantic import file {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {

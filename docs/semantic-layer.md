@@ -1,16 +1,16 @@
 # Semantic layer: entity resolution and relation graph — decision (#154)
 
-> **Status: MVP IMPLEMENTED (relation substrate + eval slice).**
+> **Status: MVP IMPLEMENTED (relation substrate, eval slice, and explicit JSON preview/apply path).**
 > `subject_aliases` and `relations` are live in the storage schema (v8), with
 > explicit store apply methods, scoped reads, and relation-expanded retrieval in
 > the deterministic eval path. This is an incremental slice, not the full
-> end-to-end #154 delivery: user-facing relation preview/apply UX and default
-> `/recall` integration are still pending.
+> default `/recall` integration: explicit import is user-facing, while default
+> recall remains conservative.
 
 This document compares three approaches for adding a semantic layer (entity
-aliases + relations) to `codex-memoryd`, makes a recommendation, and specifies
-the relation-candidate preview/apply shape and a multi-hop fixture plan that
-will *prove whether relation-aware recall actually helps* before we build it.
+aliases + relations) to `codex-memoryd`, records the local-first decision, and
+documents the implemented explicit preview/apply import path plus the multi-hop
+fixture evidence.
 
 ## Non-goals (from the issue)
 
@@ -87,13 +87,14 @@ Embed or require a graph backend.
 
 ## Recommendation
 
-**Option B, gated behind proof.** Ship the design + multi-hop fixtures now
-(this PR). Implement relation tables only if the fixtures demonstrate that
-relation-aware recall answers multi-hop questions that chained plain recall
-(Option A) cannot. If Option A already wins, document the non-goal with the
-fixture evidence — that is itself an acceptance outcome for #154.
+**Option B, proven by the deterministic eval slice.** The local relation tables
+and semantic fixtures show relation-aware retrieval improves the multi-hop
+`q_multihop_evidence` case while preserving cross-profile isolation. The
+remaining #154 delivery is an explicit reviewed JSON preview/apply path for
+aliases and relations, which keeps graph mutation user-facing and evidence
+backed.
 
-## Proposed shape (Option B, design only)
+## Implemented shape (Option B)
 
 ### Subject aliases
 
@@ -112,9 +113,8 @@ subject_aliases(
 
 Resolution is deterministic: look up `alias_key`; if found, resolve to
 `subject_id`. No fuzzy/embedding matching in v0.x (that would be #156 territory
-and is explicitly out of scope here). Alias *candidates* may be proposed but
-require apply — never silent merges (merging entities is destructive-ish and
-must be reviewable).
+and is explicitly out of scope here). Aliases are applied only through explicit
+import, never through silent merges.
 
 ### Relations
 
@@ -149,20 +149,48 @@ filters traversal to the requested scope, so even a hypothetically mis-inserted
 cross-scope row could never be traversed across the boundary. The
 `scope_isolation` fixture asserts this.
 
-### Preview / apply (mirrors procedures + dream patches)
+### Preview / apply (explicit JSON import)
 
-- `relations preview` — derive candidate relations from episodes/evidence
-  (e.g. an episode whose summary says "Alice owns the billing project" yields a
-  candidate `owns(alice, billing)`), returns candidates + rejected with reasons.
-  **No writes.**
-- `relations apply` — validate scope, evidence presence, and the unsafe-content
-  guard (same guard as procedures); insert as `active`, or quarantine with a
-  reason. **No silent graph mutation.**
-- `relations retire` — lifecycle, mirrors `retire_procedure`.
+Reviewed aliases and relations are previewed and applied from a JSON file:
 
-All evidence-backed: a relation with no `source_episode_ids`/`source_evidence`
-is rejected. Relations are recall-not-authority — they inform ranking/expansion
-but never command.
+```bash
+codex-memoryd semantic preview --file semantic.json
+codex-memoryd semantic apply --file semantic.json
+```
+
+Preview validates the file and prints `would_apply`, `already_present`, and
+`rejected` entries. It performs **no writes**. Apply runs the same validation,
+writes valid reviewed entries, reports rejected entries, and remains idempotent.
+
+The import file uses one top-level scope:
+
+```json
+{
+  "profile_id": "personal",
+  "workspace_id": "josh-personal",
+  "aliases": [
+    {
+      "subject_id": "subj_alice",
+      "alias_key": "al",
+      "source_evidence": "episode:ep_alias"
+    }
+  ],
+  "relations": [
+    {
+      "from_subject_id": "subj_alice",
+      "relation_type": "owns",
+      "to_subject_id": "subj_billing",
+      "confidence": 0.92,
+      "source_episode_ids": ["episode:ep_owns_billing"],
+      "source_evidence": "episode:ep_owns_billing"
+    }
+  ]
+}
+```
+
+All evidence-backed: aliases require `source_evidence`, and relations require
+`source_episode_ids` plus `source_evidence`. Relations are recall-not-authority:
+they inform deterministic discovery/eval paths but never command.
 
 ### Evidence refs and profile/workspace boundaries
 
@@ -176,25 +204,25 @@ but never command.
 
 ### Relation-aware recall (only if proven)
 
-Bounded expansion: given a query that resolves to a subject, optionally pull in
-records of subjects within depth ≤ 2 along `active` relations, clearly tagged
-as relation-expanded (so provenance shows *why* a record was included). Capped
-depth and capped fan-out keep it inside the perf budget. This is the piece the
-multi-hop fixtures must justify before it is built.
+Bounded expansion: given a query that resolves to a subject, the deterministic
+eval path can pull in records of subjects within depth <= 2 along `active`
+relations, with relation evidence preserved in the expansion result. Capped
+depth and capped fan-out keep it inside the perf budget.
 
-## Multi-hop fixture plan
+## Multi-hop fixtures and eval
 
-`tests/fixtures/semantic/` (data only in this PR). Each fixture defines
-subjects, episodes (evidence), proposed relations, and a multi-hop question
-with the expected answer under two retrieval modes:
+`tests/fixtures/semantic/` defines subjects, episodes (evidence), proposed
+relations, and multi-hop questions with expected answers under two retrieval
+modes:
 
 - **`chained_recall`** (Option A baseline): can the answer be assembled by
   issuing plain recalls per subject and joining?
 - **`relation_aware`** (Option B): does traversing relations return the answer
   set directly / more precisely?
 
-The fixtures are the **decision instrument**: if `relation_aware` does not beat
-`chained_recall` on these, Option B is not worth building.
+The fixtures are the **decision instrument**. The retrieval eval reports
+`relation_aware_recall` improving `q_multihop_evidence` while keeping
+`cross_profile_leak` false.
 
 | File | Multi-hop question | Tests |
 | --- | --- | --- |
@@ -206,25 +234,17 @@ The fixtures are the **decision instrument**: if `relation_aware` does not beat
 
 See `tests/fixtures/semantic/README.md` for the file format.
 
-## Migration strategy (if Option B is approved)
+## Migration status
 
-Same convention as 0006/0008: add `migrations/0009_*.sql`-style markers (or
-real `CREATE TABLE IF NOT EXISTS` for genuinely new tables — aliases/relations
-are new tables, so they can be real `CREATE TABLE` statements like 0005/0007
-rather than no-op markers), wire into `migrate()`, bump `STORAGE_SCHEMA_VERSION`
-(coordinate with #155's bump — likely a single combined bump if both land),
-reference the constant in tests, and extend `tests/schema_upgrade.rs` with the
-new-generation case. Additive under `docs/compatibility-policy.md`.
+Schema v8 includes `subject_aliases` and `relations` via
+`migrations/0009_semantic_relations.sql`. The migration is additive under
+`docs/compatibility-policy.md`, with schema-upgrade coverage asserting both
+tables exist and start empty after upgrade.
 
-## Open questions for root review
+## Follow-up boundaries
 
-1. **Build Option B, or ship Option A as a proven non-goal?** Decide *after*
-   the multi-hop fixtures are reviewed — they are designed to answer exactly
-   this. The recommendation is B *if* the fixtures show a real gap.
-2. **Alias merge semantics.** Proposed: aliases are pointers, never destructive
-   merges of subjects. Confirm we never collapse two subjects' rows.
-3. **Relation extraction source.** Proposed: derive candidates deterministically
-   from episode summaries / evidence (string-rule based), not an LLM. Confirm no
-   model in the extraction path for v0.x.
-4. **Schema-version coordination with #155.** If both land, prefer one combined
-   version bump and one `ensure_*` pass to avoid a double migration.
+- Alias merge semantics stay pointer-only: no destructive subject row collapse.
+- Relation extraction is not automatic in this slice. Reviewed JSON import is
+  the user-facing mutation path.
+- #155 temporal schema/version work must coordinate with the current storage
+  version, but temporal fields and as-of recall stay out of #154.
