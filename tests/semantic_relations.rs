@@ -191,8 +191,8 @@ fn relations_are_evidence_backed_and_never_expand_cross_profile() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProfileBoundaryDenied);
 
-    let mut no_evidence = relation(
-        "rel_no_evidence",
+    let missing_episode_evidence = relation(
+        "rel_missing_episode_evidence",
         "personal",
         "semantic-ws",
         "subj_lighthouse",
@@ -200,7 +200,23 @@ fn relations_are_evidence_backed_and_never_expand_cross_profile() {
         "subj_blue_harbor",
         vec![],
     );
-    no_evidence.source_evidence = None;
-    let err = store.insert_or_get_relation(&no_evidence).unwrap_err();
+    let err = store
+        .insert_or_get_relation(&missing_episode_evidence)
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+
+    let mut missing_source_evidence = relation(
+        "rel_missing_source_evidence",
+        "personal",
+        "semantic-ws",
+        "subj_lighthouse",
+        "depends_on",
+        "subj_blue_harbor",
+        vec!["ep_missing_source"],
+    );
+    missing_source_evidence.source_evidence = None;
+    let err = store
+        .insert_or_get_relation(&missing_source_evidence)
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidRequest);
 }

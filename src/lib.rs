@@ -36,6 +36,7 @@ pub mod proc_eval;
 pub mod protocol;
 pub mod recall;
 pub mod retrieval_eval;
+pub mod semantic_import;
 pub mod server;
 pub mod service;
 pub mod status;

@@ -804,6 +804,27 @@ impl Store {
         Ok(result)
     }
 
+    pub fn get_subject_alias(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        alias_key: &str,
+    ) -> Result<Option<SubjectAlias>> {
+        let conn = self.conn()?;
+        let alias = conn
+            .query_row(
+                &format!(
+                    "SELECT {SUBJECT_ALIAS_COLS}
+                     FROM subject_aliases
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND alias_key = ?3"
+                ),
+                params![profile_id, workspace_id, alias_key],
+                row_to_subject_alias,
+            )
+            .optional()?;
+        Ok(alias)
+    }
+
     /// Explicitly apply an evidence-backed relation. Scope and evidence are
     /// checked before persistence; relation-aware recall only reads active rows.
     pub fn insert_or_get_relation(&self, relation: &Relation) -> Result<(Relation, bool)> {
@@ -871,6 +892,37 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::storage("relation conflict without visible row"))?;
         Ok((existing, false))
+    }
+
+    pub fn get_active_relation(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        from_subject_id: &str,
+        relation_type: &str,
+        to_subject_id: &str,
+    ) -> Result<Option<Relation>> {
+        let conn = self.conn()?;
+        let relation = conn
+            .query_row(
+                &format!(
+                    "SELECT {RELATION_COLS} FROM relations
+                     WHERE profile_id = ?1 AND workspace_id = ?2
+                       AND from_subject_id = ?3 AND relation_type = ?4
+                       AND to_subject_id = ?5
+                       AND retired_at IS NULL AND state != 'retired'"
+                ),
+                params![
+                    profile_id,
+                    workspace_id,
+                    from_subject_id,
+                    relation_type,
+                    to_subject_id
+                ],
+                row_to_relation,
+            )
+            .optional()?;
+        Ok(relation)
     }
 
     /// Traverse active outgoing relations within one profile/workspace. The
@@ -3302,13 +3354,17 @@ fn validate_relation(relation: &Relation) -> Result<()> {
         )));
     }
     if relation.source_episode_ids.is_empty()
-        && relation
+        || relation
+            .source_episode_ids
+            .iter()
+            .all(|value| value.trim().is_empty())
+        || relation
             .source_evidence
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
     {
         return Err(Error::invalid_request(
-            "relation evidence is required via source_episode_ids or source_evidence",
+            "relation evidence is required via source_episode_ids and source_evidence",
         ));
     }
     Ok(())
