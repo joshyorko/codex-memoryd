@@ -72,6 +72,9 @@ fn recall_params<'a>(query: &'a str) -> RecallParams<'a> {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     }
 }
 

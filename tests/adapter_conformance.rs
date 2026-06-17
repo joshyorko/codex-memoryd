@@ -166,6 +166,8 @@ fn recall_is_advisory_budgeted_and_cited() {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })
         .expect("recall");

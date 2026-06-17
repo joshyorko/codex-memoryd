@@ -669,6 +669,8 @@ fn score_memoryd_recall_with_items(
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })?;
         let items = recall

@@ -138,6 +138,9 @@ fn recall_ignores_secret_blocked_records() {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
 
     let resp = recall::recall(&store, &params).expect("recall");
@@ -194,6 +197,9 @@ fn recall_withholds_quarantined_unsafe_and_superseded_metadata_by_default() {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
 
     let resp = recall::recall(&store, &params).expect("recall");
@@ -266,6 +272,9 @@ fn default_recall_hides_archived_stale_superseded_records_but_returns_newer_fact
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
 
     let resp = recall::recall(&store, &params).expect("recall");
@@ -336,6 +345,9 @@ fn high_risk_source_starts_quarantined_requires_promotion_and_exposes_trust_scor
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
     let hidden = recall::recall(&store, &params).expect("recall hidden");
     assert!(hidden.facts.is_empty());
@@ -390,6 +402,9 @@ fn recall_cross_profile_bleed_remains_default_deny() {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
 
     let resp = recall::recall(&store, &params).expect("recall");
@@ -418,6 +433,9 @@ fn recall_allows_legacy_metadata_without_admission_markers() {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
 
     let resp = recall::recall(&store, &params).expect("recall");
@@ -519,6 +537,9 @@ fn quarantined_prompt_injection_is_withheld_from_recall_search_and_export() {
         include_types: &[],
         exclude_types: &[],
         recency_days: None,
+        now: None,
+        as_of: None,
+        include_history: false,
     };
     let recall = recall::recall(&store, &recall_params).expect("recall");
     assert!(recall

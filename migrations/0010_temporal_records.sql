@@ -1,0 +1,2 @@
+-- Temporal memory-record columns are added idempotently by
+-- ensure_temporal_columns in src/store.rs so old databases upgrade safely.

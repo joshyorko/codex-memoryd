@@ -32,13 +32,14 @@ use crate::domain::Sensitivity;
 use crate::domain::Subject;
 use crate::domain::SubjectAlias;
 use crate::domain::SubjectKind;
+use crate::domain::TemporalState;
 use crate::domain::VisibleTurn;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 8;
+pub const STORAGE_SCHEMA_VERSION: i64 = 9;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -51,6 +52,7 @@ const MIGRATION_PROCEDURE_LIFECYCLE: &str =
     include_str!("../migrations/0008_procedure_lifecycle.sql");
 const MIGRATION_SEMANTIC_RELATIONS: &str =
     include_str!("../migrations/0009_semantic_relations.sql");
+const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -335,6 +337,8 @@ impl Store {
         conn.execute_batch(MIGRATION_PROCEDURE_LIFECYCLE)?;
         ensure_procedure_lifecycle_columns(&conn)?;
         conn.execute_batch(MIGRATION_SEMANTIC_RELATIONS)?;
+        conn.execute_batch(MIGRATION_TEMPORAL_RECORDS)?;
+        ensure_temporal_columns(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -1473,6 +1477,15 @@ impl Store {
         let now = ids::now_rfc3339();
         let (trust_state, trust_score, quarantine_reason, quarantined_at) =
             trust_defaults_for_new_record(new, &now);
+        let (
+            valid_from,
+            valid_until,
+            observed_at,
+            invalidated_at,
+            superseded_by,
+            historical_reason,
+            temporal_state,
+        ) = temporal_defaults_for_new_record(new, &now);
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO memory_records(
@@ -1480,8 +1493,10 @@ impl Store {
                 scope, type, content, related_files, tags, sensitivity,
                 portability, confidence, source_ids, content_hash, supersedes,
                 created_at, updated_at, last_used_at, archived, trust_state, trust_score,
-                quarantine_reason, quarantined_at, promoted_at, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,NULL,0,?19,?20,?21,?22,NULL,?23)",
+                quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until,
+                observed_at, invalidated_at, superseded_by, historical_reason, temporal_state,
+                metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18,NULL,0,?19,?20,?21,?22,NULL,?23,?24,?25,?26,?27,?28,?29,?30)",
             params![
                 id,
                 new.profile_id,
@@ -1505,6 +1520,13 @@ impl Store {
                 trust_score,
                 quarantine_reason,
                 quarantined_at,
+                valid_from,
+                valid_until,
+                observed_at,
+                invalidated_at,
+                superseded_by,
+                historical_reason,
+                temporal_state,
                 new.metadata.to_string(),
             ],
         )?;
@@ -1768,6 +1790,92 @@ impl Store {
             )
             .optional()?;
         Ok(result)
+    }
+
+    pub fn supersede_record(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        old_id: &str,
+        new_id: &str,
+        reason: &str,
+        now: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        if !self.scoped_record_exists(&tx, old_id, profile_id, Some(workspace_id))?
+            || !self.scoped_record_exists(&tx, new_id, profile_id, Some(workspace_id))?
+        {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        tx.execute(
+            "UPDATE memory_records
+             SET temporal_state = 'superseded',
+                 superseded_by = ?4,
+                 valid_until = COALESCE(valid_until, ?5),
+                 historical_reason = ?6,
+                 updated_at = ?5
+             WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+            params![profile_id, workspace_id, old_id, new_id, now, reason],
+        )?;
+
+        let raw: String = tx.query_row(
+            "SELECT supersedes FROM memory_records
+             WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+            params![profile_id, workspace_id, new_id],
+            |row| row.get(0),
+        )?;
+        let mut supersedes = json_str_list(&raw);
+        if !supersedes.iter().any(|id| id == old_id) {
+            supersedes.push(old_id.to_string());
+            tx.execute(
+                "UPDATE memory_records
+                 SET supersedes = ?4, updated_at = ?5
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+                params![
+                    profile_id,
+                    workspace_id,
+                    new_id,
+                    serde_json::to_string(&supersedes)?,
+                    now,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        drop(conn);
+        self.get_record(old_id)
+    }
+
+    pub fn invalidate_record(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        id: &str,
+        reason: &str,
+        now: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        if !self.scoped_record_exists(&tx, id, profile_id, Some(workspace_id))? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE memory_records
+             SET temporal_state = 'invalidated',
+                 invalidated_at = ?4,
+                 valid_until = COALESCE(valid_until, ?4),
+                 historical_reason = ?5,
+                 updated_at = ?4
+             WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
+            params![profile_id, workspace_id, id, now, reason],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_record(id)
     }
 
     pub fn records_by_patch_run_id(
@@ -3056,6 +3164,37 @@ fn ensure_procedure_lifecycle_columns(conn: &rusqlite::Connection) -> Result<()>
     Ok(())
 }
 
+fn ensure_temporal_columns(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "memory_records", "valid_from", "TEXT")?;
+    ensure_column(conn, "memory_records", "valid_until", "TEXT")?;
+    ensure_column(conn, "memory_records", "observed_at", "TEXT")?;
+    ensure_column(conn, "memory_records", "invalidated_at", "TEXT")?;
+    ensure_column(conn, "memory_records", "superseded_by", "TEXT")?;
+    ensure_column(conn, "memory_records", "historical_reason", "TEXT")?;
+    ensure_column(
+        conn,
+        "memory_records",
+        "temporal_state",
+        "TEXT NOT NULL DEFAULT 'current'",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_temporal_state
+         ON memory_records(profile_id, workspace_id, temporal_state)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_valid_time
+         ON memory_records(profile_id, workspace_id, valid_from, valid_until)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_superseded_by
+         ON memory_records(superseded_by)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn trust_defaults_for_new_record(
     new: &NewRecord,
     now: &str,
@@ -3101,6 +3240,36 @@ fn trust_defaults_for_new_record(
     )
 }
 
+fn temporal_defaults_for_new_record(
+    new: &NewRecord,
+    now: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+) {
+    let temporal_state = metadata_text(&new.metadata, "temporal_state")
+        .or_else(|| metadata_text(&new.metadata, "state"))
+        .and_then(|value| TemporalState::parse(&value))
+        .unwrap_or(TemporalState::Current)
+        .as_str()
+        .to_string();
+
+    (
+        metadata_text(&new.metadata, "valid_from"),
+        metadata_text(&new.metadata, "valid_until"),
+        metadata_text(&new.metadata, "observed_at").or_else(|| Some(now.to_string())),
+        metadata_text(&new.metadata, "invalidated_at"),
+        metadata_text(&new.metadata, "superseded_by"),
+        metadata_text(&new.metadata, "historical_reason"),
+        temporal_state,
+    )
+}
+
 fn metadata_text(metadata: &Value, key: &str) -> Option<String> {
     metadata
         .get(key)
@@ -3139,7 +3308,7 @@ fn ensure_column(
 // Row mappers and SQL helpers
 // ----------------------------------------------------------------------
 
-const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, metadata";
+const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until, observed_at, invalidated_at, superseded_by, historical_reason, temporal_state, metadata";
 const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
 const SUBJECT_COLS_S: &str =
@@ -3400,7 +3569,15 @@ fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
         quarantine_reason: row.get(23)?,
         quarantined_at: row.get(24)?,
         promoted_at: row.get(25)?,
-        metadata: json_value(&row.get::<_, String>(26)?),
+        valid_from: row.get(26)?,
+        valid_until: row.get(27)?,
+        observed_at: row.get(28)?,
+        invalidated_at: row.get(29)?,
+        superseded_by: row.get(30)?,
+        historical_reason: row.get(31)?,
+        temporal_state: TemporalState::parse(&row.get::<_, String>(32)?)
+            .unwrap_or(TemporalState::Current),
+        metadata: json_value(&row.get::<_, String>(33)?),
     })
 }
 

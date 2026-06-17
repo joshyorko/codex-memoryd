@@ -14,6 +14,7 @@ use crate::domain::MemoryRecord;
 use crate::domain::Profile;
 use crate::domain::RecordType;
 use crate::domain::RepoIdentity;
+use crate::domain::TemporalState;
 use crate::error::Result;
 use crate::protocol::Citation;
 use crate::protocol::RecallAdmission;
@@ -157,6 +158,9 @@ pub struct RecallParams<'a> {
     pub include_types: &'a [RecordType],
     pub exclude_types: &'a [RecordType],
     pub recency_days: Option<i64>,
+    pub now: Option<&'a str>,
+    pub as_of: Option<&'a str>,
+    pub include_history: bool,
 }
 
 /// A scored candidate, kept internal to ranking.
@@ -172,6 +176,8 @@ enum RecallDenyReason {
     HighRisk,
     Unsafe,
     Superseded,
+    TemporalHistorical,
+    TemporalPlanned,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,6 +186,8 @@ struct RecallPolicyWithheldCounts {
     high_risk: usize,
     unsafe_record: usize,
     superseded: usize,
+    temporal_historical: usize,
+    temporal_planned: usize,
 }
 
 impl RecallPolicyWithheldCounts {
@@ -189,6 +197,8 @@ impl RecallPolicyWithheldCounts {
             RecallDenyReason::HighRisk => self.high_risk += 1,
             RecallDenyReason::Unsafe => self.unsafe_record += 1,
             RecallDenyReason::Superseded => self.superseded += 1,
+            RecallDenyReason::TemporalHistorical => self.temporal_historical += 1,
+            RecallDenyReason::TemporalPlanned => self.temporal_planned += 1,
         }
     }
 }
@@ -287,6 +297,20 @@ fn build_withheld(
             gates: vec!["admission_policy".to_string(), "supersession".to_string()],
         });
     }
+    if policy_withheld.temporal_historical > 0 {
+        withheld.push(RecallWithheld {
+            reason: "temporal_historical".to_string(),
+            count: policy_withheld.temporal_historical,
+            gates: vec!["temporal_state".to_string(), "valid_time".to_string()],
+        });
+    }
+    if policy_withheld.temporal_planned > 0 {
+        withheld.push(RecallWithheld {
+            reason: "temporal_planned".to_string(),
+            count: policy_withheld.temporal_planned,
+            gates: vec!["temporal_state".to_string(), "valid_from".to_string()],
+        });
+    }
     if pack_withheld > 0 {
         withheld.push(RecallWithheld {
             reason: "pack_truncated".to_string(),
@@ -330,13 +354,18 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         hits
     };
 
+    let evaluation_time = params
+        .as_of
+        .or(params.now)
+        .map(str::to_string)
+        .unwrap_or_else(current_rfc3339);
     let repo_id = params.repo.map(|r| r.repo_id.as_str());
     let mut type_filtered = 0usize;
     let mut policy_withheld = RecallPolicyWithheldCounts::default();
     let mut scored: Vec<Scored> = candidates
         .into_iter()
         .filter_map(|record| {
-            if let Some(reason) = default_recall_deny_reason(&record) {
+            if let Some(reason) = recall_deny_reason(&record, params, &evaluation_time) {
                 policy_withheld.increment(reason);
                 return None;
             }
@@ -523,7 +552,28 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
     })
 }
 
-fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason> {
+fn recall_deny_reason(
+    record: &MemoryRecord,
+    params: &RecallParams,
+    evaluation_time: &str,
+) -> Option<RecallDenyReason> {
+    let default_current_mode = params.as_of.is_none() && !params.include_history;
+    if let Some(reason) = policy_recall_deny_reason(record, default_current_mode) {
+        return Some(reason);
+    }
+    if params.include_history {
+        return None;
+    }
+    if let Some(as_of) = params.as_of {
+        return as_of_temporal_deny_reason(record, as_of);
+    }
+    current_temporal_deny_reason(record, evaluation_time)
+}
+
+fn policy_recall_deny_reason(
+    record: &MemoryRecord,
+    withhold_superseded: bool,
+) -> Option<RecallDenyReason> {
     if record.trust_state == "quarantined" {
         return Some(RecallDenyReason::Quarantined);
     }
@@ -540,7 +590,7 @@ fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason>
         Some("unsafe") | Some("rejected") | Some("reject") | Some("blocked") => {
             Some(RecallDenyReason::Unsafe)
         }
-        Some("superseded") => Some(RecallDenyReason::Superseded),
+        Some("superseded") if withhold_superseded => Some(RecallDenyReason::Superseded),
         _ => metadata_string(metadata, "source_risk")
             .map(|value| normalized_policy_value(&value))
             .and_then(|risk| match risk.as_str() {
@@ -550,6 +600,47 @@ fn default_recall_deny_reason(record: &MemoryRecord) -> Option<RecallDenyReason>
                 _ => None,
             }),
     }
+}
+
+fn current_temporal_deny_reason(record: &MemoryRecord, now: &str) -> Option<RecallDenyReason> {
+    if record.temporal_state == TemporalState::Planned || after(&record.valid_from, now) {
+        return Some(RecallDenyReason::TemporalPlanned);
+    }
+    if record.temporal_state != TemporalState::Current
+        || at_or_before(&record.valid_until, now)
+        || at_or_before(&record.invalidated_at, now)
+    {
+        return Some(RecallDenyReason::TemporalHistorical);
+    }
+    None
+}
+
+fn as_of_temporal_deny_reason(record: &MemoryRecord, as_of: &str) -> Option<RecallDenyReason> {
+    if after(&record.valid_from, as_of) || after(&record.observed_at, as_of) {
+        return Some(RecallDenyReason::TemporalPlanned);
+    }
+    if at_or_before(&record.valid_until, as_of) || at_or_before(&record.invalidated_at, as_of) {
+        return Some(RecallDenyReason::TemporalHistorical);
+    }
+    None
+}
+
+fn after(timestamp: &Option<String>, cutoff: &str) -> bool {
+    timestamp
+        .as_deref()
+        .is_some_and(|timestamp| timestamp.trim() > cutoff)
+}
+
+fn at_or_before(timestamp: &Option<String>, cutoff: &str) -> bool {
+    timestamp
+        .as_deref()
+        .is_some_and(|timestamp| timestamp.trim() <= cutoff)
+}
+
+fn current_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
@@ -1426,6 +1517,9 @@ mod tests {
             include_types: &[],
             exclude_types: &[],
             recency_days: None,
+            now: None,
+            as_of: None,
+            include_history: false,
         };
         let resp = recall(&s, &params).unwrap();
         assert!(!resp.facts.is_empty());
@@ -1455,6 +1549,9 @@ mod tests {
             include_types: &[],
             exclude_types: &[],
             recency_days: None,
+            now: None,
+            as_of: None,
+            include_history: false,
         };
         let resp = recall(&store, &params).unwrap();
 
@@ -1502,6 +1599,9 @@ mod tests {
             include_types: &[],
             exclude_types: &[],
             recency_days: None,
+            now: None,
+            as_of: None,
+            include_history: false,
         };
         let resp = recall(&s, &params).unwrap();
         assert!(resp.facts.is_empty(), "must not leak across workspaces");

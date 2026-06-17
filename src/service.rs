@@ -215,6 +215,11 @@ impl Service {
             .unwrap_or(self.config.max_recall_tokens)
             .max(1);
         let pack_mode = resolve_pack_mode(req.pack_mode.as_deref())?;
+        if req.include_history && req.as_of.is_some() {
+            return Err(Error::invalid_request(
+                "use either as_of or include_history, not both",
+            ));
+        }
 
         let params = RecallParams {
             profile,
@@ -227,6 +232,9 @@ impl Service {
             include_types: &include_types,
             exclude_types: &exclude_types,
             recency_days: req.recency_days,
+            now: None,
+            as_of: req.as_of.as_deref(),
+            include_history: req.include_history,
         };
         recall::recall(&self.store, &params)
     }

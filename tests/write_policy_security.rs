@@ -66,6 +66,8 @@ fn checkpoint_rejects_secret_in_detail_field_and_does_not_persist() {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })
         .expect("recall after rejection");
