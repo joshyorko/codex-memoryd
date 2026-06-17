@@ -83,6 +83,8 @@ pub fn run_perf_report(clock: impl Fn() -> u128) -> Result<PerfReport> {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })?;
         Ok((r.facts.len(), json_bytes(&r)))

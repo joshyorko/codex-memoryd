@@ -272,6 +272,8 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })
         .unwrap();

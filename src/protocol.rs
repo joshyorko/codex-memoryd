@@ -165,6 +165,10 @@ pub struct RecallRequest {
     #[serde(default)]
     pub recency_days: Option<i64>,
     #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub include_history: bool,
+    #[serde(default)]
     pub metadata: Option<Value>,
 }
 

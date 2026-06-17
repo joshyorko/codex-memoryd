@@ -124,6 +124,10 @@ pub enum Command {
         max_tokens: Option<usize>,
         #[arg(long)]
         pack_mode: Option<String>,
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
+        #[arg(long)]
+        include_history: bool,
     },
     /// Search stored memory.
     Search {
@@ -1074,6 +1078,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             query,
             max_tokens,
             pack_mode,
+            as_of,
+            include_history,
         } => {
             let req = RecallRequest {
                 profile: profile.clone(),
@@ -1090,6 +1096,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 include_types: vec![],
                 exclude_types: vec![],
                 recency_days: None,
+                as_of: as_of.clone(),
+                include_history: *include_history,
                 metadata: None,
             };
             if cli.use_client_mode() {

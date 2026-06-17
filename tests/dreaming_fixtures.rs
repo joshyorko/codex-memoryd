@@ -589,6 +589,8 @@ fn recall_text(service: &Service, expectation: &RecallExpectation) -> String {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })
         .expect("recall runs");

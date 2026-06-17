@@ -2,6 +2,7 @@
 //! database and assert real behavior (record creation, secret rejection,
 //! idempotent local import, forget, doctor).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -51,6 +52,60 @@ fn wait_for_health(url: &str) {
 
 fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("memory.db")
+}
+
+fn insert_temporal_cli_record(
+    db: &PathBuf,
+    id: &str,
+    content: &str,
+    temporal_state: &str,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    observed_at: &str,
+    superseded_by: Option<&str>,
+) {
+    let store = Store::open(db).expect("open store");
+    store
+        .ensure_workspace("personal", "josh-personal")
+        .expect("workspace");
+    drop(store);
+
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "INSERT INTO memory_records(
+            id, profile_id, workspace_id, repo_id, subject_id, episode_id,
+            scope, type, content, related_files, tags, sensitivity, portability,
+            confidence, source_ids, content_hash, supersedes, created_at, updated_at,
+            last_used_at, archived, trust_state, trust_score, quarantine_reason,
+            quarantined_at, promoted_at, valid_from, valid_until, observed_at,
+            invalidated_at, superseded_by, historical_reason, temporal_state, metadata
+        ) VALUES (
+            ?1, 'personal', 'josh-personal', NULL, NULL, NULL,
+            'workspace', 'preference', ?2, '[]', '[]', 'personal', 'portable',
+            0.9, '[]', ?3, '[]', ?4, ?4,
+            NULL, 0, 'trusted', 1.0, NULL,
+            NULL, NULL, ?5, ?6, ?4,
+            NULL, ?7, NULL, ?8, '{}'
+        )",
+        params![
+            id,
+            content,
+            ids::content_hash(
+                "personal",
+                "josh-personal",
+                None,
+                "preference",
+                "workspace",
+                id
+            ),
+            observed_at,
+            valid_from,
+            valid_until,
+            superseded_by,
+            temporal_state,
+        ],
+    )
+    .expect("insert temporal cli record");
 }
 
 fn normalize_card_markdown_snapshot(markdown: &str) -> String {
@@ -728,6 +783,110 @@ fn cli_recall_accepts_pack_mode_and_rejects_unknown_pack() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown pack_mode"));
+}
+
+#[test]
+fn cli_recall_supports_as_of_and_include_history_modes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    insert_temporal_cli_record(
+        &db,
+        "mem_cli_spaces",
+        "Indent with spaces in this workspace.",
+        "superseded",
+        Some("2026-01-01T00:00:00Z"),
+        Some("2026-04-01T00:00:00Z"),
+        "2026-01-01T00:00:00Z",
+        Some("mem_cli_tabs"),
+    );
+    insert_temporal_cli_record(
+        &db,
+        "mem_cli_tabs",
+        "Indent with tabs in this workspace.",
+        "current",
+        Some("2026-04-01T00:00:00Z"),
+        None,
+        "2026-04-01T00:00:00Z",
+        None,
+    );
+
+    let default_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "Indent",
+        ])
+        .output()
+        .unwrap();
+    assert!(default_output.status.success());
+    let default_recall: Value = serde_json::from_slice(&default_output.stdout).unwrap();
+    let default_ids: Vec<&str> = default_recall["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|fact| fact["id"].as_str())
+        .collect();
+    assert_eq!(default_ids, vec!["mem_cli_tabs"]);
+
+    let as_of_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "Indent",
+            "--as-of",
+            "2026-02-15T00:00:00Z",
+        ])
+        .output()
+        .unwrap();
+    assert!(as_of_output.status.success());
+    let as_of_recall: Value = serde_json::from_slice(&as_of_output.stdout).unwrap();
+    let as_of_ids: Vec<&str> = as_of_recall["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|fact| fact["id"].as_str())
+        .collect();
+    assert_eq!(as_of_ids, vec!["mem_cli_spaces"]);
+
+    let history_output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "recall",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--query",
+            "Indent",
+            "--include-history",
+        ])
+        .output()
+        .unwrap();
+    assert!(history_output.status.success());
+    let history_recall: Value = serde_json::from_slice(&history_output.stdout).unwrap();
+    let history_ids: BTreeSet<&str> = history_recall["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|fact| fact["id"].as_str())
+        .collect();
+    assert_eq!(
+        history_ids,
+        BTreeSet::from(["mem_cli_spaces", "mem_cli_tabs"])
+    );
 }
 
 #[test]

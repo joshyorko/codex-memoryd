@@ -22,6 +22,7 @@ This is the landed MVP surface today:
 | Native memory migration plan | documented | Phases native Codex memory from import/fallback toward optional `memoryd-canonical` mode. |
 | Subject / episode substrate | landed | Stable subjects, append-only episodes, and the evidence ledger are the core memory shape. |
 | Recall policy metadata | landed | `recall_not_authority`, ranking, admission, and provenance metadata travel with recall. |
+| `Temporal recall` | landed | Added `--as-of` and `--include-history` recall paths for as-of and historical inspection. |
 | Current-state cards | landed MVP | `workspace_summary`, `subject_summary`, `active_preferences`, `open_questions`, `recent_scars`, `procedures_index`. |
 | Context packs | landed MVP | `default`, `debugging`, `onboarding`, `planning`, `active_task`, `review`, and `personal_context` pack modes are supported. |
 | Adapter exports | landed | `agents-md`, `claude-code`, `copilot`, `github-instructions`, `mcp-json`, `mcp-pack`, `markdown`, and `markdown-wiki`. |
@@ -278,6 +279,14 @@ target/release/codex-memoryd recall --profile personal --workspace josh-personal
 target/release/codex-memoryd search --profile personal --workspace josh-personal \
   --query "safe dogfood"
 ```
+```bash
+target/release/codex-memoryd recall --profile personal --workspace josh-personal \
+  --query "What was my workspace preference on 2026-03-01?" \
+  --as-of "2026-03-01T00:00:00Z"
+target/release/codex-memoryd recall --profile personal --workspace josh-personal \
+  --query "How has this preference evolved?" \
+  --include-history
+```
 
 ### Cards and exports
 
@@ -418,6 +427,7 @@ operator polish rather than reopen the old stale snapshot.
 | `#84` | native Codex migration | landed migration plan, parity canaries, and duplicate-loop guardrails |
 | `#85` | dogfood heartbeat | landed Compose heartbeat rebuild/import/MCP canary script |
 | `#86` | README overhaul | landed refreshed first-run and substrate story |
+| `#155` | temporal records | landed temporal fields + RFC3339 as-of/history recall; schema bumped to 9 with migration marker `0010_temporal_records.sql`. |
 
 ## Related Docs
 

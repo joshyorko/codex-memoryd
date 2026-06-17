@@ -64,6 +64,8 @@ fn recall_req(profile: &str, workspace: &str, query: &str) -> RecallRequest {
         include_types: vec![],
         exclude_types: vec![],
         recency_days: None,
+        as_of: None,
+        include_history: false,
         metadata: None,
     }
 }

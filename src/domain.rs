@@ -212,6 +212,44 @@ impl Portability {
     }
 }
 
+/// Temporal lifecycle for memory records. Default `current` preserves legacy
+/// rows unless explicit temporal fields say otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalState {
+    Planned,
+    Current,
+    Completed,
+    Superseded,
+    Invalidated,
+    Historical,
+}
+
+impl TemporalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TemporalState::Planned => "planned",
+            TemporalState::Current => "current",
+            TemporalState::Completed => "completed",
+            TemporalState::Superseded => "superseded",
+            TemporalState::Invalidated => "invalidated",
+            TemporalState::Historical => "historical",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<TemporalState> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "planned" => Some(TemporalState::Planned),
+            "current" | "active" => Some(TemporalState::Current),
+            "completed" | "done" => Some(TemporalState::Completed),
+            "superseded" => Some(TemporalState::Superseded),
+            "invalidated" => Some(TemporalState::Invalidated),
+            "historical" | "history" => Some(TemporalState::Historical),
+            _ => None,
+        }
+    }
+}
+
 /// Normalized repository identity (SPEC §4.1.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RepoIdentity {
@@ -422,6 +460,19 @@ pub struct MemoryRecord {
     pub quarantined_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promoted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalidated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub historical_reason: Option<String>,
+    pub temporal_state: TemporalState,
     pub metadata: Value,
 }
 

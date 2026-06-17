@@ -449,3 +449,33 @@ fn reopening_current_database_is_idempotent() {
     assert_eq!(report_a.recorded_version, report_b.recorded_version);
     assert!(report_b.up_to_date);
 }
+
+#[test]
+fn upgrades_legacy_records_default_temporal_columns() {
+    // Legacy rows without temporal columns should back-fill to current and keep optional
+    // temporal metadata columns as NULL.
+    let dir = TempDir::new().unwrap();
+    let path = build_old_db(&dir, "temporal_default.db", |conn| {
+        conn.execute_batch(V1_MEMORY_RECORDS).unwrap();
+        seed_v1_record(
+            conn,
+            "mem_1",
+            "Temporal defaults should be back-filled.",
+            "hash-temporal-1",
+        );
+    });
+    let store = upgrade(&path);
+
+    let rec = store.get_record("mem_1").unwrap().unwrap();
+    assert_eq!(
+        rec.temporal_state,
+        codex_memoryd::domain::TemporalState::Current,
+        "legacy records must default temporal_state=current"
+    );
+    assert!(rec.valid_from.is_none());
+    assert!(rec.valid_until.is_none());
+    assert!(rec.observed_at.is_none());
+    assert!(rec.invalidated_at.is_none());
+    assert!(rec.superseded_by.is_none());
+    assert!(rec.historical_reason.is_none());
+}

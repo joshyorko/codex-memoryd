@@ -353,6 +353,8 @@ fn handle_tool_call(
                     include_types: vec![],
                     exclude_types: vec![],
                     recency_days: None,
+                    as_of: None,
+                    include_history: false,
                     metadata: None,
                 };
                 match service.recall(req) {

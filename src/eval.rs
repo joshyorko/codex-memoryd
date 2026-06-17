@@ -312,6 +312,8 @@ fn score_memoryd(service: &Service) -> Result<BaselineResult> {
             include_types: vec![],
             exclude_types: vec![],
             recency_days: None,
+            as_of: None,
+            include_history: false,
             metadata: None,
         })?;
         returned += recall.facts.len();
@@ -379,6 +381,8 @@ pub fn run_substrate_eval() -> Result<SubstrateEvalReport> {
         include_types: vec![],
         exclude_types: vec![],
         recency_days: None,
+        as_of: None,
+        include_history: false,
         metadata: None,
     })?;
     let recall_hit = recall

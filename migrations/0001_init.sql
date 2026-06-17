@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS memory_records (
     updated_at    TEXT NOT NULL,
     last_used_at  TEXT,
     archived      INTEGER NOT NULL DEFAULT 0,
+    valid_from    TEXT,
+    valid_until   TEXT,
+    observed_at   TEXT,
+    invalidated_at TEXT,
+    superseded_by TEXT,
+    historical_reason TEXT,
+    temporal_state TEXT NOT NULL DEFAULT 'current',
     metadata      TEXT NOT NULL DEFAULT '{}'
 );
 -- Content-hash dedupe is the idempotency guarantee for writes/imports.
