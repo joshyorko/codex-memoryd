@@ -25,6 +25,7 @@ pub mod error;
 pub mod eval;
 pub mod export;
 pub mod git_import;
+pub mod hybrid_retrieval;
 pub mod ids;
 pub mod ingest;
 pub mod mcp;

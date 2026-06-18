@@ -540,6 +540,19 @@ fn cli_eval_retrieval_emits_long_history_scores_and_summary() {
         .unwrap()
         .iter()
         .any(|b| b["name"] == "verbatim_evidence"));
+    let hybrid = report["hybrid_experiments"]
+        .as_array()
+        .expect("hybrid experiments array")
+        .iter()
+        .find(|item| item["name"] == "hybrid_sparse_fusion")
+        .expect("hybrid sparse fusion experiment");
+    assert_eq!(hybrid["enabled"], false);
+    assert_eq!(hybrid["baseline"], "memoryd_recall");
+    assert_eq!(hybrid["backend"], "local_sparse_hash");
+    assert_eq!(hybrid["dimensions"], 64);
+    assert_eq!(hybrid["fusion"], 60);
+    assert!(hybrid["estimated_storage_bytes"].as_u64().unwrap() > 0);
+    assert!(hybrid["recall_at_k"].as_f64().unwrap() >= 0.0);
     assert!(report["ranking_ablations"]
         .as_array()
         .unwrap()
@@ -567,6 +580,7 @@ fn cli_eval_retrieval_emits_long_history_scores_and_summary() {
         .stdout(predicate::str::contains("long-history questions: 6"))
         .stdout(predicate::str::contains("memoryd_recall"))
         .stdout(predicate::str::contains("relation_aware_recall"))
+        .stdout(predicate::str::contains("hybrid_sparse_fusion"))
         .stdout(predicate::str::contains("verbatim_evidence"))
         .stdout(predicate::str::contains("retrieval improvements"))
         .stdout(predicate::str::contains("next ranking changes"));

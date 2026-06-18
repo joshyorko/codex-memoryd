@@ -50,6 +50,13 @@ max_tokens = 1200
 # Maximum characters stored per memory record; longer content is truncated.
 max_record_chars = 8000
 
+[recall.hybrid]
+# Disabled by default. Local-only sparse-hash prototype for fixture evals.
+enabled = false
+backend = "local_sparse_hash"
+dims = 64
+fusion_k = 60
+
 [dream]
 # Off by default. For Docker Compose dogfood, set
 # CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED=1 before `docker compose up`.
