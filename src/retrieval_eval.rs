@@ -9,12 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::config::Config;
+use crate::config::{Config, HybridRecallConfig};
 use crate::domain::{
     Portability, RecordType, Relation, RepoIdentity, Scope, Sensitivity, Subject, SubjectAlias,
     SubjectKind,
 };
 use crate::error::{Error, Result};
+use crate::hybrid_retrieval;
 use crate::ids;
 use crate::protocol::{AdapterExportRequest, RecallRequest};
 use crate::service::Service;
@@ -117,6 +118,7 @@ pub struct RetrievalEvalReport {
     pub fixture_families: Vec<String>,
     pub question_count: usize,
     pub baselines: Vec<RetrievalBaselineResult>,
+    pub hybrid_experiments: Vec<HybridExperimentResult>,
     pub retrieval_improvements: Vec<RetrievalImprovement>,
     pub ranking_ablations: Vec<RankingAblationResult>,
     pub regression_fixtures: Vec<RegressionFixture>,
@@ -136,6 +138,29 @@ pub struct RetrievalBaselineResult {
     pub latency_estimate_units: usize,
     pub cross_profile_leak: bool,
     pub failed_queries: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HybridExperimentResult {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub enabled: bool,
+    pub baseline: &'static str,
+    pub backend: &'static str,
+    pub dimensions: usize,
+    pub fusion: usize,
+    pub recall_at_k: f64,
+    pub precision_at_k: f64,
+    pub evidence_coverage: f64,
+    pub context_bytes: usize,
+    pub estimated_tokens: usize,
+    pub estimated_storage_bytes: usize,
+    pub latency_estimate_units: usize,
+    pub cross_profile_leak: bool,
+    pub failed_queries: Vec<String>,
+    pub delta_recall_at_k: f64,
+    pub delta_precision_at_k: f64,
+    pub delta_evidence_coverage: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +241,11 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
         by_question: relation_aware_by_question,
         relation_evidence_by_question,
     } = score_relation_aware_recall(&service, &fixture)?;
+    let hybrid_experiments = vec![score_hybrid_sparse_fusion(
+        &fixture,
+        &memoryd_baseline,
+        &memoryd_by_question,
+    )];
     let baselines = vec![
         score_raw_chronological(&fixture),
         score_keyword(&fixture),
@@ -321,6 +351,7 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
         fixture_families: fixture_families(&fixture),
         question_count: fixture.questions.len(),
         baselines,
+        hybrid_experiments,
         retrieval_improvements,
         ranking_ablations,
         regression_fixtures,
@@ -328,7 +359,8 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
         notes: vec![
             "fixture-only deterministic scores; no external service calls",
             "recall_not_authority remains intact; eval output is measurement, not authority",
-            "no graph, embeddings, or benchmark superiority claim in this MVP",
+            "no graph, mandatory embeddings, or benchmark superiority claim in this MVP",
+            "hybrid experiment is eval-only and does not alter default recall admission",
         ],
     })
 }
@@ -352,6 +384,27 @@ pub fn render_retrieval_summary(report: &RetrievalEvalReport) -> String {
             baseline.estimated_tokens,
             baseline.failed_queries.len()
         ));
+    }
+    out.push_str("\nhybrid experiments\n");
+    if report.hybrid_experiments.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for experiment in &report.hybrid_experiments {
+            out.push_str(&format!(
+                "- {} enabled={} backend={} dims={} fusion={} recall@k {:.2} prec@k {:.2} coverage {:.2} tokens {} storage {} failures {}\n",
+                experiment.name,
+                experiment.enabled,
+                experiment.backend,
+                experiment.dimensions,
+                experiment.fusion,
+                experiment.recall_at_k,
+                experiment.precision_at_k,
+                experiment.evidence_coverage,
+                experiment.estimated_tokens,
+                experiment.estimated_storage_bytes,
+                experiment.failed_queries.len()
+            ));
+        }
     }
     out.push_str("\nretrieval improvements\n");
     if report.retrieval_improvements.is_empty() {
@@ -932,6 +985,86 @@ fn score_precomputed(
         latency_estimate_units,
         cross_profile_leak,
         failed_queries,
+    }
+}
+
+fn score_hybrid_sparse_fusion(
+    fixture: &RetrievalFixture,
+    memoryd_baseline: &RetrievalBaselineResult,
+    memoryd_by_question: &BTreeMap<String, Vec<RetrievedItem>>,
+) -> HybridExperimentResult {
+    let hybrid_config = HybridRecallConfig::default();
+    let record_embeddings = fixture
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.id.clone(),
+                hybrid_retrieval::embed_sparse_hash(&record.content, hybrid_config.dims),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut by_question = BTreeMap::new();
+    let estimated_storage_bytes =
+        hybrid_retrieval::estimated_storage_bytes(fixture.records.len(), hybrid_config.dims);
+
+    for question in &fixture.questions {
+        let empty = Vec::new();
+        let memoryd_items = memoryd_by_question.get(&question.id).unwrap_or(&empty);
+        let memoryd_ranking = memoryd_items
+            .iter()
+            .filter_map(|item| item.fixture_id.clone())
+            .collect::<Vec<_>>();
+        let vector_ranking = hybrid_retrieval::rank_sparse_hash_with_embeddings(
+            &hybrid_retrieval::embed_sparse_hash(&question.query, hybrid_config.dims),
+            &record_embeddings,
+        );
+        let fused_ranking = hybrid_retrieval::reciprocal_rank_fusion(
+            &[memoryd_ranking, vector_ranking],
+            hybrid_config.fusion_k,
+        );
+        let items = fused_ranking
+            .into_iter()
+            .take(TOP_K)
+            .filter_map(|fixture_id| {
+                fixture
+                    .records
+                    .iter()
+                    .find(|record| record.id == fixture_id)
+                    .map(record_item)
+            })
+            .collect::<Vec<_>>();
+        by_question.insert(question.id.clone(), items);
+    }
+
+    let fused = score_precomputed(
+        "hybrid_sparse_fusion",
+        "current recall fused with local sparse-hash candidates via reciprocal-rank fusion",
+        fixture,
+        by_question,
+    );
+
+    HybridExperimentResult {
+        name: "hybrid_sparse_fusion",
+        description:
+            "current recall fused with local sparse-hash candidates via reciprocal-rank fusion",
+        enabled: hybrid_config.enabled,
+        baseline: memoryd_baseline.name,
+        backend: hybrid_retrieval::DEFAULT_HYBRID_BACKEND,
+        dimensions: hybrid_config.dims,
+        fusion: hybrid_config.fusion_k,
+        recall_at_k: fused.recall_at_k,
+        precision_at_k: fused.precision_at_k,
+        evidence_coverage: fused.evidence_coverage,
+        context_bytes: fused.context_bytes,
+        estimated_tokens: fused.estimated_tokens,
+        estimated_storage_bytes,
+        latency_estimate_units: fused.latency_estimate_units,
+        cross_profile_leak: fused.cross_profile_leak,
+        failed_queries: fused.failed_queries,
+        delta_recall_at_k: fused.recall_at_k - memoryd_baseline.recall_at_k,
+        delta_precision_at_k: fused.precision_at_k - memoryd_baseline.precision_at_k,
+        delta_evidence_coverage: fused.evidence_coverage - memoryd_baseline.evidence_coverage,
     }
 }
 

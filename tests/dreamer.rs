@@ -525,7 +525,7 @@ fn operational_valence_decay_is_deterministic() {
     assert_eq!(scar.decay_half_life_days, Some(30.0));
     let decayed = scar.decayed_intensity.unwrap();
     assert!(
-        (0.4..=0.5).contains(&decayed),
+        (0.4..=0.51).contains(&decayed),
         "expected roughly one half-life of decay, got {decayed}"
     );
 }

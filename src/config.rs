@@ -10,6 +10,9 @@ use std::path::PathBuf;
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::hybrid_retrieval::{
+    DEFAULT_HYBRID_BACKEND, DEFAULT_HYBRID_DIMS, DEFAULT_HYBRID_FUSION_K,
+};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_MAX_RECALL_TOKENS: usize = 1200;
@@ -55,6 +58,16 @@ pub struct PolicySection {
 pub struct RecallSection {
     pub max_tokens: Option<usize>,
     pub max_record_chars: Option<usize>,
+    #[serde(default)]
+    pub hybrid: HybridRecallSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HybridRecallSection {
+    pub enabled: Option<bool>,
+    pub backend: Option<String>,
+    pub dims: Option<usize>,
+    pub fusion_k: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,6 +94,43 @@ pub struct DreamSchedulerConfig {
     pub max_runtime_seconds: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct HybridRecallConfig {
+    pub enabled: bool,
+    pub backend: String,
+    pub dims: usize,
+    pub fusion_k: usize,
+}
+
+impl Default for HybridRecallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: DEFAULT_HYBRID_BACKEND.to_string(),
+            dims: DEFAULT_HYBRID_DIMS,
+            fusion_k: DEFAULT_HYBRID_FUSION_K,
+        }
+    }
+}
+
+impl HybridRecallConfig {
+    fn validate(&self) -> Result<()> {
+        if self.dims == 0 {
+            return Err(Error::invalid_request("recall.hybrid.dims must be > 0"));
+        }
+        if self.fusion_k == 0 {
+            return Err(Error::invalid_request("recall.hybrid.fusion_k must be > 0"));
+        }
+        if self.backend != DEFAULT_HYBRID_BACKEND {
+            return Err(Error::invalid_request(format!(
+                "unsupported recall.hybrid.backend '{}' (only '{}' supported)",
+                self.backend, DEFAULT_HYBRID_BACKEND
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LogSection {
     pub level: Option<String>,
@@ -98,6 +148,7 @@ pub struct Config {
     pub cross_profile_policy: String,
     pub max_recall_tokens: usize,
     pub max_record_chars: usize,
+    pub hybrid_recall: HybridRecallConfig,
     pub dream_scheduler: DreamSchedulerConfig,
     pub log_level: String,
     pub log_format: String,
@@ -121,6 +172,7 @@ impl Default for Config {
             cross_profile_policy: "default_deny".to_string(),
             max_recall_tokens: DEFAULT_MAX_RECALL_TOKENS,
             max_record_chars: DEFAULT_MAX_RECORD_CHARS,
+            hybrid_recall: HybridRecallConfig::default(),
             dream_scheduler: DreamSchedulerConfig {
                 enabled: false,
                 interval_seconds: 3600,
@@ -236,6 +288,7 @@ impl Config {
             }
         }
         apply_dream_env(&mut config)?;
+        apply_hybrid_env(&mut config)?;
         // Opt-in operator declaration that a non-loopback process bind is fronted
         // by a loopback-only publish (e.g. Docker `127.0.0.1:8787->8787`). Accepts
         // 1/true/yes. Default off — only honored when explicitly set.
@@ -289,6 +342,18 @@ impl Config {
         }
         if let Some(c) = file.recall.max_record_chars {
             self.max_record_chars = c;
+        }
+        if let Some(enabled) = file.recall.hybrid.enabled {
+            self.hybrid_recall.enabled = enabled;
+        }
+        if let Some(backend) = file.recall.hybrid.backend {
+            self.hybrid_recall.backend = backend;
+        }
+        if let Some(dims) = file.recall.hybrid.dims {
+            self.hybrid_recall.dims = dims;
+        }
+        if let Some(fusion_k) = file.recall.hybrid.fusion_k {
+            self.hybrid_recall.fusion_k = fusion_k;
         }
         if let Some(enabled) = file.dream.scheduler_enabled {
             self.dream_scheduler.enabled = enabled;
@@ -346,6 +411,7 @@ impl Config {
         if self.dream_scheduler.max_batch_size == 0 {
             return Err(Error::invalid_request("dream.max_batch_size must be > 0"));
         }
+        self.hybrid_recall.validate()?;
         Ok(())
     }
 
@@ -483,6 +549,38 @@ where
     Ok(())
 }
 
+fn apply_hybrid_env(config: &mut Config) -> Result<()> {
+    apply_hybrid_env_from(config, env_value)
+}
+
+fn apply_hybrid_env_from<F>(config: &mut Config, get: F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(enabled) = parse_bool_value(
+        "CODEX_MEMORYD_RECALL_HYBRID_ENABLED",
+        get("CODEX_MEMORYD_RECALL_HYBRID_ENABLED").and_then(clean_env_value),
+    )? {
+        config.hybrid_recall.enabled = enabled;
+    }
+    if let Some(backend) = get("CODEX_MEMORYD_RECALL_HYBRID_BACKEND").and_then(clean_env_value) {
+        config.hybrid_recall.backend = backend;
+    }
+    if let Some(dims) = parse_usize_value(
+        "CODEX_MEMORYD_RECALL_HYBRID_DIMS",
+        get("CODEX_MEMORYD_RECALL_HYBRID_DIMS").and_then(clean_env_value),
+    )? {
+        config.hybrid_recall.dims = dims;
+    }
+    if let Some(fusion_k) = parse_usize_value(
+        "CODEX_MEMORYD_RECALL_HYBRID_FUSION_K",
+        get("CODEX_MEMORYD_RECALL_HYBRID_FUSION_K").and_then(clean_env_value),
+    )? {
+        config.hybrid_recall.fusion_k = fusion_k;
+    }
+    Ok(())
+}
+
 fn bind_host(bind: &str) -> Option<String> {
     if let Ok(addr) = bind.parse::<SocketAddr>() {
         return Some(match addr {
@@ -510,6 +608,10 @@ mod tests {
         cfg.validate().expect("defaults must validate");
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.cross_profile_policy, "default_deny");
+        assert!(!cfg.hybrid_recall.enabled);
+        assert_eq!(cfg.hybrid_recall.backend, DEFAULT_HYBRID_BACKEND);
+        assert_eq!(cfg.hybrid_recall.dims, DEFAULT_HYBRID_DIMS);
+        assert_eq!(cfg.hybrid_recall.fusion_k, DEFAULT_HYBRID_FUSION_K);
     }
 
     #[test]
@@ -611,5 +713,42 @@ mod tests {
         assert!(err
             .to_string()
             .contains("CODEX_MEMORYD_DREAM_MAX_CANDIDATES"));
+    }
+
+    #[test]
+    fn recall_hybrid_file_config_can_enable() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[recall.hybrid]
+enabled = true
+backend = "local_sparse_hash"
+dims = 128
+fusion_k = 42
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        assert!(cfg.hybrid_recall.enabled);
+        assert_eq!(cfg.hybrid_recall.backend, DEFAULT_HYBRID_BACKEND);
+        assert_eq!(cfg.hybrid_recall.dims, 128);
+        assert_eq!(cfg.hybrid_recall.fusion_k, 42);
+    }
+
+    #[test]
+    fn recall_hybrid_env_can_enable() {
+        let mut cfg = Config::default();
+        apply_hybrid_env_from(&mut cfg, |key| match key {
+            "CODEX_MEMORYD_RECALL_HYBRID_ENABLED" => Some("1".to_string()),
+            "CODEX_MEMORYD_RECALL_HYBRID_BACKEND" => Some(DEFAULT_HYBRID_BACKEND.to_string()),
+            "CODEX_MEMORYD_RECALL_HYBRID_DIMS" => Some("96".to_string()),
+            "CODEX_MEMORYD_RECALL_HYBRID_FUSION_K" => Some("77".to_string()),
+            _ => None,
+        })
+        .expect("apply env");
+        assert!(cfg.hybrid_recall.enabled);
+        assert_eq!(cfg.hybrid_recall.backend, DEFAULT_HYBRID_BACKEND);
+        assert_eq!(cfg.hybrid_recall.dims, 96);
+        assert_eq!(cfg.hybrid_recall.fusion_k, 77);
     }
 }
