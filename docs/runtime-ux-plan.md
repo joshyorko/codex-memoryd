@@ -1,6 +1,24 @@
 # Runtime UX plan: paths/status inventory and Codex MCP setup (#184, #181, #175, #183)
 
-Status: first-wave plan. The recommended first implementation is read-only path inventory; Codex config mutation and adjacent app lanes should follow in separate PRs.
+Status: first-wave implementation started for the read-only path inventory; Codex config mutation and adjacent app lanes should follow in separate PRs.
+
+## Implementation log for #184
+
+Plan:
+
+1. Reuse `RuntimeOptions::resolve` and existing default config path helpers for all reported runtime paths and endpoints.
+2. Add a read-only top-level `paths` command with stable `summary` and `json` formats.
+3. Keep the command filesystem-read-only: resolve paths, check existence, and print inventory without loading/opening the store or creating runtime directories/files.
+4. Extend CLI smoke coverage for temp homes/configs and no-create behavior.
+
+Example usage:
+
+```bash
+codex-memoryd paths --format summary
+codex-memoryd paths --format json
+```
+
+The JSON output contains top-level `runtime_kind`, `url`, `bind`, `host`, `port`, and an `entries` object for `config_file`, `runtime_home`, `database`, `runtime_env`, `pid_file`, `log_file`, `backups_dir`, `exports_dir`, and `codex_memories_dir`. Each entry reports `path` or `value`, `kind`, `durability`, `exists`, and `owner`.
 
 ## Current surface
 
