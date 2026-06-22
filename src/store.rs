@@ -245,6 +245,36 @@ pub struct Store {
     degraded_reasons: Vec<String>,
 }
 
+/// Storage engine family used by the durable store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBackendKind {
+    /// The current local SQLite backend driven through `rusqlite`.
+    Sqlite,
+}
+
+/// Search implementation currently available for the durable store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageSearchMode {
+    /// SQLite FTS5 virtual tables are available.
+    Fts5,
+    /// FTS5 is unavailable; search falls back to bounded `LIKE` queries.
+    LikeFallback,
+}
+
+/// Description-only storage backend capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBackendInfo {
+    pub kind: StorageBackendKind,
+    pub driver: &'static str,
+    pub local: bool,
+    pub remote: bool,
+    pub writable: bool,
+    pub search_mode: StorageSearchMode,
+    pub backup_supported: bool,
+    pub sync_supported: bool,
+    pub degraded_reasons: Vec<String>,
+}
+
 impl Store {
     /// Open (or create) the SQLite store at `path`, run migrations, and probe
     /// FTS5. An in-memory store is created when `path` is `:memory:`.
@@ -369,6 +399,24 @@ impl Store {
     }
 
     /// Check the storage is writable by running a trivial transaction.
+    pub fn backend_info(&self) -> StorageBackendInfo {
+        StorageBackendInfo {
+            kind: StorageBackendKind::Sqlite,
+            driver: "rusqlite",
+            local: true,
+            remote: false,
+            writable: self.writable(),
+            search_mode: if self.fts_enabled {
+                StorageSearchMode::Fts5
+            } else {
+                StorageSearchMode::LikeFallback
+            },
+            backup_supported: true,
+            sync_supported: false,
+            degraded_reasons: self.degraded_reasons.clone(),
+        }
+    }
+
     pub fn writable(&self) -> bool {
         let Ok(conn) = self.conn() else {
             return false;
@@ -3763,6 +3811,29 @@ mod tests {
 
     fn mem_store() -> Store {
         Store::open(":memory:").expect("open in-memory store")
+    }
+
+    #[test]
+    fn backend_info_describes_current_sqlite_rusqlite_backend() {
+        let store = mem_store();
+        let info = store.backend_info();
+
+        assert_eq!(info.kind, StorageBackendKind::Sqlite);
+        assert_eq!(info.driver, "rusqlite");
+        assert!(info.local);
+        assert!(!info.remote);
+        assert!(info.writable);
+        assert!(matches!(
+            info.search_mode,
+            StorageSearchMode::Fts5 | StorageSearchMode::LikeFallback
+        ));
+        assert_eq!(
+            info.search_mode == StorageSearchMode::Fts5,
+            store.fts_enabled()
+        );
+        assert!(info.backup_supported);
+        assert!(!info.sync_supported);
+        assert_eq!(info.degraded_reasons.as_slice(), store.degraded_reasons());
     }
 
     fn sample_record(content: &str) -> NewRecord {
