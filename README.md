@@ -329,7 +329,7 @@ Installable adapter package templates live under [`adapters/`](./adapters/).
 They are thin host-specific wrappers around `codex-memoryd` and default to
 read-only operation:
 
-- `adapters/codex-mcp`: Codex `~/.codex/config.toml` MCP snippet.
+- `adapters/codex-mcp`: Codex MCP config snippet plus wizard reference.
 - `adapters/claude-local`: Claude-style local MCP server JSON snippet.
 - `adapters/copilot-instructions`: Copilot instructions export wrapper.
 - `adapters/generic-mcp-markdown`: generic MCP plus `AGENTS.md` and
@@ -338,6 +338,14 @@ read-only operation:
 Each package includes `.env.example`, install steps, verify commands, and
 uninstall notes. The packages do not duplicate memory logic; they call
 `codex-memoryd mcp stdio --read-only` or `codex-memoryd adapter export`.
+For Codex specifically, the preferred setup path is now:
+
+```bash
+codex-memoryd mcp codex preview
+codex-memoryd mcp codex apply
+codex-memoryd mcp codex status
+codex-memoryd mcp codex remove
+```
 
 ### Git evidence import
 
@@ -367,8 +375,8 @@ target/release/codex-memoryd --db .dogfood/mcp-sandbox-memory.db mcp stdio --rea
 ```
 
 The server exposes only `memory_status`, `memory_recall`, and `memory_search`.
-See [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md) for the exact
-`~/.codex/config.toml` snippet and smoke checks.
+See [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md) for the wizard flow,
+generated `~/.codex/config.toml` snippet, and smoke checks.
 
 The write-capable tier is intentionally opt-in:
 
