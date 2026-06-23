@@ -4036,6 +4036,93 @@ fn cli_url_client_mode_routes_daily_commands_to_daemon() {
 }
 
 #[test]
+fn cli_paths_json_reports_expected_keys_without_creating_runtime_files() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    let config = dir.path().join("missing-config.toml");
+
+    let output = bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .arg("--config")
+        .arg(&config)
+        .args(["paths", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["runtime_kind"], "native");
+    assert_eq!(json["url"]["kind"], "endpoint");
+    assert_eq!(json["bind"]["kind"], "endpoint");
+    assert_eq!(json["host"], "127.0.0.1");
+    assert_eq!(json["port"], 8787);
+    for key in [
+        "config_file",
+        "runtime_home",
+        "database",
+        "runtime_env",
+        "pid_file",
+        "log_file",
+        "backups_dir",
+        "exports_dir",
+        "codex_memories_dir",
+    ] {
+        assert!(json["entries"].get(key).is_some(), "missing {key}");
+        assert!(
+            json["entries"][key].get("path").is_some(),
+            "missing path for {key}"
+        );
+        assert!(
+            json["entries"][key].get("kind").is_some(),
+            "missing kind for {key}"
+        );
+        assert!(
+            json["entries"][key].get("durability").is_some(),
+            "missing durability for {key}"
+        );
+        assert!(
+            json["entries"][key].get("exists").is_some(),
+            "missing exists for {key}"
+        );
+        assert!(
+            json["entries"][key].get("owner").is_some(),
+            "missing owner for {key}"
+        );
+    }
+
+    assert!(!home.exists(), "paths command must not create runtime home");
+    assert!(
+        !config.exists(),
+        "paths command must not create config file"
+    );
+}
+
+#[test]
+fn cli_paths_summary_reports_resolved_runtime_values() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+
+    bin()
+        .env("CODEX_MEMORYD_HOME", &home)
+        .env("CODEX_MEMORYD_PORT", "8989")
+        .args(["paths", "--format", "summary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex-memoryd runtime paths"))
+        .stdout(predicate::str::contains("runtime_kind: native"))
+        .stdout(predicate::str::contains("url: http://127.0.0.1:8989"))
+        .stdout(predicate::str::contains("host: 127.0.0.1"))
+        .stdout(predicate::str::contains("port: 8989"))
+        .stdout(predicate::str::contains("config_file:"))
+        .stdout(predicate::str::contains("database:"))
+        .stdout(predicate::str::contains("codex_memories_dir:"));
+
+    assert!(!home.exists(), "paths summary must not create runtime home");
+}
+
+#[test]
 fn cli_init_is_idempotent_for_product_runtime_home() {
     let dir = TempDir::new().unwrap();
     let home = dir.path().join("memoryd-home");

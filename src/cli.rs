@@ -3,10 +3,12 @@
 //! `sync-local`, `export`, and `forget` exercise identical code paths. `serve`
 //! launches the daemon; `doctor` runs self-checks.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+use serde::Serialize;
 use serde_json::json;
 
 use codex_memoryd::config::CliOverrides;
@@ -110,6 +112,11 @@ pub enum Command {
     },
     /// Print provider status as JSON.
     Status,
+    /// Inspect resolved runtime paths and endpoints without mutating state.
+    Paths {
+        #[arg(long, default_value = "summary")]
+        format: PathsFormat,
+    },
     /// Recall task-relevant memory.
     Recall {
         #[arg(long)]
@@ -322,6 +329,34 @@ pub enum DreamAction {
     Enable,
     Disable,
     Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PathsFormat {
+    Summary,
+    Json,
+}
+
+#[derive(Debug, Serialize)]
+struct PathsInventory {
+    runtime_kind: String,
+    url: InventoryEntry,
+    bind: InventoryEntry,
+    host: String,
+    port: u16,
+    entries: BTreeMap<String, InventoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct InventoryEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    kind: &'static str,
+    durability: &'static str,
+    exists: bool,
+    owner: &'static str,
 }
 
 #[derive(Subcommand, Debug)]
@@ -790,6 +825,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 | Command::Logs { .. }
                 | Command::Restart
                 | Command::Upgrade
+                | Command::Paths { .. }
         )
     {
         return Err(error::Error::invalid_request(
@@ -887,6 +923,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                 print_json(&report)?;
             }
             Ok(())
+        }
+        Command::Paths { format } => {
+            let inventory = paths_inventory(&cli);
+            match format {
+                PathsFormat::Json => print_json(&inventory),
+                PathsFormat::Summary => {
+                    print_paths_summary(&inventory);
+                    Ok(())
+                }
+            }
         }
         Command::Patch { command } => {
             let service = cli.open_service(None)?;
@@ -2011,6 +2057,144 @@ fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<
     }
 
     std::fs::write(path, format!("{}\n", out.join("\n"))).map_err(error::Error::from)
+}
+
+fn paths_inventory(cli: &Cli) -> PathsInventory {
+    let runtime = cli.runtime_options();
+    let config_file = cli
+        .config
+        .clone()
+        .unwrap_or_else(codex_memoryd::config::default_config_path);
+    let runtime_env = runtime.home.join("runtime.env");
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        "config_file".to_string(),
+        path_entry(config_file, "file", "durable", "codex-memoryd"),
+    );
+    entries.insert(
+        "runtime_home".to_string(),
+        path_entry(runtime.home.clone(), "dir", "durable", "codex-memoryd"),
+    );
+    entries.insert(
+        "database".to_string(),
+        path_entry(runtime.db.clone(), "file", "durable", "codex-memoryd"),
+    );
+    entries.insert(
+        "runtime_env".to_string(),
+        path_entry(runtime_env, "file", "generated", "codex-memoryd"),
+    );
+    entries.insert(
+        "pid_file".to_string(),
+        path_entry(
+            runtime.pid_file.clone(),
+            "file",
+            "ephemeral",
+            "codex-memoryd",
+        ),
+    );
+    entries.insert(
+        "log_file".to_string(),
+        path_entry(
+            runtime.log_file.clone(),
+            "file",
+            "ephemeral",
+            "codex-memoryd",
+        ),
+    );
+    entries.insert(
+        "backups_dir".to_string(),
+        path_entry(
+            runtime.home.join("backups"),
+            "dir",
+            "durable",
+            "codex-memoryd",
+        ),
+    );
+    entries.insert(
+        "exports_dir".to_string(),
+        path_entry(
+            runtime.home.join("exports"),
+            "dir",
+            "generated",
+            "codex-memoryd",
+        ),
+    );
+    entries.insert(
+        "codex_memories_dir".to_string(),
+        path_entry(
+            runtime.codex_memories_dir.clone(),
+            "external",
+            "external",
+            "external",
+        ),
+    );
+
+    PathsInventory {
+        runtime_kind: format!("{:?}", runtime.runtime).to_ascii_lowercase(),
+        url: endpoint_entry(runtime.url),
+        bind: endpoint_entry(runtime.bind),
+        host: runtime.host,
+        port: runtime.port,
+        entries,
+    }
+}
+
+fn path_entry(
+    path: PathBuf,
+    kind: &'static str,
+    durability: &'static str,
+    owner: &'static str,
+) -> InventoryEntry {
+    let exists = path.exists();
+    InventoryEntry {
+        path: Some(path.display().to_string()),
+        value: None,
+        kind,
+        durability,
+        exists,
+        owner,
+    }
+}
+
+fn endpoint_entry(value: String) -> InventoryEntry {
+    InventoryEntry {
+        path: None,
+        value: Some(value),
+        kind: "endpoint",
+        durability: "external",
+        exists: true,
+        owner: "codex-memoryd",
+    }
+}
+
+fn print_paths_summary(inventory: &PathsInventory) {
+    println!("codex-memoryd runtime paths");
+    println!("runtime_kind: {}", inventory.runtime_kind);
+    println!(
+        "url: {}",
+        inventory.url.value.as_deref().unwrap_or_default()
+    );
+    println!(
+        "bind: {}",
+        inventory.bind.value.as_deref().unwrap_or_default()
+    );
+    println!("host: {}", inventory.host);
+    println!("port: {}", inventory.port);
+    for (name, entry) in &inventory.entries {
+        let target = entry
+            .path
+            .as_deref()
+            .or(entry.value.as_deref())
+            .unwrap_or_default();
+        println!(
+            "{name}: {target} [{kind}, {durability}, exists={exists}, owner={owner}]",
+            kind = entry.kind,
+            durability = entry.durability,
+            exists = entry.exists,
+            owner = entry.owner
+        );
+    }
 }
 
 fn runtime_decision(runtime: RuntimeKind) -> &'static str {
