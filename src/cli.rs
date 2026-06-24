@@ -4,6 +4,7 @@
 //! launches the daemon; `doctor` runs self-checks.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -396,6 +397,26 @@ pub enum McpCommand {
         #[arg(long, conflicts_with = "read_only")]
         write_tools: bool,
     },
+    /// Manage the owned Codex MCP config block.
+    Codex {
+        #[command(subcommand)]
+        command: CodexMcpCommand,
+        /// Override the target Codex config file.
+        #[arg(long, value_name = "FILE")]
+        codex_config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum CodexMcpCommand {
+    /// Show the managed MCP snippet without writing.
+    Preview,
+    /// Create or repair the managed MCP block.
+    Apply,
+    /// Inspect whether the managed MCP block is installed and matches the desired snippet.
+    Status,
+    /// Remove only the managed MCP block.
+    Remove,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1921,8 +1942,259 @@ fn dispatch(cli: Cli) -> Result<()> {
                 mcp::run_stdio(service, *write_tools)?;
                 Ok(())
             }
+            McpCommand::Codex {
+                command,
+                codex_config,
+            } => {
+                let report = manage_codex_mcp_config(
+                    &cli.runtime_options(),
+                    *command,
+                    codex_config.as_deref(),
+                )?;
+                print_json(&report)?;
+                Ok(())
+            }
         },
     }
+}
+
+const CODEX_MCP_SERVER_NAME: &str = "codex_memoryd";
+const CODEX_MCP_SECTION_HEADER: &str = "[mcp_servers.codex_memoryd]";
+const CODEX_MCP_READ_ONLY_TOOLS: &[&str] = &["memory_status", "memory_recall", "memory_search"];
+
+#[derive(Debug, Serialize)]
+struct CodexMcpConfigReport {
+    mode: &'static str,
+    status: &'static str,
+    changed: bool,
+    config_file: String,
+    config_exists: bool,
+    server_name: &'static str,
+    backup_file: Option<String>,
+    snippet: String,
+    resolved: CodexMcpResolved,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexMcpResolved {
+    command: String,
+    args: Vec<String>,
+    enabled_tools: Vec<&'static str>,
+    default_tools_approval_mode: &'static str,
+    startup_timeout_sec: u16,
+    tool_timeout_sec: u16,
+}
+
+fn manage_codex_mcp_config(
+    runtime: &RuntimeOptions,
+    command: CodexMcpCommand,
+    codex_config_override: Option<&Path>,
+) -> Result<CodexMcpConfigReport> {
+    let config_path = codex_config_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_codex_config_path);
+    let desired = render_codex_mcp_snippet(runtime);
+    let raw = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let config_exists = config_path.exists();
+    let section = find_codex_mcp_section(&raw);
+    let matches_desired = section
+        .as_ref()
+        .is_some_and(|(start, end)| raw[*start..*end].trim_end() == desired.trim_end());
+    let resolved = codex_mcp_resolved(runtime);
+    let status = match (section.is_some(), matches_desired) {
+        (false, _) => "missing",
+        (true, true) => "managed",
+        (true, false) => "drifted",
+    };
+
+    match command {
+        CodexMcpCommand::Preview | CodexMcpCommand::Status => Ok(CodexMcpConfigReport {
+            mode: match command {
+                CodexMcpCommand::Preview => "preview",
+                CodexMcpCommand::Status => "status",
+                _ => unreachable!(),
+            },
+            status,
+            changed: !matches_desired,
+            config_file: config_path.display().to_string(),
+            config_exists,
+            server_name: CODEX_MCP_SERVER_NAME,
+            backup_file: None,
+            snippet: desired,
+            resolved,
+        }),
+        CodexMcpCommand::Apply => {
+            if matches_desired {
+                return Ok(CodexMcpConfigReport {
+                    mode: "apply",
+                    status: "managed",
+                    changed: false,
+                    config_file: config_path.display().to_string(),
+                    config_exists,
+                    server_name: CODEX_MCP_SERVER_NAME,
+                    backup_file: None,
+                    snippet: desired,
+                    resolved,
+                });
+            }
+
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent).map_err(error::Error::from)?;
+            }
+            let next = upsert_codex_mcp_section(&raw, &desired);
+            let backup_file = if config_exists {
+                Some(backup_file_for(&config_path)?)
+            } else {
+                None
+            };
+            std::fs::write(&config_path, next).map_err(error::Error::from)?;
+
+            Ok(CodexMcpConfigReport {
+                mode: "apply",
+                status: if section.is_some() {
+                    "updated"
+                } else {
+                    "created"
+                },
+                changed: true,
+                config_file: config_path.display().to_string(),
+                config_exists,
+                server_name: CODEX_MCP_SERVER_NAME,
+                backup_file: backup_file.map(|path| path.display().to_string()),
+                snippet: desired,
+                resolved,
+            })
+        }
+        CodexMcpCommand::Remove => {
+            let Some(next) = remove_codex_mcp_section(&raw) else {
+                return Ok(CodexMcpConfigReport {
+                    mode: "remove",
+                    status: "absent",
+                    changed: false,
+                    config_file: config_path.display().to_string(),
+                    config_exists,
+                    server_name: CODEX_MCP_SERVER_NAME,
+                    backup_file: None,
+                    snippet: desired,
+                    resolved,
+                });
+            };
+
+            let backup_file = backup_file_for(&config_path)?;
+            std::fs::write(&config_path, next).map_err(error::Error::from)?;
+            Ok(CodexMcpConfigReport {
+                mode: "remove",
+                status: "removed",
+                changed: true,
+                config_file: config_path.display().to_string(),
+                config_exists,
+                server_name: CODEX_MCP_SERVER_NAME,
+                backup_file: Some(backup_file.display().to_string()),
+                snippet: desired,
+                resolved,
+            })
+        }
+    }
+}
+
+fn codex_mcp_resolved(runtime: &RuntimeOptions) -> CodexMcpResolved {
+    CodexMcpResolved {
+        command: runtime.binary.display().to_string(),
+        args: vec![
+            "--db".to_string(),
+            runtime.db.display().to_string(),
+            "mcp".to_string(),
+            "stdio".to_string(),
+            "--read-only".to_string(),
+        ],
+        enabled_tools: CODEX_MCP_READ_ONLY_TOOLS.to_vec(),
+        default_tools_approval_mode: "approve",
+        startup_timeout_sec: 30,
+        tool_timeout_sec: 30,
+    }
+}
+
+fn render_codex_mcp_snippet(runtime: &RuntimeOptions) -> String {
+    format!(
+        "{header}\ncommand = {command:?}\nargs = [\"--db\", {db:?}, \"mcp\", \"stdio\", \"--read-only\"]\nenabled_tools = [\"memory_status\", \"memory_recall\", \"memory_search\"]\ndefault_tools_approval_mode = \"approve\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 30\n",
+        header = CODEX_MCP_SECTION_HEADER,
+        command = runtime.binary.display().to_string(),
+        db = runtime.db.display().to_string(),
+    )
+}
+
+fn default_codex_config_path() -> PathBuf {
+    let codex_home = std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| codex_memoryd::config::expand_path(&value))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codex")
+        });
+    codex_home.join("config.toml")
+}
+
+fn find_codex_mcp_section(raw: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    let mut start = None;
+
+    for line in raw.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(section_start) = start {
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                return Some((section_start, offset));
+            }
+        } else if trimmed == CODEX_MCP_SECTION_HEADER {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+
+    start.map(|section_start| (section_start, raw.len()))
+}
+
+fn upsert_codex_mcp_section(raw: &str, desired: &str) -> String {
+    if let Some((start, end)) = find_codex_mcp_section(raw) {
+        let mut out = String::with_capacity(raw.len() + desired.len());
+        out.push_str(&raw[..start]);
+        out.push_str(desired);
+        out.push_str(&raw[end..]);
+        return out;
+    }
+
+    let mut out = raw.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(desired);
+    out
+}
+
+fn remove_codex_mcp_section(raw: &str) -> Option<String> {
+    let (start, end) = find_codex_mcp_section(raw)?;
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..start]);
+    out.push_str(&raw[end..]);
+    Some(out)
+}
+
+fn backup_file_for(path: &Path) -> Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| error::Error::invalid_request("invalid Codex config file name"))?;
+    let backup = path.with_file_name(format!("{file_name}.bak.{stamp}"));
+    std::fs::copy(path, &backup).map_err(error::Error::from)?;
+    Ok(backup)
 }
 
 /// Read markdown files from a local Codex memories directory and build sync

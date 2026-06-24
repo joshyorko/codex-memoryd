@@ -3,6 +3,7 @@
 //! idempotent local import, forget, doctor).
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -52,6 +53,31 @@ fn wait_for_health(url: &str) {
 
 fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("memory.db")
+}
+
+fn codex_home_path(dir: &TempDir) -> PathBuf {
+    dir.path().join("codex-home")
+}
+
+fn codex_config_path(dir: &TempDir) -> PathBuf {
+    codex_home_path(dir).join("config.toml")
+}
+
+fn backup_files(path: &std::path::Path) -> Vec<PathBuf> {
+    let parent = path.parent().unwrap();
+    let stem = path.file_name().unwrap().to_string_lossy().to_string();
+    let mut backups = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{stem}.bak.")))
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
 }
 
 fn insert_temporal_cli_record(
@@ -4330,4 +4356,193 @@ fn local_runtime_helper_documents_safe_runtime_contract() {
             "local runbook missing adapter config field {required:?}"
         );
     }
+}
+
+#[test]
+fn cli_mcp_codex_preview_reports_snippet_without_writing() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let codex_config = codex_config_path(&dir);
+
+    let output = bin()
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["mcp", "codex", "preview"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["mode"], "preview");
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["config_file"],
+        codex_config.to_string_lossy().to_string()
+    );
+    assert!(json["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("[mcp_servers.codex_memoryd]"));
+    assert!(json["snippet"].as_str().unwrap().contains("--read-only"));
+    assert!(json["snippet"].as_str().unwrap().contains("memory_search"));
+
+    assert!(!codex_config.exists(), "preview must not write config.toml");
+    assert!(!codex_home.exists(), "preview must not create CODEX_HOME");
+}
+
+#[test]
+fn cli_mcp_codex_apply_creates_config_and_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let codex_config = codex_config_path(&dir);
+
+    let first = bin()
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["mcp", "codex", "apply"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_json: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(first_json["mode"], "apply");
+    assert_eq!(first_json["changed"], true);
+    assert_eq!(first_json["backup_file"], Value::Null);
+
+    let created = fs::read_to_string(&codex_config).unwrap();
+    assert!(created.contains("[mcp_servers.codex_memoryd]"));
+    assert!(created.contains("--read-only"));
+    assert!(created.contains("memory_status"));
+    assert!(created.contains("memory_recall"));
+    assert!(created.contains("memory_search"));
+    assert!(!created.contains("memory_conclude"));
+
+    let second = bin()
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["mcp", "codex", "apply"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_json: Value = serde_json::from_slice(&second).unwrap();
+    assert_eq!(second_json["changed"], false);
+    assert_eq!(second_json["status"], "managed");
+    assert_eq!(fs::read_to_string(&codex_config).unwrap(), created);
+    assert!(backup_files(&codex_config).is_empty());
+}
+
+#[test]
+fn cli_mcp_codex_apply_updates_owned_block_and_preserves_unrelated_config() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let codex_config = codex_config_path(&dir);
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let original = r#"[memories]
+backend = "provider"
+
+[mcp_servers.other]
+command = "/bin/echo"
+args = ["hello"]
+
+[mcp_servers.codex_memoryd]
+command = "/tmp/old-memoryd"
+args = ["mcp", "stdio", "--write-tools"]
+enabled_tools = ["memory_conclude"]
+
+[profiles.default]
+model = "gpt-5"
+"#;
+    fs::write(&codex_config, original).unwrap();
+
+    let output = bin()
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["mcp", "codex", "apply"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["status"], "updated");
+
+    let backups = backup_files(&codex_config);
+    assert_eq!(
+        backups.len(),
+        1,
+        "apply should create one backup before update"
+    );
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+
+    let updated = fs::read_to_string(&codex_config).unwrap();
+    assert!(updated.contains("[memories]\nbackend = \"provider\""));
+    assert!(updated.contains("[mcp_servers.other]\ncommand = \"/bin/echo\""));
+    assert!(updated.contains("[profiles.default]\nmodel = \"gpt-5\""));
+    assert!(updated.contains("[mcp_servers.codex_memoryd]"));
+    assert!(updated.contains("--read-only"));
+    assert!(updated.contains("memory_status"));
+    assert!(updated.contains("memory_recall"));
+    assert!(updated.contains("memory_search"));
+    assert!(!updated.contains("--write-tools"));
+    assert!(!updated.contains("memory_conclude"));
+}
+
+#[test]
+fn cli_mcp_codex_remove_deletes_only_owned_block_and_preserves_unrelated_config() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let codex_config = codex_config_path(&dir);
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let original = r#"[memories]
+backend = "provider"
+
+[mcp_servers.codex_memoryd]
+command = "/tmp/old-memoryd"
+args = ["--db", "/tmp/memory.db", "mcp", "stdio", "--read-only"]
+enabled_tools = ["memory_status", "memory_recall", "memory_search"]
+
+[mcp_servers.other]
+command = "/bin/echo"
+args = ["hello"]
+"#;
+    fs::write(&codex_config, original).unwrap();
+
+    let output = bin()
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["mcp", "codex", "remove"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["mode"], "remove");
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["status"], "removed");
+
+    let backups = backup_files(&codex_config);
+    assert_eq!(
+        backups.len(),
+        1,
+        "remove should create one backup before update"
+    );
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+
+    let updated = fs::read_to_string(&codex_config).unwrap();
+    assert!(updated.contains("[memories]\nbackend = \"provider\""));
+    assert!(updated.contains("[mcp_servers.other]\ncommand = \"/bin/echo\""));
+    assert!(!updated.contains("[mcp_servers.codex_memoryd]"));
 }

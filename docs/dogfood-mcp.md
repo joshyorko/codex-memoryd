@@ -44,7 +44,19 @@ Bootstrap result on 2026-06-13:
 
 ## Codex MCP Config
 
-Add this to `~/.codex/config.toml`:
+Preferred flow:
+
+```bash
+codex-memoryd mcp codex preview
+codex-memoryd mcp codex apply
+codex-memoryd mcp codex status
+```
+
+The wizard writes only the owned `[mcp_servers.codex_memoryd]` block, uses the
+resolved binary/database paths from the current runtime, and backs up an
+existing `~/.codex/config.toml` before mutation.
+
+Generated block shape:
 
 ```toml
 [mcp_servers.codex_memoryd_dogfood]
