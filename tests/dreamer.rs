@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use codex_memoryd::config::{Config, DreamSchedulerConfig};
+use codex_memoryd::dream;
 use codex_memoryd::domain::{
     Checkpoint, Conclusion, Portability, Profile, RecordType, RepoIdentity, Scope, Sensitivity,
     VisibleTurn,
@@ -1904,4 +1905,57 @@ fn imported_chatgpt_turns_feed_reviewable_dream_candidates() {
 
     let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
     assert_eq!(applied.created.len(), 1);
+}
+
+#[test]
+fn imported_chatgpt_turns_do_not_exceed_native_max_records_cap() {
+    let svc = service();
+    insert_direct_record(
+        &svc,
+        "Decision: use cargo test as the repo-native validation command.",
+        json!({ "origin": "manual" }),
+    );
+    imported_chatgpt_turn(
+        &svc,
+        "chatgpt-import",
+        "user",
+        "conv-1",
+        "msg-1",
+        "Preference: keep commit messages terse.",
+        "2026-06-01T10:00:00Z",
+    );
+    imported_chatgpt_turn(
+        &svc,
+        "chatgpt-import",
+        "user",
+        "conv-1",
+        "msg-2",
+        "Preference: keep commit messages terse and direct.",
+        "2026-06-08T10:00:00Z",
+    );
+
+    let (report, _) = dream::run(
+        &svc.store,
+        &dream::DreamParams {
+            profile: Profile::Personal,
+            workspace: "ws",
+            repo_id: None,
+            mode: "preview",
+            now: "2026-06-09T00:00:00Z",
+            recency_cutoff: None,
+            include_archived_sources: false,
+            max_records: 1,
+            max_candidates: None,
+            patch_run_id: None,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .candidates
+            .iter()
+            .all(|candidate| candidate.threshold_reason != "repeated_user_steering"),
+        "imported chatgpt evidence should not exceed max_records once native records fill the cap"
+    );
 }
