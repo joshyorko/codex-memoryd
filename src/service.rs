@@ -163,7 +163,7 @@ impl Service {
     }
 
     /// Resolve a required workspace, applying the configured default when absent.
-    fn resolve_workspace(&self, raw: &Option<String>) -> String {
+    pub fn resolve_workspace(&self, raw: &Option<String>) -> String {
         raw.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
