@@ -709,7 +709,10 @@ fn cli_chatgpt_export_filters_support_multiple_ids_and_combined_zero_match() {
     assert_eq!(zero_match_json["selected_conversations"], 0);
     assert_eq!(zero_match_json["filtered_out_conversations"], 2);
     assert_eq!(zero_match_json["eligible_conversations"], 0);
-    assert_eq!(zero_match_json["conversations"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        zero_match_json["conversations"].as_array().unwrap().len(),
+        0
+    );
     assert!(zero_match_json.get("unsupported_messages").is_none());
     assert!(zero_match_json.get("privacy_screened_messages").is_none());
     assert!(zero_match_json.get("existing_messages").is_none());
