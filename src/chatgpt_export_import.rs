@@ -21,6 +21,8 @@ use crate::service::Service;
 use crate::store::ledger_safe_summary;
 use crate::store::EvidenceLedgerEntry;
 
+const MAX_CONVERSATIONS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatgptExportMode {
     List,
@@ -130,6 +132,7 @@ struct ParsedConversation {
     report: ChatgptExportConversationReport,
     accepted: Vec<AcceptedMessage>,
     rejections: Vec<ChatgptExportRejection>,
+    has_eligible_messages: bool,
 }
 
 #[derive(Debug)]
@@ -174,6 +177,23 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         }
 
         if params.mode == ChatgptExportMode::Apply {
+            if !parsed.has_eligible_messages {
+                for rejection in &parsed.rejections {
+                    record_rejection(
+                        service,
+                        profile.as_str(),
+                        &workspace,
+                        &conversation.id,
+                        &rejection.message_id,
+                        &rejection.code,
+                        &rejection.reason,
+                        &detected.payload_path,
+                    )?;
+                }
+                rejections.extend(parsed.rejections);
+                reports.push(parsed.report);
+                continue;
+            }
             service
                 .store
                 .ensure_workspace(profile.as_str(), &workspace)?;
@@ -333,7 +353,10 @@ fn parse_conversation(
             continue;
         }
         let message_id = entry.id.unwrap_or(fallback_id);
-        let content = extract_text(&message).unwrap_or_default();
+        let Some(content) = extract_text(&message) else {
+            skipped_messages += 1;
+            continue;
+        };
         match policy::screen_content(&content, usize::MAX) {
             PolicyDecision::Accept(cleaned) => {
                 if role == "user" {
@@ -372,6 +395,7 @@ fn parse_conversation(
         }
     }
 
+    let has_eligible_messages = !accepted.is_empty();
     Ok(ParsedConversation {
         report: ChatgptExportConversationReport {
             conversation_id: conversation.id.clone(),
@@ -392,6 +416,7 @@ fn parse_conversation(
         },
         accepted,
         rejections,
+        has_eligible_messages,
     })
 }
 
@@ -403,7 +428,11 @@ fn extract_text(message: &ExportMessage) -> Option<String> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    Some(text)
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn entry_time(entry: &MappingEntry) -> Option<i128> {
@@ -430,10 +459,13 @@ fn timestamp_to_rfc3339(value: &Value) -> Option<String> {
         .map(|seconds| seconds as f64)
         .or_else(|| value.as_f64())?;
     let whole = seconds.trunc() as i64;
-    let nanos = ((seconds.fract().abs()) * 1_000_000_000.0).round() as i128;
+    let mut nanos = ((seconds.fract().abs()) * 1_000_000_000.0).round() as u32;
+    if nanos >= 1_000_000_000 {
+        nanos = 999_999_999;
+    }
     let timestamp = OffsetDateTime::from_unix_timestamp(whole)
         .ok()?
-        .replace_nanosecond(nanos as u32)
+        .replace_nanosecond(nanos)
         .ok()?;
     timestamp.format(&Rfc3339).ok()
 }
@@ -464,9 +496,11 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
         })?;
         return Ok(DetectedPayload {
             payload_path: payload.display().to_string(),
-            bytes: fs::read(&payload).map_err(|err| {
-                Error::invalid_request(format!("failed to read conversations payload: {err}"))
-            })?,
+            bytes: fs::read(&payload)
+                .map_err(|err| {
+                    Error::invalid_request(format!("failed to read conversations payload: {err}"))
+                })
+                .and_then(|bytes| enforce_payload_size(bytes, &payload.display().to_string()))?,
         });
     }
 
@@ -487,10 +521,7 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
             .and_then(|value| value.to_str())
             .is_some_and(|value| value == "conversations.json")
         {
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).map_err(|_| {
-                Error::invalid_request("failed to read conversations payload from zip")
-            })?;
+            let bytes = read_zip_entry_capped(&mut entry, &name)?;
             return Ok(DetectedPayload {
                 payload_path: name,
                 bytes,
@@ -526,6 +557,37 @@ fn find_conversations_file(root: &Path) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+fn enforce_payload_size(bytes: Vec<u8>, payload_path: &str) -> Result<Vec<u8>> {
+    if bytes.len() > MAX_CONVERSATIONS_PAYLOAD_BYTES {
+        return Err(Error::invalid_request(format!(
+            "conversations payload exceeds {} bytes: {payload_path}",
+            MAX_CONVERSATIONS_PAYLOAD_BYTES
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_zip_entry_capped<R: Read>(entry: &mut R, payload_path: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = entry
+            .read(&mut chunk)
+            .map_err(|_| Error::invalid_request("failed to read conversations payload from zip"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > MAX_CONVERSATIONS_PAYLOAD_BYTES {
+            return Err(Error::invalid_request(format!(
+                "conversations payload exceeds {} bytes: {payload_path}",
+                MAX_CONVERSATIONS_PAYLOAD_BYTES
+            )));
+        }
+    }
+    Ok(bytes)
 }
 
 fn record_rejection(
