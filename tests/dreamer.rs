@@ -1030,6 +1030,9 @@ fn scheduled_dreamer_can_be_disabled() {
     let status = svc.status().unwrap();
     let scheduler = status.features.get("dream_scheduler").unwrap();
     assert_eq!(scheduler.get("enabled").unwrap(), false);
+    assert!(!status.dream_worker.enabled);
+    assert_eq!(status.dream_worker.mode, "deterministic");
+    assert!(!status.dream_worker.automatic_apply);
 }
 
 #[test]
@@ -1145,6 +1148,7 @@ fn scheduled_dreamer_failed_run_does_not_advance_watermark() {
     );
     let status = failing.status().unwrap();
     assert_eq!(status.status, "local_only");
+    assert!(!status.dream_worker.paid_provider_configured);
     assert_eq!(
         status
             .features
@@ -1203,6 +1207,11 @@ fn scheduled_dreamer_enforces_candidate_limit() {
     let scheduler = status.features.get("dream_scheduler").unwrap();
     assert_eq!(scheduler.get("last_status").unwrap(), "ok_with_limits");
     assert_eq!(scheduler.get("degraded").unwrap(), false);
+    assert_eq!(
+        status.dream_worker.last_status.as_deref(),
+        Some("ok_with_limits")
+    );
+    assert_eq!(status.dream_worker.limits.max_candidates, 1);
 }
 
 #[test]

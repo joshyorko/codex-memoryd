@@ -15,6 +15,28 @@
     "active_workspaces": ["josh-personal"],
     "last_sync": null,
     "last_dream": null,
+    "dream_worker": {
+      "enabled": false,
+      "mode": "deterministic",
+      "automatic_apply": false,
+      "paid_provider_configured": false,
+      "paid_provider_ready": false,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_run_id": null,
+      "last_watermark": null,
+      "next_eligible_run": null,
+      "limits": {
+        "interval_seconds": 3600,
+        "idle_window_seconds": 900,
+        "min_session_age_seconds": 300,
+        "min_turn_count": 2,
+        "max_batch_size": 500,
+        "max_candidates": 50,
+        "max_runtime_seconds": 30
+      }
+    },
     "pending_writes": 0,
     "local_import": {
       "status": "unknown",

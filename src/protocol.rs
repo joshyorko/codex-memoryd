@@ -103,6 +103,7 @@ pub struct StatusResponse {
     pub active_workspaces: Vec<String>,
     pub last_sync: Option<String>,
     pub last_dream: Option<DreamRunStatus>,
+    pub dream_worker: DreamWorkerStatus,
     pub pending_writes: i64,
     pub local_import: LocalImportStatus,
     pub features: Value,
@@ -137,6 +138,33 @@ pub struct ScheduledDreamStatus {
     pub last_watermark: Option<String>,
     pub next_eligible_run: Option<String>,
     pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamWorkerLimits {
+    pub interval_seconds: u64,
+    pub idle_window_seconds: i64,
+    pub min_session_age_seconds: i64,
+    pub min_turn_count: usize,
+    pub max_batch_size: usize,
+    pub max_candidates: usize,
+    pub max_runtime_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamWorkerStatus {
+    pub enabled: bool,
+    pub mode: String,
+    pub automatic_apply: bool,
+    pub paid_provider_configured: bool,
+    pub paid_provider_ready: bool,
+    pub last_run_at: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_watermark: Option<String>,
+    pub next_eligible_run: Option<String>,
+    pub limits: DreamWorkerLimits,
 }
 
 // ---------------------------------------------------------------------------

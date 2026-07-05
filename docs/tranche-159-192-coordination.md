@@ -125,6 +125,7 @@ Worker-mode contract:
 - `provider` mode is opt-in and must show configured provider/model and paid-call readiness in status; no provider call in CI.
 - Worker output is only a patch/dream preview artifact until the user explicitly applies it.
 - Status must show enabled/disabled, current mode, last run, next eligible run, and whether any paid provider is configured.
+- The first implementation slice may add only docs plus additive typed status fields; no new background behavior, provider path, or apply path changes.
 
 Non-overlap rule: do not implement provider calls or auto-apply in this tranche.
 

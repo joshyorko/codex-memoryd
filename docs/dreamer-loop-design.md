@@ -34,6 +34,9 @@ recall / store boundaries.
     conformance.
   - Hardening follow-ups remain: windowing/supersession edge cases and atomic
     durable evidence writes.
+  - Worker-mode planning now assumes an additive `dream_worker` status object
+    that reports deterministic defaults, scheduler-derived limits, and explicit
+    paid-provider readiness without performing any provider call.
 
 ## 1. CLI surface
 
