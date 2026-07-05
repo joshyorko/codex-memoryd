@@ -593,6 +593,132 @@ fn cli_chatgpt_export_apply_from_zip_is_idempotent_and_evidence_only() {
 }
 
 #[test]
+fn cli_chatgpt_export_filters_selection_and_reports_screened_counts() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-filtered");
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--conversation-id",
+            "conv-alpha",
+            "--eligible-only",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["conversation_count"], 2);
+    assert_eq!(preview_json["selected_conversations"], 1);
+    assert_eq!(preview_json["filtered_out_conversations"], 1);
+    assert_eq!(preview_json["eligible_conversations"], 1);
+    assert_eq!(preview_json["rejected_messages"], 0);
+    assert_eq!(preview_json["rejections"].as_array().unwrap().len(), 0);
+
+    let apply = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--title-contains",
+            "import review",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(apply.status.success());
+    let apply_json: Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_json["selected_conversations"], 1);
+    assert_eq!(apply_json["filtered_out_conversations"], 1);
+    assert_eq!(apply_json["created"], 2);
+    assert_eq!(count_table(&db, "visible_turns"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+}
+
+#[test]
+fn cli_chatgpt_export_filters_support_multiple_ids_and_combined_zero_match() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export");
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--conversation-id",
+            "conv-alpha",
+            "--conversation-id",
+            "conv-secret",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["selected_conversations"], 2);
+    assert_eq!(preview_json["filtered_out_conversations"], 0);
+    assert_eq!(preview_json["conversations"].as_array().unwrap().len(), 2);
+    assert!(preview_json.get("unsupported_messages").is_none());
+    assert!(preview_json.get("privacy_screened_messages").is_none());
+    assert!(preview_json.get("existing_messages").is_none());
+
+    let zero_match = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--conversation-id",
+            "conv-alpha",
+            "--title-contains",
+            "does not match",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(zero_match.status.success());
+    let zero_match_json: Value = serde_json::from_slice(&zero_match.stdout).unwrap();
+    assert_eq!(zero_match_json["selected_conversations"], 0);
+    assert_eq!(zero_match_json["filtered_out_conversations"], 2);
+    assert_eq!(zero_match_json["eligible_conversations"], 0);
+    assert_eq!(
+        zero_match_json["conversations"].as_array().unwrap().len(),
+        0
+    );
+    assert!(zero_match_json.get("unsupported_messages").is_none());
+    assert!(zero_match_json.get("privacy_screened_messages").is_none());
+    assert!(zero_match_json.get("existing_messages").is_none());
+}
+
+#[test]
 fn cli_chatgpt_export_rejects_oversized_payloads_for_directory_and_zip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

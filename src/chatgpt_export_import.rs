@@ -45,6 +45,14 @@ pub struct ChatgptExportParams<'a> {
     pub profile: Option<String>,
     pub workspace: Option<String>,
     pub mode: ChatgptExportMode,
+    pub selection: ChatgptExportSelection,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatgptExportSelection {
+    pub conversation_ids: Vec<String>,
+    pub title_contains: Option<String>,
+    pub eligible_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +82,8 @@ pub struct ChatgptExportResponse {
     pub source_path: String,
     pub payload_path: String,
     pub conversation_count: usize,
+    pub selected_conversations: usize,
+    pub filtered_out_conversations: usize,
     pub eligible_conversations: usize,
     pub user_turns: usize,
     pub assistant_turns: usize,
@@ -166,8 +176,34 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut skipped_existing = 0usize;
     let mut rejections = Vec::new();
 
+    let total_conversations = conversations.len();
+    let selected_filter_ids = params
+        .selection
+        .conversation_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_title = params
+        .selection
+        .title_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
     for conversation in conversations {
         let parsed = parse_conversation(&conversation, &detected.payload_path)?;
+        if !matches_selection(
+            &conversation.id,
+            &parsed.report.title,
+            parsed.report.eligible,
+            &selected_filter_ids,
+            selected_title.as_deref(),
+            params.selection.eligible_only,
+        ) {
+            continue;
+        }
         user_total += parsed.report.user_turns;
         assistant_total += parsed.report.assistant_turns;
         skipped_total += parsed.report.skipped_messages;
@@ -287,7 +323,9 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         mode: params.mode.as_str().to_string(),
         source_path,
         payload_path: detected.payload_path,
-        conversation_count: reports.len(),
+        conversation_count: total_conversations,
+        selected_conversations: reports.len(),
+        filtered_out_conversations: total_conversations.saturating_sub(reports.len()),
         eligible_conversations: accepted_total,
         user_turns: user_total,
         assistant_turns: assistant_total,
@@ -298,6 +336,28 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         conversations: reports,
         rejections,
     })
+}
+
+fn matches_selection(
+    conversation_id: &str,
+    title: &str,
+    eligible: bool,
+    conversation_ids: &std::collections::BTreeSet<&str>,
+    title_contains: Option<&str>,
+    eligible_only: bool,
+) -> bool {
+    if !conversation_ids.is_empty() && !conversation_ids.contains(conversation_id) {
+        return false;
+    }
+    if let Some(title_filter) = title_contains {
+        if !title.to_ascii_lowercase().contains(title_filter) {
+            return false;
+        }
+    }
+    if eligible_only && !eligible {
+        return false;
+    }
+    true
 }
 
 fn parse_conversation(
