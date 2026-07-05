@@ -88,7 +88,9 @@ pub fn parse_public_handle(value: &str) -> Option<PublicHandleKind> {
     ] {
         if let Some(suffix) = value.strip_prefix(kind.prefix()) {
             return (suffix.len() == PUBLIC_HANDLE_SUFFIX_LEN
-                && suffix.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()))
+                && suffix
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()))
             .then_some(kind);
         }
     }
@@ -196,7 +198,10 @@ mod tests {
     fn public_handles_are_stable_and_parseable() {
         let handle = public_handle(PublicHandleKind::MemoryRef, "mem_example");
         assert!(handle.starts_with("mr_"));
-        assert_eq!(parse_public_handle(&handle), Some(PublicHandleKind::MemoryRef));
+        assert_eq!(
+            parse_public_handle(&handle),
+            Some(PublicHandleKind::MemoryRef)
+        );
         assert!(is_valid_public_handle(&handle));
     }
 
@@ -204,6 +209,8 @@ mod tests {
     fn public_handles_reject_non_conforming_values() {
         assert!(!is_valid_public_handle("mem_example"));
         assert!(!is_valid_public_handle("mr_../../etc/shadow"));
-        assert!(!is_valid_public_handle("mr_ABCDEF0123456789abcdef0123456789"));
+        assert!(!is_valid_public_handle(
+            "mr_ABCDEF0123456789abcdef0123456789"
+        ));
     }
 }

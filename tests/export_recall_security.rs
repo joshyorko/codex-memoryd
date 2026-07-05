@@ -317,10 +317,9 @@ fn default_recall_hides_archived_stale_superseded_records_but_returns_newer_fact
         },
     )
     .expect("recover archived records");
-    assert!(search
-        .matches
-        .iter()
-        .any(|m| m.id != archived_stale_id && m.archived && codex_memoryd::ids::is_valid_public_handle(&m.id)));
+    assert!(search.matches.iter().any(|m| {
+        m.id != archived_stale_id && m.archived && codex_memoryd::ids::is_valid_public_handle(&m.id)
+    }));
 }
 
 #[test]
@@ -460,7 +459,10 @@ fn recall_allows_legacy_metadata_without_admission_markers() {
     assert_public_handle(&resp.facts[0].id, "mr_");
     assert_eq!(resp.citations.len(), 1);
     assert_eq!(resp.citations[0].source_path, None);
-    assert_public_handle(resp.citations[0].source_id.as_deref().expect("source id"), "msrc_");
+    assert_public_handle(
+        resp.citations[0].source_id.as_deref().expect("source id"),
+        "msrc_",
+    );
     let provenance = &resp.facts[0].policy.provenance;
     assert_public_handle(
         provenance.evidence_refs.first().expect("evidence ref"),
