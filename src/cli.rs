@@ -575,10 +575,40 @@ pub enum EvalCommand {
         #[arg(long, default_value = "summary")]
         format: String,
     },
+    /// Run neutral local benchmark runners without external datasets or providers.
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
+    },
     /// Run long-history retrieval quality evals and ranking ablations.
     Retrieval {
         #[arg(long, default_value = "summary")]
         format: String,
+        #[arg(long, value_delimiter = ',', value_name = "FAMILY_OR_ID")]
+        subset: Vec<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        dry_run_cost: bool,
+        #[arg(long, value_name = "FILE")]
+        report_out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BenchmarkCommand {
+    /// Run a tiny synthetic benchmark through builtin local runners only.
+    Synthetic {
+        #[arg(long, default_value = "summary")]
+        format: String,
+        #[arg(long, value_delimiter = ',', value_name = "FAMILY_OR_ID")]
+        subset: Vec<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        full: bool,
+        #[arg(long, value_name = "FILE")]
+        report_out: Option<PathBuf>,
     },
 }
 
@@ -1980,8 +2010,57 @@ fn dispatch(cli: Cli) -> Result<()> {
                 }
                 Ok(())
             }
-            EvalCommand::Retrieval { format } => {
-                let report = codex_memoryd::retrieval_eval::run_retrieval_eval()?;
+            EvalCommand::Benchmark { command } => match command {
+                BenchmarkCommand::Synthetic {
+                    format,
+                    subset,
+                    limit,
+                    full,
+                    report_out,
+                } => {
+                    let mut report = codex_memoryd::benchmark_eval::run_synthetic_benchmark(
+                        &codex_memoryd::benchmark_eval::SyntheticBenchmarkOptions {
+                            subset: subset.clone(),
+                            limit: *limit,
+                            full: *full,
+                        },
+                    )?;
+                    if let Some(path) = report_out {
+                        report.artifacts.report_out = Some(path.to_string_lossy().to_string());
+                        write_json_artifact(path, &report)?;
+                    }
+                    match format.as_str().to_ascii_lowercase().as_str() {
+                        "json" => print_json(&report)?,
+                        "summary" | "human" | "markdown" => {
+                            print_markdown(&codex_memoryd::benchmark_eval::render_summary(&report))
+                        }
+                        other => {
+                            return Err(error::Error::invalid_request(format!(
+                                "invalid --format '{other}'; expected 'json' or 'summary'"
+                            )))
+                        }
+                    }
+                    Ok(())
+                }
+            },
+            EvalCommand::Retrieval {
+                format,
+                subset,
+                limit,
+                dry_run_cost,
+                report_out,
+            } => {
+                let mut report = codex_memoryd::retrieval_eval::run_retrieval_eval_with_options(
+                    &codex_memoryd::retrieval_eval::RetrievalEvalOptions {
+                        subset: subset.clone(),
+                        limit: *limit,
+                        dry_run_cost: *dry_run_cost,
+                    },
+                )?;
+                if let Some(path) = report_out {
+                    report.artifacts.report_out = Some(path.to_string_lossy().to_string());
+                    write_json_artifact(path, &report)?;
+                }
                 match format.as_str().to_ascii_lowercase().as_str() {
                     "json" => print_json(&report)?,
                     "summary" | "human" | "markdown" => print_markdown(
@@ -2348,6 +2427,14 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 fn print_markdown(text: &str) {
     println!("{text}");
+}
+
+fn write_json_artifact<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(error::Error::from)?;
+    }
+    let body = serde_json::to_string_pretty(value).map_err(error::Error::from)?;
+    std::fs::write(path, format!("{body}\n")).map_err(error::Error::from)
 }
 
 fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<()> {
