@@ -11,6 +11,8 @@ use crate::policy;
 use crate::policy::BoundaryDecision;
 use crate::store::RecordQuery;
 use crate::store::Store;
+use serde_json::Map;
+use serde_json::Value;
 
 pub struct ExportParams<'a> {
     pub profile: Profile,
@@ -149,7 +151,35 @@ fn sanitize_export_record(mut record: MemoryRecord) -> MemoryRecord {
         .iter()
         .map(|memory| ids::public_handle(PublicHandleKind::MemoryRef, memory))
         .collect();
+    record.metadata = sanitize_export_metadata(&record.metadata);
     record
+}
+
+fn sanitize_export_metadata(metadata: &Value) -> Value {
+    let Some(object) = metadata.as_object() else {
+        return Value::Null;
+    };
+
+    let mut sanitized = Map::new();
+    for key in [
+        "origin",
+        "state",
+        "candidate_state",
+        "historical_reason",
+        "temporal_state",
+        "redaction_state",
+        "raw_artifact_stored",
+    ] {
+        if let Some(value) = object.get(key) {
+            sanitized.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if sanitized.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(sanitized)
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use codex_memoryd::domain::Checkpoint;
 use codex_memoryd::domain::Portability;
 use codex_memoryd::domain::Profile;
 use codex_memoryd::domain::RecordType;
@@ -559,6 +560,25 @@ fn recall_search_and_export_expose_opaque_inert_handles_only() {
         }),
     };
     let raw_id = store.upsert_record(&rec).expect("insert").id().to_string();
+    store
+        .insert_checkpoint(&Checkpoint {
+            id: "checkpoint_alpha".to_string(),
+            session_id: None,
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            summary: "checkpoint for opaque handle regression".to_string(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec!["verify handle grammar".to_string()],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: Some("codex/memory-ref-hardening".to_string()),
+            commit: Some("deadbeef".to_string()),
+            created_at: ids::now_rfc3339(),
+        })
+        .expect("insert checkpoint");
 
     let recall = recall::recall(
         &store,
@@ -613,6 +633,8 @@ fn recall_search_and_export_expose_opaque_inert_handles_only() {
     assert!(!recall_json.contains("src:../../etc/shadow"));
     assert!(!recall_json.contains("../../etc/shadow"));
     assert!(!recall_json.contains(&raw_id));
+    assert!(!recall.checkpoints.is_empty());
+    assert_public_handle(&recall.checkpoints[0].id, "mcp_");
 
     let search = recall::search(
         &store,
@@ -648,7 +670,9 @@ fn recall_search_and_export_expose_opaque_inert_handles_only() {
     assert!(!exported.body.contains(&raw_id));
     assert!(!exported.body.contains("src:../../etc/shadow"));
     assert!(!exported.body.contains("../../etc/shadow"));
+    assert!(!exported.body.contains("\"local_path\""));
     assert!(exported.body.contains("\"mr_"));
+    assert!(exported.body.contains("\"origin\": \"sync_local\""));
 }
 
 #[test]
