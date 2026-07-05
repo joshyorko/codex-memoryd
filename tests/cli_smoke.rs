@@ -354,6 +354,82 @@ fn write_refs_fixture_jsonl(dir: &TempDir, name: &str, content: &str) -> PathBuf
     path
 }
 
+fn write_chatgpt_export_dir(dir: &TempDir, name: &str) -> PathBuf {
+    let root = dir.path().join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("conversations.json"),
+        r#"[
+  {
+    "id": "conv-alpha",
+    "title": "Codex import review",
+    "create_time": 1717243200,
+    "update_time": 1717246800,
+    "mapping": {
+      "user-1": {
+        "id": "user-1",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1717243201,
+          "content": { "content_type": "text", "parts": ["How should import preview behave?"] }
+        }
+      },
+      "assistant-1": {
+        "id": "assistant-1",
+        "parent": "user-1",
+        "message": {
+          "author": { "role": "assistant" },
+          "create_time": 1717243202,
+          "content": { "content_type": "text", "parts": ["Preview should write nothing and report counts."] }
+        }
+      },
+      "tool-1": {
+        "id": "tool-1",
+        "parent": "assistant-1",
+        "message": {
+          "author": { "role": "tool" },
+          "create_time": 1717243203,
+          "content": { "content_type": "text", "parts": ["internal tool chatter"] }
+        }
+      }
+    }
+  },
+  {
+    "id": "conv-secret",
+    "title": null,
+    "create_time": 1717243300,
+    "update_time": 1717246900,
+    "mapping": {
+      "user-2": {
+        "id": "user-2",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1717243301,
+          "content": { "content_type": "text", "parts": ["token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"] }
+        }
+      }
+    }
+  }
+]"#,
+    )
+    .unwrap();
+    root
+}
+
+fn write_chatgpt_export_zip(dir: &TempDir, export_dir: &std::path::Path) -> PathBuf {
+    let zip_path = dir.path().join("chatgpt-export.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::SimpleFileOptions =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("conversations.json", options).unwrap();
+    let body = std::fs::read(export_dir.join("conversations.json")).unwrap();
+    use std::io::Write as _;
+    zip.write_all(&body).unwrap();
+    zip.finish().unwrap();
+    zip_path
+}
+
 #[test]
 fn cli_doctor_reports_ok() {
     let dir = TempDir::new().unwrap();
@@ -366,6 +442,134 @@ fn cli_doctor_reports_ok() {
         .success()
         .stdout(predicate::str::contains("codex-memoryd doctor"))
         .stdout(predicate::str::contains("writable=true"));
+}
+
+#[test]
+fn cli_chatgpt_export_list_and_preview_from_directory_write_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export");
+
+    let list = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--list",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_json: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list_json["mode"], "list");
+    assert_eq!(list_json["conversation_count"], 2);
+    assert_eq!(
+        list_json["conversations"][0]["conversation_id"],
+        "conv-alpha"
+    );
+    assert_eq!(list_json["conversations"][0]["eligible"], true);
+    assert_eq!(
+        list_json["conversations"][1]["title"],
+        "Untitled conversation"
+    );
+    assert_eq!(list_json["conversations"][1]["eligible"], false);
+    assert_eq!(count_table(&db, "visible_turns"), 0);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["mode"], "preview");
+    assert_eq!(preview_json["conversation_count"], 2);
+    assert_eq!(preview_json["eligible_conversations"], 1);
+    assert_eq!(preview_json["user_turns"], 1);
+    assert_eq!(preview_json["assistant_turns"], 1);
+    assert_eq!(preview_json["skipped_messages"], 1);
+    assert_eq!(preview_json["rejected_messages"], 1);
+    assert!(!preview_stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert_eq!(count_table(&db, "visible_turns"), 0);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_apply_from_zip_is_idempotent_and_evidence_only() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export");
+    let export_zip = write_chatgpt_export_zip(&dir, &export_dir);
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&export_zip)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["mode"], "apply");
+    assert_eq!(first_json["created"], 2);
+    assert_eq!(first_json["skipped_existing"], 0);
+    assert_eq!(first_json["rejected_messages"], 1);
+    assert!(!first_stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert_eq!(count_table(&db, "visible_turns"), 2);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 3);
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&export_zip)
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["created"], 0);
+    assert_eq!(second_json["skipped_existing"], 2);
+    assert_eq!(count_table(&db, "visible_turns"), 2);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 3);
 }
 
 #[test]

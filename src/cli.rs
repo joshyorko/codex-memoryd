@@ -12,6 +12,9 @@ use clap::Subcommand;
 use serde::Serialize;
 use serde_json::json;
 
+use codex_memoryd::chatgpt_export_import;
+use codex_memoryd::chatgpt_export_import::ChatgptExportMode;
+use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
 use codex_memoryd::conformance;
@@ -218,6 +221,11 @@ pub enum Command {
         /// Local Git repository path.
         #[arg(value_name = "REPO")]
         repo: PathBuf,
+    },
+    /// Import ChatGPT export conversations as visible-turn evidence.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
     },
     /// Export safe records as JSONL (default) or JSON.
     Export {
@@ -479,6 +487,28 @@ pub enum ProcedureCommand {
         /// Counter-evidence count at which the procedure is quarantined.
         #[arg(long, default_value_t = 2)]
         quarantine_threshold: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImportCommand {
+    /// Import ChatGPT export conversations from a zip archive or extracted directory.
+    ChatgptExport {
+        /// List conversations without preparing an import.
+        #[arg(long, conflicts_with_all = ["preview", "apply"])]
+        list: bool,
+        /// Preview only (no durable writes).
+        #[arg(long, conflicts_with = "apply")]
+        preview: bool,
+        /// Apply (write visible-turn evidence only, idempotent).
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(value_name = "EXPORT")]
+        export_path: PathBuf,
     },
 }
 
@@ -1498,6 +1528,39 @@ fn dispatch(cli: Cli) -> Result<()> {
                 },
             )?;
             print_json(&resp)?;
+            Ok(())
+        }
+        Command::Import { command } => {
+            let service = cli.open_service(None)?;
+            match command {
+                ImportCommand::ChatgptExport {
+                    list,
+                    preview,
+                    apply,
+                    profile,
+                    workspace,
+                    export_path,
+                } => {
+                    let mode = if *apply {
+                        ChatgptExportMode::Apply
+                    } else if *list {
+                        ChatgptExportMode::List
+                    } else {
+                        let _ = preview;
+                        ChatgptExportMode::Preview
+                    };
+                    let resp = chatgpt_export_import::run(
+                        &service,
+                        ChatgptExportParams {
+                            export_path,
+                            profile: profile.clone(),
+                            workspace: workspace.clone(),
+                            mode,
+                        },
+                    )?;
+                    print_json(&resp)?;
+                }
+            }
             Ok(())
         }
         Command::Export {
