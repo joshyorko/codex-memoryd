@@ -167,6 +167,24 @@ pub struct DreamWorkerStatus {
     pub limits: DreamWorkerLimits,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DreamJobBudget {
+    pub max_runtime_seconds: u64,
+    pub max_input_records: usize,
+    pub max_candidates: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DreamProviderCommand {
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct DreamJobProvider {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<DreamProviderCommand>,
+}
+
 // ---------------------------------------------------------------------------
 // Recall (SPEC §6.2)
 // ---------------------------------------------------------------------------
@@ -869,6 +887,26 @@ pub struct DreamRequest {
     pub since: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DreamJobRunRequest {
+    #[serde(default)]
+    pub job_id: Option<String>,
+    pub profile: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub repo: Option<RepoIdentity>,
+    #[serde(default)]
+    pub now: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    pub budget: DreamJobBudget,
+    #[serde(default)]
+    pub provider: Option<DreamJobProvider>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryPatchApplyRequest {
     pub profile: Option<String>,
@@ -1151,6 +1189,17 @@ pub struct DreamResponse {
     pub archived: Vec<String>,
     pub created: Vec<String>,
     pub authority: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamJobRunResponse {
+    pub job_id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub mode: String,
+    pub status: String,
+    pub limits_hit: Vec<String>,
+    pub preview: DreamResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
