@@ -15,6 +15,7 @@ use serde_json::json;
 use codex_memoryd::chatgpt_export_import;
 use codex_memoryd::chatgpt_export_import::ChatgptExportMode;
 use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
+use codex_memoryd::chatgpt_export_import::ChatgptExportSelection;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
 use codex_memoryd::conformance;
@@ -503,6 +504,15 @@ pub enum ImportCommand {
         /// Apply (write visible-turn evidence only, idempotent).
         #[arg(long)]
         apply: bool,
+        /// Select one or more conversation ids.
+        #[arg(long = "conversation-id")]
+        conversation_ids: Vec<String>,
+        /// Filter selected conversations by title substring.
+        #[arg(long)]
+        title_contains: Option<String>,
+        /// Keep only conversations with at least one importable user/assistant turn.
+        #[arg(long)]
+        eligible_only: bool,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -1537,6 +1547,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                     list,
                     preview,
                     apply,
+                    conversation_ids,
+                    title_contains,
+                    eligible_only,
                     profile,
                     workspace,
                     export_path,
@@ -1556,6 +1569,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                             profile: profile.clone(),
                             workspace: workspace.clone(),
                             mode,
+                            selection: ChatgptExportSelection {
+                                conversation_ids: conversation_ids.clone(),
+                                title_contains: title_contains.clone(),
+                                eligible_only: *eligible_only,
+                            },
                         },
                     )?;
                     print_json(&resp)?;
