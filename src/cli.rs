@@ -611,6 +611,8 @@ pub enum BenchmarkCommand {
     Synthetic {
         #[arg(long, default_value = "summary")]
         format: String,
+        #[arg(long, value_name = "FILE")]
+        input: Option<PathBuf>,
         #[arg(long, value_delimiter = ',', value_name = "FAMILY_OR_ID")]
         subset: Vec<String>,
         #[arg(long)]
@@ -2031,6 +2033,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             EvalCommand::Benchmark { command } => match command {
                 BenchmarkCommand::Synthetic {
                     format,
+                    input,
                     subset,
                     limit,
                     full,
@@ -2038,6 +2041,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 } => {
                     let mut report = codex_memoryd::benchmark_eval::run_synthetic_benchmark(
                         &codex_memoryd::benchmark_eval::SyntheticBenchmarkOptions {
+                            input: input
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().to_string()),
                             subset: subset.clone(),
                             limit: *limit,
                             full: *full,

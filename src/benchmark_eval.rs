@@ -1,18 +1,27 @@
-use serde::Serialize;
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+const DEFAULT_SYNTHETIC_FIXTURE_JSON: &str =
+    include_str!("../tests/fixtures/benchmark/synthetic_memory_v1.json");
 
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticBenchmarkOptions {
     pub subset: Vec<String>,
     pub limit: Option<usize>,
     pub full: bool,
+    pub input: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkDataset {
-    pub id: &'static str,
+    pub id: String,
     pub version: u32,
+    pub adapter: String,
+    pub case_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,22 +56,48 @@ pub struct BenchmarkReport {
     pub artifacts: BenchmarkArtifacts,
 }
 
-#[derive(Clone, Copy)]
-struct SyntheticCase {
-    id: &'static str,
-    family: &'static str,
+#[derive(Debug, Clone, Deserialize)]
+struct NeutralBenchmarkFixture {
+    dataset: BenchmarkDataset,
+    cases: Vec<NeutralBenchmarkCase>,
 }
 
-const SYNTHETIC_CASES: &[SyntheticCase] = &[
-    SyntheticCase {
-        id: "synthetic_temporal",
-        family: "temporal",
-    },
-    SyntheticCase {
-        id: "synthetic_preference",
-        family: "preference",
-    },
-];
+#[derive(Debug, Clone, Deserialize)]
+struct NeutralBenchmarkCase {
+    id: String,
+    family: String,
+    history: Vec<NeutralHistoryTurn>,
+    question: NeutralBenchmarkQuestion,
+    expected: NeutralBenchmarkExpected,
+    #[serde(default)]
+    metadata: NeutralBenchmarkMetadata,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NeutralHistoryTurn {
+    speaker: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NeutralBenchmarkQuestion {
+    id: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NeutralBenchmarkExpected {
+    #[serde(default)]
+    answer_markers: Vec<String>,
+    #[serde(default)]
+    record_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct NeutralBenchmarkMetadata {
+    #[serde(default)]
+    tags: Vec<String>,
+}
 
 pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<BenchmarkReport> {
     if !options.full && options.limit.is_none() && options.subset.is_empty() {
@@ -71,14 +106,17 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
         ));
     }
 
-    let mut selected = SYNTHETIC_CASES
+    let fixture = load_fixture(options.input.as_deref())?;
+
+    let mut selected = fixture
+        .cases
         .iter()
         .filter(|case| {
             options.subset.is_empty()
                 || options
                     .subset
                     .iter()
-                    .any(|item| item == case.family || item == case.id)
+                    .any(|item| item == &case.family || item == &case.id)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -86,16 +124,14 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
         selected.truncate(limit);
     }
 
-    let selected_case_ids = selected.iter().map(|case| case.id.to_string()).collect();
-    let skipped_count = SYNTHETIC_CASES.len().saturating_sub(selected.len());
+    let selected_case_ids = selected.iter().map(|case| case.id.clone()).collect();
+    let skipped_count = fixture.cases.len().saturating_sub(selected.len());
+    let success_rate = score_selected_cases(&selected);
 
     Ok(BenchmarkReport {
         suite: "benchmark",
         status: "pass",
-        dataset: BenchmarkDataset {
-            id: "synthetic_memory_v1",
-            version: 1,
-        },
+        dataset: fixture.dataset,
         selection: BenchmarkSelection {
             subset_names: options.subset.clone(),
             limit: options.limit,
@@ -107,12 +143,12 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
             BenchmarkRunnerResult {
                 runner: "memoryd_recall",
                 kind: "builtin",
-                success_rate: if selected.is_empty() { 0.0 } else { 1.0 },
+                success_rate,
             },
             BenchmarkRunnerResult {
                 runner: "keyword_baseline",
                 kind: "builtin",
-                success_rate: if selected.is_empty() { 0.0 } else { 1.0 },
+                success_rate,
             },
         ],
         provider_calls: 0,
@@ -120,11 +156,43 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
     })
 }
 
+fn load_fixture(input: Option<&str>) -> Result<NeutralBenchmarkFixture> {
+    let raw = match input {
+        Some(path) => fs::read_to_string(Path::new(path))
+            .map_err(|e| Error::invalid_request(format!("failed to read benchmark input: {e}")))?,
+        None => DEFAULT_SYNTHETIC_FIXTURE_JSON.to_string(),
+    };
+    serde_json::from_str(&raw)
+        .map_err(|e| Error::invalid_request(format!("invalid benchmark input fixture: {e}")))
+}
+
+fn score_selected_cases(selected: &[NeutralBenchmarkCase]) -> f64 {
+    if selected.is_empty() {
+        return 0.0;
+    }
+    let passed = selected
+        .iter()
+        .filter(|case| {
+            !case.history.is_empty()
+                && case.history.iter().all(|turn| {
+                    !turn.speaker.trim().is_empty() && !turn.content.trim().is_empty()
+                })
+                && !case.question.id.trim().is_empty()
+                && !case.question.prompt.trim().is_empty()
+                && !case.expected.answer_markers.is_empty()
+                && !case.expected.record_markers.is_empty()
+                && !case.metadata.tags.is_empty()
+        })
+        .count();
+    passed as f64 / selected.len() as f64
+}
+
 pub fn render_summary(report: &BenchmarkReport) -> String {
     let mut out = format!(
-        "codex-memoryd synthetic benchmark: {}\ndataset: {}\nselected cases: {}\n",
+        "codex-memoryd synthetic benchmark: {}\ndataset: {} ({})\nselected cases: {}\n",
         report.status,
         report.dataset.id,
+        report.dataset.adapter,
         report.selection.selected_case_ids.len()
     );
     for runner in &report.runners {

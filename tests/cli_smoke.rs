@@ -5052,6 +5052,8 @@ fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_supports_subset_full
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["suite"], "benchmark");
     assert_eq!(json["dataset"]["id"], "synthetic_memory_v1");
+    assert_eq!(json["dataset"]["adapter"], "synthetic_builtin");
+    assert_eq!(json["dataset"]["case_count"], 2);
     assert_eq!(json["selection"]["subset_names"][0], "temporal");
     assert_eq!(json["selection"]["limit"], Value::Null);
     assert_eq!(json["selection"]["full_run"], true);
@@ -5084,4 +5086,63 @@ fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_supports_subset_full
     );
     let written: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
     assert_eq!(written, json);
+}
+
+#[test]
+fn cli_eval_benchmark_synthetic_accepts_neutral_input_fixture() {
+    let dir = TempDir::new().unwrap();
+    let input_path = dir.path().join("custom-benchmark.json");
+    fs::write(
+        &input_path,
+        r#"{
+  "dataset": {
+    "id": "custom_memory_v1",
+    "version": 3,
+    "adapter": "custom_fixture",
+    "case_count": 1
+  },
+  "cases": [
+    {
+      "id": "custom_case",
+      "family": "custom",
+      "history": [
+        {"speaker": "user", "content": "Mina prefers tea over coffee."}
+      ],
+      "question": {
+        "id": "custom_question",
+        "prompt": "What does Mina prefer?"
+      },
+      "expected": {
+        "answer_markers": ["tea"],
+        "record_markers": ["Mina prefers tea"]
+      },
+      "metadata": {
+        "tags": ["custom"]
+      }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let output = bin()
+        .args([
+            "eval",
+            "benchmark",
+            "synthetic",
+            "--format",
+            "json",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--full",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["dataset"]["id"], "custom_memory_v1");
+    assert_eq!(json["dataset"]["version"], 3);
+    assert_eq!(json["dataset"]["adapter"], "custom_fixture");
+    assert_eq!(json["selection"]["selected_case_ids"][0], "custom_case");
 }

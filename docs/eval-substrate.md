@@ -41,6 +41,28 @@ Each retrieval run should include:
 `eval retrieval` remains deterministic. It reports checked-in fixture scores and
 next ranking recommendations, not hosted-benchmark claims.
 
+## Benchmark Runner Foundation (Issue #189)
+
+`codex-memoryd eval benchmark synthetic` is the first neutral benchmark-runner
+surface. It stays local-only and provider-free.
+
+```bash
+codex-memoryd eval benchmark synthetic --subset temporal --format summary
+codex-memoryd eval benchmark synthetic --full --format json
+codex-memoryd eval benchmark synthetic --input ./datasets/local-benchmark.json --full --format json
+```
+
+The default corpus lives at
+`tests/fixtures/benchmark/synthetic_memory_v1.json`. It uses a neutral JSON
+shape with:
+
+- dataset metadata (`id`, `version`, `adapter`, `case_count`)
+- cases with `history`, `question`, `expected`, and `metadata`
+
+Full public datasets remain optional and out of CI. Operators can convert a
+small local subset into this shape and pass it via `--input` without changing
+production recall behavior or enabling provider calls.
+
 ## Current MVP Coverage
 
 The first vertical slice covers the issue #53 safety and substrate gates that
