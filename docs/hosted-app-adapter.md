@@ -106,6 +106,11 @@ The assistant should cite or summarize returned memory as context. It must not
 claim the daemon's recall is current fact without verification when the memory
 itself is stale, low-confidence, cross-boundary, or otherwise qualified.
 
+Returned memory identifiers are opaque handles such as `mr_*` and `msrc_*`.
+Hosted clients may treat those values as inert display references and may
+validate their fixed grammar, but must not infer storage location, authority,
+tenant, object key, or path semantics from them.
+
 ## Review And Approval Later
 
 Memory review and patch approval are an interactive layer, not part of the MVP.
@@ -126,6 +131,8 @@ app must not infer write permission from successful status, recall, or search.
 - Default to `read_only`.
 - Require explicit capability gates before any mutation, export, apply, forget,
   or cross-profile flow.
+- Treat all returned memory handles as non-bearer tokens. Possession of an
+  `mr_*` string alone never grants dereference authority.
 - Do not store `.env` dumps, private keys, auth files, raw confidential logs,
   encrypted reasoning, or giant tool output.
 - Do not silently bridge work and personal profiles.

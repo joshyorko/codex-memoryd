@@ -55,6 +55,10 @@ These break existing consumers and must not land silently:
 - **Changing `recall_not_authority`** semantics, or any safety invariant
   (profile boundary deny-by-default, quarantine withholding, secret rejection).
   These are load-bearing and are not negotiable additive surface.
+- **Making public memory handles carry location or authority.** Public `mr_*`,
+  `msrc_*`, `msub_*`, `mep_*`, and `mcp_*` values are opaque presentation
+  handles only. They must not embed filesystem paths, URLs, tenants, object
+  keys, query fragments, class names, or secret selectors.
 
 A breaking change requires: a note in the changelog/release gate, a bump of the
 relevant version field (`manifest_version`, eval report `version`,
@@ -84,3 +88,18 @@ means:
 
 The MCP registry test additionally pins the read-only tool **count**, so adding
 a read-only tool is a deliberate one-line update rather than a silent change.
+
+## Memory Handle ADR
+
+`codex-memoryd` now treats outbound memory pointers as a security boundary:
+
+- Public memory-facing IDs use a fixed opaque grammar with allowlisted
+  prefixes: `mr_`, `msrc_`, `msub_`, `mep_`, and `mcp_`.
+- The suffix is a deterministic one-way digest over a server-side identifier.
+  Clients may validate the grammar, but they cannot derive storage location or
+  authority from the handle itself.
+- Read surfaces may return attacker-controlled inert data, but they must not
+  return storage paths or raw source identifiers as dereference hints.
+- Full dereference grants and alias mutation authorization remain deferred. This
+  slice only hardens the invariant that pointer IDs themselves are inert and
+  non-authoritative.

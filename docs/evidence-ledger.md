@@ -9,6 +9,10 @@ The ledger is not a recall source and is not authority. Recall still reads
 ledger exists so operators and future agent adapters can audit write behavior
 without reading raw rejected content or hidden implementation state.
 
+When read surfaces need to point back at ledger-backed evidence, they must emit
+opaque `msrc_*` handles instead of raw `source_id` or `source_path` values.
+Those handles are inert references, not bearer tokens or dereference authority.
+
 ## Row Model
 
 Each row is scoped by:

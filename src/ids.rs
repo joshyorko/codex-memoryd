@@ -6,6 +6,29 @@ use sha2::Sha256;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+const PUBLIC_HANDLE_SUFFIX_LEN: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicHandleKind {
+    MemoryRef,
+    SourceRef,
+    SubjectRef,
+    EpisodeRef,
+    CheckpointRef,
+}
+
+impl PublicHandleKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            PublicHandleKind::MemoryRef => "mr_",
+            PublicHandleKind::SourceRef => "msrc_",
+            PublicHandleKind::SubjectRef => "msub_",
+            PublicHandleKind::EpisodeRef => "mep_",
+            PublicHandleKind::CheckpointRef => "mcp_",
+        }
+    }
+}
+
 /// RFC3339 timestamp for "now" in UTC. All stored timestamps are RFC3339 UTC
 /// strings so they sort lexicographically and round-trip cleanly through JSON.
 pub fn now_rfc3339() -> String {
@@ -30,6 +53,48 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// Produce a one-way public handle for values that may cross the API boundary.
+/// These handles are intentionally opaque and carry no authority.
+pub fn public_handle(kind: PublicHandleKind, raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.prefix().as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(raw.trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(PUBLIC_HANDLE_SUFFIX_LEN);
+    for byte in digest {
+        suffix.push_str(&format!("{byte:02x}"));
+        if suffix.len() >= PUBLIC_HANDLE_SUFFIX_LEN {
+            suffix.truncate(PUBLIC_HANDLE_SUFFIX_LEN);
+            break;
+        }
+    }
+    format!("{}{}", kind.prefix(), suffix)
+}
+
+pub fn is_valid_public_handle(value: &str) -> bool {
+    parse_public_handle(value).is_some()
+}
+
+pub fn parse_public_handle(value: &str) -> Option<PublicHandleKind> {
+    for kind in [
+        PublicHandleKind::MemoryRef,
+        PublicHandleKind::SourceRef,
+        PublicHandleKind::SubjectRef,
+        PublicHandleKind::EpisodeRef,
+        PublicHandleKind::CheckpointRef,
+    ] {
+        if let Some(suffix) = value.strip_prefix(kind.prefix()) {
+            return (suffix.len() == PUBLIC_HANDLE_SUFFIX_LEN
+                && suffix
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()))
+            .then_some(kind);
+        }
+    }
+    None
 }
 
 /// Normalize content for hashing: trim, collapse internal whitespace runs, and
@@ -127,5 +192,25 @@ mod tests {
         let b = new_id("mem");
         assert!(a.starts_with("mem_"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn public_handles_are_stable_and_parseable() {
+        let handle = public_handle(PublicHandleKind::MemoryRef, "mem_example");
+        assert!(handle.starts_with("mr_"));
+        assert_eq!(
+            parse_public_handle(&handle),
+            Some(PublicHandleKind::MemoryRef)
+        );
+        assert!(is_valid_public_handle(&handle));
+    }
+
+    #[test]
+    fn public_handles_reject_non_conforming_values() {
+        assert!(!is_valid_public_handle("mem_example"));
+        assert!(!is_valid_public_handle("mr_../../etc/shadow"));
+        assert!(!is_valid_public_handle(
+            "mr_ABCDEF0123456789abcdef0123456789"
+        ));
     }
 }

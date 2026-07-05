@@ -5,10 +5,14 @@ use crate::domain::MemoryRecord;
 use crate::domain::Profile;
 use crate::error::Error;
 use crate::error::Result;
+use crate::ids;
+use crate::ids::PublicHandleKind;
 use crate::policy;
 use crate::policy::BoundaryDecision;
 use crate::store::RecordQuery;
 use crate::store::Store;
+use serde_json::Map;
+use serde_json::Value;
 
 pub struct ExportParams<'a> {
     pub profile: Profile,
@@ -102,7 +106,7 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
             omitted_boundary += 1;
             continue;
         }
-        exported.push(record);
+        exported.push(sanitize_export_record(record));
     }
 
     let body = match params.format {
@@ -125,6 +129,57 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
         omitted_quarantined,
         omitted_boundary,
     })
+}
+
+fn sanitize_export_record(mut record: MemoryRecord) -> MemoryRecord {
+    record.id = ids::public_handle(PublicHandleKind::MemoryRef, &record.id);
+    record.subject_id = record
+        .subject_id
+        .as_ref()
+        .map(|subject| ids::public_handle(PublicHandleKind::SubjectRef, subject));
+    record.episode_id = record
+        .episode_id
+        .as_ref()
+        .map(|episode| ids::public_handle(PublicHandleKind::EpisodeRef, episode));
+    record.source_ids = record
+        .source_ids
+        .iter()
+        .map(|source| ids::public_handle(PublicHandleKind::SourceRef, source))
+        .collect();
+    record.supersedes = record
+        .supersedes
+        .iter()
+        .map(|memory| ids::public_handle(PublicHandleKind::MemoryRef, memory))
+        .collect();
+    record.metadata = sanitize_export_metadata(&record.metadata);
+    record
+}
+
+fn sanitize_export_metadata(metadata: &Value) -> Value {
+    let Some(object) = metadata.as_object() else {
+        return Value::Null;
+    };
+
+    let mut sanitized = Map::new();
+    for key in [
+        "origin",
+        "state",
+        "candidate_state",
+        "historical_reason",
+        "temporal_state",
+        "redaction_state",
+        "raw_artifact_stored",
+    ] {
+        if let Some(value) = object.get(key) {
+            sanitized.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if sanitized.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(sanitized)
+    }
 }
 
 #[cfg(test)]
