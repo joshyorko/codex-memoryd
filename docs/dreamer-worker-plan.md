@@ -18,7 +18,8 @@ The current Dreamer engine is deterministic and policy/store-backed; it does not
 
 ## Lifecycle proposal
 
-- `dream worker status` reports enabled state, mode, paid-provider readiness, last run, last error, watermark, next eligible run, limits, and whether apply is automatic (`false`).
+- Phase 1 status contract is additive only: `/v1/status` and `codex-memoryd status` expose a first-class `dream_worker` object with `enabled`, `mode`, `automatic_apply`, paid-provider flags, last-run fields, watermark, next eligibility, and scheduler limits.
+- `dream worker status` should later read the same contract and keep field names aligned with `/v1/status`.
 - `dream worker enable --mode deterministic` is the only first implementation candidate.
 - `dream worker run --preview` can force one bounded preview cycle.
 - `dream worker run --apply` should remain explicit and should use the same policy gates and run-id/patch semantics as current apply paths.
@@ -33,6 +34,12 @@ The current Dreamer engine is deterministic and policy/store-backed; it does not
 - Recall remains background context, not authority.
 - Status must make paid-provider configuration visible.
 - Non-loopback/no-auth exposure continues to degrade status.
+
+## Current planning slice
+
+- Keep execution behavior unchanged: existing deterministic preview/apply and optional scheduler remain as-is.
+- Make the worker contract explicit in docs and typed status output so later CLI commands can bind to reviewed fields instead of inventing ad hoc JSON.
+- Report `mode: deterministic`, `automatic_apply: false`, and `paid_provider_configured: false` / `paid_provider_ready: false` until an explicit provider-mode design lands.
 
 ## Open issues before implementation
 

@@ -10,6 +10,8 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::protocol::DreamRunStatus;
+use crate::protocol::DreamWorkerLimits;
+use crate::protocol::DreamWorkerStatus;
 use crate::protocol::LocalImportStatus;
 use crate::protocol::ScheduledDreamStatus;
 use crate::protocol::StatusResponse;
@@ -40,6 +42,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     let last_dream = store.last_dream_run().unwrap_or(None);
     let pending_writes = 0; // writes are synchronous in the MVP
     let dream_scheduler = dream_scheduler_status(store, config)?;
+    let dream_worker = dream_worker_status(config, &dream_scheduler);
 
     if !writable {
         degraded_reasons.push("storage is not writable".to_string());
@@ -124,6 +127,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
             rejected: run.rejected_count,
             error_summary: run.error_summary,
         }),
+        dream_worker,
         pending_writes,
         local_import,
         features,
@@ -161,6 +165,34 @@ fn dream_scheduler_status(store: &Store, config: &Config) -> Result<ScheduledDre
         next_eligible_run,
         degraded: matches!(last_status.as_deref(), Some("error")) || last_error.is_some(),
     })
+}
+
+fn dream_worker_status(
+    config: &Config,
+    dream_scheduler: &ScheduledDreamStatus,
+) -> DreamWorkerStatus {
+    DreamWorkerStatus {
+        enabled: dream_scheduler.enabled,
+        mode: "deterministic".to_string(),
+        automatic_apply: false,
+        paid_provider_configured: false,
+        paid_provider_ready: false,
+        last_run_at: dream_scheduler.last_run_at.clone(),
+        last_status: dream_scheduler.last_status.clone(),
+        last_error: dream_scheduler.last_error.clone(),
+        last_run_id: dream_scheduler.last_run_id.clone(),
+        last_watermark: dream_scheduler.last_watermark.clone(),
+        next_eligible_run: dream_scheduler.next_eligible_run.clone(),
+        limits: DreamWorkerLimits {
+            interval_seconds: config.dream_scheduler.interval_seconds,
+            idle_window_seconds: config.dream_scheduler.idle_window_seconds,
+            min_session_age_seconds: config.dream_scheduler.min_session_age_seconds,
+            min_turn_count: config.dream_scheduler.min_turn_count,
+            max_batch_size: config.dream_scheduler.max_batch_size,
+            max_candidates: config.dream_scheduler.max_candidates,
+            max_runtime_seconds: config.dream_scheduler.max_runtime_seconds,
+        },
+    }
 }
 
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {

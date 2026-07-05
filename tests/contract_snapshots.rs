@@ -59,6 +59,7 @@ fn status_contract_shape() {
             "storage_schema_version",
             "status",
             "storage",
+            "dream_worker",
             "features",
             "degraded_reasons",
         ],
@@ -68,6 +69,31 @@ fn status_contract_shape() {
         &json["storage"],
         &["kind", "path", "writable"],
         "status.storage",
+    );
+    assert_keys(
+        &json["dream_worker"],
+        &[
+            "enabled",
+            "mode",
+            "automatic_apply",
+            "paid_provider_configured",
+            "paid_provider_ready",
+            "limits",
+        ],
+        "status.dream_worker",
+    );
+    assert_keys(
+        &json["dream_worker"]["limits"],
+        &[
+            "interval_seconds",
+            "idle_window_seconds",
+            "min_session_age_seconds",
+            "min_turn_count",
+            "max_batch_size",
+            "max_candidates",
+            "max_runtime_seconds",
+        ],
+        "status.dream_worker.limits",
     );
 }
 

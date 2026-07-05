@@ -27,4 +27,12 @@ fn dream_scheduler_env_is_visible_in_status() {
         json["features"]["dream_scheduler"]["enabled"],
         serde_json::Value::Bool(true)
     );
+    assert_eq!(
+        json["dream_worker"]["enabled"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+        json["dream_worker"]["mode"],
+        serde_json::Value::String("deterministic".to_string())
+    );
 }
