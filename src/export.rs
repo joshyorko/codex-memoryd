@@ -5,6 +5,8 @@ use crate::domain::MemoryRecord;
 use crate::domain::Profile;
 use crate::error::Error;
 use crate::error::Result;
+use crate::ids;
+use crate::ids::PublicHandleKind;
 use crate::policy;
 use crate::policy::BoundaryDecision;
 use crate::store::RecordQuery;
@@ -102,7 +104,7 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
             omitted_boundary += 1;
             continue;
         }
-        exported.push(record);
+        exported.push(sanitize_export_record(record));
     }
 
     let body = match params.format {
@@ -125,6 +127,29 @@ pub fn export(store: &Store, params: &ExportParams) -> Result<ExportResult> {
         omitted_quarantined,
         omitted_boundary,
     })
+}
+
+fn sanitize_export_record(mut record: MemoryRecord) -> MemoryRecord {
+    record.id = ids::public_handle(PublicHandleKind::MemoryRef, &record.id);
+    record.subject_id = record
+        .subject_id
+        .as_ref()
+        .map(|subject| ids::public_handle(PublicHandleKind::SubjectRef, subject));
+    record.episode_id = record
+        .episode_id
+        .as_ref()
+        .map(|episode| ids::public_handle(PublicHandleKind::EpisodeRef, episode));
+    record.source_ids = record
+        .source_ids
+        .iter()
+        .map(|source| ids::public_handle(PublicHandleKind::SourceRef, source))
+        .collect();
+    record.supersedes = record
+        .supersedes
+        .iter()
+        .map(|memory| ids::public_handle(PublicHandleKind::MemoryRef, memory))
+        .collect();
+    record
 }
 
 #[cfg(test)]

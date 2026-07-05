@@ -16,6 +16,8 @@ use crate::domain::RecordType;
 use crate::domain::RepoIdentity;
 use crate::domain::TemporalState;
 use crate::error::Result;
+use crate::ids;
+use crate::ids::PublicHandleKind;
 use crate::protocol::Citation;
 use crate::protocol::RecallAdmission;
 use crate::protocol::RecallCheckpoint;
@@ -438,7 +440,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             top_level_ranking_signals.push(signal.clone());
         }
         facts.push(RecallFact {
-            id: r.id.clone(),
+            id: ids::public_handle(PublicHandleKind::MemoryRef, &r.id),
             record_type: r.record_type.as_str().to_string(),
             scope: r.scope.as_str().to_string(),
             content: r.content.clone(),
@@ -460,13 +462,12 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
             },
         });
         citations.push(Citation {
-            memory_id: r.id.clone(),
-            source_id: r.source_ids.first().cloned(),
-            source_path: r
-                .metadata
-                .get("local_path")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            memory_id: ids::public_handle(PublicHandleKind::MemoryRef, &r.id),
+            source_id: r
+                .source_ids
+                .first()
+                .map(|source| ids::public_handle(PublicHandleKind::SourceRef, source)),
+            source_path: None,
         });
         touched.push(r.id.clone());
         if facts.len() >= 40 {
@@ -507,7 +508,7 @@ pub fn recall(store: &Store, params: &RecallParams) -> Result<RecallResponse> {
         .recent_checkpoints(params.profile.as_str(), params.workspace, repo_id, 5)?
         .into_iter()
         .map(|cp| RecallCheckpoint {
-            id: cp.id,
+            id: ids::public_handle(PublicHandleKind::CheckpointRef, &cp.id),
             summary: cp.summary,
             branch: cp.branch,
             commit: cp.commit,
@@ -660,9 +661,19 @@ fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
         profile_id: record.profile_id.clone(),
         workspace_id: record.workspace_id.clone(),
         repo_id: record.repo_id.clone(),
-        evidence_refs: record.source_ids.clone(),
-        subject_id: record.subject_id.clone(),
-        episode_id: record.episode_id.clone(),
+        evidence_refs: record
+            .source_ids
+            .iter()
+            .map(|source| ids::public_handle(PublicHandleKind::SourceRef, source))
+            .collect(),
+        subject_id: record
+            .subject_id
+            .as_ref()
+            .map(|subject| ids::public_handle(PublicHandleKind::SubjectRef, subject)),
+        episode_id: record
+            .episode_id
+            .as_ref()
+            .map(|episode| ids::public_handle(PublicHandleKind::EpisodeRef, episode)),
         source_risk,
         trust_level,
         trust_score: Some(record.trust_score),
@@ -1355,7 +1366,7 @@ pub fn search(store: &Store, params: &SearchParams) -> Result<SearchResponse> {
     let matches = records
         .into_iter()
         .map(|r| SearchMatch {
-            id: r.id,
+            id: ids::public_handle(PublicHandleKind::MemoryRef, &r.id),
             record_type: r.record_type.as_str().to_string(),
             scope: r.scope.as_str().to_string(),
             content: r.content,
@@ -1558,14 +1569,20 @@ mod tests {
         assert_eq!(resp.authority, "recall_not_authority");
         assert!(resp.withheld.is_empty());
         assert_eq!(resp.facts.len(), 2);
-        assert_eq!(resp.facts[0].id, fresh_id);
+        assert_eq!(
+            resp.facts[0].id,
+            ids::public_handle(PublicHandleKind::MemoryRef, &fresh_id)
+        );
         assert!(!resp.facts[0].policy.freshness.stale);
         assert_eq!(resp.facts[0].policy.admission.reason, "admitted_ranked");
         assert_eq!(
             resp.facts[0].policy.admission.gates,
             vec!["profile_workspace".to_string()]
         );
-        assert_eq!(resp.facts[1].id, stale_id);
+        assert_eq!(
+            resp.facts[1].id,
+            ids::public_handle(PublicHandleKind::MemoryRef, &stale_id)
+        );
         assert!(resp.facts[1].policy.freshness.stale);
         assert_eq!(resp.facts[1].policy.admission.decision, "admitted");
         assert_eq!(

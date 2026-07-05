@@ -13,6 +13,17 @@ use codex_memoryd::recall::SearchParams;
 use codex_memoryd::store::NewRecord;
 use codex_memoryd::store::Store;
 
+fn assert_public_handle(value: &str, prefix: &str) {
+    assert!(
+        codex_memoryd::ids::is_valid_public_handle(value),
+        "expected valid public handle, got {value}"
+    );
+    assert!(
+        value.starts_with(prefix),
+        "expected handle prefix {prefix}, got {value}"
+    );
+}
+
 fn store() -> Store {
     let store = Store::open(":memory:").expect("open store");
     store.ensure_workspace("personal", "ws").expect("workspace");
@@ -205,7 +216,8 @@ fn recall_withholds_quarantined_unsafe_and_superseded_metadata_by_default() {
     let resp = recall::recall(&store, &params).expect("recall");
     assert_eq!(resp.authority, "recall_not_authority");
     assert_eq!(resp.facts.len(), 1);
-    assert_eq!(resp.facts[0].id, visible_id);
+    assert_ne!(resp.facts[0].id, visible_id);
+    assert_public_handle(&resp.facts[0].id, "mr_");
     assert!(resp
         .facts
         .iter()
@@ -279,7 +291,8 @@ fn default_recall_hides_archived_stale_superseded_records_but_returns_newer_fact
 
     let resp = recall::recall(&store, &params).expect("recall");
     assert_eq!(resp.facts.len(), 1);
-    assert_eq!(resp.facts[0].id, current_id);
+    assert_ne!(resp.facts[0].id, current_id);
+    assert_public_handle(&resp.facts[0].id, "mr_");
     let serialized = serde_json::to_string(&resp).unwrap();
     assert!(serialized.contains("port 8989"));
     assert!(!serialized.contains("port 8787"));
@@ -307,7 +320,7 @@ fn default_recall_hides_archived_stale_superseded_records_but_returns_newer_fact
     assert!(search
         .matches
         .iter()
-        .any(|m| m.id == archived_stale_id && m.archived));
+        .any(|m| m.id != archived_stale_id && m.archived && codex_memoryd::ids::is_valid_public_handle(&m.id)));
 }
 
 #[test]
@@ -409,7 +422,8 @@ fn recall_cross_profile_bleed_remains_default_deny() {
 
     let resp = recall::recall(&store, &params).expect("recall");
     assert_eq!(resp.facts.len(), 1);
-    assert_eq!(resp.facts[0].id, personal_id);
+    assert_ne!(resp.facts[0].id, personal_id);
+    assert_public_handle(&resp.facts[0].id, "mr_");
     assert!(!resp.facts[0].content.contains("work-only"));
 }
 
@@ -442,7 +456,16 @@ fn recall_allows_legacy_metadata_without_admission_markers() {
     assert_eq!(resp.authority, "recall_not_authority");
     assert_eq!(resp.policy.authority, "recall_not_authority");
     assert_eq!(resp.facts.len(), 1);
-    assert_eq!(resp.facts[0].id, id);
+    assert_ne!(resp.facts[0].id, id);
+    assert_public_handle(&resp.facts[0].id, "mr_");
+    assert_eq!(resp.citations.len(), 1);
+    assert_eq!(resp.citations[0].source_path, None);
+    assert_public_handle(resp.citations[0].source_id.as_deref().expect("source id"), "msrc_");
+    let provenance = &resp.facts[0].policy.provenance;
+    assert_public_handle(
+        provenance.evidence_refs.first().expect("evidence ref"),
+        "msrc_",
+    );
 }
 
 #[test]
@@ -498,6 +521,132 @@ fn export_counts_and_omits_secret_blocked_records() {
     assert_eq!(result.omitted_boundary, 0);
     assert!(result.body.contains("visible export note"));
     assert!(!result.body.contains("secret export note"));
+    assert!(!result.body.contains("\"id\":\"mem_"));
+}
+
+#[test]
+fn recall_search_and_export_expose_opaque_inert_handles_only() {
+    let store = store();
+    let rec = NewRecord {
+        profile_id: "personal".to_string(),
+        workspace_id: "ws".to_string(),
+        repo_id: None,
+        subject_id: Some("subject_alpha".to_string()),
+        episode_id: Some("episode_alpha".to_string()),
+        scope: Scope::Workspace,
+        record_type: RecordType::Other,
+        content: "opaque handle regression note".to_string(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::Portable,
+        confidence: 0.8,
+        source_ids: vec!["src:../../etc/shadow".to_string()],
+        content_hash: ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            RecordType::Other.as_str(),
+            "workspace",
+            "opaque handle regression note",
+        ),
+        supersedes: vec!["mem_legacy_raw".to_string()],
+        metadata: serde_json::json!({
+            "origin": "sync_local",
+            "local_path": "../../etc/shadow"
+        }),
+    };
+    let raw_id = store.upsert_record(&rec).expect("insert").id().to_string();
+
+    let recall = recall::recall(
+        &store,
+        &RecallParams {
+            profile: Profile::Personal,
+            workspace: "ws",
+            repo: None,
+            query: "opaque handle regression note",
+            files: &[],
+            max_tokens: 1000,
+            pack_mode: "default",
+            include_types: &[],
+            exclude_types: &[],
+            recency_days: None,
+            now: None,
+            as_of: None,
+            include_history: false,
+        },
+    )
+    .expect("recall");
+    assert_eq!(recall.facts.len(), 1);
+    assert_ne!(recall.facts[0].id, raw_id);
+    assert_public_handle(&recall.facts[0].id, "mr_");
+    assert_public_handle(
+        recall.facts[0]
+            .policy
+            .provenance
+            .subject_id
+            .as_deref()
+            .expect("subject handle"),
+        "msub_",
+    );
+    assert_public_handle(
+        recall.facts[0]
+            .policy
+            .provenance
+            .episode_id
+            .as_deref()
+            .expect("episode handle"),
+        "mep_",
+    );
+    assert_public_handle(
+        recall.facts[0]
+            .policy
+            .provenance
+            .evidence_refs
+            .first()
+            .expect("evidence handle"),
+        "msrc_",
+    );
+    let recall_json = serde_json::to_string(&recall).expect("serialize recall");
+    assert!(!recall_json.contains("src:../../etc/shadow"));
+    assert!(!recall_json.contains("../../etc/shadow"));
+    assert!(!recall_json.contains(&raw_id));
+
+    let search = recall::search(
+        &store,
+        &SearchParams {
+            profile: Profile::Personal,
+            workspace: Some("ws"),
+            repo_id: None,
+            query: "opaque handle regression note",
+            scope: None,
+            record_type: None,
+            include_archived: false,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .expect("search");
+    assert_eq!(search.matches.len(), 1);
+    assert_public_handle(&search.matches[0].id, "mr_");
+    assert_ne!(search.matches[0].id, raw_id);
+
+    let exported = export::export(
+        &store,
+        &ExportParams {
+            profile: Profile::Personal,
+            workspace: Some("ws"),
+            repo_id: None,
+            include_archived: false,
+            format: ExportFormat::Json,
+            target_profile: None,
+        },
+    )
+    .expect("export");
+    assert!(!exported.body.contains(&raw_id));
+    assert!(!exported.body.contains("src:../../etc/shadow"));
+    assert!(!exported.body.contains("../../etc/shadow"));
+    assert!(exported.body.contains("\"mr_"));
 }
 
 #[test]
