@@ -4853,6 +4853,7 @@ fn cli_eval_retrieval_supports_subset_limit_dry_run_and_report_out() {
     assert_eq!(json["selection"]["full_run"], false);
     assert_eq!(json["cost_budget"]["dry_run"], true);
     assert_eq!(json["cost_budget"]["provider_calls"], 0);
+    assert_eq!(json["cost_budget"]["tracking"], "deterministic_local");
     assert_eq!(
         json["artifacts"]["report_out"],
         report_path.to_string_lossy().to_string()
@@ -4867,7 +4868,36 @@ fn cli_eval_retrieval_supports_subset_limit_dry_run_and_report_out() {
 }
 
 #[test]
-fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_reports_local_runners() {
+fn cli_eval_retrieval_non_dry_run_marks_cost_as_untracked() {
+    let output = bin()
+        .args([
+            "eval",
+            "retrieval",
+            "--format",
+            "json",
+            "--subset",
+            "temporal",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["status"], "pass");
+    assert_eq!(json["cost_budget"]["dry_run"], false);
+    assert_eq!(json["cost_budget"]["tracking"], "untracked");
+    assert_eq!(json["cost_budget"]["provider_calls"], Value::Null);
+    assert_eq!(json["cost_budget"]["estimated_cost_usd"], Value::Null);
+    assert!(json.get("execution").is_none());
+}
+
+#[test]
+fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_supports_subset_full_and_report_out() {
+    let dir = TempDir::new().unwrap();
+    let report_path = dir.path().join("synthetic-report.json");
+
     bin()
         .args(["eval", "benchmark", "synthetic", "--format", "json"])
         .assert()
@@ -4883,8 +4913,11 @@ fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_reports_local_runner
             "synthetic",
             "--format",
             "json",
-            "--limit",
-            "1",
+            "--subset",
+            "temporal",
+            "--full",
+            "--report-out",
+            report_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -4893,11 +4926,19 @@ fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_reports_local_runner
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["suite"], "benchmark");
     assert_eq!(json["dataset"]["id"], "synthetic_memory_v1");
-    assert_eq!(json["selection"]["limit"], 1);
-    assert_eq!(json["selection"]["full_run"], false);
+    assert_eq!(json["selection"]["subset_names"][0], "temporal");
+    assert_eq!(json["selection"]["limit"], Value::Null);
+    assert_eq!(json["selection"]["full_run"], true);
     assert_eq!(
         json["selection"]["selected_case_ids"][0],
         "synthetic_temporal"
+    );
+    assert_eq!(
+        json["selection"]["selected_case_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
     assert_eq!(json["runners"].as_array().unwrap().len(), 2);
     assert!(json["runners"]
@@ -4911,4 +4952,10 @@ fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_reports_local_runner
         .iter()
         .any(|runner| runner["runner"] == "keyword_baseline" && runner["kind"] == "builtin"));
     assert_eq!(json["provider_calls"], 0);
+    assert_eq!(
+        json["artifacts"]["report_out"],
+        report_path.to_string_lossy().to_string()
+    );
+    let written: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(written, json);
 }

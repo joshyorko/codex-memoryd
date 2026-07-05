@@ -120,7 +120,6 @@ pub struct RetrievalEvalReport {
     pub selection: EvalSelection,
     pub cost_budget: EvalCostBudget,
     pub artifacts: EvalArtifacts,
-    pub execution: EvalExecution,
     pub baselines: Vec<RetrievalBaselineResult>,
     pub hybrid_experiments: Vec<HybridExperimentResult>,
     pub retrieval_improvements: Vec<RetrievalImprovement>,
@@ -150,21 +149,15 @@ pub struct EvalSelection {
 pub struct EvalCostBudget {
     pub estimated_input_tokens: usize,
     pub estimated_output_tokens: usize,
-    pub estimated_cost_usd: f64,
-    pub provider_calls: usize,
+    pub estimated_cost_usd: Option<f64>,
+    pub provider_calls: Option<usize>,
     pub dry_run: bool,
+    pub tracking: &'static str,
 }
 
 #[derive(Debug, Serialize, Default)]
 pub struct EvalArtifacts {
     pub report_out: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EvalExecution {
-    pub interrupted: bool,
-    pub partial_report: bool,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,11 +283,6 @@ pub fn run_retrieval_eval_with_options(
             selection,
             cost_budget,
             artifacts: EvalArtifacts::default(),
-            execution: EvalExecution {
-                interrupted: false,
-                partial_report: false,
-                errors: vec![],
-            },
             baselines: vec![],
             hybrid_experiments: vec![],
             retrieval_improvements: vec![],
@@ -430,11 +418,6 @@ pub fn run_retrieval_eval_with_options(
         selection,
         cost_budget,
         artifacts: EvalArtifacts::default(),
-        execution: EvalExecution {
-            interrupted: false,
-            partial_report: false,
-            errors: vec![],
-        },
         baselines,
         hybrid_experiments,
         retrieval_improvements,
@@ -575,9 +558,14 @@ fn estimate_cost(fixture: &RetrievalFixture, dry_run: bool) -> EvalCostBudget {
     EvalCostBudget {
         estimated_input_tokens: input_bytes / 4,
         estimated_output_tokens: fixture.questions.len() * 64,
-        estimated_cost_usd: 0.0,
-        provider_calls: 0,
+        estimated_cost_usd: dry_run.then_some(0.0),
+        provider_calls: dry_run.then_some(0),
         dry_run,
+        tracking: if dry_run {
+            "deterministic_local"
+        } else {
+            "untracked"
+        },
     }
 }
 

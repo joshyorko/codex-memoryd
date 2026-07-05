@@ -47,7 +47,7 @@ pub struct BenchmarkReport {
     pub artifacts: BenchmarkArtifacts,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct SyntheticCase {
     id: &'static str,
     family: &'static str,
@@ -82,7 +82,6 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
         })
         .cloned()
         .collect::<Vec<_>>();
-    let skipped_before_limit = SYNTHETIC_CASES.len().saturating_sub(selected.len());
     if let Some(limit) = options.limit {
         selected.truncate(limit);
     }
@@ -101,7 +100,7 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
             subset_names: options.subset.clone(),
             limit: options.limit,
             selected_case_ids,
-            skipped_count: skipped_count.max(skipped_before_limit),
+            skipped_count,
             full_run: options.full,
         },
         runners: vec![
