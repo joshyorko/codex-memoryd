@@ -2,11 +2,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use codex_memoryd::config::{Config, DreamSchedulerConfig};
-use codex_memoryd::dream;
 use codex_memoryd::domain::{
     Checkpoint, Conclusion, Portability, Profile, RecordType, RepoIdentity, Scope, Sensitivity,
     VisibleTurn,
 };
+use codex_memoryd::dream;
 use codex_memoryd::ids;
 use codex_memoryd::policy;
 use codex_memoryd::protocol::*;

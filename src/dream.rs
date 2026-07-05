@@ -262,9 +262,17 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     })?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
-        records.extend(imported_chatgpt_candidate_records(store, params, imported_limit)?);
+        records.extend(imported_chatgpt_candidate_records(
+            store,
+            params,
+            imported_limit,
+        )?);
     }
-    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let evidence_window =
         build_evidence_window(store, params, params.recency_cutoff, params.now, &records)?;
     let mut candidates = Vec::new();
