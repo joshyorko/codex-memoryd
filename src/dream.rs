@@ -18,6 +18,7 @@ use crate::domain::Conclusion;
 use crate::domain::MemoryRecord;
 use crate::domain::MemorySource;
 use crate::domain::Profile;
+use crate::domain::TemporalState;
 use crate::domain::VisibleTurn;
 use crate::error::Result;
 use crate::ids;
@@ -248,7 +249,7 @@ pub struct DreamParams<'a> {
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
-    let records = store.query_records(&RecordQuery {
+    let mut records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
         repo_id: params.repo_id.map(str::to_string),
@@ -259,6 +260,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         limit: params.max_records,
         offset: 0,
     })?;
+    records.extend(imported_chatgpt_candidate_records(store, params)?);
+    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
     let evidence_window =
         build_evidence_window(store, params, params.recency_cutoff, params.now, &records)?;
     let mut candidates = Vec::new();
@@ -570,6 +573,98 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         },
         max_candidates_hit,
     ))
+}
+
+fn imported_chatgpt_candidate_records(
+    store: &Store,
+    params: &DreamParams,
+) -> Result<Vec<MemoryRecord>> {
+    let turns = store.dream_visible_turns(
+        params.profile.as_str(),
+        params.workspace,
+        params.repo_id,
+        params.recency_cutoff,
+        params.max_records,
+    )?;
+    let mut records = Vec::new();
+    for turn in turns {
+        if turn.metadata.get("origin").and_then(|value| value.as_str()) != Some("chatgpt-export") {
+            continue;
+        }
+        let class = policy::classify(&turn.content, params.profile, params.repo_id.is_some());
+        if !matches!(
+            class.record_type,
+            crate::domain::RecordType::Preference
+                | crate::domain::RecordType::Decision
+                | crate::domain::RecordType::Command
+                | crate::domain::RecordType::Gotcha
+                | crate::domain::RecordType::RepoConvention
+        ) {
+            continue;
+        }
+        let source_path = turn
+            .metadata
+            .get("message_id")
+            .and_then(|value| value.as_str())
+            .map(|message_id| {
+                let conversation_id = turn
+                    .metadata
+                    .get("conversation_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                format!("chatgpt:{conversation_id}:{message_id}")
+            });
+        records.push(MemoryRecord {
+            id: format!("dreamsrc_{}", ids::sha256_hex(turn.id.as_bytes())),
+            profile_id: params.profile.as_str().to_string(),
+            workspace_id: params.workspace.to_string(),
+            repo_id: params.repo_id.map(str::to_string),
+            subject_id: None,
+            episode_id: None,
+            scope: class.scope,
+            record_type: class.record_type,
+            content: turn.content.clone(),
+            related_files: class.related_files,
+            tags: class.tags,
+            sensitivity: class.sensitivity,
+            portability: class.portability,
+            confidence: class.confidence,
+            source_ids: vec![turn.id.clone()],
+            content_hash: ids::content_hash(
+                params.profile.as_str(),
+                params.workspace,
+                params.repo_id,
+                class.record_type.as_str(),
+                class.scope.as_str(),
+                &turn.content,
+            ),
+            supersedes: vec![],
+            created_at: turn.created_at.clone(),
+            updated_at: turn.created_at.clone(),
+            last_used_at: None,
+            archived: false,
+            trust_state: "trusted".to_string(),
+            trust_score: 1.0,
+            quarantine_reason: None,
+            quarantined_at: None,
+            promoted_at: None,
+            valid_from: None,
+            valid_until: None,
+            observed_at: Some(turn.created_at.clone()),
+            invalidated_at: None,
+            superseded_by: None,
+            historical_reason: None,
+            temporal_state: TemporalState::Current,
+            metadata: json!({
+                "origin": "visible_turn",
+                "source": "chatgpt-export",
+                "source_id": turn.id,
+                "source_path": source_path,
+                "actor": turn.actor,
+            }),
+        });
+    }
+    Ok(records)
 }
 
 fn build_evidence_window(

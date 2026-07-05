@@ -154,6 +154,42 @@ fn turn_as(svc: &Service, session_id: &str, actor: &str, content: &str, created_
     .unwrap();
 }
 
+fn imported_chatgpt_turn(
+    svc: &Service,
+    session_id: &str,
+    actor: &str,
+    conversation_id: &str,
+    message_id: &str,
+    content: &str,
+    created_at: &str,
+) {
+    svc.store
+        .ensure_session(
+            session_id,
+            "personal",
+            "ws",
+            None,
+            Some("thread"),
+            "chatgpt-export",
+        )
+        .unwrap();
+    svc.store
+        .insert_visible_turn(&VisibleTurn {
+            id: format!("turn_chatgpt_{message_id}"),
+            session_id: session_id.to_string(),
+            actor: actor.to_string(),
+            content: content.to_string(),
+            created_at: created_at.to_string(),
+            metadata: json!({
+                "origin": "chatgpt-export",
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "source_file_path": "/tmp/chatgpt-export/conversations.json",
+            }),
+        })
+        .unwrap();
+}
+
 fn seed_direct_evidence_window_refs(svc: &Service, suffix: &str, sentinel: &str) {
     let session_id = format!("sess_window_{suffix}");
     svc.store
@@ -1820,4 +1856,43 @@ fn repeated_user_steering_promotes() {
             && candidate.user_evidence_count >= 2
             && candidate.apply_eligible
     }));
+}
+
+#[test]
+fn imported_chatgpt_turns_feed_reviewable_dream_candidates() {
+    let svc = service();
+    imported_chatgpt_turn(
+        &svc,
+        "chatgpt-import",
+        "user",
+        "conv-1",
+        "msg-1",
+        "Preference: keep commit messages terse.",
+        "2026-06-01T10:00:00Z",
+    );
+    imported_chatgpt_turn(
+        &svc,
+        "chatgpt-import",
+        "user",
+        "conv-1",
+        "msg-2",
+        "Preference: keep commit messages terse and direct.",
+        "2026-06-08T10:00:00Z",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(preview.candidates.iter().any(|candidate| {
+        candidate.candidate_state == "accepted"
+            && candidate.threshold_reason == "repeated_user_steering"
+            && candidate.user_evidence_count >= 2
+            && candidate.apply_eligible
+            && candidate
+                .evidence_refs
+                .iter()
+                .all(|reference| reference.kind == "visible_turn")
+    }));
+
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    assert_eq!(applied.created.len(), 1);
 }
