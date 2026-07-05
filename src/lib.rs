@@ -16,8 +16,8 @@
 
 pub mod activation;
 pub mod backup;
-pub mod chatgpt_export_import;
 pub mod benchmark_eval;
+pub mod chatgpt_export_import;
 pub mod config;
 pub mod conformance;
 pub mod doctor;
