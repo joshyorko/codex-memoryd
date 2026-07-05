@@ -4816,3 +4816,99 @@ args = ["hello"]
     assert!(updated.contains("[mcp_servers.other]\ncommand = \"/bin/echo\""));
     assert!(!updated.contains("[mcp_servers.codex_memoryd]"));
 }
+
+#[test]
+fn cli_eval_retrieval_supports_subset_limit_dry_run_and_report_out() {
+    let dir = TempDir::new().unwrap();
+    let report_path = dir.path().join("retrieval-report.json");
+
+    let output = bin()
+        .args([
+            "eval",
+            "retrieval",
+            "--format",
+            "json",
+            "--subset",
+            "temporal",
+            "--limit",
+            "1",
+            "--dry-run-cost",
+            "--report-out",
+            report_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["suite"], "retrieval_quality");
+    assert_eq!(json["status"], "dry_run");
+    assert_eq!(json["question_count"], 1);
+    assert_eq!(json["selection"]["subset_names"][0], "temporal");
+    assert_eq!(json["selection"]["limit"], 1);
+    assert_eq!(
+        json["selection"]["selected_question_ids"][0],
+        "q_temporal_current"
+    );
+    assert_eq!(json["selection"]["full_run"], false);
+    assert_eq!(json["cost_budget"]["dry_run"], true);
+    assert_eq!(json["cost_budget"]["provider_calls"], 0);
+    assert_eq!(
+        json["artifacts"]["report_out"],
+        report_path.to_string_lossy().to_string()
+    );
+    assert!(
+        report_path.exists(),
+        "report_out should write a JSON artifact"
+    );
+
+    let written: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(written, json);
+}
+
+#[test]
+fn cli_eval_benchmark_synthetic_requires_explicit_scope_and_reports_local_runners() {
+    bin()
+        .args(["eval", "benchmark", "synthetic", "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires --limit, --subset, or --full",
+        ));
+
+    let output = bin()
+        .args([
+            "eval",
+            "benchmark",
+            "synthetic",
+            "--format",
+            "json",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["suite"], "benchmark");
+    assert_eq!(json["dataset"]["id"], "synthetic_memory_v1");
+    assert_eq!(json["selection"]["limit"], 1);
+    assert_eq!(json["selection"]["full_run"], false);
+    assert_eq!(
+        json["selection"]["selected_case_ids"][0],
+        "synthetic_temporal"
+    );
+    assert_eq!(json["runners"].as_array().unwrap().len(), 2);
+    assert!(json["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|runner| runner["runner"] == "memoryd_recall" && runner["kind"] == "builtin"));
+    assert!(json["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|runner| runner["runner"] == "keyword_baseline" && runner["kind"] == "builtin"));
+    assert_eq!(json["provider_calls"], 0);
+}

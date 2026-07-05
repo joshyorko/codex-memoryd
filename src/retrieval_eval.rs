@@ -117,6 +117,10 @@ pub struct RetrievalEvalReport {
     pub fixture: &'static str,
     pub fixture_families: Vec<String>,
     pub question_count: usize,
+    pub selection: EvalSelection,
+    pub cost_budget: EvalCostBudget,
+    pub artifacts: EvalArtifacts,
+    pub execution: EvalExecution,
     pub baselines: Vec<RetrievalBaselineResult>,
     pub hybrid_experiments: Vec<HybridExperimentResult>,
     pub retrieval_improvements: Vec<RetrievalImprovement>,
@@ -124,6 +128,43 @@ pub struct RetrievalEvalReport {
     pub regression_fixtures: Vec<RegressionFixture>,
     pub next_recommended_ranking_changes: Vec<String>,
     pub notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalEvalOptions {
+    pub subset: Vec<String>,
+    pub limit: Option<usize>,
+    pub dry_run_cost: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvalSelection {
+    pub subset_names: Vec<String>,
+    pub limit: Option<usize>,
+    pub selected_question_ids: Vec<String>,
+    pub skipped_count: usize,
+    pub full_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvalCostBudget {
+    pub estimated_input_tokens: usize,
+    pub estimated_output_tokens: usize,
+    pub estimated_cost_usd: f64,
+    pub provider_calls: usize,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct EvalArtifacts {
+    pub report_out: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvalExecution {
+    pub interrupted: bool,
+    pub partial_report: bool,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,7 +270,43 @@ impl SignalConfig {
 }
 
 pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
+    run_retrieval_eval_with_options(&RetrievalEvalOptions::default())
+}
+
+pub fn run_retrieval_eval_with_options(
+    options: &RetrievalEvalOptions,
+) -> Result<RetrievalEvalReport> {
     let fixture = load_fixture()?;
+    let (fixture, selection) = select_fixture_questions(fixture, options);
+    let cost_budget = estimate_cost(&fixture, options.dry_run_cost);
+    if options.dry_run_cost {
+        return Ok(RetrievalEvalReport {
+            suite: SUITE,
+            version: fixture.version,
+            status: "dry_run",
+            fixture: "tests/fixtures/retrieval/long_history.json",
+            fixture_families: fixture_families(&fixture),
+            question_count: fixture.questions.len(),
+            selection,
+            cost_budget,
+            artifacts: EvalArtifacts::default(),
+            execution: EvalExecution {
+                interrupted: false,
+                partial_report: false,
+                errors: vec![],
+            },
+            baselines: vec![],
+            hybrid_experiments: vec![],
+            retrieval_improvements: vec![],
+            ranking_ablations: vec![],
+            regression_fixtures: vec![],
+            next_recommended_ranking_changes: vec![],
+            notes: vec![
+                "fixture-only deterministic cost estimate; no provider calls",
+                "dry-run reports selection and estimated tokens without executing scoring",
+            ],
+        });
+    }
     let service = eval_service(&fixture)?;
     seed_fixture_records(&service, &fixture)?;
     seed_fixture_semantic_layer(&service, &fixture)?;
@@ -350,6 +427,14 @@ pub fn run_retrieval_eval() -> Result<RetrievalEvalReport> {
         fixture: "tests/fixtures/retrieval/long_history.json",
         fixture_families: fixture_families(&fixture),
         question_count: fixture.questions.len(),
+        selection,
+        cost_budget,
+        artifacts: EvalArtifacts::default(),
+        execution: EvalExecution {
+            interrupted: false,
+            partial_report: false,
+            errors: vec![],
+        },
         baselines,
         hybrid_experiments,
         retrieval_improvements,
@@ -442,6 +527,58 @@ pub fn render_retrieval_summary(report: &RetrievalEvalReport) -> String {
 fn load_fixture() -> Result<RetrievalFixture> {
     serde_json::from_str(FIXTURE_JSON)
         .map_err(|e| Error::internal(format!("parse retrieval fixture: {e}")))
+}
+
+fn select_fixture_questions(
+    mut fixture: RetrievalFixture,
+    options: &RetrievalEvalOptions,
+) -> (RetrievalFixture, EvalSelection) {
+    let original_count = fixture.questions.len();
+    let mut questions = fixture
+        .questions
+        .into_iter()
+        .filter(|question| {
+            options.subset.is_empty()
+                || options
+                    .subset
+                    .iter()
+                    .any(|item| item == &question.family || item == &question.id)
+        })
+        .collect::<Vec<_>>();
+    if let Some(limit) = options.limit {
+        questions.truncate(limit);
+    }
+    let selection = EvalSelection {
+        subset_names: options.subset.clone(),
+        limit: options.limit,
+        selected_question_ids: questions.iter().map(|q| q.id.clone()).collect(),
+        skipped_count: original_count.saturating_sub(questions.len()),
+        full_run: options.subset.is_empty() && options.limit.is_none() && !options.dry_run_cost,
+    };
+    fixture.questions = questions;
+    (fixture, selection)
+}
+
+fn estimate_cost(fixture: &RetrievalFixture, dry_run: bool) -> EvalCostBudget {
+    let input_bytes = fixture
+        .questions
+        .iter()
+        .map(|question| {
+            question.query.len()
+                + question
+                    .answer_markers
+                    .iter()
+                    .map(|m| m.len())
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    EvalCostBudget {
+        estimated_input_tokens: input_bytes / 4,
+        estimated_output_tokens: fixture.questions.len() * 64,
+        estimated_cost_usd: 0.0,
+        provider_calls: 0,
+        dry_run,
+    }
 }
 
 fn eval_service(fixture: &RetrievalFixture) -> Result<Service> {
