@@ -12,6 +12,8 @@ use crate::metrics::Metrics;
 use crate::protocol::DreamRunStatus;
 use crate::protocol::DreamWorkerLimits;
 use crate::protocol::DreamWorkerStatus;
+use crate::protocol::AdjacentOwnershipStatus;
+use crate::protocol::AdjacentRuntimeStatus;
 use crate::protocol::LocalImportStatus;
 use crate::protocol::ScheduledDreamStatus;
 use crate::protocol::StatusResponse;
@@ -43,6 +45,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     let pending_writes = 0; // writes are synchronous in the MVP
     let dream_scheduler = dream_scheduler_status(store, config)?;
     let dream_worker = dream_worker_status(config, &dream_scheduler);
+    let adjacent_runtime = adjacent_runtime_status(config);
 
     if !writable {
         degraded_reasons.push("storage is not writable".to_string());
@@ -130,6 +133,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         dream_worker,
         pending_writes,
         local_import,
+        adjacent_runtime,
         features,
         degraded_reasons,
     })
@@ -198,4 +202,62 @@ fn dream_worker_status(
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
     (parsed + Duration::seconds(seconds)).format(&Rfc3339).ok()
+}
+
+fn adjacent_runtime_status(config: &Config) -> AdjacentRuntimeStatus {
+    let memoryd_endpoint = format!("http://{}", config.bind);
+    let configured = config.adjacent_runtime.enabled;
+    let url = config.adjacent_runtime.url.clone();
+    let conflict_with_memoryd = url
+        .as_deref()
+        .zip(parse_http_endpoint(&memoryd_endpoint))
+        .is_some_and(|(url, memoryd)| parse_http_endpoint(url) == Some(memoryd));
+    let reachable = if configured && !conflict_with_memoryd {
+        url.as_deref().map(endpoint_reachable)
+    } else {
+        None
+    };
+    let status = if !configured {
+        "disabled"
+    } else if conflict_with_memoryd {
+        "conflict"
+    } else if reachable == Some(true) {
+        "reachable"
+    } else {
+        "configured"
+    };
+
+    AdjacentRuntimeStatus {
+        status: status.to_string(),
+        configured,
+        name: config.adjacent_runtime.name.clone(),
+        url,
+        reachable,
+        ownership: AdjacentOwnershipStatus {
+            owner: "adjacent-app".to_string(),
+            memoryd_endpoint,
+            conflict_with_memoryd,
+        },
+    }
+}
+
+fn endpoint_reachable(url: &str) -> bool {
+    parse_http_endpoint(url).is_some_and(|(host, port)| {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::new(host, port),
+            std::time::Duration::from_millis(200),
+        )
+        .is_ok()
+    })
+}
+
+fn parse_http_endpoint(url: &str) -> Option<(std::net::IpAddr, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    authority.parse::<std::net::SocketAddr>().ok().map(|addr| match addr {
+        std::net::SocketAddr::V4(addr) => (std::net::IpAddr::V4(*addr.ip()), addr.port()),
+        std::net::SocketAddr::V6(addr) => (std::net::IpAddr::V6(*addr.ip()), addr.port()),
+    })
 }

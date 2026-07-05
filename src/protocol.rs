@@ -91,6 +91,23 @@ pub struct LocalImportStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AdjacentOwnershipStatus {
+    pub owner: String,
+    pub memoryd_endpoint: String,
+    pub conflict_with_memoryd: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdjacentRuntimeStatus {
+    pub status: String,
+    pub configured: bool,
+    pub name: String,
+    pub url: Option<String>,
+    pub reachable: Option<bool>,
+    pub ownership: AdjacentOwnershipStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
     pub provider_name: String,
     pub provider_version: String,
@@ -106,6 +123,7 @@ pub struct StatusResponse {
     pub dream_worker: DreamWorkerStatus,
     pub pending_writes: i64,
     pub local_import: LocalImportStatus,
+    pub adjacent_runtime: AdjacentRuntimeStatus,
     pub features: Value,
     pub degraded_reasons: Vec<String>,
 }

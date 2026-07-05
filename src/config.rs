@@ -25,6 +25,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub server: ServerSection,
     #[serde(default)]
+    pub runtime: RuntimeSection,
+    #[serde(default)]
     pub storage: StorageSection,
     #[serde(default)]
     pub policy: PolicySection,
@@ -39,6 +41,19 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerSection {
     pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RuntimeSection {
+    #[serde(default)]
+    pub adjacent: AdjacentRuntimeSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdjacentRuntimeSection {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -141,6 +156,7 @@ pub struct LogSection {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
+    pub adjacent_runtime: AdjacentRuntimeConfig,
     pub storage_kind: String,
     pub storage_path: PathBuf,
     pub default_profile: String,
@@ -161,10 +177,28 @@ pub struct Config {
     pub declare_loopback_publish: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdjacentRuntimeConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub url: Option<String>,
+}
+
+impl Default for AdjacentRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: "adjacent-app".to_string(),
+            url: None,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             bind: DEFAULT_BIND.to_string(),
+            adjacent_runtime: AdjacentRuntimeConfig::default(),
             storage_kind: "sqlite".to_string(),
             storage_path: default_storage_path(),
             default_profile: "personal".to_string(),
@@ -322,6 +356,15 @@ impl Config {
         if let Some(bind) = file.server.bind {
             self.bind = bind;
         }
+        if let Some(enabled) = file.runtime.adjacent.enabled {
+            self.adjacent_runtime.enabled = enabled;
+        }
+        if let Some(name) = file.runtime.adjacent.name {
+            self.adjacent_runtime.name = name;
+        }
+        if let Some(url) = file.runtime.adjacent.url {
+            self.adjacent_runtime.url = clean_env_value(url);
+        }
         if let Some(kind) = file.storage.kind {
             self.storage_kind = kind;
         }
@@ -393,6 +436,11 @@ impl Config {
                 "unsupported storage kind '{}' (only 'sqlite' is supported)",
                 self.storage_kind
             )));
+        }
+        if self.adjacent_runtime.enabled && self.adjacent_runtime.url.is_none() {
+            return Err(Error::invalid_request(
+                "runtime.adjacent.url must be set when runtime.adjacent.enabled = true",
+            ));
         }
         if crate::domain::Profile::parse(&self.default_profile).is_none() {
             return Err(Error::invalid_request(format!(
@@ -750,5 +798,50 @@ fusion_k = 42
         assert_eq!(cfg.hybrid_recall.backend, DEFAULT_HYBRID_BACKEND);
         assert_eq!(cfg.hybrid_recall.dims, 96);
         assert_eq!(cfg.hybrid_recall.fusion_k, 77);
+    }
+
+    #[test]
+    fn adjacent_runtime_defaults_to_disabled() {
+        let cfg = Config::default();
+        assert!(!cfg.adjacent_runtime.enabled);
+        assert_eq!(cfg.adjacent_runtime.name, "adjacent-app");
+        assert_eq!(cfg.adjacent_runtime.url, None);
+    }
+
+    #[test]
+    fn adjacent_runtime_file_config_is_explicit_only() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[runtime.adjacent]
+enabled = true
+name = "dogfood-router"
+url = "http://127.0.0.1:4318"
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        cfg.validate().expect("valid adjacent runtime");
+        assert!(cfg.adjacent_runtime.enabled);
+        assert_eq!(cfg.adjacent_runtime.name, "dogfood-router");
+        assert_eq!(
+            cfg.adjacent_runtime.url.as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
+    }
+
+    #[test]
+    fn adjacent_runtime_enabled_requires_url() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[runtime.adjacent]
+enabled = true
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        let err = cfg.validate().expect_err("missing adjacent url");
+        assert!(err.to_string().contains("runtime.adjacent.url"));
     }
 }

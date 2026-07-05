@@ -44,6 +44,18 @@
       "last_apply_at": null,
       "unsynced_count": 0
     },
+    "adjacent_runtime": {
+      "status": "disabled",
+      "configured": false,
+      "name": "adjacent-app",
+      "url": null,
+      "reachable": null,
+      "ownership": {
+        "owner": "adjacent-app",
+        "memoryd_endpoint": "http://127.0.0.1:8787",
+        "conflict_with_memoryd": false
+      }
+    },
     "features": {
       "fts5": true,
       "search_mode": "fts5",
