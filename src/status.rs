@@ -7,6 +7,8 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use crate::config::Config;
+use crate::config::adjacent_runtime_conflicts;
+use crate::config::parse_local_http_endpoint;
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::protocol::DreamRunStatus;
@@ -210,8 +212,7 @@ fn adjacent_runtime_status(config: &Config) -> AdjacentRuntimeStatus {
     let url = config.adjacent_runtime.url.clone();
     let conflict_with_memoryd = url
         .as_deref()
-        .zip(parse_http_endpoint(&memoryd_endpoint))
-        .is_some_and(|(url, memoryd)| parse_http_endpoint(url) == Some(memoryd));
+        .is_some_and(|url| adjacent_runtime_conflicts(&config.bind, url));
     let reachable = if configured && !conflict_with_memoryd {
         url.as_deref().map(endpoint_reachable)
     } else {
@@ -242,22 +243,35 @@ fn adjacent_runtime_status(config: &Config) -> AdjacentRuntimeStatus {
 }
 
 fn endpoint_reachable(url: &str) -> bool {
-    parse_http_endpoint(url).is_some_and(|(host, port)| {
+    parse_local_http_endpoint(url).is_some_and(|endpoint| {
+        let host = match endpoint.host {
+            crate::config::LocalEndpointHost::Localhost => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            crate::config::LocalEndpointHost::Ip(ip) => ip,
+        };
         std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::new(host, port),
+            &std::net::SocketAddr::new(host, endpoint.port),
             std::time::Duration::from_millis(200),
         )
         .is_ok()
     })
 }
 
-fn parse_http_endpoint(url: &str) -> Option<(std::net::IpAddr, u16)> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let authority = rest.split('/').next()?;
-    authority.parse::<std::net::SocketAddr>().ok().map(|addr| match addr {
-        std::net::SocketAddr::V4(addr) => (std::net::IpAddr::V4(*addr.ip()), addr.port()),
-        std::net::SocketAddr::V6(addr) => (std::net::IpAddr::V6(*addr.ip()), addr.port()),
-    })
+#[cfg(test)]
+mod tests {
+    use super::adjacent_runtime_status;
+    use crate::config::Config;
+
+    #[test]
+    fn wildcard_memoryd_bind_conflicts_with_loopback_adjacent_url() {
+        let mut cfg = Config::default();
+        cfg.bind = "0.0.0.0:8787".to_string();
+        cfg.adjacent_runtime.enabled = true;
+        cfg.adjacent_runtime.url = Some("http://127.0.0.1:8787".to_string());
+
+        let status = adjacent_runtime_status(&cfg);
+        assert_eq!(status.status, "conflict");
+        assert!(status.ownership.conflict_with_memoryd);
+    }
 }
