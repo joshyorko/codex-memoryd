@@ -5146,3 +5146,24 @@ fn cli_eval_benchmark_synthetic_accepts_neutral_input_fixture() {
     assert_eq!(json["dataset"]["adapter"], "custom_fixture");
     assert_eq!(json["selection"]["selected_case_ids"][0], "custom_case");
 }
+
+#[test]
+fn cli_eval_benchmark_synthetic_reports_input_path_on_read_error() {
+    let dir = TempDir::new().unwrap();
+    let input_path = dir.path().join("missing-benchmark.json");
+
+    bin()
+        .args([
+            "eval",
+            "benchmark",
+            "synthetic",
+            "--format",
+            "json",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--full",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(input_path.to_string_lossy().as_ref()));
+}

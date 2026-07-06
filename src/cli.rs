@@ -2041,9 +2041,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 } => {
                     let mut report = codex_memoryd::benchmark_eval::run_synthetic_benchmark(
                         &codex_memoryd::benchmark_eval::SyntheticBenchmarkOptions {
-                            input: input
-                                .as_ref()
-                                .map(|path| path.to_string_lossy().to_string()),
+                            input: input.clone(),
                             subset: subset.clone(),
                             limit: *limit,
                             full: *full,

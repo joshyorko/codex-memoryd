@@ -13,7 +13,7 @@ pub struct SyntheticBenchmarkOptions {
     pub subset: Vec<String>,
     pub limit: Option<usize>,
     pub full: bool,
-    pub input: Option<String>,
+    pub input: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,8 +69,6 @@ struct NeutralBenchmarkCase {
     history: Vec<NeutralHistoryTurn>,
     question: NeutralBenchmarkQuestion,
     expected: NeutralBenchmarkExpected,
-    #[serde(default)]
-    metadata: NeutralBenchmarkMetadata,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,12 +89,6 @@ struct NeutralBenchmarkExpected {
     answer_markers: Vec<String>,
     #[serde(default)]
     record_markers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct NeutralBenchmarkMetadata {
-    #[serde(default)]
-    tags: Vec<String>,
 }
 
 pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<BenchmarkReport> {
@@ -156,14 +148,31 @@ pub fn run_synthetic_benchmark(options: &SyntheticBenchmarkOptions) -> Result<Be
     })
 }
 
-fn load_fixture(input: Option<&str>) -> Result<NeutralBenchmarkFixture> {
+fn load_fixture(input: Option<&Path>) -> Result<NeutralBenchmarkFixture> {
     let raw = match input {
-        Some(path) => fs::read_to_string(Path::new(path))
-            .map_err(|e| Error::invalid_request(format!("failed to read benchmark input: {e}")))?,
+        Some(path) => fs::read_to_string(path).map_err(|e| {
+            Error::invalid_request(format!(
+                "failed to read benchmark input '{}': {e}",
+                path.display()
+            ))
+        })?,
         None => DEFAULT_SYNTHETIC_FIXTURE_JSON.to_string(),
     };
-    serde_json::from_str(&raw)
-        .map_err(|e| Error::invalid_request(format!("invalid benchmark input fixture: {e}")))
+    let fixture: NeutralBenchmarkFixture = serde_json::from_str(&raw).map_err(|e| match input {
+        Some(path) => Error::invalid_request(format!(
+            "invalid benchmark input fixture '{}': {e}",
+            path.display()
+        )),
+        None => Error::internal(format!("invalid built-in benchmark fixture: {e}")),
+    })?;
+    if fixture.dataset.case_count != fixture.cases.len() {
+        return Err(Error::invalid_request(format!(
+            "benchmark dataset.case_count {} does not match cases.len() {}",
+            fixture.dataset.case_count,
+            fixture.cases.len()
+        )));
+    }
+    Ok(fixture)
 }
 
 fn score_selected_cases(selected: &[NeutralBenchmarkCase]) -> f64 {
@@ -181,7 +190,6 @@ fn score_selected_cases(selected: &[NeutralBenchmarkCase]) -> f64 {
                 && !case.question.prompt.trim().is_empty()
                 && !case.expected.answer_markers.is_empty()
                 && !case.expected.record_markers.is_empty()
-                && !case.metadata.tags.is_empty()
         })
         .count();
     passed as f64 / selected.len() as f64
@@ -202,4 +210,71 @@ pub fn render_summary(report: &BenchmarkReport) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        load_fixture, run_synthetic_benchmark, SyntheticBenchmarkOptions,
+        DEFAULT_SYNTHETIC_FIXTURE_JSON,
+    };
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn synthetic_benchmark_allows_missing_tags() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-tags.json");
+        fs::write(
+            &path,
+            r#"{
+  "dataset": {
+    "id": "custom_memory_v1",
+    "version": 1,
+    "adapter": "custom_fixture",
+    "case_count": 1
+  },
+  "cases": [
+    {
+      "id": "custom_case",
+      "family": "custom",
+      "history": [{"speaker": "user", "content": "Mina prefers tea over coffee."}],
+      "question": {"id": "q1", "prompt": "What does Mina prefer?"},
+      "expected": {
+        "answer_markers": ["tea"],
+        "record_markers": ["Mina prefers tea"]
+      }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let report = run_synthetic_benchmark(&SyntheticBenchmarkOptions {
+            full: true,
+            input: Some(path),
+            ..SyntheticBenchmarkOptions::default()
+        })
+        .expect("fixture without tags runs");
+
+        let success_rates = report
+            .runners
+            .iter()
+            .map(|runner| runner.success_rate)
+            .collect::<Vec<_>>();
+        assert_eq!(success_rates, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn load_fixture_rejects_mismatched_case_count() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad-fixture.json");
+        let raw = DEFAULT_SYNTHETIC_FIXTURE_JSON.replace("\"case_count\": 2", "\"case_count\": 99");
+        fs::write(&path, raw).unwrap();
+
+        let err = load_fixture(Some(&path)).expect_err("fixture should be rejected");
+        assert!(
+            err.to_string().contains("dataset.case_count"),
+            "unexpected error: {err}"
+        );
+    }
 }
