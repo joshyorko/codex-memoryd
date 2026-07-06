@@ -1,0 +1,60 @@
+{
+  "dataset": {
+    "id": "synthetic_memory_v1",
+    "version": 1,
+    "adapter": "synthetic_builtin",
+    "case_count": 2
+  },
+  "cases": [
+    {
+      "id": "synthetic_temporal",
+      "family": "temporal",
+      "history": [
+        {
+          "speaker": "user",
+          "content": "Jordan moved the weekly team sync from Tuesday to Thursday."
+        },
+        {
+          "speaker": "assistant",
+          "content": "Recorded: the weekly team sync is now on Thursday."
+        }
+      ],
+      "question": {
+        "id": "temporal_q1",
+        "prompt": "What day is the weekly team sync now?"
+      },
+      "expected": {
+        "answer_markers": ["Thursday"],
+        "record_markers": ["weekly team sync is now on Thursday"]
+      },
+      "metadata": {
+        "tags": ["synthetic", "temporal"]
+      }
+    },
+    {
+      "id": "synthetic_preference",
+      "family": "preference",
+      "history": [
+        {
+          "speaker": "user",
+          "content": "Riley prefers concise bullet summaries with links."
+        },
+        {
+          "speaker": "assistant",
+          "content": "Stored Riley's preference for concise bullet summaries with links."
+        }
+      ],
+      "question": {
+        "id": "preference_q1",
+        "prompt": "How should Riley receive project updates?"
+      },
+      "expected": {
+        "answer_markers": ["concise bullet summaries"],
+        "record_markers": ["preference for concise bullet summaries"]
+      },
+      "metadata": {
+        "tags": ["synthetic", "preference"]
+      }
+    }
+  ]
+}

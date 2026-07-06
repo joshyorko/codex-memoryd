@@ -298,6 +298,8 @@ target/release/codex-memoryd card show --profile personal --workspace josh-perso
   --type subject_summary
 target/release/codex-memoryd eval retrieval --format summary
 target/release/codex-memoryd eval retrieval --format json
+target/release/codex-memoryd eval benchmark synthetic --subset temporal --format summary
+target/release/codex-memoryd eval benchmark synthetic --input ./datasets/local-benchmark.json --full --format json
 target/release/codex-memoryd adapter export --target agents-md \
   --profile personal --workspace josh-personal > AGENTS.memory.md
 target/release/codex-memoryd adapter export --target mcp-pack \
@@ -320,6 +322,10 @@ card smoke suite includes a fixture-backed markdown snapshot for this contract.
 correctness, safety, procedure memory, patch rollback, and adapter/context-pack
 economics. `eval retrieval` is the deterministic, fixture-backed retrieval
 quality loop for issue #153, including long-history baselines and ablations.
+`eval benchmark synthetic` is the first public-benchmark runner foundation: it
+loads a neutral JSON corpus shape from the checked-in synthetic fixture by
+default and can point at an operator-supplied local file for tiny subset runs
+outside CI.
 See
 [`docs/eval-substrate.md`](./docs/eval-substrate.md).
 
