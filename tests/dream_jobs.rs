@@ -87,7 +87,7 @@ fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
         .unwrap();
 
     assert_eq!(run.status, "ok");
-    assert_eq!(run.mode, "deterministic");
+    assert_eq!(run.mode, "preview");
     assert_eq!(run.preview.mode, "preview");
     assert!(!run.preview.candidates.is_empty());
     assert_eq!(svc.store.count_records().unwrap(), before);
@@ -143,4 +143,34 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
 
     let last = svc.store.last_dream_run().unwrap().unwrap();
     assert_eq!(last.id, run.run_id);
+    assert_eq!(last.mode, "preview");
+}
+
+#[test]
+fn deterministic_job_run_rejects_zero_runtime_budget() {
+    let svc = service();
+
+    let err = svc
+        .run_dream_job(DreamJobRunRequest {
+            job_id: Some("job_zero_runtime".to_string()),
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None::<RepoIdentity>,
+            now: Some("2030-01-01T00:00:00Z".to_string()),
+            since: None,
+            kind: "dream_preview".to_string(),
+            mode: Some("deterministic".to_string()),
+            budget: DreamJobBudget {
+                max_runtime_seconds: 0,
+                max_input_records: 500,
+                max_candidates: 5,
+            },
+            provider: None,
+        })
+        .expect_err("zero runtime budget should be rejected");
+
+    assert!(
+        err.message.contains("max_runtime_seconds must be > 0"),
+        "unexpected error: {err:?}"
+    );
 }

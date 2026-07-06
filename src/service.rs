@@ -1653,6 +1653,11 @@ impl Service {
         if req.budget.max_candidates == 0 {
             return Err(Error::invalid_request("dream job max_candidates must be > 0"));
         }
+        if req.budget.max_runtime_seconds == 0 {
+            return Err(Error::invalid_request(
+                "dream job max_runtime_seconds must be > 0",
+            ));
+        }
         let now = req.now.unwrap_or_else(ids::now_rfc3339);
         if OffsetDateTime::parse(&now, &Rfc3339).is_err() {
             return Err(Error::invalid_request(
@@ -1732,7 +1737,7 @@ impl Service {
                     profile_id: resp.profile.clone(),
                     workspace_id: resp.workspace.clone(),
                     repo_id: resp.repo_id.clone(),
-                    mode: mode.clone(),
+                    mode: resp.mode.clone(),
                     status: status.clone(),
                     started_at,
                     completed_at: Some(completed_at.clone()),
@@ -1770,7 +1775,7 @@ impl Service {
                     job_id,
                     run_id: resp.run_id.clone(),
                     kind: "dream_preview".to_string(),
-                    mode,
+                    mode: resp.mode.clone(),
                     status,
                     limits_hit,
                     preview: resp,
