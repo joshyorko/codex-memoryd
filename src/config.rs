@@ -25,6 +25,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub server: ServerSection,
     #[serde(default)]
+    pub runtime: RuntimeSection,
+    #[serde(default)]
     pub storage: StorageSection,
     #[serde(default)]
     pub policy: PolicySection,
@@ -39,6 +41,19 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerSection {
     pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RuntimeSection {
+    #[serde(default)]
+    pub adjacent: AdjacentRuntimeSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdjacentRuntimeSection {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -141,6 +156,7 @@ pub struct LogSection {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
+    pub adjacent_runtime: AdjacentRuntimeConfig,
     pub storage_kind: String,
     pub storage_path: PathBuf,
     pub default_profile: String,
@@ -161,10 +177,40 @@ pub struct Config {
     pub declare_loopback_publish: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdjacentRuntimeConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub url: Option<String>,
+}
+
+impl Default for AdjacentRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: "adjacent-app".to_string(),
+            url: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalEndpointHost {
+    Localhost,
+    Ip(IpAddr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalHttpEndpoint {
+    pub host: LocalEndpointHost,
+    pub port: u16,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             bind: DEFAULT_BIND.to_string(),
+            adjacent_runtime: AdjacentRuntimeConfig::default(),
             storage_kind: "sqlite".to_string(),
             storage_path: default_storage_path(),
             default_profile: "personal".to_string(),
@@ -322,6 +368,15 @@ impl Config {
         if let Some(bind) = file.server.bind {
             self.bind = bind;
         }
+        if let Some(enabled) = file.runtime.adjacent.enabled {
+            self.adjacent_runtime.enabled = enabled;
+        }
+        if let Some(name) = file.runtime.adjacent.name {
+            self.adjacent_runtime.name = name;
+        }
+        if let Some(url) = file.runtime.adjacent.url {
+            self.adjacent_runtime.url = clean_env_value(url);
+        }
         if let Some(kind) = file.storage.kind {
             self.storage_kind = kind;
         }
@@ -393,6 +448,18 @@ impl Config {
                 "unsupported storage kind '{}' (only 'sqlite' is supported)",
                 self.storage_kind
             )));
+        }
+        if self.adjacent_runtime.enabled && self.adjacent_runtime.url.is_none() {
+            return Err(Error::invalid_request(
+                "runtime.adjacent.url must be set when runtime.adjacent.enabled = true",
+            ));
+        }
+        if let Some(url) = self.adjacent_runtime.url.as_deref() {
+            if parse_local_http_endpoint(url).is_none() {
+                return Err(Error::invalid_request(
+                    "runtime.adjacent.url must be a local http(s)://HOST:PORT endpoint",
+                ));
+            }
         }
         if crate::domain::Profile::parse(&self.default_profile).is_none() {
             return Err(Error::invalid_request(format!(
@@ -598,6 +665,70 @@ fn bind_host(bind: &str) -> Option<String> {
         .map(|(host, _)| host.trim().to_string())
 }
 
+pub(crate) fn parse_local_http_endpoint(url: &str) -> Option<LocalHttpEndpoint> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(port) = authority
+        .strip_prefix("localhost:")
+        .and_then(|port| port.parse::<u16>().ok())
+    {
+        return Some(LocalHttpEndpoint {
+            host: LocalEndpointHost::Localhost,
+            port,
+        });
+    }
+    let socket = authority.parse::<std::net::SocketAddr>().ok()?;
+    let host = match socket.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => LocalEndpointHost::Ip(IpAddr::V4(ip)),
+        IpAddr::V6(ip) if ip.is_loopback() => LocalEndpointHost::Ip(IpAddr::V6(ip)),
+        _ => return None,
+    };
+    Some(LocalHttpEndpoint {
+        host,
+        port: socket.port(),
+    })
+}
+
+pub(crate) fn adjacent_runtime_conflicts(memoryd_bind: &str, adjacent_url: &str) -> bool {
+    let Some(adjacent) = parse_local_http_endpoint(adjacent_url) else {
+        return false;
+    };
+    let Some((memoryd_host, memoryd_port)) = bind_host(memoryd_bind)
+        .and_then(|host| bind_port(memoryd_bind).map(|port| (host, port)))
+    else {
+        return false;
+    };
+    if memoryd_port != adjacent.port {
+        return false;
+    }
+    if memoryd_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(memoryd_ip) = memoryd_host.parse::<IpAddr>() else {
+        return false;
+    };
+    if memoryd_ip.is_unspecified() {
+        return true;
+    }
+    match (&adjacent.host, memoryd_ip) {
+        (LocalEndpointHost::Localhost, ip) => ip.is_loopback(),
+        (LocalEndpointHost::Ip(adjacent_ip), ip) => adjacent_ip == &ip,
+    }
+}
+
+fn bind_port(bind: &str) -> Option<u16> {
+    if bind.starts_with('[') {
+        let (_, port) = bind.rsplit_once("]:")?;
+        return port.parse().ok();
+    }
+    bind.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +881,82 @@ fusion_k = 42
         assert_eq!(cfg.hybrid_recall.backend, DEFAULT_HYBRID_BACKEND);
         assert_eq!(cfg.hybrid_recall.dims, 96);
         assert_eq!(cfg.hybrid_recall.fusion_k, 77);
+    }
+
+    #[test]
+    fn adjacent_runtime_defaults_to_disabled() {
+        let cfg = Config::default();
+        assert!(!cfg.adjacent_runtime.enabled);
+        assert_eq!(cfg.adjacent_runtime.name, "adjacent-app");
+        assert_eq!(cfg.adjacent_runtime.url, None);
+    }
+
+    #[test]
+    fn adjacent_runtime_file_config_is_explicit_only() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[runtime.adjacent]
+enabled = true
+name = "dogfood-router"
+url = "http://127.0.0.1:4318"
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        cfg.validate().expect("valid adjacent runtime");
+        assert!(cfg.adjacent_runtime.enabled);
+        assert_eq!(cfg.adjacent_runtime.name, "dogfood-router");
+        assert_eq!(
+            cfg.adjacent_runtime.url.as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
+    }
+
+    #[test]
+    fn adjacent_runtime_enabled_requires_url() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[runtime.adjacent]
+enabled = true
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        let err = cfg.validate().expect_err("missing adjacent url");
+        assert!(err.to_string().contains("runtime.adjacent.url"));
+    }
+
+    #[test]
+    fn adjacent_runtime_rejects_non_local_url() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[runtime.adjacent]
+enabled = true
+url = "https://example.com:443"
+"#,
+        )
+        .expect("parse file config");
+        let mut cfg = Config::default();
+        cfg.merge_file(file);
+        let err = cfg.validate().expect_err("non-local url must fail");
+        assert!(err.to_string().contains("local http(s)://HOST:PORT"));
+    }
+
+    #[test]
+    fn adjacent_runtime_conflict_treats_wildcard_bind_as_loopback_conflict() {
+        assert!(adjacent_runtime_conflicts(
+            "0.0.0.0:8787",
+            "http://127.0.0.1:8787"
+        ));
+        assert!(adjacent_runtime_conflicts(
+            "[::]:8787",
+            "https://[::1]:8787"
+        ));
+        assert!(!adjacent_runtime_conflicts(
+            "127.0.0.1:8787",
+            "http://127.0.0.1:4318"
+        ));
     }
 }

@@ -4480,6 +4480,7 @@ fn cli_paths_json_reports_expected_keys_without_creating_runtime_files() {
     assert_eq!(json["bind"]["kind"], "endpoint");
     assert_eq!(json["host"], "127.0.0.1");
     assert_eq!(json["port"], 8787);
+    assert_eq!(json["adjacent_runtime"]["status"], "disabled");
     for key in [
         "config_file",
         "runtime_home",
@@ -4519,6 +4520,36 @@ fn cli_paths_json_reports_expected_keys_without_creating_runtime_files() {
         !config.exists(),
         "paths command must not create config file"
     );
+}
+
+#[test]
+fn cli_paths_json_reports_adjacent_endpoint_ownership_when_configured() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[runtime.adjacent]\nenabled = true\nname = \"dogfood-router\"\nurl = \"http://127.0.0.1:4318\"\n",
+    )
+    .unwrap();
+
+    let output = bin()
+        .arg("--config")
+        .arg(&config)
+        .args(["paths", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["adjacent_runtime"]["status"], "configured");
+    assert_eq!(json["adjacent_runtime"]["name"], "dogfood-router");
+    assert_eq!(
+        json["entries"]["adjacent_url"]["value"],
+        "http://127.0.0.1:4318"
+    );
+    assert_eq!(json["entries"]["adjacent_url"]["owner"], "adjacent-app");
 }
 
 #[test]
@@ -4659,6 +4690,29 @@ fn cli_config_show_resolved_reports_runtime_and_daemon_values() {
         .stdout(predicate::str::contains("\"daemon\""))
         .stdout(predicate::str::contains("\"decision\": \"native\""))
         .stdout(predicate::str::contains("127.0.0.1:8787"));
+}
+
+#[test]
+fn cli_config_show_includes_adjacent_runtime_registry_and_values() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[runtime.adjacent]\nenabled = true\nname = \"dogfood-router\"\nurl = \"http://127.0.0.1:4318\"\n",
+    )
+    .unwrap();
+
+    bin()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "show", "--resolved"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CODEX_MEMORYD_ADJACENT_URL"))
+        .stdout(predicate::str::contains("CODEX_MEMORYD_ADJACENT_ENABLED"))
+        .stdout(predicate::str::contains("\"adjacent_runtime\""))
+        .stdout(predicate::str::contains("dogfood-router"))
+        .stdout(predicate::str::contains("http://127.0.0.1:4318"));
 }
 
 #[test]

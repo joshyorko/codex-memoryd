@@ -111,6 +111,21 @@ mode, `sync-local --preview ~/.codex/memories` and `sync-local --apply
 ~/.codex/memories` still use the host path; the CLI packages host files for the
 daemon so users do not need to know container mount paths.
 
+For local dogfood with a second app beside the daemon, add an explicit config
+lane instead of teaching `up`/`down` to manage that app:
+
+```toml
+[runtime.adjacent]
+enabled = true
+name = "dogfood-router"
+url = "http://127.0.0.1:4318"
+```
+
+`codex-memoryd status`, `codex-memoryd paths --format json`, and
+`codex-memoryd config show --resolved` then report the adjacent lane
+separately, including endpoint ownership and conflicts with codex-memoryd's own
+front door.
+
 ### First-run path (source build)
 
 For source checkouts, the same product commands work against the built binary.

@@ -30,6 +30,15 @@
 # built-in auth yet and is unsupported for production remote use.
 bind = "127.0.0.1:8787"
 
+[runtime.adjacent]
+# Optional local dogfood lane for a second app that sits beside codex-memoryd.
+# Disabled by default and config-file only: lifecycle commands still manage only
+# codex-memoryd. When enabled, set a distinct local endpoint so status/paths can
+# report ownership and detect conflicts with the memory daemon front door.
+enabled = false
+name = "adjacent-app"
+# url = "http://127.0.0.1:4318"
+
 [storage]
 # Only "sqlite" is supported in the MVP. A `~` is expanded to the home dir.
 kind = "sqlite"

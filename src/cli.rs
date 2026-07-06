@@ -354,6 +354,7 @@ struct PathsInventory {
     bind: InventoryEntry,
     host: String,
     port: u16,
+    adjacent_runtime: AdjacentRuntimeStatus,
     entries: BTreeMap<String, InventoryEntry>,
 }
 
@@ -1018,7 +1019,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Paths { format } => {
-            let inventory = paths_inventory(&cli);
+            let inventory = paths_inventory(&cli)?;
             match format {
                 PathsFormat::Json => print_json(&inventory),
                 PathsFormat::Summary => {
@@ -1763,6 +1764,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 "log_level": config.log_level,
                                 "declare_loopback_publish": config.declare_loopback_publish,
                             },
+                            "adjacent_runtime": {
+                                "enabled": config.adjacent_runtime.enabled,
+                                "name": config.adjacent_runtime.name,
+                                "url": config.adjacent_runtime.url,
+                            },
                             "dream": {
                                 "scheduler_enabled": config.dream_scheduler.enabled,
                                 "scheduler_interval_seconds": config.dream_scheduler.interval_seconds,
@@ -2503,8 +2509,9 @@ fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<
     std::fs::write(path, format!("{}\n", out.join("\n"))).map_err(error::Error::from)
 }
 
-fn paths_inventory(cli: &Cli) -> PathsInventory {
+fn paths_inventory(cli: &Cli) -> Result<PathsInventory> {
     let runtime = cli.runtime_options();
+    let config = cli.load_config(None)?;
     let config_file = cli
         .config
         .clone()
@@ -2573,15 +2580,29 @@ fn paths_inventory(cli: &Cli) -> PathsInventory {
             "external",
         ),
     );
+    if let Some(url) = &config.adjacent_runtime.url {
+        entries.insert(
+            "adjacent_url".to_string(),
+            InventoryEntry {
+                path: None,
+                value: Some(url.clone()),
+                kind: "endpoint",
+                durability: "external",
+                exists: config.adjacent_runtime.enabled,
+                owner: "adjacent-app",
+            },
+        );
+    }
 
-    PathsInventory {
+    Ok(PathsInventory {
         runtime_kind: format!("{:?}", runtime.runtime).to_ascii_lowercase(),
         url: endpoint_entry(runtime.url),
         bind: endpoint_entry(runtime.bind),
         host: runtime.host,
         port: runtime.port,
+        adjacent_runtime: adjacent_runtime_inventory(&config),
         entries,
-    }
+    })
 }
 
 fn path_entry(
@@ -2672,6 +2693,39 @@ fn config_registry(cli: &Cli, config: &Config, runtime: &RuntimeOptions) -> serd
         })
     };
     json!([
+        entry(
+            "CODEX_MEMORYD_ADJACENT_ENABLED",
+            "runtime-ux",
+            "config-only",
+            json!(config.adjacent_runtime.enabled),
+            false,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_ADJACENT_URL",
+            "runtime-ux",
+            "config-only",
+            json!(config.adjacent_runtime.url),
+            false,
+            true,
+            false,
+            true,
+            false
+        ),
+        entry(
+            "CODEX_MEMORYD_ADJACENT_NAME",
+            "runtime-ux",
+            "config-only",
+            json!(config.adjacent_runtime.name),
+            false,
+            true,
+            false,
+            true,
+            false
+        ),
         entry(
             "CODEX_MEMORYD_URL",
             "client",
@@ -3027,6 +3081,33 @@ fn env_source(env_key: &str, fallback: &'static str) -> &'static str {
         "env"
     } else {
         fallback
+    }
+}
+
+fn adjacent_runtime_inventory(config: &Config) -> AdjacentRuntimeStatus {
+    let memoryd_endpoint = format!("http://{}", config.bind);
+    let configured = config.adjacent_runtime.enabled;
+    let url = config.adjacent_runtime.url.clone();
+    let conflict_with_memoryd = url
+        .as_deref()
+        .is_some_and(|url| crate::config::adjacent_runtime_conflicts(&config.bind, url));
+    AdjacentRuntimeStatus {
+        status: if !configured {
+            "disabled".to_string()
+        } else if conflict_with_memoryd {
+            "conflict".to_string()
+        } else {
+            "configured".to_string()
+        },
+        configured,
+        name: config.adjacent_runtime.name.clone(),
+        url,
+        reachable: None,
+        ownership: AdjacentOwnershipStatus {
+            owner: "adjacent-app".to_string(),
+            memoryd_endpoint,
+            conflict_with_memoryd,
+        },
     }
 }
 
