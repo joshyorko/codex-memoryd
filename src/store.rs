@@ -38,8 +38,10 @@ use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
 use crate::ids;
+use crate::protocol::DreamJobBudget;
+use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 9;
+pub const STORAGE_SCHEMA_VERSION: i64 = 10;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -53,6 +55,7 @@ const MIGRATION_PROCEDURE_LIFECYCLE: &str =
 const MIGRATION_SEMANTIC_RELATIONS: &str =
     include_str!("../migrations/0009_semantic_relations.sql");
 const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
+const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -135,6 +138,24 @@ pub struct DreamRunSummary {
     pub archived_count: i64,
     pub rejected_count: i64,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DreamJobRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub kind: String,
+    pub mode: String,
+    pub status: String,
+    pub budget: DreamJobBudget,
+    pub provider: DreamJobProvider,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_run_id: Option<String>,
+    pub last_run_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,6 +390,7 @@ impl Store {
         conn.execute_batch(MIGRATION_SEMANTIC_RELATIONS)?;
         conn.execute_batch(MIGRATION_TEMPORAL_RECORDS)?;
         ensure_temporal_columns(&conn)?;
+        conn.execute_batch(MIGRATION_DREAM_JOBS)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -2884,6 +2906,87 @@ impl Store {
                  LIMIT 1",
                 [],
                 row_to_dream_summary,
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn upsert_dream_job(&self, job: &DreamJobRecord) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO dream_jobs(
+                id, profile_id, workspace_id, repo_id, kind, mode, status,
+                budget_json, provider_json, created_at, updated_at, last_run_id,
+                last_run_at, last_error
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                workspace_id = excluded.workspace_id,
+                repo_id = excluded.repo_id,
+                kind = excluded.kind,
+                mode = excluded.mode,
+                status = excluded.status,
+                budget_json = excluded.budget_json,
+                provider_json = excluded.provider_json,
+                updated_at = excluded.updated_at,
+                last_run_id = excluded.last_run_id,
+                last_run_at = excluded.last_run_at,
+                last_error = excluded.last_error",
+            params![
+                job.id,
+                job.profile_id,
+                job.workspace_id,
+                job.repo_id,
+                job.kind,
+                job.mode,
+                job.status,
+                serde_json::to_string(&job.budget)?,
+                serde_json::to_string(&job.provider)?,
+                job.created_at,
+                job.updated_at,
+                job.last_run_id,
+                job.last_run_at,
+                job.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_dream_job(&self, id: &str) -> Result<Option<DreamJobRecord>> {
+        let conn = self.conn()?;
+        let result = conn
+            .query_row(
+                "SELECT id, profile_id, workspace_id, repo_id, kind, mode, status,
+                        budget_json, provider_json, created_at, updated_at,
+                        last_run_id, last_run_at, last_error
+                 FROM dream_jobs
+                 WHERE id = ?1",
+                params![id],
+                |row| {
+                    let budget_json: String = row.get(7)?;
+                    let provider_json: String = row.get(8)?;
+                    Ok(DreamJobRecord {
+                        id: row.get(0)?,
+                        profile_id: row.get(1)?,
+                        workspace_id: row.get(2)?,
+                        repo_id: row.get(3)?,
+                        kind: row.get(4)?,
+                        mode: row.get(5)?,
+                        status: row.get(6)?,
+                        budget: serde_json::from_str(&budget_json).unwrap_or(DreamJobBudget {
+                            max_runtime_seconds: 0,
+                            max_input_records: 0,
+                            max_candidates: 0,
+                        }),
+                        provider: serde_json::from_str(&provider_json).unwrap_or_default(),
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        last_run_id: row.get(11)?,
+                        last_run_at: row.get(12)?,
+                        last_error: row.get(13)?,
+                    })
+                },
             )
             .optional()?;
         Ok(result)

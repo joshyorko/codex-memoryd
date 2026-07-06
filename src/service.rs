@@ -52,6 +52,7 @@ use crate::recall::SearchParams;
 use crate::status;
 use crate::store::ledger_safe_summary;
 use crate::store::DreamRunAudit;
+use crate::store::DreamJobRecord;
 use crate::store::DreamRunRecord;
 use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
@@ -1627,6 +1628,181 @@ impl Service {
 
     pub fn dream(&self, req: DreamRequest) -> Result<DreamResponse> {
         self.dream_with_patch_binding(req, None)
+    }
+
+    pub fn run_dream_job(&self, req: DreamJobRunRequest) -> Result<DreamJobRunResponse> {
+        let profile = self.resolve_profile(&req.profile)?;
+        let workspace = self.resolve_workspace(&req.workspace);
+        let repo_id = self.register_repo(&req.repo)?;
+        let mode = req.mode.unwrap_or_else(|| "deterministic".to_string());
+        if mode != "deterministic" {
+            return Err(Error::invalid_request(
+                "dream job mode must be deterministic in this MVP",
+            ));
+        }
+        if req.kind != "dream_preview" {
+            return Err(Error::invalid_request(
+                "dream job kind must be dream_preview in this MVP",
+            ));
+        }
+        if req.budget.max_input_records == 0 {
+            return Err(Error::invalid_request(
+                "dream job max_input_records must be > 0",
+            ));
+        }
+        if req.budget.max_candidates == 0 {
+            return Err(Error::invalid_request("dream job max_candidates must be > 0"));
+        }
+        if req.budget.max_runtime_seconds == 0 {
+            return Err(Error::invalid_request(
+                "dream job max_runtime_seconds must be > 0",
+            ));
+        }
+        let now = req.now.unwrap_or_else(ids::now_rfc3339);
+        if OffsetDateTime::parse(&now, &Rfc3339).is_err() {
+            return Err(Error::invalid_request(
+                "dream job now must be an RFC3339 timestamp",
+            ));
+        }
+        if let Some(since) = req.since.as_deref() {
+            if OffsetDateTime::parse(since, &Rfc3339).is_err() {
+                return Err(Error::invalid_request(
+                    "dream job since must be an RFC3339 timestamp",
+                ));
+            }
+        }
+
+        let started_at = ids::now_rfc3339();
+        let job_id = req.job_id.unwrap_or_else(|| ids::new_id("dream_job"));
+        let provider = req.provider.unwrap_or_default();
+        let explicit_since = req.since.is_some();
+        let source_window_start = match req.since.as_ref() {
+            Some(since) => Some(since.clone()),
+            None => self
+                .store
+                .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
+        };
+
+        self.store.upsert_dream_job(&DreamJobRecord {
+            id: job_id.clone(),
+            profile_id: profile.as_str().to_string(),
+            workspace_id: workspace.clone(),
+            repo_id: repo_id.clone(),
+            kind: req.kind.clone(),
+            mode: mode.clone(),
+            status: "running".to_string(),
+            budget: req.budget.clone(),
+            provider: provider.clone(),
+            created_at: started_at.clone(),
+            updated_at: started_at.clone(),
+            last_run_id: None,
+            last_run_at: None,
+            last_error: None,
+        })?;
+
+        let started = Instant::now();
+        let result = dream::run(
+            &self.store,
+            &dream::DreamParams {
+                profile,
+                workspace: &workspace,
+                repo_id: repo_id.as_deref(),
+                mode: "preview",
+                now: &now,
+                recency_cutoff: source_window_start.as_deref(),
+                include_archived_sources: explicit_since,
+                max_records: req.budget.max_input_records,
+                max_candidates: Some(req.budget.max_candidates),
+                patch_run_id: None,
+            },
+        );
+
+        match result {
+            Ok((resp, max_candidates_hit)) => {
+                let mut limits_hit = Vec::new();
+                if max_candidates_hit {
+                    limits_hit.push("max_candidates".to_string());
+                }
+                if started.elapsed().as_secs() >= req.budget.max_runtime_seconds {
+                    limits_hit.push("max_runtime_seconds".to_string());
+                }
+                let status = if limits_hit.is_empty() {
+                    "ok".to_string()
+                } else {
+                    "ok_with_limits".to_string()
+                };
+                let completed_at = ids::now_rfc3339();
+                self.store.insert_dream_run(&DreamRunAudit {
+                    id: resp.run_id.clone(),
+                    profile_id: resp.profile.clone(),
+                    workspace_id: resp.workspace.clone(),
+                    repo_id: resp.repo_id.clone(),
+                    mode: resp.mode.clone(),
+                    status: status.clone(),
+                    started_at,
+                    completed_at: Some(completed_at.clone()),
+                    implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+                    config_hash: dream::config_hash(),
+                    ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+                    fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
+                    source_window_start,
+                    source_window_end: Some(now),
+                    source_counts: serde_json::to_value(&resp.evidence_window)
+                        .unwrap_or_else(|_| json!({})),
+                    candidate_counts: dream::candidate_counts(&resp),
+                    created_count: resp.created.len() as i64,
+                    archived_count: resp.archived.len() as i64,
+                    rejected_count: resp.rejected.len() as i64,
+                    error_summary: None,
+                })?;
+                self.store.upsert_dream_job(&DreamJobRecord {
+                    id: job_id.clone(),
+                    profile_id: resp.profile.clone(),
+                    workspace_id: resp.workspace.clone(),
+                    repo_id: resp.repo_id.clone(),
+                    kind: req.kind,
+                    mode: mode.clone(),
+                    status: status.clone(),
+                    budget: req.budget,
+                    provider,
+                    created_at: completed_at.clone(),
+                    updated_at: completed_at.clone(),
+                    last_run_id: Some(resp.run_id.clone()),
+                    last_run_at: Some(completed_at),
+                    last_error: None,
+                })?;
+                Ok(DreamJobRunResponse {
+                    job_id,
+                    run_id: resp.run_id.clone(),
+                    kind: "dream_preview".to_string(),
+                    mode: resp.mode.clone(),
+                    status,
+                    limits_hit,
+                    preview: resp,
+                })
+            }
+            Err(err) => {
+                let completed_at = ids::now_rfc3339();
+                let summary = sanitize_error_summary(&err.message);
+                self.store.upsert_dream_job(&DreamJobRecord {
+                    id: job_id,
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace,
+                    repo_id,
+                    kind: req.kind,
+                    mode,
+                    status: "error".to_string(),
+                    budget: req.budget,
+                    provider,
+                    created_at: completed_at.clone(),
+                    updated_at: completed_at,
+                    last_run_id: None,
+                    last_run_at: None,
+                    last_error: Some(summary),
+                })?;
+                Err(err)
+            }
+        }
     }
 
     fn dream_with_patch_binding(
