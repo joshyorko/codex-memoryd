@@ -48,6 +48,25 @@ fn checkpoint(svc: &Service, summary: &str) {
     .unwrap();
 }
 
+fn base_request() -> DreamJobRunRequest {
+    DreamJobRunRequest {
+        job_id: Some("job_default".to_string()),
+        profile: Some("personal".to_string()),
+        workspace: Some("ws".to_string()),
+        repo: None::<RepoIdentity>,
+        now: Some("2030-01-01T00:00:00Z".to_string()),
+        since: None,
+        kind: "dream_preview".to_string(),
+        mode: Some("deterministic".to_string()),
+        budget: DreamJobBudget {
+            max_runtime_seconds: 30,
+            max_input_records: 500,
+            max_candidates: 5,
+        },
+        provider: None,
+    }
+}
+
 #[test]
 fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
     let svc = service();
@@ -150,27 +169,78 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
 fn deterministic_job_run_rejects_zero_runtime_budget() {
     let svc = service();
 
+    let mut req = base_request();
+    req.job_id = Some("job_zero_runtime".to_string());
+    req.budget.max_runtime_seconds = 0;
+
     let err = svc
-        .run_dream_job(DreamJobRunRequest {
-            job_id: Some("job_zero_runtime".to_string()),
-            profile: Some("personal".to_string()),
-            workspace: Some("ws".to_string()),
-            repo: None::<RepoIdentity>,
-            now: Some("2030-01-01T00:00:00Z".to_string()),
-            since: None,
-            kind: "dream_preview".to_string(),
-            mode: Some("deterministic".to_string()),
-            budget: DreamJobBudget {
-                max_runtime_seconds: 0,
-                max_input_records: 500,
-                max_candidates: 5,
-            },
-            provider: None,
-        })
+        .run_dream_job(req)
         .expect_err("zero runtime budget should be rejected");
 
     assert!(
         err.message.contains("max_runtime_seconds must be > 0"),
         "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn deterministic_job_run_rejects_invalid_mode_kind_and_timestamps() {
+    let svc = service();
+
+    let mut bad_mode = base_request();
+    bad_mode.job_id = Some("job_bad_mode".to_string());
+    bad_mode.mode = Some("model".to_string());
+    let mode_err = svc
+        .run_dream_job(bad_mode)
+        .expect_err("non-deterministic mode should be rejected");
+    assert!(mode_err.message.contains("mode must be deterministic"));
+
+    let mut bad_kind = base_request();
+    bad_kind.job_id = Some("job_bad_kind".to_string());
+    bad_kind.kind = "compact_cards".to_string();
+    let kind_err = svc
+        .run_dream_job(bad_kind)
+        .expect_err("non-preview kind should be rejected");
+    assert!(kind_err.message.contains("kind must be dream_preview"));
+
+    let mut bad_now = base_request();
+    bad_now.job_id = Some("job_bad_now".to_string());
+    bad_now.now = Some("not-a-time".to_string());
+    let now_err = svc
+        .run_dream_job(bad_now)
+        .expect_err("invalid now must be rejected");
+    assert!(now_err.message.contains("now must be an RFC3339"));
+
+    let mut bad_since = base_request();
+    bad_since.job_id = Some("job_bad_since".to_string());
+    bad_since.since = Some("not-a-time".to_string());
+    let since_err = svc
+        .run_dream_job(bad_since)
+        .expect_err("invalid since must be rejected");
+    assert!(since_err.message.contains("since must be an RFC3339"));
+}
+
+#[test]
+fn deterministic_job_run_preview_preserves_evidence_refs() {
+    let svc = service();
+    conclude(
+        &svc,
+        "I prefer concise commit messages and deterministic release scripts.",
+    );
+    let run = svc
+        .run_dream_job(DreamJobRunRequest {
+            job_id: Some("job_evidence_refs".to_string()),
+            ..base_request()
+        })
+        .expect("job run should succeed");
+
+    let has_candidate_refs = run
+        .preview
+        .candidates
+        .iter()
+        .any(|candidate| !candidate.evidence_refs.is_empty());
+    assert!(
+        has_candidate_refs,
+        "preview candidates should preserve evidence refs"
     );
 }

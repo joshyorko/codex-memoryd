@@ -6,7 +6,9 @@
 //! are orchestrated. Keeping it transport-agnostic lets the CLI exercise the
 //! exact same code paths as HTTP.
 
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 use serde_json::json;
@@ -1701,21 +1703,97 @@ impl Service {
         })?;
 
         let started = Instant::now();
-        let result = dream::run(
-            &self.store,
-            &dream::DreamParams {
-                profile,
-                workspace: &workspace,
-                repo_id: repo_id.as_deref(),
-                mode: "preview",
-                now: &now,
-                recency_cutoff: source_window_start.as_deref(),
-                include_archived_sources: explicit_since,
-                max_records: req.budget.max_input_records,
-                max_candidates: Some(req.budget.max_candidates),
-                patch_run_id: None,
-            },
-        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        let run_store = self.store.clone();
+        let run_profile = profile.clone();
+        let run_workspace = workspace.clone();
+        let run_repo_id = repo_id.clone();
+        let run_now = now.clone();
+        let run_source_window_start = source_window_start.clone();
+        let run_budget = req.budget.clone();
+        std::thread::spawn(move || {
+            let result = dream::run(
+                &run_store,
+                &dream::DreamParams {
+                    profile: run_profile,
+                    workspace: &run_workspace,
+                    repo_id: run_repo_id.as_deref(),
+                    mode: "preview",
+                    now: &run_now,
+                    recency_cutoff: run_source_window_start.as_deref(),
+                    include_archived_sources: explicit_since,
+                    max_records: run_budget.max_input_records,
+                    max_candidates: Some(run_budget.max_candidates),
+                    patch_run_id: None,
+                },
+            );
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(StdDuration::from_secs(req.budget.max_runtime_seconds)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let completed_at = ids::now_rfc3339();
+                let summary = sanitize_error_summary("dream job exceeded max_runtime_seconds");
+                let _ = self.store.insert_dream_run(&dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    "preview",
+                    &started_at,
+                    source_window_start.as_deref(),
+                    Some(&now),
+                    &summary,
+                ));
+                self.store.upsert_dream_job(&DreamJobRecord {
+                    id: job_id,
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace,
+                    repo_id,
+                    kind: req.kind,
+                    mode,
+                    status: "error".to_string(),
+                    budget: req.budget,
+                    provider,
+                    created_at: completed_at.clone(),
+                    updated_at: completed_at,
+                    last_run_id: None,
+                    last_run_at: None,
+                    last_error: Some(summary.clone()),
+                })?;
+                return Err(Error::internal(summary));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let completed_at = ids::now_rfc3339();
+                let summary = sanitize_error_summary("dream job worker thread terminated");
+                let _ = self.store.insert_dream_run(&dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    "preview",
+                    &started_at,
+                    source_window_start.as_deref(),
+                    Some(&now),
+                    &summary,
+                ));
+                self.store.upsert_dream_job(&DreamJobRecord {
+                    id: job_id,
+                    profile_id: profile.as_str().to_string(),
+                    workspace_id: workspace,
+                    repo_id,
+                    kind: req.kind,
+                    mode,
+                    status: "error".to_string(),
+                    budget: req.budget,
+                    provider,
+                    created_at: completed_at.clone(),
+                    updated_at: completed_at,
+                    last_run_id: None,
+                    last_run_at: None,
+                    last_error: Some(summary.clone()),
+                })?;
+                return Err(Error::internal(summary));
+            }
+        };
 
         match result {
             Ok((resp, max_candidates_hit)) => {
@@ -1739,7 +1817,7 @@ impl Service {
                     repo_id: resp.repo_id.clone(),
                     mode: resp.mode.clone(),
                     status: status.clone(),
-                    started_at,
+                    started_at: started_at.clone(),
                     completed_at: Some(completed_at.clone()),
                     implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
                     config_hash: dream::config_hash(),
@@ -1784,6 +1862,16 @@ impl Service {
             Err(err) => {
                 let completed_at = ids::now_rfc3339();
                 let summary = sanitize_error_summary(&err.message);
+                let _ = self.store.insert_dream_run(&dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    "preview",
+                    &started_at,
+                    source_window_start.as_deref(),
+                    Some(&now),
+                    &summary,
+                ));
                 self.store.upsert_dream_job(&DreamJobRecord {
                     id: job_id,
                     profile_id: profile.as_str().to_string(),
