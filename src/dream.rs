@@ -368,7 +368,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     }
 
     if params.recency_cutoff.is_none() || params.include_archived_sources {
-        push_threshold_candidates(&records, &mut candidates, &mut rejected);
+        push_threshold_candidates(params, &records, &mut candidates, &mut rejected)?;
     }
 
     check_deadline(params)?;
@@ -957,13 +957,16 @@ pub fn candidate_counts(response: &DreamResponse) -> serde_json::Value {
 }
 
 fn push_threshold_candidates(
+    params: &DreamParams,
     records: &[MemoryRecord],
     candidates: &mut Vec<DreamCandidate>,
     rejected: &mut Vec<DreamRejection>,
-) {
+) -> Result<()> {
+    check_deadline(params)?;
     let mut boundary_groups: BTreeMap<(String, String, Option<String>), Vec<&MemoryRecord>> =
         BTreeMap::new();
     for record in records {
+        check_deadline(params)?;
         boundary_groups
             .entry((
                 record.profile_id.clone(),
@@ -975,8 +978,9 @@ fn push_threshold_candidates(
     }
 
     for mut boundary_records in boundary_groups.into_values() {
+        check_deadline(params)?;
         boundary_records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        let mut groups = subject_groups(&boundary_records);
+        let mut groups = subject_groups(params, &boundary_records)?;
         groups.sort_by(|a, b| {
             a.first()
                 .unwrap()
@@ -986,6 +990,7 @@ fn push_threshold_candidates(
         });
 
         for evidence in groups {
+            check_deadline(params)?;
             let subject = subject_key_for_record(evidence.last().unwrap());
             let score = score_evidence(&evidence);
             if score.candidate_state == "rejected" {
@@ -1021,11 +1026,16 @@ fn push_threshold_candidates(
             );
         }
     }
+    Ok(())
 }
 
-fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryRecord>> {
+fn subject_groups<'a>(
+    params: &DreamParams,
+    records: &'a [&'a MemoryRecord],
+) -> Result<Vec<Vec<&'a MemoryRecord>>> {
     let mut groups: Vec<Vec<&'a MemoryRecord>> = Vec::new();
     for record in records {
+        check_deadline(params)?;
         if let Some(group) = groups
             .iter_mut()
             .find(|group| same_subject(group[0], record))
@@ -1035,7 +1045,7 @@ fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryReco
             groups.push(vec![*record]);
         }
     }
-    groups
+    Ok(groups)
 }
 
 fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {

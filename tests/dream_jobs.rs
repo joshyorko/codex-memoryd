@@ -74,10 +74,7 @@ fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
         &svc,
         "Right now the daemon is failing on startup, planning to patch it tomorrow.",
     );
-    conclude(
-        &svc,
-        "OAuth sync is planned; will implement it next week.",
-    );
+    conclude(&svc, "OAuth sync is planned; will implement it next week.");
     std::thread::sleep(std::time::Duration::from_millis(5));
     checkpoint(&svc, "Implemented OAuth sync and merged it.");
     let before = svc.store.count_records().unwrap();
@@ -130,10 +127,7 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
         &svc,
         "Right now the daemon is failing on startup, planning to patch it tomorrow.",
     );
-    conclude(
-        &svc,
-        "OAuth sync is planned; will implement it next week.",
-    );
+    conclude(&svc, "OAuth sync is planned; will implement it next week.");
     std::thread::sleep(std::time::Duration::from_millis(5));
     checkpoint(&svc, "Implemented OAuth sync and merged it.");
 
@@ -181,6 +175,25 @@ fn deterministic_job_run_rejects_zero_runtime_budget() {
         err.message.contains("max_runtime_seconds must be > 0"),
         "unexpected error: {err:?}"
     );
+}
+
+#[test]
+fn deterministic_job_run_rejects_oversized_runtime_budget() {
+    let svc = service();
+
+    let mut req = base_request();
+    req.job_id = Some("job_oversized_runtime".to_string());
+    req.budget.max_runtime_seconds = u64::MAX;
+
+    let err = svc
+        .run_dream_job(req)
+        .expect_err("oversized runtime budget should be rejected");
+
+    assert!(
+        err.message.contains("max_runtime_seconds is too large"),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(svc.store.count_table_rows("dream_jobs").unwrap(), 0);
 }
 
 #[test]

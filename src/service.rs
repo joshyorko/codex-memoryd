@@ -1676,6 +1676,14 @@ impl Service {
         }
 
         let started_at = ids::now_rfc3339();
+        let started = Instant::now();
+        let Some(deadline) =
+            started.checked_add(StdDuration::from_secs(req.budget.max_runtime_seconds))
+        else {
+            return Err(Error::invalid_request(
+                "dream job max_runtime_seconds is too large",
+            ));
+        };
         let job_id = req.job_id.unwrap_or_else(|| ids::new_id("dream_job"));
         let provider = req.provider.unwrap_or_default();
         let explicit_since = req.since.is_some();
@@ -1703,8 +1711,6 @@ impl Service {
             last_error: None,
         })?;
 
-        let started = Instant::now();
-        let deadline = started + StdDuration::from_secs(req.budget.max_runtime_seconds);
         let result = dream::run(
             &self.store,
             &dream::DreamParams {
