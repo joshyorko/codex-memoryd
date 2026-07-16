@@ -2052,6 +2052,7 @@ fn imported_chatgpt_rejects_stale_tasks_even_with_durable_prefixes() {
         "Preference: completed: update the README for this release.",
         "Gotcha: yesterday fix the release notes.",
         "Convention: done: implement the release checklist.",
+        "Workflow pattern: tomorrow update the schema, then run tests.",
     ];
     for (subject, content) in stale_tasks.iter().enumerate() {
         for turn_index in 1..=2 {
@@ -2114,6 +2115,110 @@ fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
             && candidate.proposed_type == "workflow_pattern"
             && candidate.apply_eligible
     }));
+}
+
+#[test]
+fn imported_chatgpt_admits_workflow_framing_with_imperative_markers() {
+    let workflows = [
+        "Workflow pattern: update the schema, then run tests.",
+        "Workflow pattern: fix the generated client before publishing.",
+        "Workflow pattern: implement the migration before deploying.",
+    ];
+    for (subject, content) in workflows.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("workflow-collision-{subject}"),
+                "user",
+                &format!("workflow-collision-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == "workflow_pattern"
+                && candidate.apply_eligible
+        }));
+    }
+}
+
+#[test]
+fn imported_chatgpt_admits_convention_framing_with_imperative_markers() {
+    let conventions = [
+        "Convention: update the changelog before each release.",
+        "Convention: fix the generated client before publishing.",
+        "Convention: implement the migration before deploying.",
+    ];
+    for (subject, content) in conventions.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("convention-collision-{subject}"),
+                "user",
+                &format!("convention-collision-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == "repo_convention"
+                && candidate.apply_eligible
+        }));
+    }
+}
+
+#[test]
+fn imported_chatgpt_rejects_unframed_imperative_tasks() {
+    let svc = service();
+    let tasks = [
+        "Update the schema, then run tests.",
+        "Fix the generated client before publishing.",
+        "Implement the migration before deploying.",
+    ];
+    for (subject, content) in tasks.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("bare-task-{subject}"),
+                "user",
+                &format!("bare-task-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+    }
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    for content in tasks {
+        assert!(preview
+            .candidates
+            .iter()
+            .all(|candidate| candidate.content != content));
+    }
 }
 
 #[test]

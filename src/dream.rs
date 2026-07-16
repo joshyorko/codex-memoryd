@@ -695,22 +695,19 @@ fn imported_chatgpt_record_type(
     let lower = content.to_ascii_lowercase();
     let stale_task = contains_any(
         &lower,
-        &[
-            "yesterday",
-            "last week",
-            "tomorrow",
-            "update the ",
-            "fix the ",
-            "implement the ",
-            "completed:",
-            "done:",
-        ],
+        &["yesterday", "last week", "tomorrow", "completed:", "done:"],
     );
     if stale_task {
         return None;
     }
     if lower.contains("workflow pattern:") || lower.starts_with("workflow:") {
         return Some(RecordType::WorkflowPattern);
+    }
+    if lower.starts_with("convention:") || lower.starts_with("repo convention:") {
+        return Some(RecordType::RepoConvention);
+    }
+    if contains_any(&lower, &["update the ", "fix the ", "implement the "]) {
+        return None;
     }
 
     match record_type {
