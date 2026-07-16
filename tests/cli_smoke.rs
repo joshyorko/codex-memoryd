@@ -374,6 +374,15 @@ fn write_chatgpt_export_dir(dir: &TempDir, name: &str) -> PathBuf {
           "content": { "content_type": "text", "parts": ["How should import preview behave?"] }
         }
       },
+      "user-rejected": {
+        "id": "user-rejected",
+        "parent": "user-1",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1717243201.5,
+          "content": { "content_type": "text", "parts": ["token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"] }
+        }
+      },
       "assistant-1": {
         "id": "assistant-1",
         "parent": "user-1",
@@ -388,7 +397,7 @@ fn write_chatgpt_export_dir(dir: &TempDir, name: &str) -> PathBuf {
         "parent": "assistant-1",
         "message": {
           "author": { "role": "tool" },
-          "create_time": 1717243203,
+          "create_time": 1717243200.5,
           "content": { "content_type": "text", "parts": ["internal tool chatter"] }
         }
       },
@@ -437,6 +446,27 @@ fn write_chatgpt_export_zip(dir: &TempDir, export_dir: &std::path::Path) -> Path
     zip.write_all(&body).unwrap();
     zip.finish().unwrap();
     zip_path
+}
+
+fn write_chatgpt_dream_export_dir(dir: &TempDir) -> PathBuf {
+    let root = dir.path().join("chatgpt-dream-export");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("conversations.json"),
+        r#"[{
+  "id": "conv-dream",
+  "title": "Durable import notes",
+  "create_time": 1782900000,
+  "update_time": 1783504800,
+  "mapping": {
+    "msg-1": {"id":"msg-1","message":{"author":{"role":"user"},"create_time":1782900001,"content":{"content_type":"text","parts":["Preference: keep commit messages terse."]}}},
+    "msg-2": {"id":"msg-2","message":{"author":{"role":"user"},"create_time":1783504801,"content":{"content_type":"text","parts":["Preference: keep commit messages terse."]}}},
+    "msg-3": {"id":"msg-3","message":{"author":{"role":"user"},"create_time":1783504802,"content":{"content_type":"text","parts":["Hello, thanks for the help."]}}}
+  }
+}]"#,
+    )
+    .unwrap();
+    root
 }
 
 fn write_oversized_chatgpt_export_dir(dir: &TempDir, name: &str) -> PathBuf {
@@ -524,7 +554,7 @@ fn cli_chatgpt_export_list_and_preview_from_directory_write_nothing() {
     assert_eq!(preview_json["user_turns"], 1);
     assert_eq!(preview_json["assistant_turns"], 1);
     assert_eq!(preview_json["skipped_messages"], 2);
-    assert_eq!(preview_json["rejected_messages"], 1);
+    assert_eq!(preview_json["rejected_messages"], 2);
     assert!(!preview_stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
     assert_eq!(count_table(&db, "visible_turns"), 0);
     assert_eq!(count_table(&db, "memory_records"), 0);
@@ -560,12 +590,29 @@ fn cli_chatgpt_export_apply_from_zip_is_idempotent_and_evidence_only() {
     assert_eq!(first_json["mode"], "apply");
     assert_eq!(first_json["created"], 2);
     assert_eq!(first_json["skipped_existing"], 0);
-    assert_eq!(first_json["rejected_messages"], 1);
+    assert_eq!(first_json["rejected_messages"], 2);
     assert!(!first_stdout.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
     assert_eq!(count_table(&db, "visible_turns"), 2);
     assert_eq!(count_table(&db, "sessions"), 1);
     assert_eq!(count_table(&db, "memory_records"), 0);
-    assert_eq!(count_table(&db, "evidence_ledger"), 3);
+    assert_eq!(count_table(&db, "evidence_ledger"), 4);
+
+    let conn = Connection::open(&db).unwrap();
+    let stored_metadata = conn
+        .prepare("SELECT metadata FROM visible_turns ORDER BY created_at")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str::<Value>(&row.unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(stored_metadata.len(), 2);
+    assert_eq!(stored_metadata[0]["origin"], "chatgpt-export");
+    assert_eq!(stored_metadata[0]["conversation_id"], "conv-alpha");
+    assert_eq!(stored_metadata[0]["message_id"], "user-1");
+    assert_eq!(stored_metadata[0]["title"], "Codex import review");
+    assert_eq!(stored_metadata[0]["turn_index"], 1);
+    assert_eq!(stored_metadata[1]["message_id"], "assistant-1");
+    assert_eq!(stored_metadata[1]["turn_index"], 3);
 
     let second = bin()
         .arg("--db")
@@ -589,7 +636,7 @@ fn cli_chatgpt_export_apply_from_zip_is_idempotent_and_evidence_only() {
     assert_eq!(count_table(&db, "visible_turns"), 2);
     assert_eq!(count_table(&db, "sessions"), 1);
     assert_eq!(count_table(&db, "memory_records"), 0);
-    assert_eq!(count_table(&db, "evidence_ledger"), 3);
+    assert_eq!(count_table(&db, "evidence_ledger"), 4);
 }
 
 #[test]
@@ -622,8 +669,8 @@ fn cli_chatgpt_export_filters_selection_and_reports_screened_counts() {
     assert_eq!(preview_json["selected_conversations"], 1);
     assert_eq!(preview_json["filtered_out_conversations"], 1);
     assert_eq!(preview_json["eligible_conversations"], 1);
-    assert_eq!(preview_json["rejected_messages"], 0);
-    assert_eq!(preview_json["rejections"].as_array().unwrap().len(), 0);
+    assert_eq!(preview_json["rejected_messages"], 1);
+    assert_eq!(preview_json["rejections"].as_array().unwrap().len(), 1);
 
     let apply = bin()
         .arg("--db")
@@ -648,7 +695,7 @@ fn cli_chatgpt_export_filters_selection_and_reports_screened_counts() {
     assert_eq!(apply_json["filtered_out_conversations"], 1);
     assert_eq!(apply_json["created"], 2);
     assert_eq!(count_table(&db, "visible_turns"), 2);
-    assert_eq!(count_table(&db, "evidence_ledger"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 3);
 }
 
 #[test]
@@ -716,6 +763,72 @@ fn cli_chatgpt_export_filters_support_multiple_ids_and_combined_zero_match() {
     assert!(zero_match_json.get("unsupported_messages").is_none());
     assert!(zero_match_json.get("privacy_screened_messages").is_none());
     assert!(zero_match_json.get("existing_messages").is_none());
+}
+
+#[test]
+fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_dream_export_dir(&dir);
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+        ])
+        .arg(&export_dir)
+        .assert()
+        .success();
+    assert_eq!(count_table(&db, "visible_turns"), 3);
+    assert_eq!(count_table(&db, "memory_records"), 0);
+
+    let patch = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "patch",
+            "preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "ws",
+            "--now",
+            "2026-07-09T00:00:00Z",
+        ])
+        .output()
+        .unwrap();
+    assert!(patch.status.success());
+    let preview: Value = serde_json::from_slice(&patch.stdout).unwrap();
+    assert_eq!(preview["actions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        preview["actions"][0]["content"],
+        "Preference: keep commit messages terse."
+    );
+    let refs = preview["actions"][0]["source_refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 2);
+    for (index, reference) in refs.iter().enumerate() {
+        assert_eq!(reference["kind"], "imported_chat_turn");
+        assert_eq!(reference["conversation_title"], "Durable import notes");
+        assert_eq!(reference["conversation_id"], "conv-dream");
+        assert_eq!(reference["message_id"], format!("msg-{}", index + 1));
+        assert_eq!(reference["turn_index"], (index + 1) as i64);
+    }
+    let opaque_ref_id = refs[0]["id"].as_str().unwrap();
+    let markdown = preview["markdown"].as_str().unwrap();
+    assert!(markdown.contains("imported ChatGPT"));
+    assert!(markdown.contains("Durable import notes"));
+    assert!(markdown.contains("conv-dream"));
+    assert!(markdown.contains("turn 1"));
+    assert!(markdown.contains("msg-1"));
+    assert!(markdown.contains(opaque_ref_id));
+    assert_eq!(count_table(&db, "memory_records"), 0);
 }
 
 #[test]

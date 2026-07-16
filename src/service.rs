@@ -2663,7 +2663,7 @@ fn render_patch_markdown(
             let refs = action
                 .source_refs
                 .iter()
-                .map(|source| source.id.clone())
+                .map(render_patch_source_ref)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("  - source_refs: {refs}\n"));
@@ -2673,6 +2673,27 @@ fn render_patch_markdown(
         }
     }
     out
+}
+
+fn render_patch_source_ref(source: &DreamEvidenceSource) -> String {
+    if source.kind != "imported_chat_turn" {
+        return source.id.clone();
+    }
+    format!(
+        "imported ChatGPT: {} [{}; turn {}; message {}; source {}]",
+        source
+            .conversation_title
+            .as_deref()
+            .map(|value| truncate_for_display(value, 60))
+            .unwrap_or_else(|| "<untitled>".to_string()),
+        source.conversation_id.as_deref().unwrap_or("<unknown>"),
+        source
+            .turn_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        source.message_id.as_deref().unwrap_or("<unknown>"),
+        source.id,
+    )
 }
 
 fn truncate_for_display(raw: &str, limit: usize) -> String {

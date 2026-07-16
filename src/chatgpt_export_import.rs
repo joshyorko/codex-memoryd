@@ -374,6 +374,7 @@ fn parse_conversation(
     let mut skipped_messages = 0usize;
     let mut user_turns = 0usize;
     let mut assistant_turns = 0usize;
+    let mut turn_index = 0usize;
 
     let mut items = mapping
         .iter()
@@ -417,6 +418,7 @@ fn parse_conversation(
             skipped_messages += 1;
             continue;
         };
+        turn_index += 1;
         match policy::screen_content(&content, usize::MAX) {
             PolicyDecision::Accept(cleaned) => {
                 if role == "user" {
@@ -436,6 +438,7 @@ fn parse_conversation(
                         "origin": "chatgpt-export",
                         "conversation_id": conversation.id,
                         "message_id": message_id,
+                        "turn_index": turn_index,
                         "title": conversation_title(&conversation.title),
                         "conversation_created_at": conversation.create_time.as_ref().and_then(timestamp_to_rfc3339),
                         "conversation_updated_at": conversation.update_time.as_ref().and_then(timestamp_to_rfc3339),
