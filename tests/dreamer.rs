@@ -2115,6 +2115,22 @@ fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
             && candidate.proposed_type == "workflow_pattern"
             && candidate.apply_eligible
     }));
+
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    assert_eq!(applied.created.len(), 1);
+    let persisted = svc.store.get_record(&applied.created[0]).unwrap().unwrap();
+    assert_eq!(persisted.record_type, RecordType::WorkflowPattern);
+    assert_eq!(
+        persisted.content_hash,
+        ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            RecordType::WorkflowPattern.as_str(),
+            persisted.scope.as_str(),
+            content,
+        )
+    );
 }
 
 #[test]

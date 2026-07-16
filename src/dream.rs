@@ -445,11 +445,13 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 }
             };
             let class = policy::classify(&content, params.profile, params.repo_id.is_some());
+            let record_type = crate::domain::RecordType::parse(&candidate.proposed_type)
+                .unwrap_or(class.record_type);
             let content_hash = ids::content_hash(
                 params.profile.as_str(),
                 params.workspace,
                 params.repo_id,
-                class.record_type.as_str(),
+                record_type.as_str(),
                 class.scope.as_str(),
                 &content,
             );
@@ -503,7 +505,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 subject_id: None,
                 episode_id: None,
                 scope: class.scope,
-                record_type: class.record_type,
+                record_type,
                 content,
                 related_files: class.related_files,
                 tags: class.tags,
