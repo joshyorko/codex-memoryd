@@ -36,7 +36,9 @@ The MVP executable job shape is intentionally narrow:
 - `mode`: only `deterministic`
 - `budget.max_runtime_seconds`
 - `budget.max_input_records`
-- `budget.max_candidates` (preview output-size cap in candidate units)
+- `budget.max_candidates` (preview output-size cap in candidate units; each
+  proposal or policy rejection consumes one unit, while stale evidence notices
+  do not)
 - `provider.command.argv` as stored config/data only
 
 Jobs persist in `dream_jobs`. The row stores the explicit budget/provider shape,

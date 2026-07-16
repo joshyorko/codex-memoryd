@@ -1,11 +1,13 @@
 use codex_memoryd::config::Config;
-use codex_memoryd::domain::RepoIdentity;
+use codex_memoryd::domain::{Portability, RecordType, RepoIdentity, Scope, Sensitivity};
+use codex_memoryd::ids;
 use codex_memoryd::protocol::{
     CheckpointRequest, ConclusionsRequest, DreamJobBudget, DreamJobProvider, DreamJobRunRequest,
     DreamProviderCommand,
 };
 use codex_memoryd::service::Service;
-use codex_memoryd::store::Store;
+use codex_memoryd::store::{NewRecord, Store};
+use serde_json::json;
 
 fn service() -> Service {
     let store = Store::open(":memory:").expect("open store");
@@ -157,6 +159,74 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
     let last = svc.store.last_dream_run().unwrap().unwrap();
     assert_eq!(last.id, run.run_id);
     assert_eq!(last.mode, "preview");
+}
+
+#[test]
+fn deterministic_job_run_budgets_policy_rejections_as_candidate_outcomes() {
+    let svc = service();
+    for (index, content) in [
+        "Right now alpha deployment secret=alpha-secret-123456",
+        "Right now beta deployment secret=beta-secret-123456",
+        "Right now gamma deployment secret=gamma-secret-123456",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        svc.store
+            .upsert_record(&NewRecord {
+                profile_id: "personal".to_string(),
+                workspace_id: "ws".to_string(),
+                repo_id: None,
+                subject_id: None,
+                episode_id: None,
+                scope: Scope::Session,
+                record_type: RecordType::Decision,
+                content: content.to_string(),
+                related_files: vec![],
+                tags: vec![],
+                sensitivity: Sensitivity::Personal,
+                portability: Portability::ProfileOnly,
+                confidence: 0.9,
+                source_ids: vec![],
+                content_hash: ids::content_hash(
+                    "personal",
+                    "ws",
+                    None,
+                    RecordType::Decision.as_str(),
+                    Scope::Session.as_str(),
+                    content,
+                ),
+                supersedes: vec![],
+                metadata: json!({
+                    "subject_key": format!("deployment-{index}"),
+                }),
+            })
+            .expect("test record should be inserted");
+    }
+
+    let mut req = base_request();
+    req.job_id = Some("job_rejection_limit".to_string());
+    req.budget.max_candidates = 1;
+    let run = svc
+        .run_dream_job(req)
+        .expect("dream job should return policy rejections");
+    let outcome_count = run.preview.candidates.len() + run.preview.rejected.len();
+
+    assert!(
+        outcome_count <= 1,
+        "candidate outcome budget exceeded: candidates={}, rejected={}, limits_hit={:?}",
+        run.preview.candidates.len(),
+        run.preview.rejected.len(),
+        run.limits_hit
+    );
+    assert!(
+        run.limits_hit.contains(&"max_candidates".to_string()),
+        "max_candidates limit missing for candidates={}, rejected={}, status={}",
+        run.preview.candidates.len(),
+        run.preview.rejected.len(),
+        run.status
+    );
+    assert_eq!(run.status, "ok_with_limits");
 }
 
 #[test]

@@ -372,19 +372,14 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     }
 
     check_deadline(params)?;
-    attach_counter_evidence_retires(&records, &mut candidates);
+    attach_counter_evidence_retires(params, &records, &mut candidates)?;
     dedupe_candidates(&mut candidates);
     let mut max_candidates_hit = false;
     if let Some(max) = params.max_candidates {
-        if let Some(limit_for_processing) = max.checked_add(1) {
-            candidates.truncate(limit_for_processing);
-            max_candidates_hit = candidates.len() > max;
-            if max_candidates_hit {
-                candidates.truncate(max);
-            }
-        } else {
-            candidates.truncate(max);
-        }
+        max_candidates_hit =
+            candidates.len() > max || rejected.len() > max.saturating_sub(candidates.len());
+        candidates.truncate(max);
+        rejected.truncate(max.saturating_sub(candidates.len()));
     }
 
     check_deadline(params)?;
@@ -1801,8 +1796,14 @@ fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
     });
 }
 
-fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [DreamCandidate]) {
+fn attach_counter_evidence_retires(
+    params: &DreamParams,
+    records: &[MemoryRecord],
+    candidates: &mut [DreamCandidate],
+) -> Result<()> {
+    check_deadline(params)?;
     for candidate in candidates {
+        check_deadline(params)?;
         let Some(kind) = marker_kind_for_candidate(candidate) else {
             continue;
         };
@@ -1811,6 +1812,7 @@ fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [D
             continue;
         }
         for record in records {
+            check_deadline(params)?;
             if candidate.supersedes.contains(&record.id) {
                 continue;
             }
@@ -1830,6 +1832,7 @@ fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [D
         candidate.retires.sort();
         candidate.retires.dedup();
     }
+    Ok(())
 }
 
 fn marker_operational_valence(record: &MemoryRecord) -> Option<&str> {
@@ -2128,4 +2131,36 @@ fn check_deadline(params: &DreamParams) -> Result<()> {
 
 fn date_part(value: &str) -> &str {
     value.split('T').next().unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_counter_evidence_retires_returns_timeout_for_expired_deadline() {
+        let params = DreamParams {
+            profile: Profile::Personal,
+            workspace: "ws",
+            repo_id: None,
+            mode: "preview",
+            now: "2030-01-01T00:00:00Z",
+            recency_cutoff: None,
+            include_archived_sources: false,
+            max_records: 0,
+            max_candidates: None,
+            patch_run_id: None,
+            deadline: Some(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .expect("instant subtraction should succeed"),
+            ),
+        };
+        let mut candidates = Vec::<DreamCandidate>::new();
+
+        let error = attach_counter_evidence_retires(&params, &[], &mut candidates)
+            .expect_err("expired post-processing deadline should return an error");
+
+        assert_eq!(error.message, "dream job exceeded max_runtime_seconds");
+    }
 }
