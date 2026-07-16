@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -246,9 +247,11 @@ pub struct DreamParams<'a> {
     pub max_records: usize,
     pub max_candidates: Option<usize>,
     pub patch_run_id: Option<&'a str>,
+    pub deadline: Option<Instant>,
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
+    check_deadline(params)?;
     let mut records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
@@ -260,6 +263,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         limit: params.max_records,
         offset: 0,
     })?;
+    check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
         records.extend(imported_chatgpt_candidate_records(
@@ -268,6 +272,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             imported_limit,
         )?);
     }
+    check_deadline(params)?;
     records.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
@@ -279,7 +284,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
 
+    check_deadline(params)?;
+
     for record in &records {
+        check_deadline(params)?;
         let state = state_for_record(record);
         let drift_prone = state != "historical" && is_drift_prone(&record.content);
         let valid_until = valid_until_for(record);
@@ -324,9 +332,13 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         }
     }
 
+    check_deadline(params)?;
+
     for newer in &records {
+        check_deadline(params)?;
         let newer_state = state_for_record(newer);
         for older in &records {
+            check_deadline(params)?;
             if newer.id == older.id
                 || !same_boundary(newer, older)
                 || newer.created_at <= older.created_at
@@ -359,6 +371,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         push_threshold_candidates(&records, &mut candidates, &mut rejected);
     }
 
+    check_deadline(params)?;
     attach_counter_evidence_retires(&records, &mut candidates);
     dedupe_candidates(&mut candidates);
     let mut max_candidates_hit = false;
@@ -374,6 +387,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         }
     }
 
+    check_deadline(params)?;
     let run_id = stable_run_id(params, &evidence_window, &records);
     let mut archived = Vec::new();
     let mut created = Vec::new();
@@ -2088,6 +2102,18 @@ fn format_time(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn check_deadline(params: &DreamParams) -> Result<()> {
+    if params
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Err(crate::error::Error::internal(
+            "dream job exceeded max_runtime_seconds",
+        ));
+    }
+    Ok(())
 }
 
 fn date_part(value: &str) -> &str {

@@ -1947,6 +1947,7 @@ fn imported_chatgpt_turns_do_not_exceed_native_max_records_cap() {
             max_records: 1,
             max_candidates: None,
             patch_run_id: None,
+            deadline: None,
         },
     )
     .unwrap();
