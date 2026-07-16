@@ -615,10 +615,12 @@ fn imported_chatgpt_candidate_records(
         if turn.metadata.get("origin").and_then(|value| value.as_str()) != Some("chatgpt-export") {
             continue;
         }
-        let class = policy::classify(&turn.content, params.profile, params.repo_id.is_some());
-        if !imported_chatgpt_eligible(&turn.content, class.record_type) {
+        let mut class = policy::classify(&turn.content, params.profile, params.repo_id.is_some());
+        let Some(record_type) = imported_chatgpt_record_type(&turn.content, class.record_type)
+        else {
             continue;
-        }
+        };
+        class.record_type = record_type;
         let source_path = turn
             .metadata
             .get("message_id")
@@ -684,17 +686,40 @@ fn imported_chatgpt_candidate_records(
     Ok(records)
 }
 
-fn imported_chatgpt_eligible(content: &str, record_type: crate::domain::RecordType) -> bool {
+fn imported_chatgpt_record_type(
+    content: &str,
+    record_type: crate::domain::RecordType,
+) -> Option<crate::domain::RecordType> {
     use crate::domain::RecordType;
+
+    let lower = content.to_ascii_lowercase();
+    let stale_task = contains_any(
+        &lower,
+        &[
+            "yesterday",
+            "last week",
+            "tomorrow",
+            "update the ",
+            "fix the ",
+            "implement the ",
+            "completed:",
+            "done:",
+        ],
+    );
+    if stale_task {
+        return None;
+    }
+    if lower.contains("workflow pattern:") || lower.starts_with("workflow:") {
+        return Some(RecordType::WorkflowPattern);
+    }
 
     match record_type {
         RecordType::Preference
         | RecordType::Decision
         | RecordType::Gotcha
         | RecordType::RepoConvention
-        | RecordType::WorkflowPattern => true,
+        | RecordType::WorkflowPattern => Some(record_type),
         RecordType::Other => {
-            let lower = content.to_ascii_lowercase();
             let durable_fact = contains_any(
                 &lower,
                 &[
@@ -704,22 +729,9 @@ fn imported_chatgpt_eligible(content: &str, record_type: crate::domain::RecordTy
                     " listens on port ",
                 ],
             );
-            let stale_task = contains_any(
-                &lower,
-                &[
-                    "yesterday",
-                    "last week",
-                    "tomorrow",
-                    "update the ",
-                    "fix the ",
-                    "implement the ",
-                    "completed:",
-                    "done:",
-                ],
-            );
-            durable_fact && !stale_task
+            durable_fact.then_some(record_type)
         }
-        _ => false,
+        _ => None,
     }
 }
 

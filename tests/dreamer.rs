@@ -2045,6 +2045,78 @@ fn imported_chatgpt_filters_low_signal_tasks_but_keeps_durable_memory_classes() 
 }
 
 #[test]
+fn imported_chatgpt_rejects_stale_tasks_even_with_durable_prefixes() {
+    let svc = service();
+    let stale_tasks = [
+        "Decision: tomorrow update the README for this release.",
+        "Preference: completed: update the README for this release.",
+        "Gotcha: yesterday fix the release notes.",
+        "Convention: done: implement the release checklist.",
+    ];
+    for (subject, content) in stale_tasks.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("stale-{subject}"),
+                "user",
+                &format!("stale-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+    }
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    for content in stale_tasks {
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .all(|candidate| candidate.content != content),
+            "durable-looking stale task became a candidate: {content}"
+        );
+    }
+}
+
+#[test]
+fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
+    let svc = service();
+    let content = "Workflow pattern: run `cargo test` before pushing.";
+    imported_chatgpt_turn(
+        &svc,
+        "workflow-command",
+        "user",
+        "workflow-conv",
+        "msg-1",
+        content,
+        "2026-06-01T10:00:00Z",
+    );
+    imported_chatgpt_turn(
+        &svc,
+        "workflow-command",
+        "user",
+        "workflow-conv",
+        "msg-2",
+        content,
+        "2026-06-08T10:00:00Z",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(preview.candidates.iter().any(|candidate| {
+        candidate.content == content
+            && candidate.proposed_type == "workflow_pattern"
+            && candidate.apply_eligible
+    }));
+}
+
+#[test]
 fn imported_chatgpt_turns_do_not_exceed_native_max_records_cap() {
     let svc = service();
     insert_direct_record(
