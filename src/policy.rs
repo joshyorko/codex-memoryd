@@ -373,6 +373,17 @@ pub fn classify(content: &str, profile: Profile, repo_present: bool) -> Classifi
     let first_line = content.lines().next().unwrap_or("").to_ascii_lowercase();
 
     let record_type = classify_type(&lower, &first_line, content);
+    classify_as(content, profile, repo_present, record_type)
+}
+
+/// Classify content metadata while preserving a reviewed record type.
+pub(crate) fn classify_as(
+    content: &str,
+    profile: Profile,
+    repo_present: bool,
+    record_type: RecordType,
+) -> Classification {
+    let lower = content.to_ascii_lowercase();
     let related_files = extract_related_files(content);
     let scope = classify_scope(record_type, repo_present, !related_files.is_empty());
     let sensitivity = classify_sensitivity(profile);

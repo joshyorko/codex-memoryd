@@ -2053,6 +2053,10 @@ fn imported_chatgpt_rejects_stale_tasks_even_with_durable_prefixes() {
         "Gotcha: yesterday fix the release notes.",
         "Convention: done: implement the release checklist.",
         "Workflow pattern: tomorrow update the schema, then run tests.",
+        "Preference: today the migration task is active.",
+        "Decision: next week we migrate the schema.",
+        "Gotcha: currently the release task is active.",
+        "Convention: will migrate the schema.",
     ];
     for (subject, content) in stale_tasks.iter().enumerate() {
         for turn_index in 1..=2 {
@@ -2120,6 +2124,9 @@ fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
     assert_eq!(applied.created.len(), 1);
     let persisted = svc.store.get_record(&applied.created[0]).unwrap().unwrap();
     assert_eq!(persisted.record_type, RecordType::WorkflowPattern);
+    assert!(persisted.tags.contains(&"workflow_pattern".to_string()));
+    assert!(!persisted.tags.contains(&"command".to_string()));
+    assert_eq!(persisted.portability, Portability::ProfileOnly);
     assert_eq!(
         persisted.content_hash,
         ids::content_hash(
@@ -2131,6 +2138,57 @@ fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
             content,
         )
     );
+}
+
+#[test]
+fn imported_chatgpt_admits_durable_types_containing_imperative_phrases() {
+    let durable = [
+        (
+            "Preference: update the dependency lockfile before releases.",
+            "preference",
+        ),
+        (
+            "Decision: fix the generated client before publishing.",
+            "decision",
+        ),
+        (
+            "Gotcha: implement the migration only after a backup.",
+            "gotcha",
+        ),
+        (
+            "Convention: update the changelog before each release.",
+            "repo_convention",
+        ),
+        (
+            "Workflow pattern: fix the schema, then run tests.",
+            "workflow_pattern",
+        ),
+    ];
+    for (subject, (content, expected_type)) in durable.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("durable-imperative-{subject}"),
+                "user",
+                &format!("durable-imperative-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == *expected_type
+                && candidate.apply_eligible
+        }));
+    }
 }
 
 #[test]

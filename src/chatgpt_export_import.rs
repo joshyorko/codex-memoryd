@@ -539,7 +539,8 @@ fn conversation_title(title: &Option<String>) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Untitled conversation");
-    match policy::screen_string_value(candidate) {
+    let (redacted, _) = policy::redact_secret_like(candidate);
+    match policy::screen_string_value(&redacted) {
         PolicyDecision::Accept(cleaned) => cleaned,
         PolicyDecision::Reject { .. } => "Untitled conversation".to_string(),
     }

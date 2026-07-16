@@ -455,7 +455,7 @@ fn write_chatgpt_dream_export_dir(dir: &TempDir) -> PathBuf {
         root.join("conversations.json"),
         r#"[{
   "id": "conv-dream",
-  "title": "Durable import notes",
+  "title": "Durable import notes ghp_abcdefghijklmnopqrstuvwxyz0123456789",
   "create_time": 1782900000,
   "update_time": 1783504800,
   "mapping": {
@@ -815,7 +815,10 @@ fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
     assert_eq!(refs.len(), 2);
     for (index, reference) in refs.iter().enumerate() {
         assert_eq!(reference["kind"], "imported_chat_turn");
-        assert_eq!(reference["conversation_title"], "Durable import notes");
+        assert_eq!(
+            reference["conversation_title"],
+            "Durable import notes [redacted:github token]"
+        );
         assert_eq!(reference["conversation_id"], "conv-dream");
         assert_eq!(reference["message_id"], format!("msg-{}", index + 1));
         assert_eq!(reference["turn_index"], (index + 1) as i64);
@@ -823,7 +826,8 @@ fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
     let opaque_ref_id = refs[0]["id"].as_str().unwrap();
     let markdown = preview["markdown"].as_str().unwrap();
     assert!(markdown.contains("imported ChatGPT"));
-    assert!(markdown.contains("Durable import notes"));
+    assert!(markdown.contains("Durable import notes [redacted:github token]"));
+    assert!(!markdown.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
     assert!(markdown.contains("conv-dream"));
     assert!(markdown.contains("turn 1"));
     assert!(markdown.contains("msg-1"));

@@ -444,9 +444,16 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                     continue;
                 }
             };
-            let class = policy::classify(&content, params.profile, params.repo_id.is_some());
             let record_type = crate::domain::RecordType::parse(&candidate.proposed_type)
-                .unwrap_or(class.record_type);
+                .unwrap_or_else(|| {
+                    policy::classify(&content, params.profile, params.repo_id.is_some()).record_type
+                });
+            let class = policy::classify_as(
+                &content,
+                params.profile,
+                params.repo_id.is_some(),
+                record_type,
+            );
             let content_hash = ids::content_hash(
                 params.profile.as_str(),
                 params.workspace,
@@ -697,7 +704,17 @@ fn imported_chatgpt_record_type(
     let lower = content.to_ascii_lowercase();
     let stale_task = contains_any(
         &lower,
-        &["yesterday", "last week", "tomorrow", "completed:", "done:"],
+        &[
+            "yesterday",
+            "last week",
+            "tomorrow",
+            "today",
+            "next week",
+            "currently",
+            "will migrate",
+            "completed:",
+            "done:",
+        ],
     );
     if stale_task {
         return None;
@@ -708,10 +725,6 @@ fn imported_chatgpt_record_type(
     if lower.starts_with("convention:") || lower.starts_with("repo convention:") {
         return Some(RecordType::RepoConvention);
     }
-    if contains_any(&lower, &["update the ", "fix the ", "implement the "]) {
-        return None;
-    }
-
     match record_type {
         RecordType::Preference
         | RecordType::Decision
@@ -719,6 +732,9 @@ fn imported_chatgpt_record_type(
         | RecordType::RepoConvention
         | RecordType::WorkflowPattern => Some(record_type),
         RecordType::Other => {
+            if contains_any(&lower, &["update the ", "fix the ", "implement the "]) {
+                return None;
+            }
             let durable_fact = contains_any(
                 &lower,
                 &[
