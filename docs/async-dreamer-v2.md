@@ -20,13 +20,25 @@ primitive and keeps execution deterministic, preview-only, and bounded.
 
 ## Job model
 
-The MVP job shape is intentionally narrow:
+The long-term job taxonomy for Async Dreamer v2 is:
+
+- `summarize_evidence_window`
+- `detect_conflicts`
+- `propose_relations`
+- `propose_temporal_transitions`
+- `propose_procedures`
+- `compact_cards`
+- `compact_packs`
+
+The MVP executable job shape is intentionally narrow:
 
 - `kind`: only `dream_preview`
 - `mode`: only `deterministic`
 - `budget.max_runtime_seconds`
 - `budget.max_input_records`
-- `budget.max_candidates`
+- `budget.max_candidates` (preview output-size cap in candidate units; each
+  proposal or policy rejection consumes one unit, while stale evidence notices
+  do not)
 - `provider.command.argv` as stored config/data only
 
 Jobs persist in `dream_jobs`. The row stores the explicit budget/provider shape,
@@ -46,6 +58,9 @@ ledger. A job run:
 4. Stores the resulting Dreamer audit row in `dream_runs`.
 5. Updates the job row with `last_run_id`, `last_run_at`, final status, and any
    safe error summary.
+
+Failure outcomes also append an `error` run in `dream_runs` (same scope/window)
+so operators can audit failed attempts alongside successful preview passes.
 
 This keeps run evidence aligned with current preview/apply reporting and avoids
 new hidden storage behavior.

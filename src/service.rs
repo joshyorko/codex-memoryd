@@ -7,6 +7,7 @@
 //! exact same code paths as HTTP.
 
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 use serde_json::json;
@@ -51,8 +52,8 @@ use crate::recall::RecallParams;
 use crate::recall::SearchParams;
 use crate::status;
 use crate::store::ledger_safe_summary;
-use crate::store::DreamRunAudit;
 use crate::store::DreamJobRecord;
+use crate::store::DreamRunAudit;
 use crate::store::DreamRunRecord;
 use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
@@ -1651,7 +1652,9 @@ impl Service {
             ));
         }
         if req.budget.max_candidates == 0 {
-            return Err(Error::invalid_request("dream job max_candidates must be > 0"));
+            return Err(Error::invalid_request(
+                "dream job max_candidates must be > 0",
+            ));
         }
         if req.budget.max_runtime_seconds == 0 {
             return Err(Error::invalid_request(
@@ -1673,6 +1676,14 @@ impl Service {
         }
 
         let started_at = ids::now_rfc3339();
+        let started = Instant::now();
+        let Some(deadline) =
+            started.checked_add(StdDuration::from_secs(req.budget.max_runtime_seconds))
+        else {
+            return Err(Error::invalid_request(
+                "dream job max_runtime_seconds is too large",
+            ));
+        };
         let job_id = req.job_id.unwrap_or_else(|| ids::new_id("dream_job"));
         let provider = req.provider.unwrap_or_default();
         let explicit_since = req.since.is_some();
@@ -1700,11 +1711,10 @@ impl Service {
             last_error: None,
         })?;
 
-        let started = Instant::now();
         let result = dream::run(
             &self.store,
             &dream::DreamParams {
-                profile,
+                profile: profile.clone(),
                 workspace: &workspace,
                 repo_id: repo_id.as_deref(),
                 mode: "preview",
@@ -1714,8 +1724,42 @@ impl Service {
                 max_records: req.budget.max_input_records,
                 max_candidates: Some(req.budget.max_candidates),
                 patch_run_id: None,
+                deadline: Some(deadline),
             },
         );
+        if started.elapsed().as_secs() >= req.budget.max_runtime_seconds && result.is_ok() {
+            let completed_at = ids::now_rfc3339();
+            let summary = sanitize_error_summary("dream job exceeded max_runtime_seconds");
+            let audit = dream_error_audit(
+                profile.as_str(),
+                &workspace,
+                repo_id.as_deref(),
+                "preview",
+                &started_at,
+                source_window_start.as_deref(),
+                Some(&now),
+                &summary,
+            );
+            let run_id = audit.id.clone();
+            self.store.insert_dream_run(&audit)?;
+            self.store.upsert_dream_job(&DreamJobRecord {
+                id: job_id,
+                profile_id: profile.as_str().to_string(),
+                workspace_id: workspace,
+                repo_id,
+                kind: req.kind,
+                mode,
+                status: "error".to_string(),
+                budget: req.budget,
+                provider,
+                created_at: completed_at.clone(),
+                updated_at: completed_at.clone(),
+                last_run_id: Some(run_id),
+                last_run_at: Some(completed_at),
+                last_error: Some(summary.clone()),
+            })?;
+            return Err(Error::internal(summary));
+        }
 
         match result {
             Ok((resp, max_candidates_hit)) => {
@@ -1739,7 +1783,7 @@ impl Service {
                     repo_id: resp.repo_id.clone(),
                     mode: resp.mode.clone(),
                     status: status.clone(),
-                    started_at,
+                    started_at: started_at.clone(),
                     completed_at: Some(completed_at.clone()),
                     implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
                     config_hash: dream::config_hash(),
@@ -1784,6 +1828,18 @@ impl Service {
             Err(err) => {
                 let completed_at = ids::now_rfc3339();
                 let summary = sanitize_error_summary(&err.message);
+                let audit = dream_error_audit(
+                    profile.as_str(),
+                    &workspace,
+                    repo_id.as_deref(),
+                    "preview",
+                    &started_at,
+                    source_window_start.as_deref(),
+                    Some(&now),
+                    &summary,
+                );
+                let run_id = audit.id.clone();
+                self.store.insert_dream_run(&audit)?;
                 self.store.upsert_dream_job(&DreamJobRecord {
                     id: job_id,
                     profile_id: profile.as_str().to_string(),
@@ -1795,9 +1851,9 @@ impl Service {
                     budget: req.budget,
                     provider,
                     created_at: completed_at.clone(),
-                    updated_at: completed_at,
-                    last_run_id: None,
-                    last_run_at: None,
+                    updated_at: completed_at.clone(),
+                    last_run_id: Some(run_id),
+                    last_run_at: Some(completed_at),
                     last_error: Some(summary),
                 })?;
                 Err(err)
@@ -1887,6 +1943,7 @@ impl Service {
                 max_records: 500,
                 max_candidates: None,
                 patch_run_id,
+                deadline: None,
             },
         );
         match result {
@@ -2029,6 +2086,7 @@ impl Service {
                 max_records: cfg.max_batch_size,
                 max_candidates: Some(cfg.max_candidates),
                 patch_run_id: None,
+                deadline: None,
             },
         );
         let elapsed = started.elapsed();

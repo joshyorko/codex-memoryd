@@ -694,7 +694,7 @@ pub(crate) fn parse_local_http_endpoint(url: &str) -> Option<LocalHttpEndpoint> 
     })
 }
 
-pub(crate) fn adjacent_runtime_conflicts(memoryd_bind: &str, adjacent_url: &str) -> bool {
+pub fn adjacent_runtime_conflicts(memoryd_bind: &str, adjacent_url: &str) -> bool {
     let Some(adjacent) = parse_local_http_endpoint(adjacent_url) else {
         return false;
     };

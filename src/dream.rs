@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -246,9 +247,11 @@ pub struct DreamParams<'a> {
     pub max_records: usize,
     pub max_candidates: Option<usize>,
     pub patch_run_id: Option<&'a str>,
+    pub deadline: Option<Instant>,
 }
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
+    check_deadline(params)?;
     let mut records = store.query_records(&RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
@@ -260,6 +263,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         limit: params.max_records,
         offset: 0,
     })?;
+    check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
         records.extend(imported_chatgpt_candidate_records(
@@ -268,6 +272,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             imported_limit,
         )?);
     }
+    check_deadline(params)?;
     records.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
@@ -279,7 +284,10 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
 
+    check_deadline(params)?;
+
     for record in &records {
+        check_deadline(params)?;
         let state = state_for_record(record);
         let drift_prone = state != "historical" && is_drift_prone(&record.content);
         let valid_until = valid_until_for(record);
@@ -324,9 +332,13 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         }
     }
 
+    check_deadline(params)?;
+
     for newer in &records {
+        check_deadline(params)?;
         let newer_state = state_for_record(newer);
         for older in &records {
+            check_deadline(params)?;
             if newer.id == older.id
                 || !same_boundary(newer, older)
                 || newer.created_at <= older.created_at
@@ -356,24 +368,21 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     }
 
     if params.recency_cutoff.is_none() || params.include_archived_sources {
-        push_threshold_candidates(&records, &mut candidates, &mut rejected);
+        push_threshold_candidates(params, &records, &mut candidates, &mut rejected)?;
     }
 
-    attach_counter_evidence_retires(&records, &mut candidates);
+    check_deadline(params)?;
+    attach_counter_evidence_retires(params, &records, &mut candidates)?;
     dedupe_candidates(&mut candidates);
     let mut max_candidates_hit = false;
     if let Some(max) = params.max_candidates {
-        if let Some(limit_for_processing) = max.checked_add(1) {
-            candidates.truncate(limit_for_processing);
-            max_candidates_hit = candidates.len() > max;
-            if max_candidates_hit {
-                candidates.truncate(max);
-            }
-        } else {
-            candidates.truncate(max);
-        }
+        max_candidates_hit =
+            candidates.len() > max || rejected.len() > max.saturating_sub(candidates.len());
+        candidates.truncate(max);
+        rejected.truncate(max.saturating_sub(candidates.len()));
     }
 
+    check_deadline(params)?;
     let run_id = stable_run_id(params, &evidence_window, &records);
     let mut archived = Vec::new();
     let mut created = Vec::new();
@@ -943,13 +952,16 @@ pub fn candidate_counts(response: &DreamResponse) -> serde_json::Value {
 }
 
 fn push_threshold_candidates(
+    params: &DreamParams,
     records: &[MemoryRecord],
     candidates: &mut Vec<DreamCandidate>,
     rejected: &mut Vec<DreamRejection>,
-) {
+) -> Result<()> {
+    check_deadline(params)?;
     let mut boundary_groups: BTreeMap<(String, String, Option<String>), Vec<&MemoryRecord>> =
         BTreeMap::new();
     for record in records {
+        check_deadline(params)?;
         boundary_groups
             .entry((
                 record.profile_id.clone(),
@@ -961,8 +973,9 @@ fn push_threshold_candidates(
     }
 
     for mut boundary_records in boundary_groups.into_values() {
+        check_deadline(params)?;
         boundary_records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        let mut groups = subject_groups(&boundary_records);
+        let mut groups = subject_groups(params, &boundary_records)?;
         groups.sort_by(|a, b| {
             a.first()
                 .unwrap()
@@ -972,6 +985,7 @@ fn push_threshold_candidates(
         });
 
         for evidence in groups {
+            check_deadline(params)?;
             let subject = subject_key_for_record(evidence.last().unwrap());
             let score = score_evidence(&evidence);
             if score.candidate_state == "rejected" {
@@ -1007,11 +1021,16 @@ fn push_threshold_candidates(
             );
         }
     }
+    Ok(())
 }
 
-fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryRecord>> {
+fn subject_groups<'a>(
+    params: &DreamParams,
+    records: &'a [&'a MemoryRecord],
+) -> Result<Vec<Vec<&'a MemoryRecord>>> {
     let mut groups: Vec<Vec<&'a MemoryRecord>> = Vec::new();
     for record in records {
+        check_deadline(params)?;
         if let Some(group) = groups
             .iter_mut()
             .find(|group| same_subject(group[0], record))
@@ -1021,7 +1040,7 @@ fn subject_groups<'a>(records: &'a [&'a MemoryRecord]) -> Vec<Vec<&'a MemoryReco
             groups.push(vec![*record]);
         }
     }
-    groups
+    Ok(groups)
 }
 
 fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
@@ -1777,8 +1796,14 @@ fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
     });
 }
 
-fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [DreamCandidate]) {
+fn attach_counter_evidence_retires(
+    params: &DreamParams,
+    records: &[MemoryRecord],
+    candidates: &mut [DreamCandidate],
+) -> Result<()> {
+    check_deadline(params)?;
     for candidate in candidates {
+        check_deadline(params)?;
         let Some(kind) = marker_kind_for_candidate(candidate) else {
             continue;
         };
@@ -1787,6 +1812,7 @@ fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [D
             continue;
         }
         for record in records {
+            check_deadline(params)?;
             if candidate.supersedes.contains(&record.id) {
                 continue;
             }
@@ -1806,6 +1832,7 @@ fn attach_counter_evidence_retires(records: &[MemoryRecord], candidates: &mut [D
         candidate.retires.sort();
         candidate.retires.dedup();
     }
+    Ok(())
 }
 
 fn marker_operational_valence(record: &MemoryRecord) -> Option<&str> {
@@ -2090,6 +2117,50 @@ fn format_time(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+fn check_deadline(params: &DreamParams) -> Result<()> {
+    if params
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Err(crate::error::Error::internal(
+            "dream job exceeded max_runtime_seconds",
+        ));
+    }
+    Ok(())
+}
+
 fn date_part(value: &str) -> &str {
     value.split('T').next().unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_counter_evidence_retires_returns_timeout_for_expired_deadline() {
+        let params = DreamParams {
+            profile: Profile::Personal,
+            workspace: "ws",
+            repo_id: None,
+            mode: "preview",
+            now: "2030-01-01T00:00:00Z",
+            recency_cutoff: None,
+            include_archived_sources: false,
+            max_records: 0,
+            max_candidates: None,
+            patch_run_id: None,
+            deadline: Some(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .expect("instant subtraction should succeed"),
+            ),
+        };
+        let mut candidates = Vec::<DreamCandidate>::new();
+
+        let error = attach_counter_evidence_retires(&params, &[], &mut candidates)
+            .expect_err("expired post-processing deadline should return an error");
+
+        assert_eq!(error.message, "dream job exceeded max_runtime_seconds");
+    }
 }

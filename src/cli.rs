@@ -3090,7 +3090,7 @@ fn adjacent_runtime_inventory(config: &Config) -> AdjacentRuntimeStatus {
     let url = config.adjacent_runtime.url.clone();
     let conflict_with_memoryd = url
         .as_deref()
-        .is_some_and(|url| crate::config::adjacent_runtime_conflicts(&config.bind, url));
+        .is_some_and(|url| codex_memoryd::config::adjacent_runtime_conflicts(&config.bind, url));
     AdjacentRuntimeStatus {
         status: if !configured {
             "disabled".to_string()
