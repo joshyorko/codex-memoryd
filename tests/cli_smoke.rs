@@ -1379,13 +1379,20 @@ fn cli_recall_supports_as_of_and_include_history_modes() {
         .unwrap();
     assert!(default_output.status.success());
     let default_recall: Value = serde_json::from_slice(&default_output.stdout).unwrap();
-    let default_ids: Vec<&str> = default_recall["facts"]
+    let default_ids: Vec<String> = default_recall["facts"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|fact| fact["id"].as_str())
+        .map(str::to_string)
         .collect();
-    assert_eq!(default_ids, vec!["mem_cli_tabs"]);
+    assert_eq!(
+        default_ids,
+        vec![ids::public_handle(
+            ids::PublicHandleKind::MemoryRef,
+            "mem_cli_tabs"
+        )]
+    );
 
     let as_of_output = bin()
         .arg("--db")
@@ -1405,13 +1412,20 @@ fn cli_recall_supports_as_of_and_include_history_modes() {
         .unwrap();
     assert!(as_of_output.status.success());
     let as_of_recall: Value = serde_json::from_slice(&as_of_output.stdout).unwrap();
-    let as_of_ids: Vec<&str> = as_of_recall["facts"]
+    let as_of_ids: Vec<String> = as_of_recall["facts"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|fact| fact["id"].as_str())
+        .map(str::to_string)
         .collect();
-    assert_eq!(as_of_ids, vec!["mem_cli_spaces"]);
+    assert_eq!(
+        as_of_ids,
+        vec![ids::public_handle(
+            ids::PublicHandleKind::MemoryRef,
+            "mem_cli_spaces"
+        )]
+    );
 
     let history_output = bin()
         .arg("--db")
@@ -1430,15 +1444,19 @@ fn cli_recall_supports_as_of_and_include_history_modes() {
         .unwrap();
     assert!(history_output.status.success());
     let history_recall: Value = serde_json::from_slice(&history_output.stdout).unwrap();
-    let history_ids: BTreeSet<&str> = history_recall["facts"]
+    let history_ids: BTreeSet<String> = history_recall["facts"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|fact| fact["id"].as_str())
+        .map(str::to_string)
         .collect();
     assert_eq!(
         history_ids,
-        BTreeSet::from(["mem_cli_spaces", "mem_cli_tabs"])
+        BTreeSet::from([
+            ids::public_handle(ids::PublicHandleKind::MemoryRef, "mem_cli_spaces"),
+            ids::public_handle(ids::PublicHandleKind::MemoryRef, "mem_cli_tabs"),
+        ])
     );
 }
 
@@ -5336,5 +5354,7 @@ fn cli_eval_benchmark_synthetic_reports_input_path_on_read_error() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(input_path.to_string_lossy().as_ref()));
+        .stderr(predicate::str::contains(
+            input_path.to_string_lossy().as_ref(),
+        ));
 }

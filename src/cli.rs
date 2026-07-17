@@ -1007,6 +1007,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let service = cli.open_service(None)?;
                 let status = service.status()?;
                 print_json(&status)?;
+            } else if cli.runtime.is_some() && cli.url.is_none() {
+                let report = native_runtime::status(&cli.runtime_options());
+                print_json(&report)?;
             } else if let Ok(body) = native_runtime::http_get(&format!(
                 "{}/v1/status",
                 cli.runtime_options().url.trim_end_matches('/')
@@ -2511,7 +2514,8 @@ fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<
 
 fn paths_inventory(cli: &Cli) -> Result<PathsInventory> {
     let runtime = cli.runtime_options();
-    let config = cli.load_config(None)?;
+    let config_path = cli.config.as_deref().filter(|path| path.exists());
+    let config = Config::load(config_path, &cli.overrides(None))?;
     let config_file = cli
         .config
         .clone()

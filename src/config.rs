@@ -698,8 +698,8 @@ pub fn adjacent_runtime_conflicts(memoryd_bind: &str, adjacent_url: &str) -> boo
     let Some(adjacent) = parse_local_http_endpoint(adjacent_url) else {
         return false;
     };
-    let Some((memoryd_host, memoryd_port)) = bind_host(memoryd_bind)
-        .and_then(|host| bind_port(memoryd_bind).map(|port| (host, port)))
+    let Some((memoryd_host, memoryd_port)) =
+        bind_host(memoryd_bind).and_then(|host| bind_port(memoryd_bind).map(|port| (host, port)))
     else {
         return false;
     };
@@ -726,7 +726,8 @@ fn bind_port(bind: &str) -> Option<u16> {
         let (_, port) = bind.rsplit_once("]:")?;
         return port.parse().ok();
     }
-    bind.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
 }
 
 #[cfg(test)]

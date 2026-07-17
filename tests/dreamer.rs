@@ -346,10 +346,9 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
             cursor: None,
         })
         .unwrap();
-    assert!(archived_search
-        .matches
-        .iter()
-        .any(|m| m.id == old_id && m.archived));
+    assert!(archived_search.matches.iter().any(|m| {
+        m.id == ids::public_handle(ids::PublicHandleKind::MemoryRef, &old_id) && m.archived
+    }));
 }
 
 #[test]
@@ -551,11 +550,24 @@ fn apply_persists_marker_provenance_for_created_records() {
 
 #[test]
 fn operational_valence_decay_is_deterministic() {
-    let svc = service();
-    conclude(
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("dream.db");
+    let store = Store::open(&db).unwrap();
+    let config = Config {
+        default_workspace: "ws".to_string(),
+        ..Default::default()
+    };
+    let svc = Service::new(store, config);
+    let record_id = conclude(
         &svc,
         "Battle scar: the flaky cache failed twice, but recovered by switching to local fallback.",
     );
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE memory_records SET created_at = ?1, updated_at = ?1, observed_at = ?1 WHERE id = ?2",
+        params!["2026-06-14T00:00:00Z", record_id],
+    )
+    .unwrap();
 
     let preview = dream(&svc, "preview", "2026-07-14T00:00:00Z");
     let scar = preview

@@ -58,7 +58,10 @@ fn adjacent_runtime_defaults_to_disabled_status() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status is json");
     assert_eq!(json["adjacent_runtime"]["status"], "disabled");
     assert_eq!(json["adjacent_runtime"]["configured"], false);
-    assert_eq!(json["adjacent_runtime"]["ownership"]["owner"], "adjacent-app");
+    assert_eq!(
+        json["adjacent_runtime"]["ownership"]["owner"],
+        "adjacent-app"
+    );
 }
 
 #[test]
