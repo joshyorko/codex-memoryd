@@ -4,8 +4,15 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use assert_cmd::prelude::*;
 use codex_memoryd::domain::Portability;
@@ -31,6 +38,64 @@ fn bin() -> Command {
 fn unused_loopback_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().to_string()
+}
+
+fn clear_runtime_env(command: &mut Command) {
+    for key in [
+        "CODEX_MEMORYD_URL",
+        "CODEX_MEMORYD_RUNTIME",
+        "CODEX_MEMORYD_RUNTIME_DIR",
+        "CODEX_MEMORYD_HOST",
+        "CODEX_MEMORYD_PORT",
+        "CODEX_MEMORYD_BIND",
+        "CODEX_MEMORYD_DB",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn sentinel_listener() -> (
+    String,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let hit = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let hit_for_thread = Arc::clone(&hit);
+    let stop_for_thread = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    hit_for_thread.store(true, Ordering::Relaxed);
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let body = "SENTINEL-UNRELATED-ENDPOINT";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (url, hit, stop, handle)
+}
+
+fn finish_sentinel(stop: Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
 }
 
 fn wait_for_health(url: &str) {
@@ -4507,14 +4572,179 @@ fn cli_help_lists_all_commands() {
 #[test]
 fn cli_container_status_reports_managed_runtime_shape_without_compose() {
     let dir = TempDir::new().unwrap();
+    let port = unused_loopback_addr()
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .to_string();
 
-    bin()
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    command
         .env("CODEX_MEMORYD_HOME", dir.path().join("memoryd-home"))
+        .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+        .env("CODEX_MEMORYD_PORT", &port)
         .args(["--runtime", "container", "status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"runtime\": \"container\""))
-        .stdout(predicate::str::contains("127.0.0.1:8787 -> container:8787"));
+        .stdout(predicate::str::contains(format!(
+            "127.0.0.1:{port} -> container:8787"
+        )));
+}
+
+#[test]
+fn cli_status_source_precedence_matrix_is_deterministic() {
+    let dir = TempDir::new().unwrap();
+
+    let default_port = unused_loopback_addr()
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .to_string();
+    let mut default_endpoint = bin();
+    clear_runtime_env(&mut default_endpoint);
+    let default_output = default_endpoint
+        .env("CODEX_MEMORYD_HOME", dir.path().join("default-home"))
+        .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+        .env("CODEX_MEMORYD_PORT", &default_port)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(default_output.status.success());
+    let default_body = String::from_utf8_lossy(&default_output.stdout);
+    assert!(default_body.contains("\"runtime\": \"native\""));
+
+    let (env_url, env_hit, env_stop, env_handle) = sentinel_listener();
+    let mut env_url_command = bin();
+    clear_runtime_env(&mut env_url_command);
+    let env_url_output = env_url_command
+        .env("CODEX_MEMORYD_HOME", dir.path().join("env-url-home"))
+        .env("CODEX_MEMORYD_URL", &env_url)
+        .arg("status")
+        .output()
+        .unwrap();
+    finish_sentinel(env_stop, env_handle);
+    assert!(env_url_output.status.success());
+    assert!(
+        env_hit.load(Ordering::Relaxed),
+        "environment URL listener was not contacted; stdout={}",
+        String::from_utf8_lossy(&env_url_output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&env_url_output.stdout),
+        "SENTINEL-UNRELATED-ENDPOINT"
+    );
+
+    let (explicit_url, explicit_url_hit, explicit_url_stop, explicit_url_handle) =
+        sentinel_listener();
+    let explicit_url_env = unused_loopback_addr();
+    let mut explicit_url_command = bin();
+    clear_runtime_env(&mut explicit_url_command);
+    let explicit_url_output = explicit_url_command
+        .env("CODEX_MEMORYD_HOME", dir.path().join("explicit-url-home"))
+        .env("CODEX_MEMORYD_RUNTIME", "container")
+        .env("CODEX_MEMORYD_URL", &explicit_url_env)
+        .arg("--url")
+        .arg(&explicit_url)
+        .arg("status")
+        .output()
+        .unwrap();
+    finish_sentinel(explicit_url_stop, explicit_url_handle);
+    assert!(explicit_url_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&explicit_url_output.stdout),
+        "SENTINEL-UNRELATED-ENDPOINT"
+    );
+    assert!(explicit_url_hit.load(Ordering::Relaxed));
+
+    let (runtime_env_url, runtime_env_hit, runtime_env_stop, runtime_env_handle) =
+        sentinel_listener();
+    let runtime_env_home = dir.path().join("runtime-env-home");
+    fs::create_dir_all(&runtime_env_home).unwrap();
+    fs::write(
+        runtime_env_home.join("runtime.env"),
+        format!("CODEX_MEMORYD_RUNTIME=container\nCODEX_MEMORYD_URL={runtime_env_url}\n"),
+    )
+    .unwrap();
+    let mut runtime_env_command = bin();
+    clear_runtime_env(&mut runtime_env_command);
+    let runtime_env_output = runtime_env_command
+        .env("CODEX_MEMORYD_HOME", &runtime_env_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    finish_sentinel(runtime_env_stop, runtime_env_handle);
+    assert!(runtime_env_output.status.success());
+    let runtime_env_body = String::from_utf8_lossy(&runtime_env_output.stdout);
+    assert!(runtime_env_body.contains("\"runtime\": \"container\""));
+    assert!(!runtime_env_body.contains("SENTINEL-UNRELATED-ENDPOINT"));
+    assert!(runtime_env_hit.load(Ordering::Relaxed));
+
+    let (env_runtime_url, env_runtime_hit, env_runtime_stop, env_runtime_handle) =
+        sentinel_listener();
+    let mut env_runtime_command = bin();
+    clear_runtime_env(&mut env_runtime_command);
+    let env_runtime_output = env_runtime_command
+        .env("CODEX_MEMORYD_HOME", dir.path().join("env-runtime-home"))
+        .env("CODEX_MEMORYD_RUNTIME", "container")
+        .env("CODEX_MEMORYD_URL", &env_runtime_url)
+        .arg("status")
+        .output()
+        .unwrap();
+    finish_sentinel(env_runtime_stop, env_runtime_handle);
+    assert!(env_runtime_output.status.success());
+    let env_runtime_body = String::from_utf8_lossy(&env_runtime_output.stdout);
+    assert!(env_runtime_body.contains("\"runtime\": \"container\""));
+    assert!(!env_runtime_body.contains("SENTINEL-UNRELATED-ENDPOINT"));
+    assert!(env_runtime_hit.load(Ordering::Relaxed));
+
+    let (
+        explicit_runtime_url,
+        explicit_runtime_hit,
+        explicit_runtime_stop,
+        explicit_runtime_handle,
+    ) = sentinel_listener();
+    let managed_port = unused_loopback_addr()
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .to_string();
+    let mut explicit_runtime_command = bin();
+    clear_runtime_env(&mut explicit_runtime_command);
+    let explicit_runtime_output = explicit_runtime_command
+        .env(
+            "CODEX_MEMORYD_HOME",
+            dir.path().join("explicit-runtime-home"),
+        )
+        .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+        .env("CODEX_MEMORYD_PORT", &managed_port)
+        .env("CODEX_MEMORYD_URL", &explicit_runtime_url)
+        .args(["--runtime", "container", "status"])
+        .output()
+        .unwrap();
+    finish_sentinel(explicit_runtime_stop, explicit_runtime_handle);
+    assert!(explicit_runtime_output.status.success());
+    let explicit_runtime_body = String::from_utf8_lossy(&explicit_runtime_output.stdout);
+    assert!(explicit_runtime_body.contains("\"runtime\": \"container\""));
+    assert!(!explicit_runtime_body.contains("SENTINEL-UNRELATED-ENDPOINT"));
+    assert!(!explicit_runtime_hit.load(Ordering::Relaxed));
+
+    let db = dir.path().join("local-mode.db");
+    let (db_url, db_hit, db_stop, db_handle) = sentinel_listener();
+    let mut db_command = bin();
+    clear_runtime_env(&mut db_command);
+    let db_output = db_command
+        .env("CODEX_MEMORYD_URL", &db_url)
+        .arg("--db")
+        .arg(&db)
+        .arg("status")
+        .output()
+        .unwrap();
+    finish_sentinel(db_stop, db_handle);
+    assert!(db_output.status.success());
+    assert!(String::from_utf8_lossy(&db_output.stdout).contains("provider_name"));
+    assert!(!db_hit.load(Ordering::Relaxed));
 }
 
 #[test]
@@ -4655,6 +4885,119 @@ fn cli_paths_json_reports_expected_keys_without_creating_runtime_files() {
         !config.exists(),
         "paths command must not create config file"
     );
+}
+
+#[test]
+fn cli_paths_missing_selected_config_does_not_load_valid_default_config() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    let default_config = home.join("config.toml");
+    let selected_config = dir.path().join("selected-config.toml");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        &default_config,
+        "[runtime.adjacent]\nenabled = true\nname = \"unselected-default\"\nurl = \"http://127.0.0.1:19999\"\n",
+    )
+    .unwrap();
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .arg("--config")
+        .arg(&selected_config)
+        .args(["paths", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["entries"]["config_file"]["path"],
+        selected_config.to_string_lossy().as_ref()
+    );
+    assert_eq!(json["entries"]["config_file"]["exists"], false);
+    assert_eq!(json["adjacent_runtime"]["status"], "disabled");
+    assert!(json["entries"].get("adjacent_url").is_none());
+    assert!(!selected_config.exists());
+}
+
+#[test]
+fn cli_paths_missing_selected_config_ignores_malformed_default_config() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    let default_config = home.join("config.toml");
+    let selected_config = dir.path().join("selected-config.toml");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&default_config, "[runtime.adjacent\n").unwrap();
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .arg("--config")
+        .arg(&selected_config)
+        .args(["paths", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["entries"]["config_file"]["exists"], false);
+    assert_eq!(json["adjacent_runtime"]["status"], "disabled");
+}
+
+#[test]
+fn cli_paths_malformed_selected_config_still_fails() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    let selected_config = dir.path().join("selected-config.toml");
+    fs::write(&selected_config, "[runtime.adjacent\n").unwrap();
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .arg("--config")
+        .arg(&selected_config)
+        .args(["paths", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("parse config"));
+    assert!(stderr.contains(selected_config.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn cli_operational_command_still_requires_missing_selected_config() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    let selected_config = dir.path().join("missing-config.toml");
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .arg("--config")
+        .arg(&selected_config)
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("config file not found"));
+    assert!(stderr.contains(selected_config.to_string_lossy().as_ref()));
 }
 
 #[test]

@@ -18,6 +18,7 @@ use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
 use codex_memoryd::chatgpt_export_import::ChatgptExportSelection;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
+use codex_memoryd::config::ConfigLoadSource;
 use codex_memoryd::conformance;
 use codex_memoryd::domain;
 use codex_memoryd::error;
@@ -63,11 +64,11 @@ pub struct Cli {
     pub local: bool,
 
     /// Daemon endpoint for client mode.
-    #[arg(long, global = true, value_name = "URL", env = "CODEX_MEMORYD_URL")]
+    #[arg(long, global = true, value_name = "URL")]
     pub url: Option<String>,
 
     /// Managed runtime kind for lifecycle commands.
-    #[arg(long, global = true, value_enum, env = "CODEX_MEMORYD_RUNTIME")]
+    #[arg(long, global = true, value_enum)]
     pub runtime: Option<RuntimeKind>,
 
     #[command(subcommand)]
@@ -859,13 +860,17 @@ impl Cli {
         self.runtime_options_with_endpoint(None, None, None)
     }
 
-    fn runtime_options_with_endpoint(
+    fn runtime_resolution(&self) -> native_runtime::RuntimeResolution {
+        self.runtime_resolution_with_endpoint(None, None, None)
+    }
+
+    fn runtime_resolution_with_endpoint(
         &self,
         host: Option<String>,
         port: Option<u16>,
         bind: Option<String>,
-    ) -> RuntimeOptions {
-        RuntimeOptions::resolve(
+    ) -> native_runtime::RuntimeResolution {
+        RuntimeOptions::resolve_with_source(
             self.runtime,
             self.url.clone(),
             self.db.clone(),
@@ -873,6 +878,16 @@ impl Cli {
             port,
             bind,
         )
+    }
+
+    fn runtime_options_with_endpoint(
+        &self,
+        host: Option<String>,
+        port: Option<u16>,
+        bind: Option<String>,
+    ) -> RuntimeOptions {
+        self.runtime_resolution_with_endpoint(host, port, bind)
+            .options
     }
 
     fn use_client_mode(&self) -> bool {
@@ -1007,17 +1022,33 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let service = cli.open_service(None)?;
                 let status = service.status()?;
                 print_json(&status)?;
-            } else if cli.runtime.is_some() && cli.url.is_none() {
-                let report = native_runtime::status(&cli.runtime_options());
-                print_json(&report)?;
-            } else if let Ok(body) = native_runtime::http_get(&format!(
-                "{}/v1/status",
-                cli.runtime_options().url.trim_end_matches('/')
-            )) {
-                print!("{body}");
             } else {
-                let report = native_runtime::status(&cli.runtime_options());
-                print_json(&report)?;
+                let resolution = cli.runtime_resolution();
+                let runtime = &resolution.options;
+                if cli.url.is_some() {
+                    if let Ok(body) = native_runtime::http_get(&format!(
+                        "{}/v1/status",
+                        runtime.url.trim_end_matches('/')
+                    )) {
+                        print!("{body}");
+                    } else {
+                        let report = native_runtime::status(runtime);
+                        print_json(&report)?;
+                    }
+                } else if resolution.runtime_source
+                    != native_runtime::RuntimeSelectionSource::Default
+                {
+                    let report = native_runtime::status(runtime);
+                    print_json(&report)?;
+                } else if let Ok(body) = native_runtime::http_get(&format!(
+                    "{}/v1/status",
+                    runtime.url.trim_end_matches('/')
+                )) {
+                    print!("{body}");
+                } else {
+                    let report = native_runtime::status(runtime);
+                    print_json(&report)?;
+                }
             }
             Ok(())
         }
@@ -1729,11 +1760,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Config { command } => match command {
             ConfigCommand::Show { resolved } => {
                 let config = cli.load_config(None)?;
-                let runtime = cli.runtime_options();
+                let resolution = cli.runtime_resolution();
+                let runtime = resolution.options;
                 print_json(&json!({
                             "resolved": *resolved,
                             "config_file": cli.config.clone().unwrap_or_else(codex_memoryd::config::default_config_path),
-                            "registry": config_registry(&cli, &config, &runtime),
+                            "registry": config_registry(&cli, &config, &runtime, resolution.runtime_source),
                             "client": {
                                 "url": runtime.url,
                                 "local": cli.local,
@@ -2514,8 +2546,11 @@ fn set_dream_scheduler_enabled(path: &std::path::Path, enabled: bool) -> Result<
 
 fn paths_inventory(cli: &Cli) -> Result<PathsInventory> {
     let runtime = cli.runtime_options();
-    let config_path = cli.config.as_deref().filter(|path| path.exists());
-    let config = Config::load(config_path, &cli.overrides(None))?;
+    let config_source = match cli.config.as_deref() {
+        Some(path) => ConfigLoadSource::ExplicitOptional(path),
+        None => ConfigLoadSource::Default,
+    };
+    let config = Config::load_from_source(config_source, &cli.overrides(None))?;
     let config_file = cli
         .config
         .clone()
@@ -2674,7 +2709,12 @@ fn runtime_decision(runtime: RuntimeKind) -> &'static str {
     }
 }
 
-fn config_registry(cli: &Cli, config: &Config, runtime: &RuntimeOptions) -> serde_json::Value {
+fn config_registry(
+    cli: &Cli,
+    config: &Config,
+    runtime: &RuntimeOptions,
+    runtime_source: native_runtime::RuntimeSelectionSource,
+) -> serde_json::Value {
     let entry = |key: &str,
                  owner: &str,
                  source: &str,
@@ -2744,7 +2784,7 @@ fn config_registry(cli: &Cli, config: &Config, runtime: &RuntimeOptions) -> serd
         entry(
             "CODEX_MEMORYD_RUNTIME",
             "native-runtime/container-runtime",
-            source_for(cli.runtime.is_some(), "CODEX_MEMORYD_RUNTIME"),
+            runtime_source.as_str(),
             json!(format!("{:?}", runtime.runtime).to_ascii_lowercase()),
             true,
             true,
