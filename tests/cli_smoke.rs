@@ -4736,6 +4736,7 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
     clear_runtime_env(&mut db_command);
     let db_output = db_command
         .env("CODEX_MEMORYD_URL", &db_url)
+        .arg("--local")
         .arg("--db")
         .arg(&db)
         .arg("status")
@@ -4745,6 +4746,64 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
     assert!(db_output.status.success());
     assert!(String::from_utf8_lossy(&db_output.stdout).contains("provider_name"));
     assert!(!db_hit.load(Ordering::Relaxed));
+}
+
+#[test]
+fn cli_rejects_invalid_runtime_environment_for_status_and_lifecycle() {
+    let dir = TempDir::new().unwrap();
+
+    for command_name in ["status", "down"] {
+        let mut command = bin();
+        clear_runtime_env(&mut command);
+        let output = command
+            .env("CODEX_MEMORYD_HOME", dir.path().join(command_name))
+            .env("CODEX_MEMORYD_RUNTIME", "containre")
+            .arg(command_name)
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{command_name} unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid CODEX_MEMORYD_RUNTIME") || stderr.contains("containre"),
+            "{command_name} stderr did not identify the invalid runtime: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_url_and_db_environment_without_local_but_local_is_explicit() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("env-mode.db");
+    let (url, hit, stop, handle) = sentinel_listener();
+
+    let mut rejected = bin();
+    clear_runtime_env(&mut rejected);
+    let output = rejected
+        .env("CODEX_MEMORYD_URL", &url)
+        .env("CODEX_MEMORYD_DB", &db)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--url and --db conflict"));
+
+    let mut local = bin();
+    clear_runtime_env(&mut local);
+    let local_output = local
+        .env("CODEX_MEMORYD_URL", &url)
+        .env("CODEX_MEMORYD_DB", &db)
+        .args(["--local", "status"])
+        .output()
+        .unwrap();
+    finish_sentinel(stop, handle);
+
+    assert!(local_output.status.success());
+    assert!(String::from_utf8_lossy(&local_output.stdout).contains("provider_name"));
+    assert!(!hit.load(Ordering::Relaxed));
 }
 
 #[test]

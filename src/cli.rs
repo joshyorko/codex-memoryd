@@ -921,8 +921,37 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
+fn client_url_is_present(cli: &Cli) -> bool {
+    cli.url.is_some()
+        || ["CODEX_MEMORYD_URL", "CODEX_MEMORYD_BASE_URL"]
+            .iter()
+            .any(|key| {
+                std::env::var(key)
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+}
+
+fn validate_runtime_environment() -> Result<()> {
+    let Some(value) = std::env::var("CODEX_MEMORYD_RUNTIME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native" | "container" | "auto" | "compose-dev" | "compose_dev" | "compose" => Ok(()),
+        _ => Err(error::Error::invalid_request(format!(
+            "invalid CODEX_MEMORYD_RUNTIME value '{value}' (expected native, container, auto, or compose-dev)"
+        ))),
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
-    if cli.url.is_some()
+    validate_runtime_environment()?;
+
+    if client_url_is_present(&cli)
         && cli.db.is_some()
         && !cli.local
         && !matches!(
