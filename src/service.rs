@@ -2663,7 +2663,7 @@ fn render_patch_markdown(
             let refs = action
                 .source_refs
                 .iter()
-                .map(|source| source.id.clone())
+                .map(render_patch_source_ref)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("  - source_refs: {refs}\n"));
@@ -2673,6 +2673,47 @@ fn render_patch_markdown(
         }
     }
     out
+}
+
+fn render_patch_source_ref(source: &DreamEvidenceSource) -> String {
+    if source.kind != "imported_chat_turn" {
+        return source.id.clone();
+    }
+    format!(
+        "imported ChatGPT: {} (conversation {}), turn {}, message {}, source {}",
+        markdown_inline_field(
+            source.conversation_title.as_deref().unwrap_or("<untitled>"),
+            Some(60),
+        ),
+        markdown_inline_field(
+            source.conversation_id.as_deref().unwrap_or("<unknown>"),
+            None,
+        ),
+        source
+            .turn_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        markdown_inline_field(source.message_id.as_deref().unwrap_or("<unknown>"), None),
+        markdown_inline_field(&source.id, None),
+    )
+}
+
+fn markdown_inline_field(raw: &str, limit: Option<usize>) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = limit
+        .map(|limit| truncate_for_display(&normalized, limit))
+        .unwrap_or(normalized);
+    let longest_backtick_run = normalized
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run + 1);
+    if normalized.starts_with('`') || normalized.ends_with('`') {
+        format!("{fence} {normalized} {fence}")
+    } else {
+        format!("{fence}{normalized}{fence}")
+    }
 }
 
 fn truncate_for_display(raw: &str, limit: usize) -> String {
@@ -3469,4 +3510,37 @@ fn map_code(code: &str) -> ErrorCode {
 
 fn ledger_hash(parts: &[&str]) -> String {
     ids::sha256_hex(parts.join("\u{1f}").as_bytes())
+}
+
+#[cfg(test)]
+mod imported_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn imported_patch_source_normalizes_and_escapes_adversarial_provenance() {
+        let source = DreamEvidenceSource {
+            id: "src|\n# heading".to_string(),
+            kind: "imported_chat_turn".to_string(),
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: None,
+            actor: Some("user".to_string()),
+            record_type: None,
+            state: None,
+            source_path: None,
+            summary: None,
+            conversation_id: Some("`conv]\n- injected: *boom*`".to_string()),
+            conversation_title: Some("Title\n`tick` [link](url) *bold*".to_string()),
+            message_id: Some("msg[\r\n_bad_".to_string()),
+            turn_index: Some(7),
+        };
+
+        let rendered = render_patch_source_ref(&source);
+
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
+        assert_eq!(
+            rendered,
+            "imported ChatGPT: ``Title `tick` [link](url) *bold*`` (conversation `` `conv] - injected: *boom*` ``), turn 7, message `msg[ _bad_`, source `src| # heading`"
+        );
+    }
 }

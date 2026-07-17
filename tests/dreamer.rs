@@ -164,6 +164,11 @@ fn imported_chatgpt_turn(
     content: &str,
     created_at: &str,
 ) {
+    let turn_index = message_id
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
     svc.store
         .ensure_session(
             session_id,
@@ -176,7 +181,7 @@ fn imported_chatgpt_turn(
         .unwrap();
     svc.store
         .insert_visible_turn(&VisibleTurn {
-            id: format!("turn_chatgpt_{message_id}"),
+            id: format!("turn_chatgpt_{conversation_id}_{message_id}"),
             session_id: session_id.to_string(),
             actor: actor.to_string(),
             content: content.to_string(),
@@ -184,7 +189,9 @@ fn imported_chatgpt_turn(
             metadata: json!({
                 "origin": "chatgpt-export",
                 "conversation_id": conversation_id,
+                "title": "Imported planning",
                 "message_id": message_id,
+                "turn_index": turn_index,
                 "source_file_path": "/tmp/chatgpt-export/conversations.json",
             }),
         })
@@ -1890,21 +1897,402 @@ fn imported_chatgpt_turns_feed_reviewable_dream_candidates() {
         "2026-06-08T10:00:00Z",
     );
 
+    turn(
+        &svc,
+        "native",
+        "Preference: native evidence remains distinct.",
+        "2026-06-08T12:00:00Z",
+    );
+    let before_preview = svc.store.count_records().unwrap();
     let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+    assert_eq!(svc.store.count_records().unwrap(), before_preview);
+
+    let imported_window_ref = preview
+        .evidence_window
+        .visible_turns
+        .sources
+        .iter()
+        .find(|reference| reference.id == "turn_chatgpt_conv-1_msg-1")
+        .unwrap();
+    assert_eq!(imported_window_ref.kind, "imported_chat_turn");
+    assert_eq!(
+        imported_window_ref.conversation_title.as_deref(),
+        Some("Imported planning")
+    );
+    assert_eq!(
+        imported_window_ref.conversation_id.as_deref(),
+        Some("conv-1")
+    );
+    assert_eq!(imported_window_ref.message_id.as_deref(), Some("msg-1"));
+    assert_eq!(imported_window_ref.turn_index, Some(1));
+    assert_eq!(
+        imported_window_ref.source_path.as_deref(),
+        Some("chatgpt:conv-1:msg-1")
+    );
+    assert_eq!(
+        imported_window_ref.summary.as_deref(),
+        Some("imported_chat:Imported planning")
+    );
+    assert!(preview
+        .evidence_window
+        .visible_turns
+        .sources
+        .iter()
+        .any(|reference| reference.kind == "visible_turn" && reference.conversation_id.is_none()));
 
     assert!(preview.candidates.iter().any(|candidate| {
         candidate.candidate_state == "accepted"
             && candidate.threshold_reason == "repeated_user_steering"
             && candidate.user_evidence_count >= 2
             && candidate.apply_eligible
-            && candidate
-                .evidence_refs
-                .iter()
-                .all(|reference| reference.kind == "visible_turn")
+            && candidate.evidence_refs.iter().all(|reference| {
+                reference.kind == "imported_chat_turn"
+                    && reference.conversation_title.as_deref() == Some("Imported planning")
+                    && reference.conversation_id.as_deref() == Some("conv-1")
+                    && reference.message_id.is_some()
+                    && reference.turn_index.is_some()
+            })
     }));
 
     let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
     assert_eq!(applied.created.len(), 1);
+}
+
+#[test]
+fn imported_chatgpt_filters_low_signal_tasks_but_keeps_durable_memory_classes() {
+    let svc = service();
+    let durable = [
+        "Preference: keep commit messages terse.",
+        "Decision: use SQLite for durable storage.",
+        "Gotcha: do not run migrations without a backup.",
+        "Convention: always use cargo test for validation.",
+        "Durable fact: the memory daemon listens on port 7421.",
+        "Workflow pattern: run focused tests before the full suite.",
+    ];
+    for (subject, content) in durable.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("durable-{subject}"),
+                "user",
+                &format!("conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+    }
+    let low_signal = [
+        "Hello there.",
+        "Yesterday, update the README for this release.",
+        "Run cargo test.",
+        "Completed: update the README.",
+    ];
+    for (subject, content) in low_signal.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("noise-{subject}"),
+                "user",
+                &format!("noise-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T11:00:00Z"
+                } else {
+                    "2026-06-08T11:00:00Z"
+                },
+            );
+        }
+    }
+    imported_chatgpt_turn(
+        &svc,
+        "assistant-only",
+        "assistant",
+        "assistant-conv",
+        "msg-1",
+        "Preference: use tabs for indentation.",
+        "2026-06-01T12:00:00Z",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    for content in durable {
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .any(|candidate| candidate.content == content),
+            "missing durable imported candidate: {content}"
+        );
+    }
+    for content in low_signal {
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .all(|candidate| candidate.content != content),
+            "low-signal imported content became a candidate: {content}"
+        );
+    }
+    assert!(preview.candidates.iter().any(|candidate| {
+        candidate.content.contains("use tabs for indentation") && !candidate.apply_eligible
+    }));
+}
+
+#[test]
+fn imported_chatgpt_rejects_stale_tasks_even_with_durable_prefixes() {
+    let svc = service();
+    let stale_tasks = [
+        "Decision: tomorrow update the README for this release.",
+        "Preference: completed: update the README for this release.",
+        "Gotcha: yesterday fix the release notes.",
+        "Convention: done: implement the release checklist.",
+        "Workflow pattern: tomorrow update the schema, then run tests.",
+        "Preference: today the migration task is active.",
+        "Decision: next week we migrate the schema.",
+        "Gotcha: currently the release task is active.",
+        "Convention: will migrate the schema.",
+    ];
+    for (subject, content) in stale_tasks.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("stale-{subject}"),
+                "user",
+                &format!("stale-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+    }
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    for content in stale_tasks {
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .all(|candidate| candidate.content != content),
+            "durable-looking stale task became a candidate: {content}"
+        );
+    }
+}
+
+#[test]
+fn imported_chatgpt_promotes_command_bearing_reusable_workflow() {
+    let svc = service();
+    let content = "Workflow pattern: run `cargo test` before pushing.";
+    imported_chatgpt_turn(
+        &svc,
+        "workflow-command",
+        "user",
+        "workflow-conv",
+        "msg-1",
+        content,
+        "2026-06-01T10:00:00Z",
+    );
+    imported_chatgpt_turn(
+        &svc,
+        "workflow-command",
+        "user",
+        "workflow-conv",
+        "msg-2",
+        content,
+        "2026-06-08T10:00:00Z",
+    );
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    assert!(preview.candidates.iter().any(|candidate| {
+        candidate.content == content
+            && candidate.proposed_type == "workflow_pattern"
+            && candidate.apply_eligible
+    }));
+
+    let applied = dream(&svc, "apply", "2026-06-09T00:00:00Z");
+    assert_eq!(applied.created.len(), 1);
+    let persisted = svc.store.get_record(&applied.created[0]).unwrap().unwrap();
+    assert_eq!(persisted.record_type, RecordType::WorkflowPattern);
+    assert!(persisted.tags.contains(&"workflow_pattern".to_string()));
+    assert!(!persisted.tags.contains(&"command".to_string()));
+    assert_eq!(persisted.portability, Portability::ProfileOnly);
+    assert_eq!(
+        persisted.content_hash,
+        ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            RecordType::WorkflowPattern.as_str(),
+            persisted.scope.as_str(),
+            content,
+        )
+    );
+}
+
+#[test]
+fn imported_chatgpt_admits_durable_types_containing_imperative_phrases() {
+    let durable = [
+        (
+            "Preference: update the dependency lockfile before releases.",
+            "preference",
+        ),
+        (
+            "Decision: fix the generated client before publishing.",
+            "decision",
+        ),
+        (
+            "Gotcha: implement the migration only after a backup.",
+            "gotcha",
+        ),
+        (
+            "Convention: update the changelog before each release.",
+            "repo_convention",
+        ),
+        (
+            "Workflow pattern: fix the schema, then run tests.",
+            "workflow_pattern",
+        ),
+    ];
+    for (subject, (content, expected_type)) in durable.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("durable-imperative-{subject}"),
+                "user",
+                &format!("durable-imperative-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == *expected_type
+                && candidate.apply_eligible
+        }));
+    }
+}
+
+#[test]
+fn imported_chatgpt_admits_workflow_framing_with_imperative_markers() {
+    let workflows = [
+        "Workflow pattern: update the schema, then run tests.",
+        "Workflow pattern: fix the generated client before publishing.",
+        "Workflow pattern: implement the migration before deploying.",
+    ];
+    for (subject, content) in workflows.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("workflow-collision-{subject}"),
+                "user",
+                &format!("workflow-collision-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == "workflow_pattern"
+                && candidate.apply_eligible
+        }));
+    }
+}
+
+#[test]
+fn imported_chatgpt_admits_convention_framing_with_imperative_markers() {
+    let conventions = [
+        "Convention: update the changelog before each release.",
+        "Convention: fix the generated client before publishing.",
+        "Convention: implement the migration before deploying.",
+    ];
+    for (subject, content) in conventions.iter().enumerate() {
+        let svc = service();
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("convention-collision-{subject}"),
+                "user",
+                &format!("convention-collision-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+        let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.content == *content
+                && candidate.proposed_type == "repo_convention"
+                && candidate.apply_eligible
+        }));
+    }
+}
+
+#[test]
+fn imported_chatgpt_rejects_unframed_imperative_tasks() {
+    let svc = service();
+    let tasks = [
+        "Update the schema, then run tests.",
+        "Fix the generated client before publishing.",
+        "Implement the migration before deploying.",
+    ];
+    for (subject, content) in tasks.iter().enumerate() {
+        for turn_index in 1..=2 {
+            imported_chatgpt_turn(
+                &svc,
+                &format!("bare-task-{subject}"),
+                "user",
+                &format!("bare-task-conv-{subject}"),
+                &format!("msg-{turn_index}"),
+                content,
+                if turn_index == 1 {
+                    "2026-06-01T10:00:00Z"
+                } else {
+                    "2026-06-08T10:00:00Z"
+                },
+            );
+        }
+    }
+
+    let preview = dream(&svc, "preview", "2026-06-09T00:00:00Z");
+
+    for content in tasks {
+        assert!(preview
+            .candidates
+            .iter()
+            .all(|candidate| candidate.content != content));
+    }
 }
 
 #[test]

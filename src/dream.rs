@@ -444,12 +444,21 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                     continue;
                 }
             };
-            let class = policy::classify(&content, params.profile, params.repo_id.is_some());
+            let record_type = crate::domain::RecordType::parse(&candidate.proposed_type)
+                .unwrap_or_else(|| {
+                    policy::classify(&content, params.profile, params.repo_id.is_some()).record_type
+                });
+            let class = policy::classify_as(
+                &content,
+                params.profile,
+                params.repo_id.is_some(),
+                record_type,
+            );
             let content_hash = ids::content_hash(
                 params.profile.as_str(),
                 params.workspace,
                 params.repo_id,
-                class.record_type.as_str(),
+                record_type.as_str(),
                 class.scope.as_str(),
                 &content,
             );
@@ -503,7 +512,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 subject_id: None,
                 episode_id: None,
                 scope: class.scope,
-                record_type: class.record_type,
+                record_type,
                 content,
                 related_files: class.related_files,
                 tags: class.tags,
@@ -615,17 +624,12 @@ fn imported_chatgpt_candidate_records(
         if turn.metadata.get("origin").and_then(|value| value.as_str()) != Some("chatgpt-export") {
             continue;
         }
-        let class = policy::classify(&turn.content, params.profile, params.repo_id.is_some());
-        if !matches!(
-            class.record_type,
-            crate::domain::RecordType::Preference
-                | crate::domain::RecordType::Decision
-                | crate::domain::RecordType::Command
-                | crate::domain::RecordType::Gotcha
-                | crate::domain::RecordType::RepoConvention
-        ) {
+        let mut class = policy::classify(&turn.content, params.profile, params.repo_id.is_some());
+        let Some(record_type) = imported_chatgpt_record_type(&turn.content, class.record_type)
+        else {
             continue;
-        }
+        };
+        class.record_type = record_type;
         let source_path = turn
             .metadata
             .get("message_id")
@@ -638,6 +642,12 @@ fn imported_chatgpt_candidate_records(
                     .unwrap_or("unknown");
                 format!("chatgpt:{conversation_id}:{message_id}")
             });
+        let mut metadata = turn.metadata.clone();
+        metadata["origin"] = json!("visible_turn");
+        metadata["source"] = json!("chatgpt-export");
+        metadata["source_id"] = json!(turn.id);
+        metadata["source_path"] = json!(source_path);
+        metadata["actor"] = json!(turn.actor);
         records.push(MemoryRecord {
             id: format!("dreamsrc_{}", ids::sha256_hex(turn.id.as_bytes())),
             profile_id: params.profile.as_str().to_string(),
@@ -679,16 +689,65 @@ fn imported_chatgpt_candidate_records(
             superseded_by: None,
             historical_reason: None,
             temporal_state: TemporalState::Current,
-            metadata: json!({
-                "origin": "visible_turn",
-                "source": "chatgpt-export",
-                "source_id": turn.id,
-                "source_path": source_path,
-                "actor": turn.actor,
-            }),
+            metadata,
         });
     }
     Ok(records)
+}
+
+fn imported_chatgpt_record_type(
+    content: &str,
+    record_type: crate::domain::RecordType,
+) -> Option<crate::domain::RecordType> {
+    use crate::domain::RecordType;
+
+    let lower = content.to_ascii_lowercase();
+    let stale_task = contains_any(
+        &lower,
+        &[
+            "yesterday",
+            "last week",
+            "tomorrow",
+            "today",
+            "next week",
+            "currently",
+            "will migrate",
+            "completed:",
+            "done:",
+        ],
+    );
+    if stale_task {
+        return None;
+    }
+    if lower.contains("workflow pattern:") || lower.starts_with("workflow:") {
+        return Some(RecordType::WorkflowPattern);
+    }
+    if lower.starts_with("convention:") || lower.starts_with("repo convention:") {
+        return Some(RecordType::RepoConvention);
+    }
+    match record_type {
+        RecordType::Preference
+        | RecordType::Decision
+        | RecordType::Gotcha
+        | RecordType::RepoConvention
+        | RecordType::WorkflowPattern => Some(record_type),
+        RecordType::Other => {
+            if contains_any(&lower, &["update the ", "fix the ", "implement the "]) {
+                return None;
+            }
+            let durable_fact = contains_any(
+                &lower,
+                &[
+                    "durable fact:",
+                    "fact:",
+                    " is located at ",
+                    " listens on port ",
+                ],
+            );
+            durable_fact.then_some(record_type)
+        }
+        _ => None,
+    }
 }
 
 fn build_evidence_window(
@@ -742,16 +801,35 @@ fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
         count: records.len(),
         sources: records
             .iter()
-            .map(|record| DreamEvidenceSource {
-                id: record.id.clone(),
-                kind: "visible_turn".to_string(),
-                created_at: record.created_at.clone(),
-                updated_at: None,
-                actor: Some(record.actor.clone()),
-                record_type: None,
-                state: None,
-                source_path: Some(format!("turn:{}", record.session_id)),
-                summary: Some("visible_turn".to_string()),
+            .map(|record| {
+                let provenance = imported_chatgpt_provenance(&record.metadata);
+                DreamEvidenceSource {
+                    id: record.id.clone(),
+                    kind: provenance
+                        .as_ref()
+                        .map(|_| "imported_chat_turn")
+                        .unwrap_or("visible_turn")
+                        .to_string(),
+                    created_at: record.created_at.clone(),
+                    updated_at: None,
+                    actor: Some(record.actor.clone()),
+                    record_type: None,
+                    state: None,
+                    source_path: provenance
+                        .as_ref()
+                        .and_then(ImportedChatgptProvenance::source_path)
+                        .or_else(|| Some(format!("turn:{}", record.session_id))),
+                    summary: provenance
+                        .as_ref()
+                        .map(ImportedChatgptProvenance::summary)
+                        .or_else(|| Some("visible_turn".to_string())),
+                    conversation_id: provenance.as_ref().and_then(|p| p.conversation_id.clone()),
+                    conversation_title: provenance
+                        .as_ref()
+                        .and_then(|p| p.conversation_title.clone()),
+                    message_id: provenance.as_ref().and_then(|p| p.message_id.clone()),
+                    turn_index: provenance.and_then(|p| p.turn_index),
+                }
             })
             .collect(),
     }
@@ -772,6 +850,10 @@ fn stream_from_conclusions(records: &[Conclusion]) -> DreamEvidenceStream {
                 state: None,
                 source_path: record.source_id.clone(),
                 summary: Some("conclusion".to_string()),
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
             })
             .collect(),
     }
@@ -795,6 +877,10 @@ fn stream_from_checkpoints(records: &[Checkpoint]) -> DreamEvidenceStream {
                     .as_ref()
                     .map(|session_id| format!("session:{session_id}")),
                 summary: Some("checkpoint".to_string()),
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
             })
             .collect(),
     }
@@ -815,6 +901,10 @@ fn stream_from_sources(records: &[MemorySource]) -> DreamEvidenceStream {
                 state: None,
                 source_path: record.source_path.clone(),
                 summary: Some(record.kind.clone()),
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
             })
             .collect(),
     }
@@ -839,6 +929,10 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
                     record.record_type.as_str(),
                     state_for_record(record)
                 )),
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
             })
             .collect(),
     }
@@ -1342,6 +1436,7 @@ fn evidence_ids(evidence: &MemoryRecord) -> Vec<String> {
 }
 
 fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
+    let provenance = imported_chatgpt_provenance(&record.metadata);
     let kind = record
         .metadata
         .get("origin")
@@ -1357,7 +1452,11 @@ fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
         .to_string();
     DreamEvidenceSource {
         id: record.id.clone(),
-        kind,
+        kind: if provenance.is_some() {
+            "imported_chat_turn".to_string()
+        } else {
+            kind
+        },
         created_at: record.created_at.clone(),
         updated_at: Some(record.updated_at.clone()),
         actor: record
@@ -1378,7 +1477,59 @@ fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
             record.record_type.as_str(),
             state_for_record(record)
         )),
+        conversation_id: provenance.as_ref().and_then(|p| p.conversation_id.clone()),
+        conversation_title: provenance
+            .as_ref()
+            .and_then(|p| p.conversation_title.clone()),
+        message_id: provenance.as_ref().and_then(|p| p.message_id.clone()),
+        turn_index: provenance.and_then(|p| p.turn_index),
     }
+}
+
+#[derive(Default)]
+struct ImportedChatgptProvenance {
+    conversation_id: Option<String>,
+    conversation_title: Option<String>,
+    message_id: Option<String>,
+    turn_index: Option<i64>,
+}
+
+impl ImportedChatgptProvenance {
+    fn source_path(&self) -> Option<String> {
+        Some(format!(
+            "chatgpt:{}:{}",
+            self.conversation_id.as_deref()?,
+            self.message_id.as_deref()?
+        ))
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "imported_chat:{}",
+            self.conversation_title.as_deref().unwrap_or("<untitled>")
+        )
+    }
+}
+
+fn imported_chatgpt_provenance(metadata: &serde_json::Value) -> Option<ImportedChatgptProvenance> {
+    let imported = metadata.get("origin").and_then(|value| value.as_str())
+        == Some("chatgpt-export")
+        || metadata.get("source").and_then(|value| value.as_str()) == Some("chatgpt-export");
+    imported.then(|| ImportedChatgptProvenance {
+        conversation_id: metadata
+            .get("conversation_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        conversation_title: metadata
+            .get("title")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        message_id: metadata
+            .get("message_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        turn_index: metadata.get("turn_index").and_then(|value| value.as_i64()),
+    })
 }
 
 fn observations_from_candidates(candidates: &[DreamCandidate]) -> Vec<DreamObservation> {
