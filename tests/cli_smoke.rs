@@ -4749,6 +4749,95 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
 }
 
 #[test]
+fn cli_explicit_runtime_overrides_invalid_runtime_environment() {
+    let dir = TempDir::new().unwrap();
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env(
+            "CODEX_MEMORYD_HOME",
+            dir.path().join("explicit-runtime-home"),
+        )
+        .env("CODEX_MEMORYD_RUNTIME", "containre")
+        .args(["--runtime", "container", "status"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "explicit runtime was blocked by invalid env: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"runtime\": \"container\""));
+}
+
+#[test]
+fn cli_client_command_keeps_process_url_with_explicit_runtime() {
+    let dir = TempDir::new().unwrap();
+    let (url, hit, stop, handle) = sentinel_listener();
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", dir.path().join("client-home"))
+        .env("CODEX_MEMORYD_URL", &url)
+        .args(["--runtime", "container", "search", "--query", "probe"])
+        .output()
+        .unwrap();
+    finish_sentinel(stop, handle);
+
+    assert!(
+        hit.load(Ordering::Relaxed),
+        "client did not use process URL"
+    );
+    assert!(output.status.success());
+}
+
+#[test]
+fn cli_native_runtime_env_status_keeps_daemon_status_contract() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("native-home");
+    let db = dir.path().join("daemon.db");
+    let bind = unused_loopback_addr();
+    let url = format!("http://{bind}");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("runtime.env"),
+        format!("CODEX_MEMORYD_RUNTIME=native\nCODEX_MEMORYD_URL={url}\n"),
+    )
+    .unwrap();
+
+    let mut child = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["serve", "--bind", &bind])
+        .spawn()
+        .unwrap();
+    wait_for_health(&url);
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .args(["status"])
+        .output()
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains("provider_name"),
+        "unexpected status body: {body}"
+    );
+    assert!(body.contains("\"dream_worker\""));
+}
+
+#[test]
 fn cli_rejects_invalid_runtime_environment_for_status_and_lifecycle() {
     let dir = TempDir::new().unwrap();
 

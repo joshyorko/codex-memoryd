@@ -864,6 +864,16 @@ impl Cli {
         self.runtime_resolution_with_endpoint(None, None, None)
     }
 
+    fn client_runtime_options(&self) -> RuntimeOptions {
+        let mut resolution = self.runtime_resolution();
+        if self.url.is_none() {
+            if let Some(url) = process_url() {
+                resolution.options.url = url;
+            }
+        }
+        resolution.options
+    }
+
     fn runtime_resolution_with_endpoint(
         &self,
         host: Option<String>,
@@ -897,7 +907,7 @@ impl Cli {
     fn client_endpoint(&self, path: &str) -> String {
         format!(
             "{}{}",
-            self.runtime_options().url.trim_end_matches('/'),
+            self.client_runtime_options().url.trim_end_matches('/'),
             path
         )
     }
@@ -922,14 +932,17 @@ pub fn run(cli: Cli) -> i32 {
 }
 
 fn client_url_is_present(cli: &Cli) -> bool {
-    cli.url.is_some()
-        || ["CODEX_MEMORYD_URL", "CODEX_MEMORYD_BASE_URL"]
-            .iter()
-            .any(|key| {
-                std::env::var(key)
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty())
-            })
+    cli.url.is_some() || process_url().is_some()
+}
+
+fn process_url() -> Option<String> {
+    ["CODEX_MEMORYD_URL", "CODEX_MEMORYD_BASE_URL"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn validate_runtime_environment() -> Result<()> {
@@ -949,7 +962,9 @@ fn validate_runtime_environment() -> Result<()> {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
-    validate_runtime_environment()?;
+    if cli.runtime.is_none() {
+        validate_runtime_environment()?;
+    }
 
     if client_url_is_present(&cli)
         && cli.db.is_some()
@@ -1064,9 +1079,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                         let report = native_runtime::status(runtime);
                         print_json(&report)?;
                     }
-                } else if resolution.runtime_source
-                    != native_runtime::RuntimeSelectionSource::Default
-                {
+                } else if matches!(
+                    runtime.runtime,
+                    RuntimeKind::Container | RuntimeKind::ComposeDev
+                ) {
                     let report = native_runtime::status(runtime);
                     print_json(&report)?;
                 } else if let Ok(body) = native_runtime::http_get(&format!(
