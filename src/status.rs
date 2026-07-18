@@ -180,7 +180,7 @@ fn dream_worker_status(
     DreamWorkerStatus {
         enabled: dream_scheduler.enabled,
         mode: "deterministic".to_string(),
-        automatic_apply: false,
+        automatic_apply: config.dream_scheduler.automatic_apply,
         paid_provider_configured: false,
         paid_provider_ready: false,
         last_run_at: dream_scheduler.last_run_at.clone(),
@@ -260,7 +260,7 @@ fn endpoint_reachable(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::adjacent_runtime_status;
+    use super::{adjacent_runtime_status, dream_worker_status, ScheduledDreamStatus};
     use crate::config::Config;
 
     #[test]
@@ -273,5 +273,25 @@ mod tests {
         let status = adjacent_runtime_status(&cfg);
         assert_eq!(status.status, "conflict");
         assert!(status.ownership.conflict_with_memoryd);
+    }
+
+    #[test]
+    fn dream_worker_status_reports_automatic_apply_config() {
+        let mut cfg = Config::default();
+        cfg.dream_scheduler.automatic_apply = true;
+
+        let scheduler_status = ScheduledDreamStatus {
+            enabled: true,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_run_id: None,
+            last_watermark: None,
+            next_eligible_run: None,
+            degraded: false,
+        };
+        let status = dream_worker_status(&cfg, &scheduler_status);
+
+        assert!(status.automatic_apply);
     }
 }

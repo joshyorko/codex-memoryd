@@ -61,7 +61,6 @@ use crate::store::RecordQuery;
 use crate::store::Store;
 
 const SCHEDULED_DREAM_KIND: &str = "scheduled";
-const SCHEDULED_DREAM_MODE: &str = "apply";
 const CARD_BUILD_SPEC_VERSION: &str = "card-summary-v1";
 const CARD_STALE_DAYS: i64 = 120;
 const ADAPTER_VIEW_VERSION: &str = "adapter-view-v1";
@@ -1993,6 +1992,7 @@ impl Service {
 
     pub fn scheduled_dream(&self, now: Option<String>) -> Result<ScheduledDreamResponse> {
         let cfg = self.config.dream_scheduler;
+        let mode = scheduled_dream_mode(cfg.automatic_apply);
         let profile = self.resolve_profile(&Some(self.config.default_profile.clone()))?;
         let workspace = self.config.default_workspace.clone();
         let now = now.unwrap_or_else(ids::now_rfc3339);
@@ -2016,7 +2016,7 @@ impl Service {
                 run_id: ids::new_id("dream"),
                 profile_id: profile.as_str().to_string(),
                 workspace_id: workspace,
-                mode: SCHEDULED_DREAM_MODE.to_string(),
+                mode: mode.to_string(),
                 kind: SCHEDULED_DREAM_KIND.to_string(),
                 status: "error".to_string(),
                 started_at: now.clone(),
@@ -2079,7 +2079,7 @@ impl Service {
                 profile,
                 workspace: &workspace,
                 repo_id: None,
-                mode: SCHEDULED_DREAM_MODE,
+                mode,
                 now: &now,
                 recency_cutoff: watermark_before.as_deref(),
                 include_archived_sources: false,
@@ -2137,7 +2137,7 @@ impl Service {
                     run_id: ids::new_id("dream"),
                     profile_id: profile.as_str().to_string(),
                     workspace_id: workspace,
-                    mode: SCHEDULED_DREAM_MODE.to_string(),
+                    mode: mode.to_string(),
                     kind: SCHEDULED_DREAM_KIND.to_string(),
                     status: "error".to_string(),
                     started_at: now.clone(),
@@ -3467,6 +3467,10 @@ fn screen_json_metadata(field: &str, value: &Value) -> Result<()> {
     }
 }
 
+fn scheduled_dream_mode(automatic_apply: bool) -> &'static str {
+    if automatic_apply { "apply" } else { "preview" }
+}
+
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
     (parsed + Duration::seconds(seconds)).format(&Rfc3339).ok()
@@ -3542,5 +3546,16 @@ mod imported_provenance_tests {
             rendered,
             "imported ChatGPT: ``Title `tick` [link](url) *bold*`` (conversation `` `conv] - injected: *boom*` ``), turn 7, message `msg[ _bad_`, source `src| # heading`"
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduled_dream_mode_tests {
+    use super::scheduled_dream_mode;
+
+    #[test]
+    fn scheduled_dreams_preview_unless_automatic_apply_is_enabled() {
+        assert_eq!(scheduled_dream_mode(false), "preview");
+        assert_eq!(scheduled_dream_mode(true), "apply");
     }
 }

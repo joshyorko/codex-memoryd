@@ -100,6 +100,7 @@ pub struct DreamSection {
 #[derive(Debug, Clone, Copy)]
 pub struct DreamSchedulerConfig {
     pub enabled: bool,
+    pub automatic_apply: bool,
     pub interval_seconds: u64,
     pub idle_window_seconds: i64,
     pub min_session_age_seconds: i64,
@@ -221,6 +222,7 @@ impl Default for Config {
             hybrid_recall: HybridRecallConfig::default(),
             dream_scheduler: DreamSchedulerConfig {
                 enabled: false,
+                automatic_apply: false,
                 interval_seconds: 3600,
                 idle_window_seconds: 900,
                 min_session_age_seconds: 300,
@@ -596,6 +598,12 @@ where
     )? {
         config.dream_scheduler.enabled = enabled;
     }
+    if let Some(automatic_apply) = parse_bool_value(
+        "CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY",
+        get("CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.automatic_apply = automatic_apply;
+    }
     if let Some(seconds) = parse_u64_value(
         "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
         get("CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS").and_then(clean_env_value),
@@ -832,6 +840,7 @@ mod tests {
     #[test]
     fn env_can_enable_dream_scheduler_for_compose() {
         let mut cfg = Config::default();
+        assert!(!cfg.dream_scheduler.automatic_apply);
         apply_dream_env_from(&mut cfg, |key| {
             Some(
                 match key {
@@ -843,6 +852,7 @@ mod tests {
                     "CODEX_MEMORYD_DREAM_MAX_BATCH_SIZE" => "25",
                     "CODEX_MEMORYD_DREAM_MAX_CANDIDATES" => "7",
                     "CODEX_MEMORYD_DREAM_MAX_RUNTIME_SECONDS" => "9",
+                    "CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY" => "true",
                     _ => return None,
                 }
                 .to_string(),
@@ -858,6 +868,7 @@ mod tests {
         assert_eq!(cfg.dream_scheduler.max_batch_size, 25);
         assert_eq!(cfg.dream_scheduler.max_candidates, 7);
         assert_eq!(cfg.dream_scheduler.max_runtime_seconds, 9);
+        assert!(cfg.dream_scheduler.automatic_apply);
     }
 
     #[test]
