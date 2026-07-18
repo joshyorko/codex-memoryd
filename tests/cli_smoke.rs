@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -49,9 +51,31 @@ fn clear_runtime_env(command: &mut Command) {
         "CODEX_MEMORYD_PORT",
         "CODEX_MEMORYD_BIND",
         "CODEX_MEMORYD_DB",
+        "CODEX_MEMORYD_CONTAINER_RUNTIME",
     ] {
         command.env_remove(key);
     }
+}
+
+#[cfg(unix)]
+fn fake_container_runtime(root: &std::path::Path, running: bool) -> PathBuf {
+    let path = root.join(if running {
+        "fake-container-runtime-running"
+    } else {
+        "fake-container-runtime-stopped"
+    });
+    let state = if running { "true" } else { "false" };
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then printf '%s\\n' {state}; exit 0; fi\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 fn sentinel_listener() -> (
@@ -4570,6 +4594,7 @@ fn cli_help_lists_all_commands() {
 }
 
 #[test]
+#[cfg(unix)]
 fn cli_container_status_reports_managed_runtime_shape_without_compose() {
     let dir = TempDir::new().unwrap();
     let port = unused_loopback_addr()
@@ -4584,6 +4609,10 @@ fn cli_container_status_reports_managed_runtime_shape_without_compose() {
         .env("CODEX_MEMORYD_HOME", dir.path().join("memoryd-home"))
         .env("CODEX_MEMORYD_HOST", "127.0.0.1")
         .env("CODEX_MEMORYD_PORT", &port)
+        .env(
+            "CODEX_MEMORYD_CONTAINER_RUNTIME",
+            fake_container_runtime(dir.path(), false),
+        )
         .args(["--runtime", "container", "status"])
         .assert()
         .success()
@@ -4594,8 +4623,47 @@ fn cli_container_status_reports_managed_runtime_shape_without_compose() {
 }
 
 #[test]
+#[cfg(unix)]
+fn cli_managed_status_does_not_probe_default_endpoint() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("memoryd-home");
+    fs::create_dir_all(&home).unwrap();
+    let (url, hit, stop, handle) = sentinel_listener();
+    fs::write(
+        home.join("runtime.env"),
+        format!("CODEX_MEMORYD_RUNTIME=container\nCODEX_MEMORYD_URL={url}\n"),
+    )
+    .unwrap();
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &home)
+        .env(
+            "CODEX_MEMORYD_CONTAINER_RUNTIME",
+            fake_container_runtime(dir.path(), false),
+        )
+        .args(["--runtime", "container", "status"])
+        .output()
+        .unwrap();
+    finish_sentinel(stop, handle);
+
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"process\": \"stopped\""));
+    assert!(body.contains("\"health\": \"unreachable\""));
+    assert!(!hit.load(Ordering::Relaxed));
+}
+
+#[test]
+#[cfg(unix)]
 fn cli_status_source_precedence_matrix_is_deterministic() {
     let dir = TempDir::new().unwrap();
+    let running_runtime = fake_container_runtime(dir.path(), true);
 
     let default_port = unused_loopback_addr()
         .rsplit_once(':')
@@ -4671,6 +4739,7 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
     clear_runtime_env(&mut runtime_env_command);
     let runtime_env_output = runtime_env_command
         .env("CODEX_MEMORYD_HOME", &runtime_env_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &running_runtime)
         .arg("status")
         .output()
         .unwrap();
@@ -4689,6 +4758,7 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
         .env("CODEX_MEMORYD_HOME", dir.path().join("env-runtime-home"))
         .env("CODEX_MEMORYD_RUNTIME", "container")
         .env("CODEX_MEMORYD_URL", &env_runtime_url)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &running_runtime)
         .arg("status")
         .output()
         .unwrap();
@@ -4720,6 +4790,7 @@ fn cli_status_source_precedence_matrix_is_deterministic() {
         .env("CODEX_MEMORYD_HOST", "127.0.0.1")
         .env("CODEX_MEMORYD_PORT", &managed_port)
         .env("CODEX_MEMORYD_URL", &explicit_runtime_url)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &running_runtime)
         .args(["--runtime", "container", "status"])
         .output()
         .unwrap();
