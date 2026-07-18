@@ -1124,7 +1124,7 @@ pub struct DreamCandidate {
     pub apply_eligible: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamObservation {
     pub id: String,
     pub key: String,

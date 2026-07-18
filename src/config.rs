@@ -111,6 +111,25 @@ pub struct DreamSchedulerConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct DreamProviderConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl Default for DreamProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct HybridRecallConfig {
     pub enabled: bool,
     pub backend: String,
@@ -167,6 +186,7 @@ pub struct Config {
     pub max_record_chars: usize,
     pub hybrid_recall: HybridRecallConfig,
     pub dream_scheduler: DreamSchedulerConfig,
+    pub dream_provider: DreamProviderConfig,
     pub log_level: String,
     pub log_format: String,
     /// Operator declaration that a non-loopback *process* bind is nonetheless
@@ -231,6 +251,7 @@ impl Default for Config {
                 max_candidates: 50,
                 max_runtime_seconds: 30,
             },
+            dream_provider: DreamProviderConfig::default(),
             log_level: "info".to_string(),
             log_format: "text".to_string(),
             declare_loopback_publish: false,
@@ -593,6 +614,21 @@ where
     F: Fn(&str) -> Option<String>,
 {
     if let Some(enabled) = parse_bool_value(
+        "CODEX_MEMORYD_PROVIDER_ENABLED",
+        get("CODEX_MEMORYD_PROVIDER_ENABLED").and_then(clean_env_value),
+    )? {
+        config.dream_provider.enabled = enabled;
+    }
+    if let Some(endpoint) = get("CODEX_MEMORYD_PROVIDER_ENDPOINT").and_then(clean_env_value) {
+        config.dream_provider.endpoint = endpoint;
+    }
+    if let Some(api_key) = get("CODEX_MEMORYD_PROVIDER_API_KEY").and_then(clean_env_value) {
+        config.dream_provider.api_key = api_key;
+    }
+    if let Some(model) = get("CODEX_MEMORYD_PROVIDER_MODEL").and_then(clean_env_value) {
+        config.dream_provider.model = model;
+    }
+    if let Some(enabled) = parse_bool_value(
         "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED",
         get("CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED").and_then(clean_env_value),
     )? {
@@ -869,6 +905,33 @@ mod tests {
         assert_eq!(cfg.dream_scheduler.max_candidates, 7);
         assert_eq!(cfg.dream_scheduler.max_runtime_seconds, 9);
         assert!(cfg.dream_scheduler.automatic_apply);
+    }
+
+    #[test]
+    fn dream_provider_defaults_to_disabled_and_empty() {
+        let cfg = Config::default();
+        assert!(!cfg.dream_provider.enabled);
+        assert!(cfg.dream_provider.endpoint.is_empty());
+        assert!(cfg.dream_provider.api_key.is_empty());
+        assert!(cfg.dream_provider.model.is_empty());
+    }
+
+    #[test]
+    fn dream_provider_env_configures_openai_compatible_endpoint() {
+        let mut cfg = Config::default();
+        apply_dream_env_from(&mut cfg, |key| match key {
+            "CODEX_MEMORYD_PROVIDER_ENABLED" => Some("true".to_string()),
+            "CODEX_MEMORYD_PROVIDER_ENDPOINT" => Some("http://localhost:4000/v1".to_string()),
+            "CODEX_MEMORYD_PROVIDER_API_KEY" => Some("secret".to_string()),
+            "CODEX_MEMORYD_PROVIDER_MODEL" => Some("local-model".to_string()),
+            _ => None,
+        })
+        .expect("apply provider env");
+
+        assert!(cfg.dream_provider.enabled);
+        assert_eq!(cfg.dream_provider.endpoint, "http://localhost:4000/v1");
+        assert_eq!(cfg.dream_provider.api_key, "secret");
+        assert_eq!(cfg.dream_provider.model, "local-model");
     }
 
     #[test]

@@ -181,8 +181,9 @@ fn dream_worker_status(
         enabled: dream_scheduler.enabled,
         mode: "deterministic".to_string(),
         automatic_apply: config.dream_scheduler.automatic_apply,
-        paid_provider_configured: false,
-        paid_provider_ready: false,
+        paid_provider_configured: config.dream_provider.enabled,
+        paid_provider_ready: config.dream_provider.enabled
+            && !config.dream_provider.endpoint.trim().is_empty(),
         last_run_at: dream_scheduler.last_run_at.clone(),
         last_status: dream_scheduler.last_status.clone(),
         last_error: dream_scheduler.last_error.clone(),
@@ -293,5 +294,30 @@ mod tests {
         let status = dream_worker_status(&cfg, &scheduler_status);
 
         assert!(status.automatic_apply);
+    }
+
+    #[test]
+    fn dream_worker_status_reports_provider_configuration_and_readiness() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.enabled = true;
+        let scheduler_status = ScheduledDreamStatus {
+            enabled: true,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_run_id: None,
+            last_watermark: None,
+            next_eligible_run: None,
+            degraded: false,
+        };
+
+        let configured = dream_worker_status(&cfg, &scheduler_status);
+        assert!(configured.paid_provider_configured);
+        assert!(!configured.paid_provider_ready);
+
+        cfg.dream_provider.endpoint = "http://localhost:4000/v1".to_string();
+        let ready = dream_worker_status(&cfg, &scheduler_status);
+        assert!(ready.paid_provider_configured);
+        assert!(ready.paid_provider_ready);
     }
 }

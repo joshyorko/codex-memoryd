@@ -2095,7 +2095,30 @@ impl Service {
             limits_hit.push("max_runtime_seconds".to_string());
         }
         match result {
-            Ok((run, max_candidates_hit)) => {
+            Ok((mut run, max_candidates_hit)) => {
+                let provider_config = &self.config.dream_provider;
+                if provider_config.enabled && !provider_config.endpoint.trim().is_empty() {
+                    if let Ok(context) = scheduled_dream_provider_context(
+                        &self.store,
+                        profile.as_str(),
+                        &workspace,
+                        watermark_before.as_deref(),
+                        cfg.max_batch_size,
+                    ) {
+                        if let Ok(observations) = crate::provider::generate_observations(
+                            &provider_config.endpoint,
+                            &provider_config.api_key,
+                            &provider_config.model,
+                            &context,
+                        ) {
+                            run.observations.extend(
+                                observations
+                                    .into_iter()
+                                    .filter_map(|value| serde_json::from_value(value).ok()),
+                            );
+                        }
+                    }
+                }
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
@@ -3468,7 +3491,26 @@ fn screen_json_metadata(field: &str, value: &Value) -> Result<()> {
 }
 
 fn scheduled_dream_mode(automatic_apply: bool) -> &'static str {
-    if automatic_apply { "apply" } else { "preview" }
+    if automatic_apply {
+        "apply"
+    } else {
+        "preview"
+    }
+}
+
+fn scheduled_dream_provider_context(
+    store: &Store,
+    profile: &str,
+    workspace: &str,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<String> {
+    let visible_turns = store.dream_visible_turns(profile, workspace, None, since, limit)?;
+    let imported_memories = store.dream_memory_sources(profile, workspace, since, limit)?;
+    Ok(serde_json::to_string(&json!({
+        "visible_turns": visible_turns,
+        "imported_memories": imported_memories,
+    }))?)
 }
 
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {
