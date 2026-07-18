@@ -29,6 +29,35 @@ pub enum RuntimeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSelectionSource {
+    /// An explicit runtime argument supplied by the caller.
+    Cli,
+    /// A process environment runtime selection.
+    Environment,
+    /// A runtime selection discovered from the selected runtime home.
+    RuntimeEnv,
+    /// No runtime selection; use the native/default endpoint behavior.
+    Default,
+}
+
+impl RuntimeSelectionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Environment => "env",
+            Self::RuntimeEnv => "runtime.env",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeResolution {
+    pub options: RuntimeOptions,
+    pub runtime_source: RuntimeSelectionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitMode {
     Product,
     Dogfood,
@@ -56,6 +85,10 @@ pub struct RuntimeOptions {
     pub codex_memories_dir: PathBuf,
     pub uid: Option<String>,
     pub gid: Option<String>,
+    /// Whether the resolved endpoint was explicitly selected or configured.
+    /// A derived default endpoint must not be used as managed-runtime health
+    /// evidence because it may belong to an unrelated daemon.
+    endpoint_configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,44 +132,63 @@ impl RuntimeOptions {
         port_override: Option<u16>,
         bind_override: Option<String>,
     ) -> RuntimeOptions {
+        Self::resolve_with_source(
+            runtime,
+            url,
+            db_override,
+            host_override,
+            port_override,
+            bind_override,
+        )
+        .options
+    }
+
+    pub fn resolve_with_source(
+        runtime: Option<RuntimeKind>,
+        url: Option<String>,
+        db_override: Option<PathBuf>,
+        host_override: Option<String>,
+        port_override: Option<u16>,
+        bind_override: Option<String>,
+    ) -> RuntimeResolution {
         let home = env_path("CODEX_MEMORYD_HOME")
             .or_else(|| env_path("CODEX_MEMORYD_RUNTIME_DIR"))
             .unwrap_or_else(config::default_home_dir);
         let runtime_env = read_runtime_env(&home.join("runtime.env"));
         let endpoint_overridden =
             host_override.is_some() || port_override.is_some() || bind_override.is_some();
-        let runtime = runtime
-            .or_else(|| env_runtime("CODEX_MEMORYD_RUNTIME"))
-            .or_else(|| runtime_env_runtime(&runtime_env, "CODEX_MEMORYD_RUNTIME"))
-            .unwrap_or(RuntimeKind::Native);
+        let (runtime, runtime_source) = resolve_runtime(runtime, &runtime_env);
+        let process_bind = env_value("CODEX_MEMORYD_BIND");
+        let runtime_env_bind = runtime_env_value(&runtime_env, "CODEX_MEMORYD_BIND");
+        let process_host = env_value("CODEX_MEMORYD_HOST");
+        let runtime_env_host = runtime_env_value(&runtime_env, "CODEX_MEMORYD_HOST");
+        let process_port = env_value("CODEX_MEMORYD_PORT");
+        let runtime_env_port = runtime_env_value(&runtime_env, "CODEX_MEMORYD_PORT");
+        let process_url =
+            env_value("CODEX_MEMORYD_URL").or_else(|| env_value("CODEX_MEMORYD_BASE_URL"));
+        let runtime_env_url = runtime_env_value(&runtime_env, "CODEX_MEMORYD_URL")
+            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BASE_URL"));
 
         let bind_candidate = bind_override
             .clone()
-            .or_else(|| {
-                std::env::var("CODEX_MEMORYD_BIND")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-            })
-            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BIND"));
+            .or_else(|| process_bind.clone())
+            .or_else(|| runtime_env_bind.clone());
         let parsed_bind = bind_candidate.as_deref().and_then(parse_bind_host_port);
 
         let host = host_override
-            .or_else(|| {
-                std::env::var("CODEX_MEMORYD_HOST")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-            })
-            .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_HOST"))
+            .or_else(|| process_host.clone())
+            .or_else(|| runtime_env_host.clone())
             .or_else(|| parsed_bind.as_ref().map(|(host, _)| host.clone()))
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let port = port_override
             .or_else(|| {
-                std::env::var("CODEX_MEMORYD_PORT")
-                    .ok()
+                process_port
+                    .as_deref()
                     .and_then(|v| v.trim().parse::<u16>().ok())
             })
             .or_else(|| {
-                runtime_env_value(&runtime_env, "CODEX_MEMORYD_PORT")
+                runtime_env_port
+                    .as_deref()
                     .and_then(|v| v.trim().parse::<u16>().ok())
             })
             .or_else(|| parsed_bind.as_ref().map(|(_, port)| *port))
@@ -204,42 +256,58 @@ impl RuntimeOptions {
             .filter(|v| !v.trim().is_empty())
             .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_GID"))
             .or_else(|| command_output("id", &["-g"]));
-        let url = url
-            .or_else(|| {
-                if endpoint_overridden {
-                    None
-                } else {
-                    std::env::var("CODEX_MEMORYD_URL")
-                        .ok()
-                        .or_else(|| std::env::var("CODEX_MEMORYD_BASE_URL").ok())
-                        .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_URL"))
-                        .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BASE_URL"))
-                }
-            })
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| format!("http://{host}:{port}"));
+        // An explicit URL is the client endpoint override. Without one, an
+        // explicit runtime wins over process URL variables so a lower-
+        // precedence client setting cannot redirect managed-runtime status;
+        // the selected runtime.env URL remains available for that runtime.
+        let bind_configured = endpoint_overridden
+            || process_bind.is_some()
+            || runtime_env_bind.is_some()
+            || process_host.is_some()
+            || runtime_env_host.is_some()
+            || process_port.is_some()
+            || runtime_env_port.is_some();
+        let (url, endpoint_configured) = if let Some(url) = url.filter(|v| !v.trim().is_empty()) {
+            (url, true)
+        } else if endpoint_overridden {
+            (format!("http://{host}:{port}"), true)
+        } else if runtime_source == RuntimeSelectionSource::Cli {
+            match runtime_env_url {
+                Some(url) => (url, true),
+                None => (format!("http://{host}:{port}"), bind_configured),
+            }
+        } else {
+            match process_url.or(runtime_env_url) {
+                Some(url) => (url, true),
+                None => (format!("http://{host}:{port}"), bind_configured),
+            }
+        };
 
-        RuntimeOptions {
-            runtime,
-            home,
-            url,
-            host,
-            port,
-            bind,
-            db,
-            pid_file,
-            log_file,
-            profile,
-            workspace,
-            log_level,
-            binary,
-            allow_non_loopback,
-            image,
-            container_name,
-            container_runtime,
-            codex_memories_dir,
-            uid,
-            gid,
+        RuntimeResolution {
+            options: RuntimeOptions {
+                runtime,
+                home,
+                url,
+                host,
+                port,
+                bind,
+                db,
+                pid_file,
+                log_file,
+                profile,
+                workspace,
+                log_level,
+                binary,
+                allow_non_loopback,
+                image,
+                container_name,
+                container_runtime,
+                codex_memories_dir,
+                uid,
+                gid,
+                endpoint_configured,
+            },
+            runtime_source,
         }
     }
 }
@@ -680,6 +748,14 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
         .map(|running| if running { "running" } else { "stopped" })
         .unwrap_or("unavailable")
         .to_string();
+    let health = if process == "running"
+        && opts.endpoint_configured
+        && http_get(&format!("{}/healthz", opts.url.trim_end_matches('/'))).is_ok()
+    {
+        "ok"
+    } else {
+        "unreachable"
+    };
     RuntimeStatusReport {
         runtime: "container".to_string(),
         process,
@@ -692,11 +768,7 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
             container_runtime_name(opts),
             opts.container_name
         ),
-        health: if http_get(&format!("{}/healthz", opts.url.trim_end_matches('/'))).is_ok() {
-            "ok".to_string()
-        } else {
-            "unreachable".to_string()
-        },
+        health: health.to_string(),
     }
 }
 
@@ -952,10 +1024,11 @@ fn bind_is_loopback(bind: &str) -> bool {
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| config::expand_path(&v))
+    env_value(key).map(|v| config::expand_path(&v))
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn runtime_env_path(entries: &[(String, String)], key: &str) -> Option<PathBuf> {
@@ -1014,6 +1087,22 @@ fn parse_bind_host_port(bind: &str) -> Option<(String, u16)> {
     }
     let (host, port) = bind.rsplit_once(':')?;
     Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
+fn resolve_runtime(
+    explicit: Option<RuntimeKind>,
+    runtime_env: &[(String, String)],
+) -> (RuntimeKind, RuntimeSelectionSource) {
+    if let Some(runtime) = explicit {
+        return (runtime, RuntimeSelectionSource::Cli);
+    }
+    if let Some(runtime) = env_runtime("CODEX_MEMORYD_RUNTIME") {
+        return (runtime, RuntimeSelectionSource::Environment);
+    }
+    if let Some(runtime) = runtime_env_runtime(runtime_env, "CODEX_MEMORYD_RUNTIME") {
+        return (runtime, RuntimeSelectionSource::RuntimeEnv);
+    }
+    (RuntimeKind::Native, RuntimeSelectionSource::Default)
 }
 
 fn env_runtime(key: &str) -> Option<RuntimeKind> {

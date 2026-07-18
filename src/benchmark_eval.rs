@@ -183,9 +183,10 @@ fn score_selected_cases(selected: &[NeutralBenchmarkCase]) -> f64 {
         .iter()
         .filter(|case| {
             !case.history.is_empty()
-                && case.history.iter().all(|turn| {
-                    !turn.speaker.trim().is_empty() && !turn.content.trim().is_empty()
-                })
+                && case
+                    .history
+                    .iter()
+                    .all(|turn| !turn.speaker.trim().is_empty() && !turn.content.trim().is_empty())
                 && !case.question.id.trim().is_empty()
                 && !case.question.prompt.trim().is_empty()
                 && !case.expected.answer_markers.is_empty()

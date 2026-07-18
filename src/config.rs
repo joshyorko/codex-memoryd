@@ -246,6 +246,13 @@ pub struct CliOverrides {
     pub log_level: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigLoadSource<'a> {
+    Default,
+    ExplicitRequired(&'a Path),
+    ExplicitOptional(&'a Path),
+}
+
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
@@ -285,12 +292,30 @@ impl Config {
     ///   `CODEX_MEMORYD_LOG`, and `CODEX_MEMORYD_DREAM_*` scheduler controls.
     /// * `overrides` — explicit CLI flags.
     pub fn load(config_path: Option<&Path>, overrides: &CliOverrides) -> Result<Config> {
+        let source = match config_path {
+            Some(path) => ConfigLoadSource::ExplicitRequired(path),
+            None => ConfigLoadSource::Default,
+        };
+        Self::load_from_source(source, overrides)
+    }
+
+    /// Load config using an explicit source contract.
+    ///
+    /// `Default` discovers the optional default config, `ExplicitRequired`
+    /// errors when its selected file is absent, and `ExplicitOptional` only
+    /// inspects its selected file when present without falling back to the
+    /// default config path.
+    pub fn load_from_source(
+        source: ConfigLoadSource<'_>,
+        overrides: &CliOverrides,
+    ) -> Result<Config> {
         let mut config = Config::default();
 
         // 1. Config file.
-        let (path, required) = match config_path {
-            Some(p) => (p.to_path_buf(), true),
-            None => (default_config_path(), false),
+        let (path, required) = match source {
+            ConfigLoadSource::Default => (default_config_path(), false),
+            ConfigLoadSource::ExplicitRequired(path) => (path.to_path_buf(), true),
+            ConfigLoadSource::ExplicitOptional(path) => (path.to_path_buf(), false),
         };
         if path.exists() {
             let raw = std::fs::read_to_string(&path).map_err(|e| {
@@ -698,8 +723,8 @@ pub fn adjacent_runtime_conflicts(memoryd_bind: &str, adjacent_url: &str) -> boo
     let Some(adjacent) = parse_local_http_endpoint(adjacent_url) else {
         return false;
     };
-    let Some((memoryd_host, memoryd_port)) = bind_host(memoryd_bind)
-        .and_then(|host| bind_port(memoryd_bind).map(|port| (host, port)))
+    let Some((memoryd_host, memoryd_port)) =
+        bind_host(memoryd_bind).and_then(|host| bind_port(memoryd_bind).map(|port| (host, port)))
     else {
         return false;
     };
@@ -726,7 +751,8 @@ fn bind_port(bind: &str) -> Option<u16> {
         let (_, port) = bind.rsplit_once("]:")?;
         return port.parse().ok();
     }
-    bind.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
 }
 
 #[cfg(test)]
