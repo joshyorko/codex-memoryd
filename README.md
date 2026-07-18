@@ -32,6 +32,51 @@ This is the landed MVP surface today:
 | MCP dogfood | landed read-only | Exposes `memory_status`, `memory_recall`, and `memory_search` only. |
 | Dreamer patch lifecycle | landed MVP | Preview/apply exists for reviewable consolidation; broader procedural automation is still roadmap work. |
 
+## OpenAI Build Week Provenance
+
+`codex-memoryd` existed before OpenAI Build Week as a local-first daemon, CLI,
+MCP surface, SQLite memory substrate, recall policy system, temporal record
+model, local Codex-memory importer, and deterministic Dreamer prototype. That
+foundation should not be described as newly built during Build Week.
+
+The Build Week GPT-5.6/Codex work was split across a small set of auditable
+threads and commits:
+
+- Canonical governed-continuity implementation thread:
+  `019f60a8-8ddd-7b00-8a8e-daf055ed45b5`.
+- Baseline/audit/product-shaping thread:
+  `019f5922-57c3-7493-9281-29a4634b3d22`.
+- Supporting submission-finalization/bootstrap UX thread:
+  `019ed048-8f2b-73d1-ae82-8db3f4e13403`.
+
+The core new Build Week implementation is the Codex-side governed recall bridge
+on the sibling Codex fork branch `build-week/codex-memoryd-governed-runtime`:
+
+- `acb7d19c2d296116e2c8f793a48b53d59e764d55`:
+  maintenance-only port of the portable memory runtime to the current upstream
+  Codex APIs.
+- `2189ae1835df12dc6f017934290d642519e8a2e0`: preserves structured governed
+  MemoryD recall through Codex, sends real repository/branch/thread/file scope,
+  requests `active_task` packs with a 900-token budget, keeps legacy
+  MemoryD/Honcho compatibility, and separates model-visible admitted context
+  from sanitized inspection metadata.
+- `631c5125dff17b0bef948bdd3df7458a7c336b2e`: records the governed recall
+  bridge milestone in Build Week evidence docs.
+
+This repository's submission-finalization thread produced the CLI-first
+bootstrap/runtime UX slice:
+
+- `7cf1e30`: makes `codex-memoryd init --port 8989`, `up`, `status`,
+  `sync-local --apply ~/.codex/memories`, and `recall` usable without Docker
+  Compose or hidden image-tag knowledge; adds explicit resolved runtime config,
+  optional managed-container mode, a local image build path, safer container
+  errors, Dreamer env pass-through for managed containers, and a stale/superseded
+  default-recall regression test.
+
+The official submission Session ID comes from `/feedback` executed in the
+representative core implementation thread, not the finalization thread. The
+generated Session ID is `019f60a8-8ddd-7b00-8a8e-daf055ed45b5`.
+
 ## Safety Model
 
 - Loopback-only is the default dogfood posture.
