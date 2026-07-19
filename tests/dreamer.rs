@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use codex_memoryd::config::{Config, DreamSchedulerConfig};
+use codex_memoryd::config::{Config, DreamProviderConfig, DreamSchedulerConfig};
 use codex_memoryd::domain::{
     Checkpoint, Conclusion, Portability, Profile, RecordType, RepoIdentity, Scope, Sensitivity,
     VisibleTurn,
@@ -14,6 +14,8 @@ use codex_memoryd::service::Service;
 use codex_memoryd::store::{NewRecord, Store, UpsertOutcome};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use tempfile::TempDir;
 
 fn service() -> Service {
@@ -1159,6 +1161,109 @@ fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
         Some("2026-06-09T00:00:00Z")
     );
     assert!(second.run.unwrap().candidates.is_empty());
+}
+
+#[test]
+fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+    let address = listener.local_addr().expect("provider address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let mut request = [0_u8; 8192];
+        stream.read(&mut request).expect("read provider request");
+        let observation = json!({
+            "id": "obs_provider_220",
+            "key": "obs_provider_220",
+            "kind": "dream_observation",
+            "category": "preference",
+            "subject_key": "provider-output-style",
+            "summary": "Prefer concise provider output",
+            "content": "Prefer concise provider output for routine status updates.",
+            "confidence": 0.9,
+            "state": "active",
+            "evidence_refs": [],
+            "retires": [],
+            "counter_evidence_refs": [],
+            "first_seen_at": "2026-06-09T00:00:00Z",
+            "last_seen_at": "2026-06-09T00:01:00Z",
+            "authority": "recall_not_authority",
+            "policy": "provider_generated",
+            "apply_eligible": false
+        });
+        let content = json!([observation]).to_string();
+        let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write provider response");
+    });
+
+    let temp = TempDir::new().expect("temp db");
+    let db_path = temp.path().join("memory.db");
+    let store = Store::open(&db_path).expect("open store");
+    let mut scheduler = scheduler_config();
+    scheduler.automatic_apply = true;
+    let svc = Service::new(
+        store,
+        Config {
+            default_workspace: "ws".to_string(),
+            dream_scheduler: scheduler,
+            dream_provider: DreamProviderConfig {
+                enabled: true,
+                endpoint: format!("http://{address}/v1"),
+                api_key: String::new(),
+                model: "test-model".to_string(),
+            },
+            ..Default::default()
+        },
+    );
+    turn(
+        &svc,
+        "session-provider",
+        "Routine status updates should remain useful.",
+        "2026-06-09T00:00:00Z",
+    );
+    turn(
+        &svc,
+        "session-provider",
+        "Concise summaries are easier to scan.",
+        "2026-06-09T00:01:00Z",
+    );
+
+    let scheduled = svc
+        .scheduled_dream(Some("2030-06-09T00:00:00Z".to_string()))
+        .expect("scheduled dream");
+    server.join().expect("provider server");
+
+    let run = scheduled.run.expect("dream run");
+    let observation = run
+        .observations
+        .iter()
+        .find(|observation| observation.id == "obs_provider_220")
+        .expect("provider observation");
+    assert_eq!(observation.policy, "accepted");
+    assert!(observation.apply_eligible);
+    let record = svc
+        .store
+        .query_records(&Default::default())
+        .unwrap()
+        .into_iter()
+        .find(|record| record.content == observation.content)
+        .expect("promoted provider memory");
+    assert!(run.created.contains(&record.id));
+
+    let conn = Connection::open(db_path).expect("open ledger db");
+    let ledger_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_ledger WHERE source_kind = 'dream_provider_apply' AND source_id = 'obs_provider_220' AND policy_state = 'accepted'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("provider ledger entry");
+    assert_eq!(ledger_count, 1);
 }
 
 #[test]

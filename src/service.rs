@@ -2095,7 +2095,7 @@ impl Service {
             limits_hit.push("max_runtime_seconds".to_string());
         }
         match result {
-            Ok((mut run, max_candidates_hit)) => {
+            Ok((mut run, mut max_candidates_hit)) => {
                 let provider_config = &self.config.dream_provider;
                 if provider_config.enabled && !provider_config.endpoint.trim().is_empty() {
                     if let Ok(context) = scheduled_dream_provider_context(
@@ -2111,11 +2111,34 @@ impl Service {
                             &provider_config.model,
                             &context,
                         ) {
+                            let provider_start = run.observations.len();
                             run.observations.extend(
                                 observations
                                     .into_iter()
                                     .filter_map(|value| serde_json::from_value(value).ok()),
                             );
+                            if mode == "apply" {
+                                let deterministic_attempts =
+                                    run.candidates.len().saturating_add(run.rejected.len());
+                                let remaining_candidates = if max_candidates_hit {
+                                    0
+                                } else {
+                                    cfg.max_candidates.saturating_sub(deterministic_attempts)
+                                };
+                                if promote_provider_observations(
+                                    &self.store,
+                                    profile.as_str(),
+                                    &workspace,
+                                    run.repo_id.as_deref(),
+                                    &run.run_id,
+                                    &mut run.observations[provider_start..],
+                                    &mut run.created,
+                                    &mut run.archived,
+                                    remaining_candidates,
+                                ) {
+                                    max_candidates_hit = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -3498,6 +3521,155 @@ fn scheduled_dream_mode(automatic_apply: bool) -> &'static str {
     }
 }
 
+fn promote_provider_observations(
+    store: &Store,
+    profile: &str,
+    workspace: &str,
+    repo_id: Option<&str>,
+    run_id: &str,
+    observations: &mut [DreamObservation],
+    created: &mut Vec<String>,
+    archived: &mut Vec<String>,
+    max_candidates: usize,
+) -> bool {
+    let mut attempts = 0;
+    for observation in observations {
+        if observation.kind != "dream_observation"
+            || observation.policy != "provider_generated"
+            || observation.authority != "recall_not_authority"
+        {
+            continue;
+        }
+        if attempts >= max_candidates {
+            return true;
+        }
+        attempts += 1;
+        let content = match policy::screen_content(&observation.content, policy::MAX_RECORD_CHARS) {
+            PolicyDecision::Accept(content) => content,
+            PolicyDecision::Reject { .. } => continue,
+        };
+        let resolved_profile = Profile::parse(profile).unwrap_or(Profile::Personal);
+        let record_type = RecordType::parse(&observation.category).unwrap_or_else(|| {
+            policy::classify(&content, resolved_profile, repo_id.is_some()).record_type
+        });
+        let class = policy::classify_as(&content, resolved_profile, repo_id.is_some(), record_type);
+        let content_hash = ids::content_hash(
+            profile,
+            workspace,
+            repo_id,
+            record_type.as_str(),
+            class.scope.as_str(),
+            &content,
+        );
+        let source_ids = observation
+            .evidence_refs
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let valid_retires = observation
+            .retires
+            .iter()
+            .filter(|id| matches!(store.get_record(id), Ok(Some(_))))
+            .cloned()
+            .collect::<Vec<_>>();
+        observation.policy = "accepted".to_string();
+        observation.apply_eligible = true;
+        observation.confidence = observation.confidence.clamp(0.0, 1.0);
+        let observation_metadata = sanitized_provider_observation_metadata(observation);
+        let subject_key = sanitized_provider_metadata_string(&observation.subject_key);
+        let observation_id = sanitized_provider_metadata_string(&observation.id);
+        let observation_state = sanitized_provider_metadata_string(&observation.state);
+        let outcome = match store.upsert_record(&NewRecord {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: repo_id.map(str::to_string),
+            subject_id: None,
+            episode_id: None,
+            scope: class.scope,
+            record_type,
+            content,
+            related_files: class.related_files,
+            tags: class.tags,
+            sensitivity: class.sensitivity,
+            portability: class.portability,
+            confidence: observation.confidence,
+            source_ids,
+            content_hash: content_hash.clone(),
+            supersedes: valid_retires.clone(),
+            metadata: json!({
+                "origin": "dreamer_provider",
+                "dream_run_id": run_id,
+                "run_id": run_id,
+                "policy_outcome": observation.policy,
+                "subject_key": subject_key,
+                "observation_id": observation_id,
+                "state": observation_state,
+                "observation": observation_metadata,
+            }),
+        }) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(error = %err, "provider observation promotion write failed");
+                continue;
+            }
+        };
+        if let crate::store::UpsertOutcome::Created(id) = &outcome {
+            created.push(id.clone());
+            if !valid_retires.is_empty() {
+                match store.archive_records(profile, Some(workspace), &valid_retires) {
+                    Ok((archived_ids, _)) => archived.extend(archived_ids),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "provider observation retirement archive failed");
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Err(err) = store.record_evidence_ledger(&EvidenceLedgerEntry {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: repo_id.map(str::to_string),
+            subject_key: Some(observation.subject_key.clone()),
+            source_kind: "dream_provider_apply".to_string(),
+            source_id: Some(observation.id.clone()),
+            source_path: Some(format!("dream-provider:{}", observation.subject_key)),
+            source_hash: content_hash,
+            safe_summary: ledger_safe_summary(&observation.content),
+            policy_state: "accepted".to_string(),
+            metadata: json!({
+                "dream_run_id": run_id,
+                "observation_id": observation.id,
+                "subject_key": observation.subject_key,
+                "provider_generated": true,
+            }),
+        }) {
+            tracing::warn!(error = %err, "provider observation evidence ledger write failed");
+        }
+    }
+    attempts >= max_candidates && max_candidates > 0
+}
+
+fn sanitized_provider_observation_metadata(observation: &DreamObservation) -> Value {
+    json!({
+        "id": sanitized_provider_metadata_string(&observation.id),
+        "key": sanitized_provider_metadata_string(&observation.key),
+        "kind": sanitized_provider_metadata_string(&observation.kind),
+        "category": sanitized_provider_metadata_string(&observation.category),
+        "subject_key": sanitized_provider_metadata_string(&observation.subject_key),
+        "confidence": observation.confidence,
+        "state": sanitized_provider_metadata_string(&observation.state),
+        "authority": sanitized_provider_metadata_string(&observation.authority),
+        "policy": sanitized_provider_metadata_string(&observation.policy),
+    })
+}
+
+fn sanitized_provider_metadata_string(value: &str) -> String {
+    match policy::screen_content(value, 512) {
+        PolicyDecision::Accept(value) => value,
+        PolicyDecision::Reject { .. } => "[redacted]".to_string(),
+    }
+}
+
 fn scheduled_dream_provider_context(
     store: &Store,
     profile: &str,
@@ -3593,11 +3765,313 @@ mod imported_provenance_tests {
 
 #[cfg(test)]
 mod scheduled_dream_mode_tests {
-    use super::scheduled_dream_mode;
+    use super::*;
+    use crate::domain::TemporalState;
+
+    fn provider_observation(id: &str, content: &str) -> DreamObservation {
+        serde_json::from_value(json!({
+            "id": id,
+            "key": id,
+            "kind": "dream_observation",
+            "category": "decision",
+            "subject_key": "provider-subject",
+            "summary": "safe summary",
+            "content": content,
+            "confidence": 1.7,
+            "state": "active",
+            "trigger": "sensitive trigger details",
+            "first_seen_at": "2026-07-18T00:00:00Z",
+            "last_seen_at": "2026-07-18T00:00:00Z",
+            "authority": "recall_not_authority",
+            "policy": "provider_generated",
+            "apply_eligible": false
+        }))
+        .expect("provider observation")
+    }
+
+    fn existing_record(content: &str) -> NewRecord {
+        NewRecord {
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Workspace,
+            record_type: RecordType::Decision,
+            content: content.to_string(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: 0.8,
+            source_ids: vec![],
+            content_hash: ids::sha256_hex(content.as_bytes()),
+            supersedes: vec![],
+            metadata: json!({}),
+        }
+    }
 
     #[test]
     fn scheduled_dreams_preview_unless_automatic_apply_is_enabled() {
         assert_eq!(scheduled_dream_mode(false), "preview");
         assert_eq!(scheduled_dream_mode(true), "apply");
+    }
+
+    #[test]
+    fn provider_promotion_clamps_confidence_archives_retires_and_screens_metadata() {
+        let store = Store::open(":memory:").expect("store");
+        let old_id = match store
+            .upsert_record(&existing_record("retired provider fact"))
+            .expect("old record")
+        {
+            crate::store::UpsertOutcome::Created(id) => id,
+            crate::store::UpsertOutcome::Skipped(_) => unreachable!(),
+        };
+        let mut observation = provider_observation("obs-1", "new provider fact");
+        observation.id = "AKIAIOSFODNN7EXAMPLE".to_string();
+        observation.subject_key = "AKIAIOSFODNN7EXAMPLE".to_string();
+        observation.state = "historical".to_string();
+        observation.retires.push(old_id.clone());
+        let mut observations = vec![observation];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        let max_candidates_hit = promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        assert!(max_candidates_hit);
+        let promoted = store
+            .get_record(&created[0])
+            .expect("read")
+            .expect("promoted");
+        assert_eq!(promoted.confidence, 1.0);
+        assert_eq!(promoted.temporal_state, TemporalState::Historical);
+        assert_eq!(promoted.metadata["state"], "historical");
+        assert_eq!(promoted.metadata["subject_key"], "[redacted]");
+        assert_eq!(promoted.metadata["observation_id"], "[redacted]");
+        assert!(promoted.metadata["observation"].get("content").is_none());
+        assert!(promoted.metadata["observation"].get("trigger").is_none());
+        assert_eq!(promoted.supersedes, vec![old_id.clone()]);
+        assert_eq!(archived, vec![old_id.clone()]);
+        assert!(
+            store
+                .get_record(&old_id)
+                .expect("read")
+                .expect("old")
+                .archived
+        );
+    }
+
+    #[test]
+    fn provider_promotion_stops_at_candidate_cap() {
+        let store = Store::open(":memory:").expect("store");
+        let mut observations = vec![
+            provider_observation("obs-1", "first provider fact"),
+            provider_observation("obs-2", "second provider fact"),
+        ];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        let max_candidates_hit = promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        assert!(max_candidates_hit);
+        assert_eq!(created.len(), 1);
+        assert_eq!(store.count_records().expect("count"), 1);
+    }
+
+    #[test]
+    fn provider_promotion_rejected_candidate_consumes_budget() {
+        let store = Store::open(":memory:").expect("store");
+        let mut observations = vec![
+            provider_observation("obs-secret", "AKIAIOSFODNN7EXAMPLE"),
+            provider_observation("obs-safe", "safe provider fact"),
+        ];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        let max_candidates_hit = promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        assert!(max_candidates_hit);
+        assert!(created.is_empty());
+        assert_eq!(store.count_records().expect("count"), 0);
+    }
+
+    #[test]
+    fn provider_promotion_duplicate_does_not_archive_retires() {
+        let store = Store::open(":memory:").expect("store");
+        let duplicate_content = "duplicate provider fact";
+        let mut initial = vec![provider_observation("obs-initial", duplicate_content)];
+        let mut initial_created = vec![];
+        let mut archived = vec![];
+        promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-initial",
+            &mut initial,
+            &mut initial_created,
+            &mut archived,
+            1,
+        );
+        let retired_id = match store
+            .upsert_record(&existing_record("record that must remain active"))
+            .expect("retired record")
+        {
+            crate::store::UpsertOutcome::Created(id) => id,
+            crate::store::UpsertOutcome::Skipped(_) => unreachable!(),
+        };
+        let mut observation = provider_observation("obs-duplicate", duplicate_content);
+        observation.retires.push(retired_id.clone());
+        let mut observations = vec![observation];
+        let mut created = vec![];
+
+        promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        assert!(created.is_empty());
+        assert!(
+            !store
+                .get_record(&retired_id)
+                .expect("read")
+                .expect("retired")
+                .archived
+        );
+    }
+
+    #[test]
+    fn provider_promotion_preserves_provider_evidence_refs() {
+        let store = Store::open(":memory:").expect("store");
+        let existing_id = match store
+            .upsert_record(&existing_record("real evidence"))
+            .expect("evidence record")
+        {
+            crate::store::UpsertOutcome::Created(id) => id,
+            crate::store::UpsertOutcome::Skipped(_) => unreachable!(),
+        };
+        let mut observation = provider_observation("obs-evidence", "provider fact with evidence");
+        observation.evidence_refs = vec![
+            DreamEvidenceSource {
+                id: existing_id.clone(),
+                kind: "memory_record".to_string(),
+                created_at: "2026-07-18T00:00:00Z".to_string(),
+                updated_at: None,
+                actor: None,
+                record_type: None,
+                state: None,
+                source_path: None,
+                summary: None,
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
+            },
+            DreamEvidenceSource {
+                id: "hallucinated-evidence".to_string(),
+                kind: "memory_record".to_string(),
+                created_at: "2026-07-18T00:00:00Z".to_string(),
+                updated_at: None,
+                actor: None,
+                record_type: None,
+                state: None,
+                source_path: None,
+                summary: None,
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
+            },
+        ];
+        let mut observations = vec![observation];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        let promoted = store
+            .get_record(&created[0])
+            .expect("read")
+            .expect("promoted");
+        assert_eq!(
+            promoted.source_ids,
+            vec![existing_id, "hallucinated-evidence".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_promotion_excludes_unknown_retire_ids() {
+        let store = Store::open(":memory:").expect("store");
+        let mut observation = provider_observation("obs-retire", "provider fact with retirement");
+        observation.retires = vec!["missing-record".to_string()];
+        let mut observations = vec![observation];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        let promoted = store
+            .get_record(&created[0])
+            .expect("read")
+            .expect("promoted");
+        assert!(promoted.supersedes.is_empty());
+        assert!(archived.is_empty());
     }
 }
