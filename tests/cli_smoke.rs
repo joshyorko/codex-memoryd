@@ -855,6 +855,71 @@ fn cli_chatgpt_export_filters_support_multiple_ids_and_combined_zero_match() {
 }
 
 #[test]
+fn cli_chatgpt_export_filters_by_date_and_max_conversations() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-dated");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--since",
+            "2024-06-01",
+            "--max-conversations",
+            "1",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["selected_conversations"], 1);
+    assert_eq!(report["conversations"][0]["conversation_id"], "conv-alpha");
+}
+
+#[test]
+fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-manifest");
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--conversation-id",
+            "conv-alpha",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let manifest_path = report["manifest_path"].as_str().expect("manifest path");
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["selected_source_ids"],
+        serde_json::json!(["conv-alpha"])
+    );
+    assert_eq!(manifest["created"], 2);
+}
+
+#[test]
 fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
@@ -5069,6 +5134,7 @@ fn cli_paths_json_reports_expected_keys_without_creating_runtime_files() {
         "config_file",
         "runtime_home",
         "database",
+        "last_chatgpt_import_manifest",
         "runtime_env",
         "pid_file",
         "log_file",
