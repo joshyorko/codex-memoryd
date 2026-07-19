@@ -506,12 +506,24 @@ pub enum ImportCommand {
         /// Apply (write visible-turn evidence only, idempotent).
         #[arg(long)]
         apply: bool,
+        /// Confirm importing every conversation in a large archive.
+        #[arg(long)]
+        all: bool,
         /// Select one or more conversation ids.
         #[arg(long = "conversation-id")]
         conversation_ids: Vec<String>,
         /// Filter selected conversations by title substring.
         #[arg(long)]
         title_contains: Option<String>,
+        /// Keep conversations updated on or after this UTC date or RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Keep conversations updated before this UTC date or RFC3339 timestamp.
+        #[arg(long)]
+        until: Option<String>,
+        /// Stop after this many selected conversations.
+        #[arg(long)]
+        max_conversations: Option<usize>,
         /// Keep only conversations with at least one importable user/assistant turn.
         #[arg(long)]
         eligible_only: bool,
@@ -1659,8 +1671,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                     list,
                     preview,
                     apply,
+                    all,
                     conversation_ids,
                     title_contains,
+                    since,
+                    until,
+                    max_conversations,
                     eligible_only,
                     profile,
                     workspace,
@@ -1684,6 +1700,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                             selection: ChatgptExportSelection {
                                 conversation_ids: conversation_ids.clone(),
                                 title_contains: title_contains.clone(),
+                                since: since.clone(),
+                                until: until.clone(),
+                                max_conversations: *max_conversations,
+                                all: *all,
                                 eligible_only: *eligible_only,
                             },
                         },
@@ -2614,6 +2634,12 @@ fn paths_inventory(cli: &Cli) -> Result<PathsInventory> {
     entries.insert(
         "database".to_string(),
         path_entry(runtime.db.clone(), "file", "durable", "codex-memoryd"),
+    );
+    let mut chatgpt_manifest = runtime.db.clone();
+    chatgpt_manifest.set_extension("chatgpt-import-manifest.json");
+    entries.insert(
+        "last_chatgpt_import_manifest".to_string(),
+        path_entry(chatgpt_manifest, "file", "durable", "codex-memoryd"),
     );
     entries.insert(
         "runtime_env".to_string(),
