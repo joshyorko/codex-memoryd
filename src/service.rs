@@ -2095,7 +2095,7 @@ impl Service {
             limits_hit.push("max_runtime_seconds".to_string());
         }
         match result {
-            Ok((mut run, max_candidates_hit)) => {
+            Ok((mut run, mut max_candidates_hit)) => {
                 let provider_config = &self.config.dream_provider;
                 if provider_config.enabled && !provider_config.endpoint.trim().is_empty() {
                     if let Ok(context) = scheduled_dream_provider_context(
@@ -2118,7 +2118,12 @@ impl Service {
                                     .filter_map(|value| serde_json::from_value(value).ok()),
                             );
                             if mode == "apply" {
-                                promote_provider_observations(
+                                let remaining_candidates = if max_candidates_hit {
+                                    0
+                                } else {
+                                    cfg.max_candidates.saturating_sub(run.created.len())
+                                };
+                                if promote_provider_observations(
                                     &self.store,
                                     profile.as_str(),
                                     &workspace,
@@ -2126,7 +2131,10 @@ impl Service {
                                     &run.run_id,
                                     &mut run.observations[provider_start..],
                                     &mut run.created,
-                                )?;
+                                    remaining_candidates,
+                                ) {
+                                    max_candidates_hit = true;
+                                }
                             }
                         }
                     }
@@ -3518,13 +3526,18 @@ fn promote_provider_observations(
     run_id: &str,
     observations: &mut [DreamObservation],
     created: &mut Vec<String>,
-) -> Result<()> {
+    max_candidates: usize,
+) -> bool {
+    let mut promoted = 0;
     for observation in observations {
         if observation.kind != "dream_observation"
             || observation.policy != "provider_generated"
             || observation.authority != "recall_not_authority"
         {
             continue;
+        }
+        if promoted >= max_candidates {
+            return true;
         }
         let content = match policy::screen_content(&observation.content, policy::MAX_RECORD_CHARS) {
             PolicyDecision::Accept(content) => content,
@@ -3550,7 +3563,9 @@ fn promote_provider_observations(
             .collect::<Vec<_>>();
         observation.policy = "accepted".to_string();
         observation.apply_eligible = true;
-        let outcome = store.upsert_record(&NewRecord {
+        observation.confidence = observation.confidence.clamp(0.0, 1.0);
+        let observation_metadata = sanitized_provider_observation_metadata(observation);
+        let outcome = match store.upsert_record(&NewRecord {
             profile_id: profile.to_string(),
             workspace_id: workspace.to_string(),
             repo_id: repo_id.map(str::to_string),
@@ -3574,11 +3589,28 @@ fn promote_provider_observations(
                 "policy_outcome": observation.policy,
                 "subject_key": observation.subject_key,
                 "observation_id": observation.id,
-                "observation_refs": observation.evidence_refs,
-                "observation": observation,
+                "observation_state": observation.state,
+                "observation": observation_metadata,
             }),
-        })?;
-        store.record_evidence_ledger(&EvidenceLedgerEntry {
+        }) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(error = %err, "provider observation promotion write failed");
+                continue;
+            }
+        };
+        promoted += 1;
+        if let crate::store::UpsertOutcome::Created(id) = &outcome {
+            created.push(id.clone());
+        }
+        if !observation.retires.is_empty() {
+            if let Err(err) = store.archive_records(profile, Some(workspace), &observation.retires)
+            {
+                tracing::warn!(error = %err, "provider observation retirement archive failed");
+                continue;
+            }
+        }
+        if let Err(err) = store.record_evidence_ledger(&EvidenceLedgerEntry {
             profile_id: profile.to_string(),
             workspace_id: workspace.to_string(),
             repo_id: repo_id.map(str::to_string),
@@ -3595,12 +3627,32 @@ fn promote_provider_observations(
                 "subject_key": observation.subject_key,
                 "provider_generated": true,
             }),
-        })?;
-        if let crate::store::UpsertOutcome::Created(id) = outcome {
-            created.push(id);
+        }) {
+            tracing::warn!(error = %err, "provider observation evidence ledger write failed");
         }
     }
-    Ok(())
+    promoted >= max_candidates && max_candidates > 0
+}
+
+fn sanitized_provider_observation_metadata(observation: &DreamObservation) -> Value {
+    json!({
+        "id": sanitized_provider_metadata_string(&observation.id),
+        "key": sanitized_provider_metadata_string(&observation.key),
+        "kind": sanitized_provider_metadata_string(&observation.kind),
+        "category": sanitized_provider_metadata_string(&observation.category),
+        "subject_key": sanitized_provider_metadata_string(&observation.subject_key),
+        "confidence": observation.confidence,
+        "state": sanitized_provider_metadata_string(&observation.state),
+        "authority": sanitized_provider_metadata_string(&observation.authority),
+        "policy": sanitized_provider_metadata_string(&observation.policy),
+    })
+}
+
+fn sanitized_provider_metadata_string(value: &str) -> String {
+    match policy::screen_content(value, 512) {
+        PolicyDecision::Accept(value) => value,
+        PolicyDecision::Reject { .. } => "[redacted]".to_string(),
+    }
 }
 
 fn scheduled_dream_provider_context(
@@ -3698,11 +3750,123 @@ mod imported_provenance_tests {
 
 #[cfg(test)]
 mod scheduled_dream_mode_tests {
-    use super::scheduled_dream_mode;
+    use super::*;
+
+    fn provider_observation(id: &str, content: &str) -> DreamObservation {
+        serde_json::from_value(json!({
+            "id": id,
+            "key": id,
+            "kind": "dream_observation",
+            "category": "decision",
+            "subject_key": "provider-subject",
+            "summary": "safe summary",
+            "content": content,
+            "confidence": 1.7,
+            "state": "active",
+            "trigger": "sensitive trigger details",
+            "first_seen_at": "2026-07-18T00:00:00Z",
+            "last_seen_at": "2026-07-18T00:00:00Z",
+            "authority": "recall_not_authority",
+            "policy": "provider_generated",
+            "apply_eligible": false
+        }))
+        .expect("provider observation")
+    }
+
+    fn existing_record(content: &str) -> NewRecord {
+        NewRecord {
+            profile_id: "personal".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Workspace,
+            record_type: RecordType::Decision,
+            content: content.to_string(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: 0.8,
+            source_ids: vec![],
+            content_hash: ids::sha256_hex(content.as_bytes()),
+            supersedes: vec![],
+            metadata: json!({}),
+        }
+    }
 
     #[test]
     fn scheduled_dreams_preview_unless_automatic_apply_is_enabled() {
         assert_eq!(scheduled_dream_mode(false), "preview");
         assert_eq!(scheduled_dream_mode(true), "apply");
+    }
+
+    #[test]
+    fn provider_promotion_clamps_confidence_archives_retires_and_screens_metadata() {
+        let store = Store::open(":memory:").expect("store");
+        let old_id = match store
+            .upsert_record(&existing_record("retired provider fact"))
+            .expect("old record")
+        {
+            crate::store::UpsertOutcome::Created(id) => id,
+            crate::store::UpsertOutcome::Skipped(_) => unreachable!(),
+        };
+        let mut observation = provider_observation("obs-1", "new provider fact");
+        observation.retires.push(old_id.clone());
+        let mut observations = vec![observation];
+        let mut created = vec![];
+
+        let max_candidates_hit = promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            1,
+        );
+
+        assert!(max_candidates_hit);
+        let promoted = store
+            .get_record(&created[0])
+            .expect("read")
+            .expect("promoted");
+        assert_eq!(promoted.confidence, 1.0);
+        assert_eq!(promoted.metadata["observation_state"], "active");
+        assert!(promoted.metadata["observation"].get("content").is_none());
+        assert!(promoted.metadata["observation"].get("trigger").is_none());
+        assert!(
+            store
+                .get_record(&old_id)
+                .expect("read")
+                .expect("old")
+                .archived
+        );
+    }
+
+    #[test]
+    fn provider_promotion_stops_at_candidate_cap() {
+        let store = Store::open(":memory:").expect("store");
+        let mut observations = vec![
+            provider_observation("obs-1", "first provider fact"),
+            provider_observation("obs-2", "second provider fact"),
+        ];
+        let mut created = vec![];
+
+        let max_candidates_hit = promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            1,
+        );
+
+        assert!(max_candidates_hit);
+        assert_eq!(created.len(), 1);
+        assert_eq!(store.count_records().expect("count"), 1);
     }
 }
