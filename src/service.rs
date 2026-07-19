@@ -2111,11 +2111,23 @@ impl Service {
                             &provider_config.model,
                             &context,
                         ) {
+                            let provider_start = run.observations.len();
                             run.observations.extend(
                                 observations
                                     .into_iter()
                                     .filter_map(|value| serde_json::from_value(value).ok()),
                             );
+                            if mode == "apply" {
+                                promote_provider_observations(
+                                    &self.store,
+                                    profile.as_str(),
+                                    &workspace,
+                                    run.repo_id.as_deref(),
+                                    &run.run_id,
+                                    &mut run.observations[provider_start..],
+                                    &mut run.created,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -3496,6 +3508,99 @@ fn scheduled_dream_mode(automatic_apply: bool) -> &'static str {
     } else {
         "preview"
     }
+}
+
+fn promote_provider_observations(
+    store: &Store,
+    profile: &str,
+    workspace: &str,
+    repo_id: Option<&str>,
+    run_id: &str,
+    observations: &mut [DreamObservation],
+    created: &mut Vec<String>,
+) -> Result<()> {
+    for observation in observations {
+        if observation.kind != "dream_observation"
+            || observation.policy != "provider_generated"
+            || observation.authority != "recall_not_authority"
+        {
+            continue;
+        }
+        let content = match policy::screen_content(&observation.content, policy::MAX_RECORD_CHARS) {
+            PolicyDecision::Accept(content) => content,
+            PolicyDecision::Reject { .. } => continue,
+        };
+        let resolved_profile = Profile::parse(profile).unwrap_or(Profile::Personal);
+        let record_type = RecordType::parse(&observation.category).unwrap_or_else(|| {
+            policy::classify(&content, resolved_profile, repo_id.is_some()).record_type
+        });
+        let class = policy::classify_as(&content, resolved_profile, repo_id.is_some(), record_type);
+        let content_hash = ids::content_hash(
+            profile,
+            workspace,
+            repo_id,
+            record_type.as_str(),
+            class.scope.as_str(),
+            &content,
+        );
+        let source_ids = observation
+            .evidence_refs
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        observation.policy = "accepted".to_string();
+        observation.apply_eligible = true;
+        let outcome = store.upsert_record(&NewRecord {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: repo_id.map(str::to_string),
+            subject_id: None,
+            episode_id: None,
+            scope: class.scope,
+            record_type,
+            content,
+            related_files: class.related_files,
+            tags: class.tags,
+            sensitivity: class.sensitivity,
+            portability: class.portability,
+            confidence: observation.confidence,
+            source_ids,
+            content_hash: content_hash.clone(),
+            supersedes: observation.retires.clone(),
+            metadata: json!({
+                "origin": "dreamer_provider",
+                "dream_run_id": run_id,
+                "run_id": run_id,
+                "policy_outcome": observation.policy,
+                "subject_key": observation.subject_key,
+                "observation_id": observation.id,
+                "observation_refs": observation.evidence_refs,
+                "observation": observation,
+            }),
+        })?;
+        store.record_evidence_ledger(&EvidenceLedgerEntry {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: repo_id.map(str::to_string),
+            subject_key: Some(observation.subject_key.clone()),
+            source_kind: "dream_provider_apply".to_string(),
+            source_id: Some(observation.id.clone()),
+            source_path: Some(format!("dream-provider:{}", observation.subject_key)),
+            source_hash: content_hash,
+            safe_summary: ledger_safe_summary(&observation.content),
+            policy_state: "accepted".to_string(),
+            metadata: json!({
+                "dream_run_id": run_id,
+                "observation_id": observation.id,
+                "subject_key": observation.subject_key,
+                "provider_generated": true,
+            }),
+        })?;
+        if let crate::store::UpsertOutcome::Created(id) = outcome {
+            created.push(id);
+        }
+    }
+    Ok(())
 }
 
 fn scheduled_dream_provider_context(
