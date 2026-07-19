@@ -2133,6 +2133,7 @@ impl Service {
                                     &run.run_id,
                                     &mut run.observations[provider_start..],
                                     &mut run.created,
+                                    &mut run.archived,
                                     remaining_candidates,
                                 ) {
                                     max_candidates_hit = true;
@@ -3528,6 +3529,7 @@ fn promote_provider_observations(
     run_id: &str,
     observations: &mut [DreamObservation],
     created: &mut Vec<String>,
+    archived: &mut Vec<String>,
     max_candidates: usize,
 ) -> bool {
     let mut attempts = 0;
@@ -3562,8 +3564,13 @@ fn promote_provider_observations(
         let source_ids = observation
             .evidence_refs
             .iter()
-            .filter(|source| matches!(store.get_record(&source.id), Ok(Some(_))))
             .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let valid_retires = observation
+            .retires
+            .iter()
+            .filter(|id| matches!(store.get_record(id), Ok(Some(_))))
+            .cloned()
             .collect::<Vec<_>>();
         observation.policy = "accepted".to_string();
         observation.apply_eligible = true;
@@ -3588,7 +3595,7 @@ fn promote_provider_observations(
             confidence: observation.confidence,
             source_ids,
             content_hash: content_hash.clone(),
-            supersedes: observation.retires.clone(),
+            supersedes: valid_retires.clone(),
             metadata: json!({
                 "origin": "dreamer_provider",
                 "dream_run_id": run_id,
@@ -3608,12 +3615,13 @@ fn promote_provider_observations(
         };
         if let crate::store::UpsertOutcome::Created(id) = &outcome {
             created.push(id.clone());
-            if !observation.retires.is_empty() {
-                if let Err(err) =
-                    store.archive_records(profile, Some(workspace), &observation.retires)
-                {
-                    tracing::warn!(error = %err, "provider observation retirement archive failed");
-                    continue;
+            if !valid_retires.is_empty() {
+                match store.archive_records(profile, Some(workspace), &valid_retires) {
+                    Ok((archived_ids, _)) => archived.extend(archived_ids),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "provider observation retirement archive failed");
+                        continue;
+                    }
                 }
             }
         }
@@ -3826,6 +3834,7 @@ mod scheduled_dream_mode_tests {
         observation.retires.push(old_id.clone());
         let mut observations = vec![observation];
         let mut created = vec![];
+        let mut archived = vec![];
 
         let max_candidates_hit = promote_provider_observations(
             &store,
@@ -3835,6 +3844,7 @@ mod scheduled_dream_mode_tests {
             "run-1",
             &mut observations,
             &mut created,
+            &mut archived,
             1,
         );
 
@@ -3850,6 +3860,8 @@ mod scheduled_dream_mode_tests {
         assert_eq!(promoted.metadata["observation_id"], "[redacted]");
         assert!(promoted.metadata["observation"].get("content").is_none());
         assert!(promoted.metadata["observation"].get("trigger").is_none());
+        assert_eq!(promoted.supersedes, vec![old_id.clone()]);
+        assert_eq!(archived, vec![old_id.clone()]);
         assert!(
             store
                 .get_record(&old_id)
@@ -3867,6 +3879,7 @@ mod scheduled_dream_mode_tests {
             provider_observation("obs-2", "second provider fact"),
         ];
         let mut created = vec![];
+        let mut archived = vec![];
 
         let max_candidates_hit = promote_provider_observations(
             &store,
@@ -3876,6 +3889,7 @@ mod scheduled_dream_mode_tests {
             "run-1",
             &mut observations,
             &mut created,
+            &mut archived,
             1,
         );
 
@@ -3892,6 +3906,7 @@ mod scheduled_dream_mode_tests {
             provider_observation("obs-safe", "safe provider fact"),
         ];
         let mut created = vec![];
+        let mut archived = vec![];
 
         let max_candidates_hit = promote_provider_observations(
             &store,
@@ -3901,6 +3916,7 @@ mod scheduled_dream_mode_tests {
             "run-1",
             &mut observations,
             &mut created,
+            &mut archived,
             1,
         );
 
@@ -3915,6 +3931,7 @@ mod scheduled_dream_mode_tests {
         let duplicate_content = "duplicate provider fact";
         let mut initial = vec![provider_observation("obs-initial", duplicate_content)];
         let mut initial_created = vec![];
+        let mut archived = vec![];
         promote_provider_observations(
             &store,
             "personal",
@@ -3923,6 +3940,7 @@ mod scheduled_dream_mode_tests {
             "run-initial",
             &mut initial,
             &mut initial_created,
+            &mut archived,
             1,
         );
         let retired_id = match store
@@ -3945,6 +3963,7 @@ mod scheduled_dream_mode_tests {
             "run-1",
             &mut observations,
             &mut created,
+            &mut archived,
             1,
         );
 
@@ -3959,7 +3978,7 @@ mod scheduled_dream_mode_tests {
     }
 
     #[test]
-    fn provider_promotion_filters_unknown_evidence_refs() {
+    fn provider_promotion_preserves_provider_evidence_refs() {
         let store = Store::open(":memory:").expect("store");
         let existing_id = match store
             .upsert_record(&existing_record("real evidence"))
@@ -4003,6 +4022,7 @@ mod scheduled_dream_mode_tests {
         ];
         let mut observations = vec![observation];
         let mut created = vec![];
+        let mut archived = vec![];
 
         promote_provider_observations(
             &store,
@@ -4012,6 +4032,7 @@ mod scheduled_dream_mode_tests {
             "run-1",
             &mut observations,
             &mut created,
+            &mut archived,
             1,
         );
 
@@ -4019,6 +4040,38 @@ mod scheduled_dream_mode_tests {
             .get_record(&created[0])
             .expect("read")
             .expect("promoted");
-        assert_eq!(promoted.source_ids, vec![existing_id]);
+        assert_eq!(
+            promoted.source_ids,
+            vec![existing_id, "hallucinated-evidence".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_promotion_excludes_unknown_retire_ids() {
+        let store = Store::open(":memory:").expect("store");
+        let mut observation = provider_observation("obs-retire", "provider fact with retirement");
+        observation.retires = vec!["missing-record".to_string()];
+        let mut observations = vec![observation];
+        let mut created = vec![];
+        let mut archived = vec![];
+
+        promote_provider_observations(
+            &store,
+            "personal",
+            "ws",
+            None,
+            "run-1",
+            &mut observations,
+            &mut created,
+            &mut archived,
+            1,
+        );
+
+        let promoted = store
+            .get_record(&created[0])
+            .expect("read")
+            .expect("promoted");
+        assert!(promoted.supersedes.is_empty());
+        assert!(archived.is_empty());
     }
 }
