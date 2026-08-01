@@ -819,7 +819,17 @@ fn cli_chatgpt_export_shards_are_stable_across_directory_and_scrambled_zip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let export_dir = write_chatgpt_sharded_export_dir(&dir, "chatgpt-cross-shard");
-    let export_zip = write_chatgpt_sharded_export_zip(&dir, "chatgpt-cross-shard");
+    let renamed_zip = dir.path().join("chatgpt-cross-shard-renamed.zip");
+    let file = fs::File::create(&renamed_zip).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
+    for member in ["conversations-001.json", "conversations-000.json"] {
+        zip.start_file(format!("export-root/{member}"), options)
+            .unwrap();
+        zip.write_all(&fs::read(export_dir.join(member)).unwrap())
+            .unwrap();
+    }
+    zip.finish().unwrap();
 
     let filtered = bin()
         .arg("--db")
@@ -831,7 +841,7 @@ fn cli_chatgpt_export_shards_are_stable_across_directory_and_scrambled_zip() {
             "--conversation-id",
             "conv-one",
         ])
-        .arg(&export_zip)
+        .arg(&renamed_zip)
         .output()
         .unwrap();
     assert!(filtered.status.success());
@@ -872,15 +882,27 @@ fn cli_chatgpt_export_shards_are_stable_across_directory_and_scrambled_zip() {
             .unwrap()
             .starts_with("conversations-")
     );
+    let durable_counts = [
+        count_table(&db, "memory_sources"),
+        count_table(&db, "evidence_ledger"),
+        count_table(&db, "policy_events"),
+        count_table(&db, "sessions"),
+        count_table(&db, "visible_turns"),
+    ];
+    assert_eq!(durable_counts, [2, 2, 0, 2, 2]);
 
     let second = bin()
         .arg("--db")
         .arg(&db)
         .args(["import", "chatgpt-export", "--apply"])
-        .arg(&export_zip)
+        .arg(&renamed_zip)
         .output()
         .unwrap();
-    assert!(second.status.success());
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     let second: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second["created"], 0);
     assert_eq!(second["skipped_existing"], 2);
@@ -892,6 +914,16 @@ fn cli_chatgpt_export_shards_are_stable_across_directory_and_scrambled_zip() {
         .map(|row| row.unwrap())
         .collect::<Vec<_>>();
     assert_eq!(ids_after, ids);
+    assert_eq!(
+        [
+            count_table(&db, "memory_sources"),
+            count_table(&db, "evidence_ledger"),
+            count_table(&db, "policy_events"),
+            count_table(&db, "sessions"),
+            count_table(&db, "visible_turns"),
+        ],
+        durable_counts
+    );
 }
 
 #[test]

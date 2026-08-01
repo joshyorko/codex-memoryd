@@ -440,10 +440,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                 inject_chatgpt_apply_failure(&mut staged_writes)?;
 
                 for message in &parsed.accepted {
-                    let source_ref = format!(
-                        "{}:{}:{}",
-                        payload_path, conversation.id, message.message_id
-                    );
+                    let source_ref = format!("chatgpt:{}:{}", conversation.id, message.message_id);
                     let source_hash = ids::sha256_hex(
                         format!("chatgpt-export:{session_id}:{}", message.message_id).as_bytes(),
                     );
@@ -500,6 +497,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                                 "message_id": message.message_id,
                                 "session_id": session_id,
                                 "source": "chatgpt-export",
+                                "source_member": payload_path,
                             }),
                         },
                     )?;
@@ -1556,7 +1554,7 @@ fn record_rejection_in_transaction(
     reason: &str,
     payload_path: &str,
 ) -> Result<()> {
-    let source_path = format!("{payload_path}:{conversation_id}:{message_id}");
+    let source_path = format!("chatgpt:{conversation_id}:{message_id}:{code}");
     let source_hash = ids::sha256_hex(
         format!("{profile}\n{workspace}\n{conversation_id}\n{message_id}\n{code}").as_bytes(),
     );
@@ -1579,6 +1577,7 @@ fn record_rejection_in_transaction(
                 "conversation_id": conversation_id,
                 "message_id": message_id,
                 "source": "chatgpt-export",
+                "source_member": payload_path,
             }),
         },
     )?;
