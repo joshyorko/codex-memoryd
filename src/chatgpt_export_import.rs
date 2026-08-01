@@ -951,9 +951,10 @@ fn conversation_member_name(name: &str) -> Option<Option<u32>> {
 }
 
 fn validate_payload_names(payloads: &mut Vec<PayloadMember>) -> Result<()> {
-    if payloads.len() > MAX_CONVERSATION_MEMBERS {
+    let max_members = max_conversation_members();
+    if payloads.len() > max_members {
         return Err(Error::invalid_request(format!(
-            "ChatGPT export has more than {MAX_CONVERSATION_MEMBERS} conversation members"
+            "ChatGPT export has more than {max_members} conversation members"
         )));
     }
     let mut legacy = 0usize;
@@ -1006,6 +1007,17 @@ fn validate_payload_names(payloads: &mut Vec<PayloadMember>) -> Result<()> {
         ))
     });
     Ok(())
+}
+
+fn max_conversation_members() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_MEMBERS
 }
 
 fn validate_zip_member_path(name: &str) -> Result<()> {

@@ -553,6 +553,22 @@ fn write_chatgpt_sharded_export_dir(dir: &TempDir, name: &str) -> PathBuf {
     root
 }
 
+fn write_chatgpt_sharded_export_zip(dir: &TempDir, name: &str) -> PathBuf {
+    let root = write_chatgpt_sharded_export_dir(dir, &format!("{name}-source"));
+    let path = dir.path().join(format!("{name}.zip"));
+    let file = fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::SimpleFileOptions =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for member in ["conversations-001.json", "conversations-000.json"] {
+        zip.start_file(member, options).unwrap();
+        zip.write_all(&fs::read(root.join(member)).unwrap())
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+
 fn write_chatgpt_dream_export_dir(dir: &TempDir) -> PathBuf {
     let root = dir.path().join("chatgpt-dream-export");
     std::fs::create_dir_all(&root).unwrap();
@@ -701,6 +717,66 @@ fn cli_chatgpt_export_preview_discovers_numbered_shards_in_numeric_order_without
     assert_eq!(count_table(&db, "sessions"), 0);
     assert_eq!(count_table(&db, "visible_turns"), 0);
     assert_eq!(count_table(&db, "evidence_ledger"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_zip_shards_use_numeric_order_and_reject_unsafe_sets() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let archive = write_chatgpt_sharded_export_zip(&dir, "chatgpt-shards-scrambled");
+    let preview = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let report: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(report["conversations"][0]["conversation_id"], "conv-zero");
+    assert_eq!(report["conversations"][1]["conversation_id"], "conv-one");
+
+    let invalid = dir.path().join("invalid-chatgpt-shards.zip");
+    let file = fs::File::create(&invalid).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
+    for member in [
+        "nested/conversations-000.json",
+        "other/conversations-000.json",
+        "../conversations-001.json",
+    ] {
+        zip.start_file(member, options).unwrap();
+        zip.write_all(b"[]").unwrap();
+    }
+    zip.finish().unwrap();
+    let rejected = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&invalid)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsafe zip member path"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_rejects_member_count_above_test_limit_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_sharded_export_dir(&dir, "chatgpt-member-limit");
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBERS", "1")
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conversation members"));
+    assert_eq!(count_table(&db, "sessions"), 0);
 }
 
 #[test]
