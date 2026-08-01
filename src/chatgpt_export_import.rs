@@ -32,6 +32,8 @@ const MAX_CONVERSATIONS_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONVERSATION_MEMBERS: usize = 1_024;
 const MAX_CONVERSATION_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CONVERSATION_COMPRESSION_RATIO: u64 = 100;
+const MAX_CONVERSATION_VALUE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONVERSATION_NESTING: usize = 64;
 const MAX_MESSAGES: usize = 1_000_000;
 const LARGE_ARCHIVE_CONVERSATIONS: usize = 100;
 
@@ -609,6 +611,11 @@ fn parse_conversation(
     conversation: &ExportConversation,
     payload_path: &str,
 ) -> Result<ParsedConversation> {
+    validate_string_value(&conversation.id)?;
+    if let Some(title) = &conversation.title {
+        validate_string_value(title)?;
+    }
+    validate_json_value(&conversation.mapping, 0)?;
     let mapping = conversation.mapping.as_object().ok_or_else(|| {
         Error::invalid_request(
             "unsupported ChatGPT export schema: conversation mapping must be an object",
@@ -727,6 +734,42 @@ fn parse_conversation(
         rejections,
         has_eligible_messages,
     })
+}
+
+fn validate_json_value(value: &Value, depth: usize) -> Result<()> {
+    if depth > max_conversation_nesting() {
+        return Err(Error::invalid_request(format!(
+            "ChatGPT export JSON nesting exceeds {} levels",
+            max_conversation_nesting()
+        )));
+    }
+    match value {
+        Value::String(value) => validate_string_value(value),
+        Value::Array(values) => {
+            for value in values {
+                validate_json_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                validate_string_value(key)?;
+                validate_json_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn validate_string_value(value: &str) -> Result<()> {
+    let max_value_bytes = max_conversation_value_bytes();
+    if value.len() > max_value_bytes {
+        return Err(Error::invalid_request(format!(
+            "ChatGPT export JSON value exceeds {max_value_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn extract_text(message: &ExportMessage) -> Option<String> {
@@ -1092,6 +1135,28 @@ fn max_conversation_compression_ratio() -> u64 {
     MAX_CONVERSATION_COMPRESSION_RATIO
 }
 
+fn max_conversation_value_bytes() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_VALUE_BYTES
+}
+
+fn max_conversation_nesting() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_NESTING")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_NESTING
+}
+
 fn validate_zip_member_path(name: &str) -> Result<()> {
     if name.contains('\\')
         || Path::new(name).is_absolute()
@@ -1140,9 +1205,9 @@ fn stream_conversation_array<R: Read>(
         on_conversation: &mut on_conversation,
     }
     .deserialize(&mut deserializer)
-    .map_err(|_| {
+    .map_err(|err| {
         Error::invalid_request(format!(
-            "unsupported ChatGPT export schema: invalid conversations payload: {name}"
+            "unsupported ChatGPT export schema: invalid conversations payload {name}: {err}"
         ))
     })?;
     deserializer.end().map_err(|_| {
