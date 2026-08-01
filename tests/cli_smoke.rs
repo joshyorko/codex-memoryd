@@ -815,6 +815,86 @@ fn cli_chatgpt_export_zip_shards_use_numeric_order_and_reject_unsafe_sets() {
 }
 
 #[test]
+fn cli_chatgpt_export_shards_are_stable_across_directory_and_scrambled_zip() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_sharded_export_dir(&dir, "chatgpt-cross-shard");
+    let export_zip = write_chatgpt_sharded_export_zip(&dir, "chatgpt-cross-shard");
+
+    let filtered = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--conversation-id",
+            "conv-one",
+        ])
+        .arg(&export_zip)
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    let filtered: Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered["conversation_count"], 2);
+    assert_eq!(filtered["selected_conversations"], 1);
+    assert_eq!(filtered["conversations"][0]["conversation_id"], "conv-one");
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["created"], 2);
+    assert_eq!(first["skipped_existing"], 0);
+    let conn = Connection::open(&db).unwrap();
+    let ids = conn
+        .prepare("SELECT id FROM visible_turns ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    let provenance = conn
+        .query_row(
+            "SELECT metadata FROM visible_turns WHERE id = ?1",
+            [&ids[0]],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(
+        serde_json::from_str::<Value>(&provenance).unwrap()["source_file_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("conversations-")
+    );
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_zip)
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["created"], 0);
+    assert_eq!(second["skipped_existing"], 2);
+    let ids_after = conn
+        .prepare("SELECT id FROM visible_turns ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids_after, ids);
+}
+
+#[test]
 fn cli_chatgpt_export_rejects_member_count_above_test_limit_before_writes() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
@@ -975,6 +1055,144 @@ fn cli_chatgpt_export_rejects_incomplete_and_mixed_directory_shards_before_write
         .unwrap();
     assert!(!mixed.status.success());
     assert!(String::from_utf8_lossy(&mixed.stderr).contains("ambiguous ChatGPT export"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_rejects_duplicate_conversation_and_message_identities_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("chatgpt-duplicate-identities");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(
+        export_dir.join("conversations-000.json"),
+        r#"[{"id":"conv-duplicate","mapping":{}}]"#,
+    )
+    .unwrap();
+    fs::write(
+        export_dir.join("conversations-001.json"),
+        r#"[{"id":"conv-duplicate","mapping":{}}]"#,
+    )
+    .unwrap();
+    let duplicate_conversation = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!duplicate_conversation.status.success());
+    assert!(String::from_utf8_lossy(&duplicate_conversation.stderr)
+        .contains("duplicate conversation identity"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+
+    fs::remove_file(export_dir.join("conversations-001.json")).unwrap();
+    fs::write(
+        export_dir.join("conversations-000.json"),
+        r#"[{"id":"conv-message","mapping":{"first":{"id":"message-duplicate"},"second":{"id":"message-duplicate"}}}]"#,
+    )
+    .unwrap();
+    let duplicate_message = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!duplicate_message.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate_message.stderr).contains("duplicate message identity")
+    );
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_chatgpt_export_rejects_directory_symlinks_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("chatgpt-symlink");
+    let outside = dir.path().join("outside-conversations.json");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(&outside, "[]").unwrap();
+    std::os::unix::fs::symlink(&outside, export_dir.join("conversations.json")).unwrap();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe symlink"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_reports_malformed_shard_name_without_writes() {
+    for malformed_index in 0..3 {
+        let dir = TempDir::new().unwrap();
+        let db = db_path(&dir);
+        let export_dir = dir.path().join("chatgpt-malformed-shards");
+        fs::create_dir_all(&export_dir).unwrap();
+        for index in 0..3 {
+            let body = if index == malformed_index { "{" } else { "[]" };
+            fs::write(
+                export_dir.join(format!("conversations-{index:03}.json")),
+                body,
+            )
+            .unwrap();
+        }
+        let output = bin()
+            .arg("--db")
+            .arg(&db)
+            .args(["import", "chatgpt-export", "--apply"])
+            .arg(&export_dir)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("conversations-{malformed_index:03}.json")));
+        assert!(!stderr.contains("conversation content"));
+        assert_eq!(count_table(&db, "sessions"), 0);
+        assert_eq!(count_table(&db, "visible_turns"), 0);
+    }
+}
+
+#[test]
+fn cli_chatgpt_export_previews_a_shard_larger_than_the_former_member_cap() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("chatgpt-large-shard");
+    fs::create_dir_all(&export_dir).unwrap();
+    let padding = "x".repeat(1024 * 1024);
+    let conversations = (0..17)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("conv-large-{index}"),
+                "mapping": {},
+                "padding": padding,
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        export_dir.join("conversations.json"),
+        serde_json::to_vec(&conversations).unwrap(),
+    )
+    .unwrap();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["conversation_count"], 17);
+    assert_eq!(report["selected_conversations"], 17);
     assert_eq!(count_table(&db, "sessions"), 0);
 }
 
