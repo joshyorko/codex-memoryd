@@ -744,6 +744,35 @@ fn cli_chatgpt_export_bounds_conversation_report_details_without_changing_counts
 }
 
 #[test]
+fn cli_chatgpt_export_reports_conversations_in_stable_member_order() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("chatgpt-stable-report-order");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(
+        export_dir.join("conversations.json"),
+        r#"[
+          {"id":"conv-z","mapping":{}},
+          {"id":"conv-a","mapping":{}}
+        ]"#,
+    )
+    .unwrap();
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["conversations"][0]["conversation_id"], "conv-a");
+    assert_eq!(report["conversations"][1]["conversation_id"], "conv-z");
+}
+
+#[test]
 fn cli_chatgpt_export_zip_shards_use_numeric_order_and_reject_unsafe_sets() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

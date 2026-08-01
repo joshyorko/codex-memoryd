@@ -198,6 +198,12 @@ struct ParsedConversation {
 }
 
 #[derive(Debug)]
+struct ReportDetail {
+    member_index: usize,
+    report: ChatgptExportConversationReport,
+}
+
+#[derive(Debug)]
 struct AcceptedMessage {
     message_id: String,
     actor: String,
@@ -265,7 +271,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         });
     }
 
-    let mut reports = Vec::new();
+    let mut reports = Vec::<ReportDetail>::new();
     let mut selected_conversations = 0usize;
     let mut conversation_details_truncated = 0usize;
     let mut skipped_conversation_details_truncated = 0usize;
@@ -326,6 +332,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
 
     let mut staged_writes = 0usize;
     let mut process_member = |member: &PayloadMember,
+                              member_index: usize,
                               transaction: Option<&rusqlite::Transaction<'_>>|
      -> Result<()> {
         let payload_path = member.name().to_string();
@@ -386,7 +393,10 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                     );
                     push_report_detail(
                         &mut reports,
-                        parsed.report,
+                        ReportDetail {
+                            member_index,
+                            report: parsed.report,
+                        },
                         &mut conversation_details_truncated,
                     );
                     return Ok(());
@@ -492,7 +502,10 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             );
             push_report_detail(
                 &mut reports,
-                parsed.report,
+                ReportDetail {
+                    member_index,
+                    report: parsed.report,
+                },
                 &mut conversation_details_truncated,
             );
             Ok(())
@@ -501,16 +514,37 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     };
     if params.mode == ChatgptExportMode::Apply {
         service.store.transaction(|tx| {
-            for member in &detected.payloads {
-                process_member(member, Some(tx))?;
+            for (member_index, member) in detected.payloads.iter().enumerate() {
+                process_member(member, member_index, Some(tx))?;
             }
             Ok(())
         })?;
     } else {
-        for member in &detected.payloads {
-            process_member(member, None)?;
+        for (member_index, member) in detected.payloads.iter().enumerate() {
+            process_member(member, member_index, None)?;
         }
     }
+
+    reports.sort_by(|left, right| {
+        left.member_index.cmp(&right.member_index).then_with(|| {
+            left.report
+                .updated_at
+                .as_deref()
+                .or(left.report.created_at.as_deref())
+                .cmp(
+                    &right
+                        .report
+                        .updated_at
+                        .as_deref()
+                        .or(right.report.created_at.as_deref()),
+                )
+                .then_with(|| {
+                    left.report
+                        .conversation_id
+                        .cmp(&right.report.conversation_id)
+                })
+        })
+    });
 
     let mut response = ChatgptExportResponse {
         mode: params.mode.as_str().to_string(),
@@ -531,7 +565,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         rejection_details_truncated,
         manifest_path: None,
         members,
-        conversations: reports,
+        conversations: reports.into_iter().map(|detail| detail.report).collect(),
         skipped_conversations,
         rejections,
     };
