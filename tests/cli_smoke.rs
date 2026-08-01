@@ -537,6 +537,22 @@ fn write_chatgpt_export_zip(dir: &TempDir, export_dir: &std::path::Path) -> Path
     zip_path
 }
 
+fn write_chatgpt_sharded_export_dir(dir: &TempDir, name: &str) -> PathBuf {
+    let root = dir.path().join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("conversations-001.json"),
+        r#"[{"id":"conv-one","title":"One","mapping":{"m-one":{"id":"m-one","message":{"author":{"role":"user"},"create_time":1717243201,"content":{"parts":["one"]}}}}}]"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("conversations-000.json"),
+        r#"[{"id":"conv-zero","title":"Zero","mapping":{"m-zero":{"id":"m-zero","message":{"author":{"role":"assistant"},"create_time":1717243202,"content":{"parts":["zero"]}}}}}]"#,
+    )
+    .unwrap();
+    root
+}
+
 fn write_chatgpt_dream_export_dir(dir: &TempDir) -> PathBuf {
     let root = dir.path().join("chatgpt-dream-export");
     std::fs::create_dir_all(&root).unwrap();
@@ -649,6 +665,35 @@ fn cli_chatgpt_export_list_and_preview_from_directory_write_nothing() {
     assert_eq!(count_table(&db, "memory_records"), 0);
     assert_eq!(count_table(&db, "evidence_ledger"), 0);
     assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
+fn cli_chatgpt_export_preview_discovers_numbered_shards_in_numeric_order_without_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_sharded_export_dir(&dir, "chatgpt-sharded-export");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["conversation_count"], 2);
+    assert_eq!(report["selected_conversations"], 2);
+    assert_eq!(report["conversations"][0]["conversation_id"], "conv-zero");
+    assert_eq!(report["conversations"][1]["conversation_id"], "conv-one");
+    assert_eq!(count_table(&db, "sessions"), 0);
+    assert_eq!(count_table(&db, "visible_turns"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
 }
 
 #[test]
@@ -1106,7 +1151,7 @@ fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
 }
 
 #[test]
-fn cli_chatgpt_export_rejects_oversized_payloads_for_directory_and_zip() {
+fn cli_chatgpt_export_rejects_invalid_large_payloads_for_directory_and_zip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let export_dir = write_oversized_chatgpt_export_dir(&dir, "oversized-chatgpt-export");
@@ -1129,7 +1174,7 @@ fn cli_chatgpt_export_rejects_oversized_payloads_for_directory_and_zip() {
         .unwrap();
     assert!(!preview.status.success());
     let preview_stderr = String::from_utf8_lossy(&preview.stderr);
-    assert!(preview_stderr.contains("conversations payload exceeds 16777216 bytes"));
+    assert!(preview_stderr.contains("invalid conversations payload"));
 
     let apply = bin()
         .arg("--db")
@@ -1148,7 +1193,7 @@ fn cli_chatgpt_export_rejects_oversized_payloads_for_directory_and_zip() {
         .unwrap();
     assert!(!apply.status.success());
     let apply_stderr = String::from_utf8_lossy(&apply.stderr);
-    assert!(apply_stderr.contains("conversations payload exceeds 16777216 bytes"));
+    assert!(apply_stderr.contains("invalid conversations payload"));
 }
 
 #[test]

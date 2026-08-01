@@ -364,6 +364,19 @@ impl Store {
         self.pool.get().map_err(Error::from)
     }
 
+    /// Run a logical import as one SQLite transaction. The callback may stage
+    /// many rows, but none become durable unless it returns successfully.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let value = operation(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     /// Run migrations and probe FTS5. Idempotent.
     fn migrate(&mut self) -> Result<()> {
         let conn = self.conn()?;
@@ -4062,5 +4075,17 @@ mod tests {
             .unwrap();
         assert!(!created2);
         assert_eq!(s1.id, s2.id);
+    }
+
+    #[test]
+    fn transaction_rolls_back_all_writes_when_the_import_fails() {
+        let store = mem_store();
+        let result: Result<()> = store.transaction(|tx| {
+            tx.execute("INSERT INTO profiles(id, display_name, created_at, updated_at, default_portability_policy) VALUES ('p', 'p', 'now', 'now', 'profile_only')", [])?;
+            Err(Error::storage("injected import failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(store.active_profiles().unwrap().is_empty());
     }
 }
