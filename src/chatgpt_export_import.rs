@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ const MAX_CONVERSATION_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CONVERSATION_COMPRESSION_RATIO: u64 = 100;
 const MAX_CONVERSATION_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONVERSATION_NESTING: usize = 64;
+const MAX_CONVERSATION_REPORT_DETAILS: usize = 1_000;
 const MAX_MESSAGES: usize = 1_000_000;
 const LARGE_ARCHIVE_CONVERSATIONS: usize = 100;
 
@@ -134,6 +136,9 @@ pub struct ChatgptExportResponse {
     pub rejected_messages: usize,
     pub created: usize,
     pub skipped_existing: usize,
+    pub conversation_details_truncated: usize,
+    pub skipped_conversation_details_truncated: usize,
+    pub rejection_details_truncated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
     pub members: Vec<ChatgptExportMemberReport>,
@@ -261,6 +266,10 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     }
 
     let mut reports = Vec::new();
+    let mut selected_conversations = 0usize;
+    let mut conversation_details_truncated = 0usize;
+    let mut skipped_conversation_details_truncated = 0usize;
+    let mut rejection_details_truncated = 0usize;
     let mut accepted_total = 0usize;
     let mut assistant_total = 0usize;
     let mut user_total = 0usize;
@@ -324,20 +333,29 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             if params
                 .selection
                 .max_conversations
-                .is_some_and(|max| reports.len() >= max)
+                .is_some_and(|max| selected_conversations >= max)
             {
                 let parsed = parse_conversation(&conversation, &payload_path)?;
-                skipped_conversations.push(skipped_conversation_report(
-                    &parsed.report,
-                    "max-conversations limit reached".to_string(),
-                ));
+                push_report_detail(
+                    &mut skipped_conversations,
+                    skipped_conversation_report(
+                        &parsed.report,
+                        "max-conversations limit reached".to_string(),
+                    ),
+                    &mut skipped_conversation_details_truncated,
+                );
                 return Ok(());
             }
             let parsed = parse_conversation(&conversation, &payload_path)?;
             if let Some(reason) = filters.skip_reason(&parsed.report) {
-                skipped_conversations.push(skipped_conversation_report(&parsed.report, reason));
+                push_report_detail(
+                    &mut skipped_conversations,
+                    skipped_conversation_report(&parsed.report, reason),
+                    &mut skipped_conversation_details_truncated,
+                );
                 return Ok(());
             }
+            selected_conversations += 1;
             user_total += parsed.report.user_turns;
             assistant_total += parsed.report.assistant_turns;
             skipped_total += parsed.report.skipped_messages;
@@ -361,8 +379,16 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                             &payload_path,
                         )?;
                     }
-                    rejections.extend(parsed.rejections);
-                    reports.push(parsed.report);
+                    extend_report_details(
+                        &mut rejections,
+                        parsed.rejections,
+                        &mut rejection_details_truncated,
+                    );
+                    push_report_detail(
+                        &mut reports,
+                        parsed.report,
+                        &mut conversation_details_truncated,
+                    );
                     return Ok(());
                 }
                 Store::ensure_workspace_in_transaction(tx, profile.as_str(), &workspace)?;
@@ -459,8 +485,16 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                 }
             }
 
-            rejections.extend(parsed.rejections);
-            reports.push(parsed.report);
+            extend_report_details(
+                &mut rejections,
+                parsed.rejections,
+                &mut rejection_details_truncated,
+            );
+            push_report_detail(
+                &mut reports,
+                parsed.report,
+                &mut conversation_details_truncated,
+            );
             Ok(())
         })?;
         Ok(())
@@ -483,8 +517,8 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         source_path,
         payload_path: detected.payload_path,
         conversation_count: total_conversations,
-        selected_conversations: reports.len(),
-        filtered_out_conversations: total_conversations.saturating_sub(reports.len()),
+        selected_conversations,
+        filtered_out_conversations: total_conversations.saturating_sub(selected_conversations),
         eligible_conversations: accepted_total,
         user_turns: user_total,
         assistant_turns: assistant_total,
@@ -492,6 +526,9 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         rejected_messages: rejected_total,
         created,
         skipped_existing,
+        conversation_details_truncated,
+        skipped_conversation_details_truncated,
+        rejection_details_truncated,
         manifest_path: None,
         members,
         conversations: reports,
@@ -545,6 +582,20 @@ fn skipped_conversation_report(
         updated_at: report.updated_at.clone(),
         eligible: report.eligible,
         selection_reason,
+    }
+}
+
+fn push_report_detail<T>(details: &mut Vec<T>, detail: T, truncated: &mut usize) {
+    if details.len() < max_conversation_report_details() {
+        details.push(detail);
+    } else {
+        *truncated += 1;
+    }
+}
+
+fn extend_report_details<T>(details: &mut Vec<T>, source: Vec<T>, truncated: &mut usize) {
+    for detail in source {
+        push_report_detail(details, detail, truncated);
     }
 }
 
@@ -1157,6 +1208,17 @@ fn max_conversation_nesting() -> usize {
     MAX_CONVERSATION_NESTING
 }
 
+fn max_conversation_report_details() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_REPORT_DETAILS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_REPORT_DETAILS
+}
+
 fn validate_zip_member_path(name: &str) -> Result<()> {
     if name.contains('\\')
         || Path::new(name).is_absolute()
@@ -1180,7 +1242,7 @@ fn stream_conversations(
                     "failed to read conversations payload {name}: {err}"
                 ))
             })?;
-            stream_conversation_array(file, on_conversation, name)
+            stream_conversation_array(BoundedJsonReader::new(file), on_conversation, name)
         }
         PayloadMember::Zip { archive, name } => {
             let file = fs::File::open(archive).map_err(|err| {
@@ -1190,8 +1252,83 @@ fn stream_conversations(
             let entry = archive.by_name(name).map_err(|_| {
                 Error::invalid_request(format!("failed to read conversations member: {name}"))
             })?;
-            stream_conversation_array(entry, on_conversation, name)
+            stream_conversation_array(BoundedJsonReader::new(entry), on_conversation, name)
         }
+    }
+}
+
+struct BoundedJsonReader<R> {
+    reader: R,
+    max_value_bytes: usize,
+    max_nesting: usize,
+    nesting: usize,
+    in_string: bool,
+    escaped: bool,
+    string_bytes: usize,
+}
+
+impl<R> BoundedJsonReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            max_value_bytes: max_conversation_value_bytes(),
+            max_nesting: max_conversation_nesting(),
+            nesting: 0,
+            in_string: false,
+            escaped: false,
+            string_bytes: 0,
+        }
+    }
+
+    fn inspect(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for byte in bytes {
+            if self.in_string {
+                if *byte == b'"' && !self.escaped {
+                    self.in_string = false;
+                    self.string_bytes = 0;
+                    continue;
+                }
+                self.string_bytes = self.string_bytes.saturating_add(1);
+                if self.string_bytes > self.max_value_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ChatGPT export JSON value exceeds configured byte limit",
+                    ));
+                }
+                self.escaped = *byte == b'\\' && !self.escaped;
+                if *byte != b'\\' {
+                    self.escaped = false;
+                }
+                continue;
+            }
+            match *byte {
+                b'"' => {
+                    self.in_string = true;
+                    self.escaped = false;
+                    self.string_bytes = 0;
+                }
+                b'{' | b'[' => {
+                    self.nesting = self.nesting.saturating_add(1);
+                    if self.nesting > self.max_nesting {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ChatGPT export JSON nesting exceeds configured depth limit",
+                        ));
+                    }
+                }
+                b'}' | b']' => self.nesting = self.nesting.saturating_sub(1),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BoundedJsonReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.reader.read(buffer)?;
+        self.inspect(&buffer[..bytes_read])?;
+        Ok(bytes_read)
     }
 }
 
@@ -1321,4 +1458,62 @@ fn record_rejection_in_transaction(
         "chatgpt-export",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    static LIMIT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position == self.bytes.len() {
+                return Ok(0);
+            }
+            buffer[0] = self.bytes[self.position];
+            self.position += 1;
+            self.reads.set(self.reads.get() + 1);
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn bounded_reader_rejects_an_oversized_token_before_consuming_the_payload() {
+        let _guard = LIMIT_ENV_LOCK.lock().unwrap();
+        let old_limit = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES").ok();
+        std::env::set_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES", "4");
+        let payload = format!("[\"{}\"]", "x".repeat(32)).into_bytes();
+        let reads = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: payload.clone(),
+            position: 0,
+            reads: reads.clone(),
+        };
+
+        let result = stream_conversation_array(
+            BoundedJsonReader::new(reader),
+            |_| Ok(()),
+            "conversations.json",
+        );
+
+        if let Some(limit) = old_limit {
+            std::env::set_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES", limit);
+        } else {
+            std::env::remove_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES");
+        }
+        assert!(result.is_err());
+        assert!(reads.get() < payload.len());
+    }
 }

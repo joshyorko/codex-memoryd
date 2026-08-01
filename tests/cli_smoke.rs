@@ -720,6 +720,30 @@ fn cli_chatgpt_export_preview_discovers_numbered_shards_in_numeric_order_without
 }
 
 #[test]
+fn cli_chatgpt_export_bounds_conversation_report_details_without_changing_counts() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_sharded_export_dir(&dir, "chatgpt-report-limit");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_MAX_CONVERSATION_REPORT_DETAILS", "1")
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["conversation_count"], 2);
+    assert_eq!(report["selected_conversations"], 2);
+    assert_eq!(report["conversations"].as_array().unwrap().len(), 1);
+    assert_eq!(report["conversation_details_truncated"], 1);
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
 fn cli_chatgpt_export_zip_shards_use_numeric_order_and_reject_unsafe_sets() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
