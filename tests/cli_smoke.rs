@@ -788,6 +788,88 @@ fn cli_chatgpt_export_filters_selection_and_reports_screened_counts() {
 }
 
 #[test]
+fn cli_chatgpt_export_preview_explains_filtered_out_conversations() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-explanations");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--preview",
+            "--title-contains",
+            "codex",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["conversations"][0]["conversation_id"], "conv-alpha");
+    assert_eq!(
+        report["conversations"][0]["selection_reason"],
+        "matched selection filters"
+    );
+    assert_eq!(
+        report["skipped_conversations"][0]["conversation_id"],
+        "conv-secret"
+    );
+    assert_eq!(
+        report["skipped_conversations"][0]["selection_reason"],
+        "title does not contain \"codex\""
+    );
+}
+
+#[test]
+fn cli_chatgpt_export_apply_large_archive_requires_filter_or_all() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("large-chatgpt-export");
+    fs::create_dir_all(&export_dir).unwrap();
+    let conversations = (0..101)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("conv-{index}"),
+                "title": format!("Conversation {index}"),
+                "mapping": {},
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        export_dir.join("conversations.json"),
+        serde_json::to_vec(&conversations).unwrap(),
+    )
+    .unwrap();
+
+    let blocked = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("pass a selection filter or --all"));
+
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply", "--all"])
+        .arg(&export_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"selected_conversations\": 101"));
+}
+
+#[test]
 fn cli_chatgpt_export_filters_support_multiple_ids_and_combined_zero_match() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
@@ -884,6 +966,14 @@ fn cli_chatgpt_export_filters_by_date_and_max_conversations() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["selected_conversations"], 1);
     assert_eq!(report["conversations"][0]["conversation_id"], "conv-alpha");
+    assert_eq!(
+        report["skipped_conversations"][0]["conversation_id"],
+        "conv-secret"
+    );
+    assert_eq!(
+        report["skipped_conversations"][0]["selection_reason"],
+        "max-conversations limit reached"
+    );
 }
 
 #[test]
@@ -917,6 +1007,23 @@ fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
         serde_json::json!(["conv-alpha"])
     );
     assert_eq!(manifest["created"], 2);
+
+    let paths = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["paths", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(paths.status.success());
+    let inventory: Value = serde_json::from_slice(&paths.stdout).unwrap();
+    assert_eq!(
+        inventory["entries"]["last_chatgpt_import_manifest"]["path"],
+        manifest_path
+    );
+    assert_eq!(
+        inventory["entries"]["last_chatgpt_import_manifest"]["exists"],
+        true
+    );
 }
 
 #[test]
