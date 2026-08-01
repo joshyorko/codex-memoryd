@@ -800,6 +800,44 @@ fn cli_chatgpt_export_rejects_declared_member_size_above_test_limit_before_write
 }
 
 #[test]
+fn cli_chatgpt_export_rejects_zip_declared_total_and_ratio_limits_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let zip_path = dir.path().join("chatgpt-limits.zip");
+    let file = fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::SimpleFileOptions =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("conversations.json", options).unwrap();
+    use std::io::Write as _;
+    zip.write_all(&vec![b'a'; 4096]).unwrap();
+    zip.finish().unwrap();
+
+    let total = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_MAX_CONVERSATION_TOTAL_BYTES", "1")
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&zip_path)
+        .output()
+        .unwrap();
+    assert!(!total.status.success());
+    assert!(String::from_utf8_lossy(&total.stderr).contains("archive declared total"));
+
+    let ratio = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_MAX_CONVERSATION_COMPRESSION_RATIO", "1")
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&zip_path)
+        .output()
+        .unwrap();
+    assert!(!ratio.status.success());
+    assert!(String::from_utf8_lossy(&ratio.stderr).contains("compression ratio"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
 fn cli_chatgpt_export_rejects_incomplete_and_mixed_directory_shards_before_writes() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

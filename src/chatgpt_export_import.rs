@@ -30,6 +30,8 @@ use crate::store::Store;
 
 const MAX_CONVERSATIONS_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONVERSATION_MEMBERS: usize = 1_024;
+const MAX_CONVERSATION_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CONVERSATION_COMPRESSION_RATIO: u64 = 100;
 const MAX_MESSAGES: usize = 1_000_000;
 const LARGE_ARCHIVE_CONVERSATIONS: usize = 100;
 
@@ -862,6 +864,7 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
         )
     })?;
     let mut payloads = Vec::new();
+    let mut declared_total_bytes = 0u64;
     for idx in 0..archive.len() {
         let entry = archive
             .by_index(idx)
@@ -872,6 +875,31 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
         if entry.size() > max_member_bytes {
             return Err(Error::invalid_request(format!(
                 "archive member exceeds {max_member_bytes} bytes: {name}"
+            )));
+        }
+        declared_total_bytes = declared_total_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| {
+                Error::invalid_request("ChatGPT archive declared total size overflow")
+            })?;
+        let max_total_bytes = max_conversation_total_bytes();
+        if declared_total_bytes > max_total_bytes {
+            return Err(Error::invalid_request(format!(
+                "ChatGPT archive declared total exceeds {max_total_bytes} bytes"
+            )));
+        }
+        let compressed_size = entry.compressed_size();
+        let ratio = if entry.size() == 0 {
+            0
+        } else if compressed_size == 0 {
+            u64::MAX
+        } else {
+            entry.size().div_ceil(compressed_size)
+        };
+        let max_ratio = max_conversation_compression_ratio();
+        if ratio > max_ratio {
+            return Err(Error::invalid_request(format!(
+                "ChatGPT archive member compression ratio exceeds {max_ratio}: {name}"
             )));
         }
         if Path::new(&name)
@@ -1040,6 +1068,28 @@ fn max_conversation_member_bytes() -> u64 {
         return limit;
     }
     MAX_CONVERSATIONS_MEMBER_BYTES
+}
+
+fn max_conversation_total_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_TOTAL_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_TOTAL_BYTES
+}
+
+fn max_conversation_compression_ratio() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_COMPRESSION_RATIO")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_COMPRESSION_RATIO
 }
 
 fn validate_zip_member_path(name: &str) -> Result<()> {
