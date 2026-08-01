@@ -1,8 +1,16 @@
+use std::collections::HashSet;
+use std::fmt;
 use std::fs;
+use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use serde::de::DeserializeSeed;
+use serde::de::Error as _;
+use serde::de::SeqAccess;
+use serde::de::Visitor;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -20,8 +28,16 @@ use crate::policy::PolicyDecision;
 use crate::service::Service;
 use crate::store::ledger_safe_summary;
 use crate::store::EvidenceLedgerEntry;
+use crate::store::Store;
 
-const MAX_CONVERSATIONS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONVERSATIONS_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_CONVERSATION_MEMBERS: usize = 1_024;
+const MAX_CONVERSATION_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CONVERSATION_COMPRESSION_RATIO: u64 = 100;
+const MAX_CONVERSATION_VALUE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONVERSATION_NESTING: usize = 64;
+const MAX_CONVERSATION_REPORT_DETAILS: usize = 1_000;
+const MAX_MESSAGES: usize = 1_000_000;
 const LARGE_ARCHIVE_CONVERSATIONS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +117,12 @@ pub struct ChatgptExportRejection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ChatgptExportMemberReport {
+    pub name: String,
+    pub conversation_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatgptExportResponse {
     pub mode: String,
     pub source_path: String,
@@ -115,8 +137,16 @@ pub struct ChatgptExportResponse {
     pub rejected_messages: usize,
     pub created: usize,
     pub skipped_existing: usize,
+    pub conversation_details_truncated: usize,
+    pub skipped_conversation_details_truncated: usize,
+    pub rejection_details_truncated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+    pub members: Vec<ChatgptExportMemberReport>,
     pub conversations: Vec<ChatgptExportConversationReport>,
     pub skipped_conversations: Vec<ChatgptExportSkippedConversationReport>,
     pub rejections: Vec<ChatgptExportRejection>,
@@ -173,6 +203,12 @@ struct ParsedConversation {
 }
 
 #[derive(Debug)]
+struct ReportDetail {
+    member_index: usize,
+    report: ChatgptExportConversationReport,
+}
+
+#[derive(Debug)]
 struct AcceptedMessage {
     message_id: String,
     actor: String,
@@ -186,14 +222,65 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let workspace = service.resolve_workspace(&params.workspace);
     let source_path = params.export_path.display().to_string();
     let detected = detect_payload(params.export_path)?;
-    let conversations: Vec<ExportConversation> =
-        serde_json::from_slice(&detected.bytes).map_err(|_| {
-            Error::invalid_request(
-                "unsupported ChatGPT export schema: invalid conversations payload",
-            )
+    let mut total_conversations = 0usize;
+    let mut total_messages = 0usize;
+    let mut conversation_ids = HashSet::new();
+    let mut message_ids = HashSet::new();
+    let mut members = Vec::new();
+    for member in &detected.payloads {
+        let mut member_conversation_count = 0usize;
+        stream_conversations(member, |conversation| {
+            member_conversation_count += 1;
+            total_conversations = total_conversations.checked_add(1).ok_or_else(|| {
+                Error::invalid_request("ChatGPT export has too many conversations")
+            })?;
+            if total_conversations > 100_000 {
+                return Err(Error::invalid_request(
+                    "ChatGPT export exceeds the 100000 conversation limit",
+                ));
+            }
+            if !conversation_ids.insert(conversation.id.clone()) {
+                return Err(Error::invalid_request(
+                    "invalid ChatGPT export: duplicate conversation identity",
+                ));
+            }
+            let mapping = conversation.mapping.as_object().ok_or_else(|| {
+                Error::invalid_request(
+                    "unsupported ChatGPT export schema: conversation mapping must be an object",
+                )
+            })?;
+            for (fallback_message_id, value) in mapping {
+                total_messages = total_messages.checked_add(1).ok_or_else(|| {
+                    Error::invalid_request("ChatGPT export has too many messages")
+                })?;
+                if total_messages > MAX_MESSAGES {
+                    return Err(Error::invalid_request(
+                        "ChatGPT export exceeds the 1000000 message limit",
+                    ));
+                }
+                let message_id = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fallback_message_id);
+                if !message_ids.insert((conversation.id.clone(), message_id.to_string())) {
+                    return Err(Error::invalid_request(
+                        "invalid ChatGPT export: duplicate message identity",
+                    ));
+                }
+            }
+            Ok(())
         })?;
+        members.push(ChatgptExportMemberReport {
+            name: member.name().to_string(),
+            conversation_count: member_conversation_count,
+        });
+    }
 
-    let mut reports = Vec::new();
+    let mut reports = Vec::<ReportDetail>::new();
+    let mut selected_conversations = 0usize;
+    let mut conversation_details_truncated = 0usize;
+    let mut skipped_conversation_details_truncated = 0usize;
+    let mut rejection_details_truncated = 0usize;
     let mut accepted_total = 0usize;
     let mut assistant_total = 0usize;
     let mut user_total = 0usize;
@@ -203,8 +290,8 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut skipped_existing = 0usize;
     let mut rejections = Vec::new();
     let mut skipped_conversations = Vec::new();
+    let mut selected_conversation_ids = Vec::new();
 
-    let total_conversations = conversations.len();
     if params.mode == ChatgptExportMode::Apply
         && total_conversations > LARGE_ARCHIVE_CONVERSATIONS
         && !params.selection.all
@@ -249,148 +336,255 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         eligible_only: params.selection.eligible_only,
     };
 
-    for conversation in conversations {
-        let parsed = parse_conversation(&conversation, &detected.payload_path)?;
-        if let Some(selection_reason) = filters.skip_reason(&parsed.report) {
-            skipped_conversations.push(skipped_conversation_report(
-                &parsed.report,
-                selection_reason,
-            ));
-            continue;
-        }
-        if params
-            .selection
-            .max_conversations
-            .is_some_and(|max| reports.len() >= max)
-        {
-            skipped_conversations.push(skipped_conversation_report(
-                &parsed.report,
-                "max-conversations limit reached".to_string(),
-            ));
-            continue;
-        }
-        user_total += parsed.report.user_turns;
-        assistant_total += parsed.report.assistant_turns;
-        skipped_total += parsed.report.skipped_messages;
-        rejected_total += parsed.report.rejected_messages;
-        if parsed.report.eligible {
-            accepted_total += 1;
-        }
+    let manifest_path = import_manifest_path(&service.store.path_display());
+    let pending_manifest_path = pending_import_manifest_path(&manifest_path);
+    let mut pending_manifest_written = false;
+    let mut staged_writes = 0usize;
+    let mut process_member = |member: Option<&PayloadMember>,
+                              member_index: usize,
+                              transaction: Option<&rusqlite::Transaction<'_>>|
+     -> Result<()> {
+        let Some(member) = member else {
+            let manifest = chatgpt_import_manifest(
+                &detected.payload_path,
+                &selected_conversation_ids,
+                created,
+                skipped_existing,
+                rejected_total,
+            );
+            let encoded = serde_json::to_vec_pretty(&manifest).map_err(|err| {
+                Error::internal(format!("serialize ChatGPT import manifest: {err}"))
+            })?;
+            pending_manifest_written = true;
+            write_pending_manifest(&pending_manifest_path, &encoded)?;
+            inject_chatgpt_after_pending_manifest_failure()?;
+            return Ok(());
+        };
+        let payload_path = member.name().to_string();
+        stream_conversations(member, |conversation| {
+            if params
+                .selection
+                .max_conversations
+                .is_some_and(|max| selected_conversations >= max)
+            {
+                let parsed = parse_conversation(&conversation, &payload_path)?;
+                push_report_detail(
+                    &mut skipped_conversations,
+                    skipped_conversation_report(
+                        &parsed.report,
+                        "max-conversations limit reached".to_string(),
+                    ),
+                    &mut skipped_conversation_details_truncated,
+                );
+                return Ok(());
+            }
+            let parsed = parse_conversation(&conversation, &payload_path)?;
+            if let Some(reason) = filters.skip_reason(&parsed.report) {
+                push_report_detail(
+                    &mut skipped_conversations,
+                    skipped_conversation_report(&parsed.report, reason),
+                    &mut skipped_conversation_details_truncated,
+                );
+                return Ok(());
+            }
+            selected_conversations += 1;
+            user_total += parsed.report.user_turns;
+            assistant_total += parsed.report.assistant_turns;
+            skipped_total += parsed.report.skipped_messages;
+            rejected_total += parsed.report.rejected_messages;
+            if parsed.report.eligible {
+                accepted_total += 1;
+            }
 
-        if params.mode == ChatgptExportMode::Apply {
-            if !parsed.has_eligible_messages {
+            if params.mode == ChatgptExportMode::Apply {
+                let tx = transaction.expect("apply runs inside an import transaction");
+                if !parsed.has_eligible_messages {
+                    for rejection in &parsed.rejections {
+                        record_rejection_in_transaction(
+                            tx,
+                            profile.as_str(),
+                            &workspace,
+                            &conversation.id,
+                            &rejection.message_id,
+                            &rejection.code,
+                            &rejection.reason,
+                            &payload_path,
+                        )?;
+                    }
+                    selected_conversation_ids.push(parsed.report.conversation_id.clone());
+                    extend_report_details(
+                        &mut rejections,
+                        parsed.rejections,
+                        &mut rejection_details_truncated,
+                    );
+                    push_report_detail(
+                        &mut reports,
+                        ReportDetail {
+                            member_index,
+                            report: parsed.report,
+                        },
+                        &mut conversation_details_truncated,
+                    );
+                    return Ok(());
+                }
+                Store::ensure_workspace_in_transaction(tx, profile.as_str(), &workspace)?;
+                inject_chatgpt_apply_failure(&mut staged_writes)?;
+                let session_id = format!("chatgpt:{}", conversation.id);
+                Store::ensure_session_in_transaction(
+                    tx,
+                    &session_id,
+                    profile.as_str(),
+                    &workspace,
+                    "chatgpt-export",
+                )?;
+                inject_chatgpt_apply_failure(&mut staged_writes)?;
+
+                for message in &parsed.accepted {
+                    let source_ref = format!("chatgpt:{}:{}", conversation.id, message.message_id);
+                    let source_hash = ids::sha256_hex(
+                        format!("chatgpt-export:{session_id}:{}", message.message_id).as_bytes(),
+                    );
+                    let (source, source_created) = Store::upsert_source_in_transaction(
+                        tx,
+                        profile.as_str(),
+                        &workspace,
+                        "visible_turn",
+                        Some(&source_ref),
+                        &source_hash,
+                        &message.metadata,
+                    )?;
+                    if !source_created {
+                        skipped_existing += 1;
+                        continue;
+                    }
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
+
+                    let turn_id = format!(
+                        "turn_chatgpt_{}",
+                        ids::sha256_hex(format!("{session_id}:{}", message.message_id).as_bytes())
+                            .chars()
+                            .take(24)
+                            .collect::<String>()
+                    );
+                    Store::insert_visible_turn_in_transaction(
+                        tx,
+                        &VisibleTurn {
+                            id: turn_id.clone(),
+                            session_id: session_id.clone(),
+                            actor: message.actor.clone(),
+                            content: message.content.clone(),
+                            created_at: message.created_at.clone(),
+                            metadata: message.metadata.clone(),
+                        },
+                    )?;
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
+                    Store::record_evidence_ledger_in_transaction(
+                        tx,
+                        &EvidenceLedgerEntry {
+                            profile_id: profile.as_str().to_string(),
+                            workspace_id: workspace.clone(),
+                            repo_id: None,
+                            subject_key: None,
+                            source_kind: "visible_turn".to_string(),
+                            source_id: Some(source.id),
+                            source_path: Some(source_ref),
+                            source_hash,
+                            safe_summary: ledger_safe_summary(&message.content),
+                            policy_state: "accepted".to_string(),
+                            metadata: json!({
+                                "actor": message.actor,
+                                "conversation_id": conversation.id,
+                                "message_id": message.message_id,
+                                "session_id": session_id,
+                                "source": "chatgpt-export",
+                                "source_member": payload_path,
+                            }),
+                        },
+                    )?;
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
+                    created += 1;
+                }
+
                 for rejection in &parsed.rejections {
-                    record_rejection(
-                        service,
+                    record_rejection_in_transaction(
+                        tx,
                         profile.as_str(),
                         &workspace,
                         &conversation.id,
                         &rejection.message_id,
                         &rejection.code,
                         &rejection.reason,
-                        &detected.payload_path,
+                        &payload_path,
                     )?;
                 }
-                rejections.extend(parsed.rejections);
-                reports.push(parsed.report);
-                continue;
-            }
-            service
-                .store
-                .ensure_workspace(profile.as_str(), &workspace)?;
-            let session_id = format!("chatgpt:{}", conversation.id);
-            service.store.ensure_session(
-                &session_id,
-                profile.as_str(),
-                &workspace,
-                None,
-                None,
-                "chatgpt-export",
-            )?;
-
-            for message in &parsed.accepted {
-                let source_ref = format!(
-                    "{}:{}:{}",
-                    detected.payload_path, conversation.id, message.message_id
-                );
-                let source_hash = ids::sha256_hex(
-                    format!("chatgpt-export:{session_id}:{}", message.message_id).as_bytes(),
-                );
-                let (source, source_created) = service.store.upsert_source(
-                    profile.as_str(),
-                    &workspace,
-                    "visible_turn",
-                    Some(&source_ref),
-                    &source_hash,
-                    &message.metadata,
-                )?;
-                if !source_created {
-                    skipped_existing += 1;
-                    continue;
-                }
-
-                let turn_id = format!(
-                    "turn_chatgpt_{}",
-                    ids::sha256_hex(format!("{session_id}:{}", message.message_id).as_bytes())
-                        .chars()
-                        .take(24)
-                        .collect::<String>()
-                );
-                service.store.insert_visible_turn(&VisibleTurn {
-                    id: turn_id.clone(),
-                    session_id: session_id.clone(),
-                    actor: message.actor.clone(),
-                    content: message.content.clone(),
-                    created_at: message.created_at.clone(),
-                    metadata: message.metadata.clone(),
-                })?;
-                service.store.record_evidence_ledger(&EvidenceLedgerEntry {
-                    profile_id: profile.as_str().to_string(),
-                    workspace_id: workspace.clone(),
-                    repo_id: None,
-                    subject_key: None,
-                    source_kind: "visible_turn".to_string(),
-                    source_id: Some(source.id),
-                    source_path: Some(source_ref),
-                    source_hash,
-                    safe_summary: ledger_safe_summary(&message.content),
-                    policy_state: "accepted".to_string(),
-                    metadata: json!({
-                        "actor": message.actor,
-                        "conversation_id": conversation.id,
-                        "message_id": message.message_id,
-                        "session_id": session_id,
-                        "source": "chatgpt-export",
-                    }),
-                })?;
-                created += 1;
             }
 
-            for rejection in &parsed.rejections {
-                record_rejection(
-                    service,
-                    profile.as_str(),
-                    &workspace,
-                    &conversation.id,
-                    &rejection.message_id,
-                    &rejection.code,
-                    &rejection.reason,
-                    &detected.payload_path,
-                )?;
+            selected_conversation_ids.push(parsed.report.conversation_id.clone());
+            extend_report_details(
+                &mut rejections,
+                parsed.rejections,
+                &mut rejection_details_truncated,
+            );
+            push_report_detail(
+                &mut reports,
+                ReportDetail {
+                    member_index,
+                    report: parsed.report,
+                },
+                &mut conversation_details_truncated,
+            );
+            Ok(())
+        })?;
+        Ok(())
+    };
+    if params.mode == ChatgptExportMode::Apply {
+        let apply_result = service.store.transaction(|tx| {
+            for (member_index, member) in detected.payloads.iter().enumerate() {
+                process_member(Some(member), member_index, Some(tx))?;
             }
+            process_member(None, usize::MAX, Some(tx))?;
+            Ok(())
+        });
+        if let Err(err) = apply_result {
+            if pending_manifest_written {
+                let _ = fs::remove_file(&pending_manifest_path);
+            }
+            return Err(err);
         }
-
-        rejections.extend(parsed.rejections);
-        reports.push(parsed.report);
+    } else {
+        for (member_index, member) in detected.payloads.iter().enumerate() {
+            process_member(Some(member), member_index, None)?;
+        }
     }
+
+    reports.sort_by(|left, right| {
+        left.member_index.cmp(&right.member_index).then_with(|| {
+            left.report
+                .updated_at
+                .as_deref()
+                .or(left.report.created_at.as_deref())
+                .cmp(
+                    &right
+                        .report
+                        .updated_at
+                        .as_deref()
+                        .or(right.report.created_at.as_deref()),
+                )
+                .then_with(|| {
+                    left.report
+                        .conversation_id
+                        .cmp(&right.report.conversation_id)
+                })
+        })
+    });
 
     let mut response = ChatgptExportResponse {
         mode: params.mode.as_str().to_string(),
         source_path,
         payload_path: detected.payload_path,
         conversation_count: total_conversations,
-        selected_conversations: reports.len(),
-        filtered_out_conversations: total_conversations.saturating_sub(reports.len()),
+        selected_conversations,
+        filtered_out_conversations: total_conversations.saturating_sub(selected_conversations),
         eligible_conversations: accepted_total,
         user_turns: user_total,
         assistant_turns: assistant_total,
@@ -398,29 +592,30 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         rejected_messages: rejected_total,
         created,
         skipped_existing,
+        conversation_details_truncated,
+        skipped_conversation_details_truncated,
+        rejection_details_truncated,
         manifest_path: None,
-        conversations: reports,
+        manifest_status: None,
+        manifest_warning: None,
+        members,
+        conversations: reports.into_iter().map(|detail| detail.report).collect(),
         skipped_conversations,
         rejections,
     };
     if params.mode == ChatgptExportMode::Apply {
-        let manifest_path = import_manifest_path(&service.store.path_display());
-        let manifest = json!({
-            "manifest_version": 1,
-            "source": "chatgpt-export",
-            "created_at": ids::now_rfc3339(),
-            "payload_path": manifest_payload_path(&response.payload_path),
-            "selected_source_ids": response.conversations.iter().map(|conversation| conversation.conversation_id.as_str()).collect::<Vec<_>>(),
-            "selected_conversations": response.selected_conversations,
-            "created": response.created,
-            "skipped_existing": response.skipped_existing,
-            "rejected_messages": response.rejected_messages,
-        });
-        let encoded = serde_json::to_vec_pretty(&manifest)
-            .map_err(|err| Error::internal(format!("serialize ChatGPT import manifest: {err}")))?;
-        fs::write(&manifest_path, encoded)
-            .map_err(|err| Error::storage(format!("write ChatGPT import manifest: {err}")))?;
-        response.manifest_path = Some(manifest_path.display().to_string());
+        match finalize_pending_manifest(&pending_manifest_path, &manifest_path) {
+            Ok(()) => {
+                response.manifest_path = Some(manifest_path.display().to_string());
+                response.manifest_status = Some("finalized".to_string());
+            }
+            Err(_) => {
+                response.manifest_status = Some("pending".to_string());
+                response.manifest_warning = Some(
+                    "ChatGPT import data is durable but manifest publication is pending; rerun the same apply command to finalize it.".to_string(),
+                );
+            }
+        }
     }
     Ok(response)
 }
@@ -439,20 +634,6 @@ impl ChatgptExportSelection {
     }
 }
 
-fn import_manifest_path(store_path: &str) -> PathBuf {
-    let mut path = PathBuf::from(store_path);
-    path.set_extension("chatgpt-import-manifest.json");
-    path
-}
-
-fn manifest_payload_path(payload_path: &str) -> String {
-    Path::new(payload_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("conversations.json")
-        .to_string()
-}
-
 fn skipped_conversation_report(
     report: &ChatgptExportConversationReport,
     selection_reason: String,
@@ -465,6 +646,75 @@ fn skipped_conversation_report(
         eligible: report.eligible,
         selection_reason,
     }
+}
+
+fn push_report_detail<T>(details: &mut Vec<T>, detail: T, truncated: &mut usize) {
+    if details.len() < max_conversation_report_details() {
+        details.push(detail);
+    } else {
+        *truncated += 1;
+    }
+}
+
+fn extend_report_details<T>(details: &mut Vec<T>, source: Vec<T>, truncated: &mut usize) {
+    for detail in source {
+        push_report_detail(details, detail, truncated);
+    }
+}
+
+fn import_manifest_path(store_path: &str) -> PathBuf {
+    let mut path = PathBuf::from(store_path);
+    path.set_extension("chatgpt-import-manifest.json");
+    path
+}
+
+fn pending_import_manifest_path(manifest_path: &Path) -> PathBuf {
+    let mut path = manifest_path.to_path_buf();
+    path.set_extension("pending.json");
+    path
+}
+
+fn chatgpt_import_manifest(
+    payload_path: &str,
+    selected_conversation_ids: &[String],
+    created: usize,
+    skipped_existing: usize,
+    rejected_messages: usize,
+) -> Value {
+    json!({
+        "manifest_version": 1,
+        "source": "chatgpt-export",
+        "created_at": ids::now_rfc3339(),
+        "payload_path": manifest_payload_path(payload_path),
+        "selected_source_ids": selected_conversation_ids,
+        "selected_conversations": selected_conversation_ids.len(),
+        "created": created,
+        "skipped_existing": skipped_existing,
+        "rejected_messages": rejected_messages,
+    })
+}
+
+fn write_pending_manifest(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::File::create(path)
+        .map_err(|err| Error::storage(format!("write pending ChatGPT import manifest: {err}")))?;
+    file.write_all(bytes)
+        .map_err(|err| Error::storage(format!("write pending ChatGPT import manifest: {err}")))?;
+    file.sync_all()
+        .map_err(|err| Error::storage(format!("sync pending ChatGPT import manifest: {err}")))
+}
+
+fn finalize_pending_manifest(pending_path: &Path, manifest_path: &Path) -> Result<()> {
+    inject_chatgpt_manifest_finalization_failure()?;
+    fs::rename(pending_path, manifest_path)
+        .map_err(|err| Error::storage(format!("finalize ChatGPT import manifest: {err}")))
+}
+
+fn manifest_payload_path(payload_path: &str) -> String {
+    Path::new(payload_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("conversations.json")
+        .to_string()
 }
 
 impl ChatgptExportFilters {
@@ -516,6 +766,11 @@ fn parse_conversation(
     conversation: &ExportConversation,
     payload_path: &str,
 ) -> Result<ParsedConversation> {
+    validate_string_value(&conversation.id)?;
+    if let Some(title) = &conversation.title {
+        validate_string_value(title)?;
+    }
+    validate_json_value(&conversation.mapping, 0)?;
     let mapping = conversation.mapping.as_object().ok_or_else(|| {
         Error::invalid_request(
             "unsupported ChatGPT export schema: conversation mapping must be an object",
@@ -636,6 +891,42 @@ fn parse_conversation(
     })
 }
 
+fn validate_json_value(value: &Value, depth: usize) -> Result<()> {
+    if depth > max_conversation_nesting() {
+        return Err(Error::invalid_request(format!(
+            "ChatGPT export JSON nesting exceeds {} levels",
+            max_conversation_nesting()
+        )));
+    }
+    match value {
+        Value::String(value) => validate_string_value(value),
+        Value::Array(values) => {
+            for value in values {
+                validate_json_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                validate_string_value(key)?;
+                validate_json_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn validate_string_value(value: &str) -> Result<()> {
+    let max_value_bytes = max_conversation_value_bytes();
+    if value.len() > max_value_bytes {
+        return Err(Error::invalid_request(format!(
+            "ChatGPT export JSON value exceeds {max_value_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn extract_text(message: &ExportMessage) -> Option<String> {
     let parts = message.content.as_ref()?.parts.as_ref()?;
     let text = parts
@@ -701,23 +992,65 @@ fn conversation_title(title: &Option<String>) -> String {
 
 struct DetectedPayload {
     payload_path: String,
-    bytes: Vec<u8>,
+    payloads: Vec<PayloadMember>,
+}
+
+enum PayloadMember {
+    Directory { path: PathBuf, name: String },
+    Zip { archive: PathBuf, name: String },
+}
+
+impl PayloadMember {
+    fn name(&self) -> &str {
+        match self {
+            Self::Directory { name, .. } | Self::Zip { name, .. } => name,
+        }
+    }
 }
 
 fn detect_payload(path: &Path) -> Result<DetectedPayload> {
     if path.is_dir() {
-        let payload = find_conversations_file(path)?.ok_or_else(|| {
-            Error::invalid_request(
+        let payloads = find_conversations_files(path)?;
+        if payloads.is_empty() {
+            return Err(Error::invalid_request(
                 "unsupported ChatGPT export schema: conversations payload not found",
-            )
-        })?;
-        return Ok(DetectedPayload {
-            payload_path: payload.display().to_string(),
-            bytes: fs::read(&payload)
-                .map_err(|err| {
-                    Error::invalid_request(format!("failed to read conversations payload: {err}"))
+            ));
+        }
+        let mut payloads = payloads
+            .into_iter()
+            .map(|payload| {
+                let name = payload
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("conversations.json")
+                    .to_string();
+                let size = fs::metadata(&payload)
+                    .map_err(|err| {
+                        Error::invalid_request(format!(
+                            "failed to inspect conversations payload: {err}"
+                        ))
+                    })?
+                    .len();
+                let max_member_bytes = max_conversation_member_bytes();
+                if size > max_member_bytes {
+                    return Err(Error::invalid_request(format!(
+                        "conversations member exceeds {max_member_bytes} bytes: {name}"
+                    )));
+                }
+                Ok(PayloadMember::Directory {
+                    path: payload,
+                    name,
                 })
-                .and_then(|bytes| enforce_payload_size(bytes, &payload.display().to_string()))?,
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_payload_names(&mut payloads)?;
+        let payload_path = payloads
+            .first()
+            .map(|payload| payload.name().to_string())
+            .expect("non-empty conversations payloads");
+        return Ok(DetectedPayload {
+            payload_path,
+            payloads,
         });
     }
 
@@ -728,30 +1061,77 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
             "unsupported ChatGPT export schema: expected a zip archive or extracted directory",
         )
     })?;
+    let mut payloads = Vec::new();
+    let mut declared_total_bytes = 0u64;
     for idx in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(idx)
             .map_err(|_| Error::invalid_request("failed to read zip entry from ChatGPT export"))?;
         let name = entry.name().to_string();
+        validate_zip_member_path(&name)?;
+        let max_member_bytes = max_conversation_member_bytes();
+        if entry.size() > max_member_bytes {
+            return Err(Error::invalid_request(format!(
+                "archive member exceeds {max_member_bytes} bytes: {name}"
+            )));
+        }
+        declared_total_bytes = declared_total_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| {
+                Error::invalid_request("ChatGPT archive declared total size overflow")
+            })?;
+        let max_total_bytes = max_conversation_total_bytes();
+        if declared_total_bytes > max_total_bytes {
+            return Err(Error::invalid_request(format!(
+                "ChatGPT archive declared total exceeds {max_total_bytes} bytes"
+            )));
+        }
+        let compressed_size = entry.compressed_size();
+        let ratio = if entry.size() == 0 {
+            0
+        } else if compressed_size == 0 {
+            u64::MAX
+        } else {
+            entry.size().div_ceil(compressed_size)
+        };
+        let max_ratio = max_conversation_compression_ratio();
+        if ratio > max_ratio {
+            return Err(Error::invalid_request(format!(
+                "ChatGPT archive member compression ratio exceeds {max_ratio}: {name}"
+            )));
+        }
         if Path::new(&name)
             .file_name()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value == "conversations.json")
+            .is_some_and(|value| conversation_member_name(value).is_some())
         {
-            let bytes = read_zip_entry_capped(&mut entry, &name)?;
-            return Ok(DetectedPayload {
-                payload_path: name,
-                bytes,
+            payloads.push(PayloadMember::Zip {
+                archive: path.to_path_buf(),
+                name,
             });
         }
     }
-    Err(Error::invalid_request(
-        "unsupported ChatGPT export schema: conversations payload not found",
-    ))
+    validate_payload_names(&mut payloads)?;
+    let payload_path = payloads
+        .first()
+        .map(|member| member.name().to_string())
+        .ok_or_else(|| {
+            Error::invalid_request(
+                "unsupported ChatGPT export schema: conversations payload not found",
+            )
+        })?;
+    Ok(DetectedPayload {
+        payload_path,
+        payloads,
+    })
 }
 
-fn find_conversations_file(root: &Path) -> Result<Option<PathBuf>> {
-    let mut stack = vec![root.to_path_buf()];
+fn find_conversations_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let root = root.canonicalize().map_err(|err| {
+        Error::invalid_request(format!("failed to resolve export directory: {err}"))
+    })?;
+    let mut stack = vec![root];
+    let mut payloads = Vec::new();
     while let Some(path) = stack.pop() {
         for entry in fs::read_dir(&path).map_err(|err| {
             Error::invalid_request(format!("failed to read export directory: {err}"))
@@ -760,6 +1140,15 @@ fn find_conversations_file(root: &Path) -> Result<Option<PathBuf>> {
                 Error::invalid_request(format!("failed to read export directory entry: {err}"))
             })?;
             let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|err| {
+                Error::invalid_request(format!("failed to inspect export directory entry: {err}"))
+            })?;
+            if file_type.is_symlink() {
+                return Err(Error::invalid_request(format!(
+                    "unsafe symlink in ChatGPT export directory: {}",
+                    entry.file_name().to_string_lossy()
+                )));
+            }
             if entry_path.is_dir() {
                 stack.push(entry_path);
                 continue;
@@ -767,48 +1156,396 @@ fn find_conversations_file(root: &Path) -> Result<Option<PathBuf>> {
             if entry_path
                 .file_name()
                 .and_then(|value| value.to_str())
-                .is_some_and(|value| value == "conversations.json")
+                .is_some_and(|value| conversation_member_name(value).is_some())
             {
-                return Ok(Some(entry_path));
+                payloads.push(entry_path);
             }
         }
     }
-    Ok(None)
+    payloads.sort_by(|left, right| {
+        conversation_member_name(
+            left.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        )
+        .cmp(&conversation_member_name(
+            right
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        ))
+    });
+    Ok(payloads)
 }
 
-fn enforce_payload_size(bytes: Vec<u8>, payload_path: &str) -> Result<Vec<u8>> {
-    if bytes.len() > MAX_CONVERSATIONS_PAYLOAD_BYTES {
+fn conversation_member_name(name: &str) -> Option<Option<u32>> {
+    if name == "conversations.json" {
+        return Some(None);
+    }
+    let number = name.strip_prefix("conversations-")?.strip_suffix(".json")?;
+    (number.len() == 3 && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| Some(number.parse().expect("three digit shard number")))
+}
+
+fn validate_payload_names(payloads: &mut Vec<PayloadMember>) -> Result<()> {
+    let max_members = max_conversation_members();
+    if payloads.len() > max_members {
         return Err(Error::invalid_request(format!(
-            "conversations payload exceeds {} bytes: {payload_path}",
-            MAX_CONVERSATIONS_PAYLOAD_BYTES
+            "ChatGPT export has more than {max_members} conversation members"
         )));
     }
-    Ok(bytes)
-}
-
-fn read_zip_entry_capped<R: Read>(entry: &mut R, payload_path: &str) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let read = entry
-            .read(&mut chunk)
-            .map_err(|_| Error::invalid_request("failed to read conversations payload from zip"))?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > MAX_CONVERSATIONS_PAYLOAD_BYTES {
-            return Err(Error::invalid_request(format!(
-                "conversations payload exceeds {} bytes: {payload_path}",
-                MAX_CONVERSATIONS_PAYLOAD_BYTES
-            )));
+    let mut legacy = 0usize;
+    let mut numbered = Vec::new();
+    for member in payloads.iter() {
+        match conversation_member_name(
+            Path::new(member.name())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ) {
+            Some(None) => legacy += 1,
+            Some(Some(number)) => numbered.push(number),
+            None => unreachable!("only conversation members are collected"),
         }
     }
-    Ok(bytes)
+    if legacy > 0 && !numbered.is_empty() {
+        return Err(Error::invalid_request("ambiguous ChatGPT export: found both conversations.json and numbered conversations shards"));
+    }
+    if legacy > 1 {
+        return Err(Error::invalid_request(
+            "ambiguous ChatGPT export: duplicate conversations.json members",
+        ));
+    }
+    numbered.sort_unstable();
+    if numbered.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::invalid_request(
+            "invalid ChatGPT export: duplicate numbered conversations shard",
+        ));
+    }
+    if numbered
+        .iter()
+        .enumerate()
+        .any(|(index, number)| *number as usize != index)
+    {
+        return Err(Error::invalid_request("incomplete ChatGPT export: numbered conversations shards must start at 000 and be contiguous"));
+    }
+    payloads.sort_by(|left, right| {
+        conversation_member_name(
+            Path::new(left.name())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        )
+        .cmp(&conversation_member_name(
+            Path::new(right.name())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ))
+    });
+    Ok(())
 }
 
-fn record_rejection(
-    service: &Service,
+fn max_conversation_members() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_MEMBERS
+}
+
+fn max_conversation_member_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBER_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATIONS_MEMBER_BYTES
+}
+
+fn max_conversation_total_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_TOTAL_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_TOTAL_BYTES
+}
+
+fn max_conversation_compression_ratio() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_COMPRESSION_RATIO")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_COMPRESSION_RATIO
+}
+
+fn max_conversation_value_bytes() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_VALUE_BYTES
+}
+
+fn max_conversation_nesting() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_NESTING")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_NESTING
+}
+
+fn max_conversation_report_details() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_REPORT_DETAILS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATION_REPORT_DETAILS
+}
+
+fn validate_zip_member_path(name: &str) -> Result<()> {
+    if name.contains('\\')
+        || Path::new(name).is_absolute()
+        || name.split('/').any(|part| part == "..")
+    {
+        return Err(Error::invalid_request(format!(
+            "unsafe zip member path: {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn stream_conversations(
+    member: &PayloadMember,
+    on_conversation: impl FnMut(ExportConversation) -> Result<()>,
+) -> Result<()> {
+    match member {
+        PayloadMember::Directory { path, name } => {
+            let file = fs::File::open(path).map_err(|err| {
+                Error::invalid_request(format!(
+                    "failed to read conversations payload {name}: {err}"
+                ))
+            })?;
+            stream_conversation_array(BoundedJsonReader::new(file), on_conversation, name)
+        }
+        PayloadMember::Zip { archive, name } => {
+            let file = fs::File::open(archive).map_err(|err| {
+                Error::invalid_request(format!("failed to open ChatGPT export: {err}"))
+            })?;
+            let mut archive = ZipArchive::new(file).map_err(|_| Error::invalid_request("unsupported ChatGPT export schema: expected a zip archive or extracted directory"))?;
+            let entry = archive.by_name(name).map_err(|_| {
+                Error::invalid_request(format!("failed to read conversations member: {name}"))
+            })?;
+            stream_conversation_array(BoundedJsonReader::new(entry), on_conversation, name)
+        }
+    }
+}
+
+struct BoundedJsonReader<R> {
+    reader: R,
+    max_value_bytes: usize,
+    max_nesting: usize,
+    nesting: usize,
+    in_string: bool,
+    escaped: bool,
+    string_bytes: usize,
+}
+
+impl<R> BoundedJsonReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            max_value_bytes: max_conversation_value_bytes(),
+            max_nesting: max_conversation_nesting(),
+            nesting: 0,
+            in_string: false,
+            escaped: false,
+            string_bytes: 0,
+        }
+    }
+
+    fn inspect(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for byte in bytes {
+            if self.in_string {
+                if *byte == b'"' && !self.escaped {
+                    self.in_string = false;
+                    self.string_bytes = 0;
+                    continue;
+                }
+                self.string_bytes = self.string_bytes.saturating_add(1);
+                if self.string_bytes > self.max_value_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ChatGPT export JSON value exceeds configured byte limit",
+                    ));
+                }
+                self.escaped = *byte == b'\\' && !self.escaped;
+                if *byte != b'\\' {
+                    self.escaped = false;
+                }
+                continue;
+            }
+            match *byte {
+                b'"' => {
+                    self.in_string = true;
+                    self.escaped = false;
+                    self.string_bytes = 0;
+                }
+                b'{' | b'[' => {
+                    self.nesting = self.nesting.saturating_add(1);
+                    if self.nesting > self.max_nesting {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ChatGPT export JSON nesting exceeds configured depth limit",
+                        ));
+                    }
+                }
+                b'}' | b']' => self.nesting = self.nesting.saturating_sub(1),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BoundedJsonReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.reader.read(buffer)?;
+        self.inspect(&buffer[..bytes_read])?;
+        Ok(bytes_read)
+    }
+}
+
+fn stream_conversation_array<R: Read>(
+    reader: R,
+    mut on_conversation: impl FnMut(ExportConversation) -> Result<()>,
+    name: &str,
+) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    ConversationSequenceSeed {
+        on_conversation: &mut on_conversation,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|err| {
+        Error::invalid_request(format!(
+            "unsupported ChatGPT export schema: invalid conversations payload {name}: {err}"
+        ))
+    })?;
+    deserializer.end().map_err(|_| {
+        Error::invalid_request(format!(
+            "unsupported ChatGPT export schema: invalid conversations payload: {name}"
+        ))
+    })
+}
+
+struct ConversationSequenceSeed<'a, F> {
+    on_conversation: &'a mut F,
+}
+
+impl<'de, F> DeserializeSeed<'de> for ConversationSequenceSeed<'_, F>
+where
+    F: FnMut(ExportConversation) -> Result<()>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ConversationSequenceVisitor {
+            on_conversation: self.on_conversation,
+        })
+    }
+}
+
+struct ConversationSequenceVisitor<'a, F> {
+    on_conversation: &'a mut F,
+}
+
+impl<'de, F> Visitor<'de> for ConversationSequenceVisitor<'_, F>
+where
+    F: FnMut(ExportConversation) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of ChatGPT conversations")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(conversation) = sequence.next_element::<ExportConversation>()? {
+            (self.on_conversation)(conversation).map_err(A::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+fn inject_chatgpt_apply_failure(staged_writes: &mut usize) -> Result<()> {
+    *staged_writes += 1;
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_WRITES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|target| *staged_writes >= target)
+    {
+        return Err(Error::storage("injected ChatGPT import write failure"));
+    }
+    Ok(())
+}
+
+fn inject_chatgpt_manifest_finalization_failure() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_MANIFEST_FINALIZE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(Error::storage(
+            "injected ChatGPT import manifest finalization failure",
+        ));
+    }
+    Ok(())
+}
+
+fn inject_chatgpt_after_pending_manifest_failure() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_PENDING_MANIFEST")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(Error::storage(
+            "injected ChatGPT import pending manifest failure",
+        ));
+    }
+    Ok(())
+}
+
+fn record_rejection_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
     profile: &str,
     workspace: &str,
     conversation_id: &str,
@@ -817,30 +1554,35 @@ fn record_rejection(
     reason: &str,
     payload_path: &str,
 ) -> Result<()> {
-    let source_path = format!("{payload_path}:{conversation_id}:{message_id}");
+    let source_path = format!("chatgpt:{conversation_id}:{message_id}:{code}");
     let source_hash = ids::sha256_hex(
         format!("{profile}\n{workspace}\n{conversation_id}\n{message_id}\n{code}").as_bytes(),
     );
-    service.store.record_evidence_ledger(&EvidenceLedgerEntry {
-        profile_id: profile.to_string(),
-        workspace_id: workspace.to_string(),
-        repo_id: None,
-        subject_key: None,
-        source_kind: "visible_turn".to_string(),
-        source_id: None,
-        source_path: Some(source_path),
-        source_hash,
-        safe_summary: ledger_safe_summary(&format!(
-            "rejected chatgpt export message {conversation_id}/{message_id}: {reason}"
-        )),
-        policy_state: code.to_string(),
-        metadata: json!({
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "source": "chatgpt-export",
-        }),
-    })?;
-    service.store.record_policy_event(
+    Store::record_evidence_ledger_in_transaction(
+        tx,
+        &EvidenceLedgerEntry {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: None,
+            subject_key: None,
+            source_kind: "visible_turn".to_string(),
+            source_id: None,
+            source_path: Some(source_path),
+            source_hash,
+            safe_summary: ledger_safe_summary(&format!(
+                "rejected chatgpt export message {conversation_id}/{message_id}: {reason}"
+            )),
+            policy_state: code.to_string(),
+            metadata: json!({
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "source": "chatgpt-export",
+                "source_member": payload_path,
+            }),
+        },
+    )?;
+    Store::record_policy_event_in_transaction(
+        tx,
         Some(profile),
         Some(workspace),
         "rejected_turn",
@@ -849,4 +1591,62 @@ fn record_rejection(
         "chatgpt-export",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    static LIMIT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position == self.bytes.len() {
+                return Ok(0);
+            }
+            buffer[0] = self.bytes[self.position];
+            self.position += 1;
+            self.reads.set(self.reads.get() + 1);
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn bounded_reader_rejects_an_oversized_token_before_consuming_the_payload() {
+        let _guard = LIMIT_ENV_LOCK.lock().unwrap();
+        let old_limit = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES").ok();
+        std::env::set_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES", "4");
+        let payload = format!("[\"{}\"]", "x".repeat(32)).into_bytes();
+        let reads = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: payload.clone(),
+            position: 0,
+            reads: reads.clone(),
+        };
+
+        let result = stream_conversation_array(
+            BoundedJsonReader::new(reader),
+            |_| Ok(()),
+            "conversations.json",
+        );
+
+        if let Some(limit) = old_limit {
+            std::env::set_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES", limit);
+        } else {
+            std::env::remove_var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_VALUE_BYTES");
+        }
+        assert!(result.is_err());
+        assert!(reads.get() < payload.len());
+    }
 }

@@ -364,6 +364,165 @@ impl Store {
         self.pool.get().map_err(Error::from)
     }
 
+    /// Run a logical import as one SQLite transaction. The callback may stage
+    /// many rows, but none become durable unless it returns successfully.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let value = operation(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn ensure_workspace_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        profile_id: &str,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let now = ids::now_rfc3339();
+        tx.execute(
+            "INSERT INTO profiles(id, display_name, created_at, updated_at, default_portability_policy)
+             VALUES (?1, ?1, ?2, ?2, 'profile_only')
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![profile_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO workspaces(id, profile_id, display_name, created_at, updated_at)
+             VALUES (?1, ?2, ?1, ?3, ?3)
+             ON CONFLICT(profile_id, id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![workspace_id, profile_id, ids::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_session_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        profile_id: &str,
+        workspace_id: &str,
+        source: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO sessions(id, profile_id, workspace_id, repo_id, thread_id, source, started_at, ended_at, metadata)
+             VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, NULL, '{}')
+             ON CONFLICT(id) DO NOTHING",
+            params![session_id, profile_id, workspace_id, source, ids::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_source_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        profile_id: &str,
+        workspace_id: &str,
+        kind: &str,
+        source_path: Option<&str>,
+        source_hash: &str,
+        metadata: &Value,
+    ) -> Result<(MemorySource, bool)> {
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT id, profile_id, workspace_id, kind, source_path, source_hash, created_at, ingested_at, metadata
+                 FROM memory_sources
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND source_hash = ?3
+                   AND (source_path IS ?4 OR source_path = ?4)",
+                params![profile_id, workspace_id, source_hash, source_path],
+                row_to_source,
+            )
+            .optional()?
+        {
+            return Ok((existing, false));
+        }
+        let now = ids::now_rfc3339();
+        let source = MemorySource {
+            id: ids::new_id("src"),
+            profile_id: profile_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            kind: kind.to_string(),
+            source_path: source_path.map(ToOwned::to_owned),
+            source_hash: source_hash.to_string(),
+            created_at: now.clone(),
+            ingested_at: now,
+            metadata: metadata.clone(),
+        };
+        tx.execute(
+            "INSERT INTO memory_sources(id, profile_id, workspace_id, kind, source_path, source_hash, created_at, ingested_at, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8)",
+            params![source.id, source.profile_id, source.workspace_id, source.kind, source.source_path, source.source_hash, source.created_at, source.metadata.to_string()],
+        )?;
+        Ok((source, true))
+    }
+
+    pub fn insert_visible_turn_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        turn: &VisibleTurn,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO visible_turns(id, session_id, actor, content, created_at, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                turn.id,
+                turn.session_id,
+                turn.actor,
+                turn.content,
+                turn.created_at,
+                turn.metadata.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_evidence_ledger_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        entry: &EvidenceLedgerEntry,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO evidence_ledger(
+                id, event_key, profile_id, workspace_id, repo_id, subject_key,
+                source_kind, source_id, source_path, source_hash, safe_summary,
+                policy_state, created_at, trust_state, trust_score, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'trusted',1.0,?14)",
+            params![
+                ids::new_id("led"),
+                evidence_ledger_event_key(entry),
+                &entry.profile_id,
+                &entry.workspace_id,
+                &entry.repo_id,
+                &entry.subject_key,
+                &entry.source_kind,
+                &entry.source_id,
+                &entry.source_path,
+                &entry.source_hash,
+                &entry.safe_summary,
+                &entry.policy_state,
+                ids::now_rfc3339(),
+                entry.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_policy_event_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        profile_id: Option<&str>,
+        workspace_id: Option<&str>,
+        kind: &str,
+        code: &str,
+        reason: &str,
+        context: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO policy_events(id, profile_id, workspace_id, kind, code, reason, context, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ids::new_id("pol"), profile_id, workspace_id, kind, code, reason, context, ids::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Run migrations and probe FTS5. Idempotent.
     fn migrate(&mut self) -> Result<()> {
         let conn = self.conn()?;
@@ -4062,5 +4221,17 @@ mod tests {
             .unwrap();
         assert!(!created2);
         assert_eq!(s1.id, s2.id);
+    }
+
+    #[test]
+    fn transaction_rolls_back_all_writes_when_the_import_fails() {
+        let store = mem_store();
+        let result: Result<()> = store.transaction(|tx| {
+            tx.execute("INSERT INTO profiles(id, display_name, created_at, updated_at, default_portability_policy) VALUES ('p', 'p', 'now', 'now', 'profile_only')", [])?;
+            Err(Error::storage("injected import failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(store.active_profiles().unwrap().is_empty());
     }
 }
