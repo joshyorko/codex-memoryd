@@ -430,6 +430,28 @@ Preview/apply/idempotency are the same path in both modes. Apply writes safe
 subject episodes and evidence ledger rows only; it does not promote Git evidence
 to active memory records on its own.
 
+### ChatGPT export selection and import
+
+Inspect an extracted ChatGPT export or zip before any writes. `--list` and
+`--preview` emit stable, pretty JSON with each selected conversation's ID,
+title, timestamps, turn counts, eligibility, and selection reason. Preview
+also lists excluded conversations with the filter or limit that skipped them.
+
+```bash
+target/release/codex-memoryd import chatgpt-export --list ~/Downloads/chatgpt-export.zip
+target/release/codex-memoryd import chatgpt-export --preview --since 2026-01-01 ~/Downloads/chatgpt-export.zip
+target/release/codex-memoryd import chatgpt-export --apply --title-contains codex-memoryd ~/Downloads/chatgpt-export.zip
+target/release/codex-memoryd import chatgpt-export --apply --conversation-id CONVERSATION_ID ~/Downloads/chatgpt-export.zip
+```
+
+Filters compose: repeat `--conversation-id`, use `--title-contains`, constrain
+updates with `--since` and `--until` (UTC date or RFC3339), limit results with
+`--max-conversations`, or use `--eligible-only`. Applying an archive over 100
+conversations requires a filter or explicit `--all` confirmation. Every apply
+writes a content-free manifest of the logical payload member, selected source
+IDs, and counts; locate its path through `codex-memoryd paths --format json` under
+`last_chatgpt_import_manifest`.
+
 ### MCP read-only dogfood
 
 The Codex-facing MCP runbook is intentionally read-only. `mcp stdio` defaults

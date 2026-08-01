@@ -22,6 +22,7 @@ use crate::store::ledger_safe_summary;
 use crate::store::EvidenceLedgerEntry;
 
 const MAX_CONVERSATIONS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const LARGE_ARCHIVE_CONVERSATIONS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatgptExportMode {
@@ -52,7 +53,19 @@ pub struct ChatgptExportParams<'a> {
 pub struct ChatgptExportSelection {
     pub conversation_ids: Vec<String>,
     pub title_contains: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub max_conversations: Option<usize>,
+    pub all: bool,
     pub eligible_only: bool,
+}
+
+struct ChatgptExportFilters {
+    conversation_ids: std::collections::BTreeSet<String>,
+    title_contains: Option<String>,
+    since: Option<OffsetDateTime>,
+    until: Option<OffsetDateTime>,
+    eligible_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +79,17 @@ pub struct ChatgptExportConversationReport {
     pub skipped_messages: usize,
     pub rejected_messages: usize,
     pub eligible: bool,
+    pub selection_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatgptExportSkippedConversationReport {
+    pub conversation_id: String,
+    pub title: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub eligible: bool,
+    pub selection_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,7 +115,10 @@ pub struct ChatgptExportResponse {
     pub rejected_messages: usize,
     pub created: usize,
     pub skipped_existing: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
     pub conversations: Vec<ChatgptExportConversationReport>,
+    pub skipped_conversations: Vec<ChatgptExportSkippedConversationReport>,
     pub rejections: Vec<ChatgptExportRejection>,
 }
 
@@ -175,33 +202,71 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut created = 0usize;
     let mut skipped_existing = 0usize;
     let mut rejections = Vec::new();
+    let mut skipped_conversations = Vec::new();
 
     let total_conversations = conversations.len();
-    let selected_filter_ids = params
+    if params.mode == ChatgptExportMode::Apply
+        && total_conversations > LARGE_ARCHIVE_CONVERSATIONS
+        && !params.selection.all
+        && !params.selection.has_filter()
+    {
+        return Err(Error::invalid_request(format!(
+            "ChatGPT archive has {total_conversations} conversations; pass a selection filter or --all to apply every conversation"
+        )));
+    }
+    let conversation_ids = params
         .selection
         .conversation_ids
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_title = params
+        .map(ToOwned::to_owned)
+        .collect();
+    let title_contains = params
         .selection
         .title_contains
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
+    let since = params
+        .selection
+        .since
+        .as_deref()
+        .map(parse_filter_timestamp)
+        .transpose()?;
+    let until = params
+        .selection
+        .until
+        .as_deref()
+        .map(parse_filter_timestamp)
+        .transpose()?;
+    let filters = ChatgptExportFilters {
+        conversation_ids,
+        title_contains,
+        since,
+        until,
+        eligible_only: params.selection.eligible_only,
+    };
 
     for conversation in conversations {
         let parsed = parse_conversation(&conversation, &detected.payload_path)?;
-        if !matches_selection(
-            &conversation.id,
-            &parsed.report.title,
-            parsed.report.eligible,
-            &selected_filter_ids,
-            selected_title.as_deref(),
-            params.selection.eligible_only,
-        ) {
+        if let Some(selection_reason) = filters.skip_reason(&parsed.report) {
+            skipped_conversations.push(skipped_conversation_report(
+                &parsed.report,
+                selection_reason,
+            ));
+            continue;
+        }
+        if params
+            .selection
+            .max_conversations
+            .is_some_and(|max| reports.len() >= max)
+        {
+            skipped_conversations.push(skipped_conversation_report(
+                &parsed.report,
+                "max-conversations limit reached".to_string(),
+            ));
             continue;
         }
         user_total += parsed.report.user_turns;
@@ -319,7 +384,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         reports.push(parsed.report);
     }
 
-    Ok(ChatgptExportResponse {
+    let mut response = ChatgptExportResponse {
         mode: params.mode.as_str().to_string(),
         source_path,
         payload_path: detected.payload_path,
@@ -333,31 +398,118 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         rejected_messages: rejected_total,
         created,
         skipped_existing,
+        manifest_path: None,
         conversations: reports,
+        skipped_conversations,
         rejections,
-    })
+    };
+    if params.mode == ChatgptExportMode::Apply {
+        let manifest_path = import_manifest_path(&service.store.path_display());
+        let manifest = json!({
+            "manifest_version": 1,
+            "source": "chatgpt-export",
+            "created_at": ids::now_rfc3339(),
+            "payload_path": manifest_payload_path(&response.payload_path),
+            "selected_source_ids": response.conversations.iter().map(|conversation| conversation.conversation_id.as_str()).collect::<Vec<_>>(),
+            "selected_conversations": response.selected_conversations,
+            "created": response.created,
+            "skipped_existing": response.skipped_existing,
+            "rejected_messages": response.rejected_messages,
+        });
+        let encoded = serde_json::to_vec_pretty(&manifest)
+            .map_err(|err| Error::internal(format!("serialize ChatGPT import manifest: {err}")))?;
+        fs::write(&manifest_path, encoded)
+            .map_err(|err| Error::storage(format!("write ChatGPT import manifest: {err}")))?;
+        response.manifest_path = Some(manifest_path.display().to_string());
+    }
+    Ok(response)
 }
 
-fn matches_selection(
-    conversation_id: &str,
-    title: &str,
-    eligible: bool,
-    conversation_ids: &std::collections::BTreeSet<&str>,
-    title_contains: Option<&str>,
-    eligible_only: bool,
-) -> bool {
-    if !conversation_ids.is_empty() && !conversation_ids.contains(conversation_id) {
-        return false;
+impl ChatgptExportSelection {
+    fn has_filter(&self) -> bool {
+        !self.conversation_ids.iter().all(|id| id.trim().is_empty())
+            || self
+                .title_contains
+                .as_deref()
+                .is_some_and(|title| !title.trim().is_empty())
+            || self.since.is_some()
+            || self.until.is_some()
+            || self.max_conversations.is_some()
+            || self.eligible_only
     }
-    if let Some(title_filter) = title_contains {
-        if !title.to_ascii_lowercase().contains(title_filter) {
-            return false;
+}
+
+fn import_manifest_path(store_path: &str) -> PathBuf {
+    let mut path = PathBuf::from(store_path);
+    path.set_extension("chatgpt-import-manifest.json");
+    path
+}
+
+fn manifest_payload_path(payload_path: &str) -> String {
+    Path::new(payload_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("conversations.json")
+        .to_string()
+}
+
+fn skipped_conversation_report(
+    report: &ChatgptExportConversationReport,
+    selection_reason: String,
+) -> ChatgptExportSkippedConversationReport {
+    ChatgptExportSkippedConversationReport {
+        conversation_id: report.conversation_id.clone(),
+        title: report.title.clone(),
+        created_at: report.created_at.clone(),
+        updated_at: report.updated_at.clone(),
+        eligible: report.eligible,
+        selection_reason,
+    }
+}
+
+impl ChatgptExportFilters {
+    fn skip_reason(&self, report: &ChatgptExportConversationReport) -> Option<String> {
+        if !self.conversation_ids.is_empty()
+            && !self.conversation_ids.contains(&report.conversation_id)
+        {
+            return Some("conversation id was not selected".to_string());
         }
+        if let Some(title_filter) = self.title_contains.as_deref() {
+            if !report.title.to_ascii_lowercase().contains(title_filter) {
+                return Some(format!("title does not contain {title_filter:?}"));
+            }
+        }
+        let updated_at = report
+            .updated_at
+            .as_deref()
+            .or(report.created_at.as_deref())
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+        if let Some(since) = self.since {
+            if updated_at.is_none_or(|updated_at| updated_at < since) {
+                return Some("updated time is before --since or unavailable".to_string());
+            }
+        }
+        if let Some(until) = self.until {
+            if updated_at.is_none_or(|updated_at| updated_at >= until) {
+                return Some("updated time is on or after --until or unavailable".to_string());
+            }
+        }
+        if self.eligible_only && !report.eligible {
+            return Some("conversation has no importable user or assistant turns".to_string());
+        }
+        None
     }
-    if eligible_only && !eligible {
-        return false;
-    }
-    true
+}
+
+fn parse_filter_timestamp(value: &str) -> Result<OffsetDateTime> {
+    let value = value.trim();
+    let value = if value.len() == 10 {
+        format!("{value}T00:00:00Z")
+    } else {
+        value.to_string()
+    };
+    OffsetDateTime::parse(&value, &Rfc3339)
+        .map_err(|_| Error::invalid_request(format!("invalid date filter: {value}")))
 }
 
 fn parse_conversation(
@@ -476,6 +628,7 @@ fn parse_conversation(
             skipped_messages,
             rejected_messages: rejections.len(),
             eligible: !accepted.is_empty(),
+            selection_reason: "matched selection filters".to_string(),
         },
         accepted,
         rejections,
