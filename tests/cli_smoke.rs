@@ -697,6 +697,40 @@ fn cli_chatgpt_export_preview_discovers_numbered_shards_in_numeric_order_without
 }
 
 #[test]
+fn cli_chatgpt_export_rejects_incomplete_and_mixed_directory_shards_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("invalid-chatgpt-shards");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(export_dir.join("conversations-000.json"), "[]").unwrap();
+    fs::write(export_dir.join("conversations-002.json"), "[]").unwrap();
+
+    let incomplete = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--preview"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("incomplete ChatGPT export"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+
+    fs::remove_file(export_dir.join("conversations-002.json")).unwrap();
+    fs::write(export_dir.join("conversations.json"), "[]").unwrap();
+    let mixed = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
+    assert!(String::from_utf8_lossy(&mixed.stderr).contains("ambiguous ChatGPT export"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
 fn cli_chatgpt_export_apply_from_zip_is_idempotent_and_evidence_only() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

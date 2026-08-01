@@ -806,11 +806,7 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
                 "unsupported ChatGPT export schema: conversations payload not found",
             ));
         }
-        let payload_path = payloads
-            .first()
-            .map(|payload| payload.display().to_string())
-            .expect("non-empty conversations payloads");
-        let payloads = payloads
+        let mut payloads = payloads
             .into_iter()
             .map(|payload| {
                 let name = payload.display().to_string();
@@ -823,6 +819,11 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
                 Ok(PayloadMember::Directory { path: payload, name })
             })
             .collect::<Result<Vec<_>>>()?;
+        validate_payload_names(&mut payloads)?;
+        let payload_path = payloads
+            .first()
+            .map(|payload| payload.name().to_string())
+            .expect("non-empty conversations payloads");
         return Ok(DetectedPayload {
             payload_path,
             payloads,
