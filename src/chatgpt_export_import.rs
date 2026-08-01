@@ -409,8 +409,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             "manifest_version": 1,
             "source": "chatgpt-export",
             "created_at": ids::now_rfc3339(),
-            "source_path": response.source_path,
-            "payload_path": response.payload_path,
+            "payload_path": manifest_payload_path(&response.payload_path),
             "selected_source_ids": response.conversations.iter().map(|conversation| conversation.conversation_id.as_str()).collect::<Vec<_>>(),
             "selected_conversations": response.selected_conversations,
             "created": response.created,
@@ -444,6 +443,14 @@ fn import_manifest_path(store_path: &str) -> PathBuf {
     let mut path = PathBuf::from(store_path);
     path.set_extension("chatgpt-import-manifest.json");
     path
+}
+
+fn manifest_payload_path(payload_path: &str) -> String {
+    Path::new(payload_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("conversations.json")
+        .to_string()
 }
 
 fn skipped_conversation_report(

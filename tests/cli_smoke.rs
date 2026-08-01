@@ -980,7 +980,8 @@ fn cli_chatgpt_export_filters_by_date_and_max_conversations() {
 fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
-    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-manifest");
+    let export_dir =
+        write_chatgpt_export_dir(&dir, "chatgpt-export-manifest-do-not-persist-host-path");
     let output = bin()
         .arg("--db")
         .arg(&db)
@@ -1001,7 +1002,15 @@ fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let manifest_path = report["manifest_path"].as_str().expect("manifest path");
-    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    let manifest_bytes = fs::read(manifest_path).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&manifest_bytes)
+            .contains("chatgpt-export-manifest-do-not-persist-host-path"),
+        "manifest must not disclose the absolute export path"
+    );
+    assert!(manifest.get("source_path").is_none());
+    assert_eq!(manifest["payload_path"], "conversations.json");
     assert_eq!(
         manifest["selected_source_ids"],
         serde_json::json!(["conv-alpha"])

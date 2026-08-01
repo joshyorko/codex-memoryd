@@ -448,8 +448,8 @@ Filters compose: repeat `--conversation-id`, use `--title-contains`, constrain
 updates with `--since` and `--until` (UTC date or RFC3339), limit results with
 `--max-conversations`, or use `--eligible-only`. Applying an archive over 100
 conversations requires a filter or explicit `--all` confirmation. Every apply
-writes a content-free manifest of selected source IDs and counts; locate its
-path through `codex-memoryd paths --format json` under
+writes a content-free manifest of the logical payload member, selected source
+IDs, and counts; locate its path through `codex-memoryd paths --format json` under
 `last_chatgpt_import_manifest`.
 
 ### MCP read-only dogfood
