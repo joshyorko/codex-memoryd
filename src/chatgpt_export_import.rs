@@ -69,6 +69,14 @@ pub struct ChatgptExportSelection {
     pub eligible_only: bool,
 }
 
+struct ChatgptExportFilters {
+    conversation_ids: std::collections::BTreeSet<String>,
+    title_contains: Option<String>,
+    since: Option<OffsetDateTime>,
+    until: Option<OffsetDateTime>,
+    eligible_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatgptExportConversationReport {
     pub conversation_id: String,
@@ -268,14 +276,15 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             "ChatGPT archive has {total_conversations} conversations; pass a selection filter or --all to apply every conversation"
         )));
     }
-    let selected_filter_ids = params
+    let conversation_ids = params
         .selection
         .conversation_ids
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_title = params
+        .map(ToOwned::to_owned)
+        .collect();
+    let title_contains = params
         .selection
         .title_contains
         .as_deref()
@@ -294,6 +303,13 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         .as_deref()
         .map(parse_filter_timestamp)
         .transpose()?;
+    let filters = ChatgptExportFilters {
+        conversation_ids,
+        title_contains,
+        since,
+        until,
+        eligible_only: params.selection.eligible_only,
+    };
 
     let mut staged_writes = 0usize;
     let mut process_member = |member: &PayloadMember,
@@ -314,26 +330,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                 return Ok(());
             }
             let parsed = parse_conversation(&conversation, &payload_path)?;
-            if !matches_selection(
-                &conversation.id,
-                &parsed.report.title,
-                parsed
-                    .report
-                    .updated_at
-                    .as_deref()
-                    .or(parsed.report.created_at.as_deref()),
-                parsed.report.eligible,
-                &selected_filter_ids,
-                selected_title.as_deref(),
-                since,
-                until,
-                params.selection.eligible_only,
-            ) {
-                let reason = selected_title
-                    .as_deref()
-                    .filter(|title| !parsed.report.title.to_ascii_lowercase().contains(title))
-                    .map(|title| format!("title does not contain {title:?}"))
-                    .unwrap_or_else(|| "did not match selection filters".to_string());
+            if let Some(reason) = filters.skip_reason(&parsed.report) {
                 skipped_conversations.push(skipped_conversation_report(&parsed.report, reason));
                 return Ok(());
             }
@@ -561,40 +558,38 @@ fn manifest_payload_path(payload_path: &str) -> String {
         .to_string()
 }
 
-fn matches_selection(
-    conversation_id: &str,
-    title: &str,
-    updated_at: Option<&str>,
-    eligible: bool,
-    conversation_ids: &std::collections::BTreeSet<&str>,
-    title_contains: Option<&str>,
-    since: Option<OffsetDateTime>,
-    until: Option<OffsetDateTime>,
-    eligible_only: bool,
-) -> bool {
-    if !conversation_ids.is_empty() && !conversation_ids.contains(conversation_id) {
-        return false;
-    }
-    if let Some(title_filter) = title_contains {
-        if !title.to_ascii_lowercase().contains(title_filter) {
-            return false;
+impl ChatgptExportFilters {
+    fn skip_reason(&self, report: &ChatgptExportConversationReport) -> Option<String> {
+        if !self.conversation_ids.is_empty()
+            && !self.conversation_ids.contains(&report.conversation_id)
+        {
+            return Some("conversation id was not selected".to_string());
         }
-    }
-    let updated_at = updated_at.and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-    if let Some(since) = since {
-        if updated_at.is_none_or(|updated_at| updated_at < since) {
-            return false;
+        if let Some(title_filter) = self.title_contains.as_deref() {
+            if !report.title.to_ascii_lowercase().contains(title_filter) {
+                return Some(format!("title does not contain {title_filter:?}"));
+            }
         }
-    }
-    if let Some(until) = until {
-        if updated_at.is_none_or(|updated_at| updated_at >= until) {
-            return false;
+        let updated_at = report
+            .updated_at
+            .as_deref()
+            .or(report.created_at.as_deref())
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+        if let Some(since) = self.since {
+            if updated_at.is_none_or(|updated_at| updated_at < since) {
+                return Some("updated time is before --since or unavailable".to_string());
+            }
         }
+        if let Some(until) = self.until {
+            if updated_at.is_none_or(|updated_at| updated_at >= until) {
+                return Some("updated time is on or after --until or unavailable".to_string());
+            }
+        }
+        if self.eligible_only && !report.eligible {
+            return Some("conversation has no importable user or assistant turns".to_string());
+        }
+        None
     }
-    if eligible_only && !eligible {
-        return false;
-    }
-    true
 }
 
 fn parse_filter_timestamp(value: &str) -> Result<OffsetDateTime> {
