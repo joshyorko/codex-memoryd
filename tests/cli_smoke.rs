@@ -1081,6 +1081,44 @@ fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
 }
 
 #[test]
+fn cli_chatgpt_export_apply_rolls_back_every_write_when_injected_failure_occurs() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-atomic-failure");
+    let mut manifest_path = db.clone();
+    manifest_path.set_extension("chatgpt-import-manifest.json");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_WRITES", "1")
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--conversation-id",
+            "conv-alpha",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "injected write failure must fail apply"
+    );
+    assert_eq!(count_table(&db, "sessions"), 0);
+    assert_eq!(count_table(&db, "memory_sources"), 0);
+    assert_eq!(count_table(&db, "visible_turns"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+    assert_eq!(count_table(&db, "policy_events"), 0);
+    assert!(
+        !manifest_path.exists(),
+        "failed apply must not write a manifest"
+    );
+}
+
+#[test]
 fn cli_chatgpt_export_apply_to_patch_preview_keeps_only_durable_provenance() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);

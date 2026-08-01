@@ -26,6 +26,7 @@ use crate::policy::PolicyDecision;
 use crate::service::Service;
 use crate::store::ledger_safe_summary;
 use crate::store::EvidenceLedgerEntry;
+use crate::store::Store;
 
 const MAX_CONVERSATIONS_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONVERSATION_MEMBERS: usize = 1_024;
@@ -79,6 +80,17 @@ pub struct ChatgptExportConversationReport {
     pub skipped_messages: usize,
     pub rejected_messages: usize,
     pub eligible: bool,
+    pub selection_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatgptExportSkippedConversationReport {
+    pub conversation_id: String,
+    pub title: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub eligible: bool,
+    pub selection_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +119,7 @@ pub struct ChatgptExportResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
     pub conversations: Vec<ChatgptExportConversationReport>,
+    pub skipped_conversations: Vec<ChatgptExportSkippedConversationReport>,
     pub rejections: Vec<ChatgptExportRejection>,
 }
 
@@ -230,6 +243,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut created = 0usize;
     let mut skipped_existing = 0usize;
     let mut rejections = Vec::new();
+    let mut skipped_conversations = Vec::new();
 
     if params.mode == ChatgptExportMode::Apply
         && total_conversations > LARGE_ARCHIVE_CONVERSATIONS
@@ -267,7 +281,10 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         .map(parse_filter_timestamp)
         .transpose()?;
 
-    for member in &detected.payloads {
+    let mut staged_writes = 0usize;
+    let mut process_member = |member: &PayloadMember,
+                              transaction: Option<&rusqlite::Transaction<'_>>|
+     -> Result<()> {
         let payload_path = member.name().to_string();
         stream_conversations(member, |conversation| {
             if params
@@ -275,6 +292,11 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                 .max_conversations
                 .is_some_and(|max| reports.len() >= max)
             {
+                let parsed = parse_conversation(&conversation, &payload_path)?;
+                skipped_conversations.push(skipped_conversation_report(
+                    &parsed.report,
+                    "max-conversations limit reached".to_string(),
+                ));
                 return Ok(());
             }
             let parsed = parse_conversation(&conversation, &payload_path)?;
@@ -293,6 +315,12 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                 until,
                 params.selection.eligible_only,
             ) {
+                let reason = selected_title
+                    .as_deref()
+                    .filter(|title| !parsed.report.title.to_ascii_lowercase().contains(title))
+                    .map(|title| format!("title does not contain {title:?}"))
+                    .unwrap_or_else(|| "did not match selection filters".to_string());
+                skipped_conversations.push(skipped_conversation_report(&parsed.report, reason));
                 return Ok(());
             }
             user_total += parsed.report.user_turns;
@@ -304,10 +332,11 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             }
 
             if params.mode == ChatgptExportMode::Apply {
+                let tx = transaction.expect("apply runs inside an import transaction");
                 if !parsed.has_eligible_messages {
                     for rejection in &parsed.rejections {
-                        record_rejection(
-                            service,
+                        record_rejection_in_transaction(
+                            tx,
                             profile.as_str(),
                             &workspace,
                             &conversation.id,
@@ -321,18 +350,17 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                     reports.push(parsed.report);
                     return Ok(());
                 }
-                service
-                    .store
-                    .ensure_workspace(profile.as_str(), &workspace)?;
+                Store::ensure_workspace_in_transaction(tx, profile.as_str(), &workspace)?;
+                inject_chatgpt_apply_failure(&mut staged_writes)?;
                 let session_id = format!("chatgpt:{}", conversation.id);
-                service.store.ensure_session(
+                Store::ensure_session_in_transaction(
+                    tx,
                     &session_id,
                     profile.as_str(),
                     &workspace,
-                    None,
-                    None,
                     "chatgpt-export",
                 )?;
+                inject_chatgpt_apply_failure(&mut staged_writes)?;
 
                 for message in &parsed.accepted {
                     let source_ref = format!(
@@ -342,7 +370,8 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                     let source_hash = ids::sha256_hex(
                         format!("chatgpt-export:{session_id}:{}", message.message_id).as_bytes(),
                     );
-                    let (source, source_created) = service.store.upsert_source(
+                    let (source, source_created) = Store::upsert_source_in_transaction(
+                        tx,
                         profile.as_str(),
                         &workspace,
                         "visible_turn",
@@ -354,6 +383,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                         skipped_existing += 1;
                         continue;
                     }
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
 
                     let turn_id = format!(
                         "turn_chatgpt_{}",
@@ -362,39 +392,47 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                             .take(24)
                             .collect::<String>()
                     );
-                    service.store.insert_visible_turn(&VisibleTurn {
-                        id: turn_id.clone(),
-                        session_id: session_id.clone(),
-                        actor: message.actor.clone(),
-                        content: message.content.clone(),
-                        created_at: message.created_at.clone(),
-                        metadata: message.metadata.clone(),
-                    })?;
-                    service.store.record_evidence_ledger(&EvidenceLedgerEntry {
-                        profile_id: profile.as_str().to_string(),
-                        workspace_id: workspace.clone(),
-                        repo_id: None,
-                        subject_key: None,
-                        source_kind: "visible_turn".to_string(),
-                        source_id: Some(source.id),
-                        source_path: Some(source_ref),
-                        source_hash,
-                        safe_summary: ledger_safe_summary(&message.content),
-                        policy_state: "accepted".to_string(),
-                        metadata: json!({
-                            "actor": message.actor,
-                            "conversation_id": conversation.id,
-                            "message_id": message.message_id,
-                            "session_id": session_id,
-                            "source": "chatgpt-export",
-                        }),
-                    })?;
+                    Store::insert_visible_turn_in_transaction(
+                        tx,
+                        &VisibleTurn {
+                            id: turn_id.clone(),
+                            session_id: session_id.clone(),
+                            actor: message.actor.clone(),
+                            content: message.content.clone(),
+                            created_at: message.created_at.clone(),
+                            metadata: message.metadata.clone(),
+                        },
+                    )?;
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
+                    Store::record_evidence_ledger_in_transaction(
+                        tx,
+                        &EvidenceLedgerEntry {
+                            profile_id: profile.as_str().to_string(),
+                            workspace_id: workspace.clone(),
+                            repo_id: None,
+                            subject_key: None,
+                            source_kind: "visible_turn".to_string(),
+                            source_id: Some(source.id),
+                            source_path: Some(source_ref),
+                            source_hash,
+                            safe_summary: ledger_safe_summary(&message.content),
+                            policy_state: "accepted".to_string(),
+                            metadata: json!({
+                                "actor": message.actor,
+                                "conversation_id": conversation.id,
+                                "message_id": message.message_id,
+                                "session_id": session_id,
+                                "source": "chatgpt-export",
+                            }),
+                        },
+                    )?;
+                    inject_chatgpt_apply_failure(&mut staged_writes)?;
                     created += 1;
                 }
 
                 for rejection in &parsed.rejections {
-                    record_rejection(
-                        service,
+                    record_rejection_in_transaction(
+                        tx,
                         profile.as_str(),
                         &workspace,
                         &conversation.id,
@@ -410,6 +448,19 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             reports.push(parsed.report);
             Ok(())
         })?;
+        Ok(())
+    };
+    if params.mode == ChatgptExportMode::Apply {
+        service.store.transaction(|tx| {
+            for member in &detected.payloads {
+                process_member(member, Some(tx))?;
+            }
+            Ok(())
+        })?;
+    } else {
+        for member in &detected.payloads {
+            process_member(member, None)?;
+        }
     }
 
     let mut response = ChatgptExportResponse {
@@ -428,6 +479,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         skipped_existing,
         manifest_path: None,
         conversations: reports,
+        skipped_conversations,
         rejections,
     };
     if params.mode == ChatgptExportMode::Apply {
@@ -436,8 +488,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             "manifest_version": 1,
             "source": "chatgpt-export",
             "created_at": ids::now_rfc3339(),
-            "source_path": response.source_path,
-            "payload_path": response.payload_path,
+            "payload_path": manifest_payload_path(&response.payload_path),
             "selected_source_ids": response.conversations.iter().map(|conversation| conversation.conversation_id.as_str()).collect::<Vec<_>>(),
             "selected_conversations": response.selected_conversations,
             "created": response.created,
@@ -467,10 +518,32 @@ impl ChatgptExportSelection {
     }
 }
 
+fn skipped_conversation_report(
+    report: &ChatgptExportConversationReport,
+    selection_reason: String,
+) -> ChatgptExportSkippedConversationReport {
+    ChatgptExportSkippedConversationReport {
+        conversation_id: report.conversation_id.clone(),
+        title: report.title.clone(),
+        created_at: report.created_at.clone(),
+        updated_at: report.updated_at.clone(),
+        eligible: report.eligible,
+        selection_reason,
+    }
+}
+
 fn import_manifest_path(store_path: &str) -> PathBuf {
     let mut path = PathBuf::from(store_path);
     path.set_extension("chatgpt-import-manifest.json");
     path
+}
+
+fn manifest_payload_path(payload_path: &str) -> String {
+    Path::new(payload_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("conversations.json")
+        .to_string()
 }
 
 fn matches_selection(
@@ -636,6 +709,7 @@ fn parse_conversation(
             skipped_messages,
             rejected_messages: rejections.len(),
             eligible: !accepted.is_empty(),
+            selection_reason: "matched selection filters".to_string(),
         },
         accepted,
         rejections,
@@ -764,7 +838,7 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
     })?;
     let mut payloads = Vec::new();
     for idx in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(idx)
             .map_err(|_| Error::invalid_request("failed to read zip entry from ChatGPT export"))?;
         let name = entry.name().to_string();
@@ -1024,8 +1098,21 @@ where
     }
 }
 
-fn record_rejection(
-    service: &Service,
+fn inject_chatgpt_apply_failure(staged_writes: &mut usize) -> Result<()> {
+    *staged_writes += 1;
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_WRITES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|target| *staged_writes >= target)
+    {
+        return Err(Error::storage("injected ChatGPT import write failure"));
+    }
+    Ok(())
+}
+
+fn record_rejection_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
     profile: &str,
     workspace: &str,
     conversation_id: &str,
@@ -1038,26 +1125,30 @@ fn record_rejection(
     let source_hash = ids::sha256_hex(
         format!("{profile}\n{workspace}\n{conversation_id}\n{message_id}\n{code}").as_bytes(),
     );
-    service.store.record_evidence_ledger(&EvidenceLedgerEntry {
-        profile_id: profile.to_string(),
-        workspace_id: workspace.to_string(),
-        repo_id: None,
-        subject_key: None,
-        source_kind: "visible_turn".to_string(),
-        source_id: None,
-        source_path: Some(source_path),
-        source_hash,
-        safe_summary: ledger_safe_summary(&format!(
-            "rejected chatgpt export message {conversation_id}/{message_id}: {reason}"
-        )),
-        policy_state: code.to_string(),
-        metadata: json!({
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "source": "chatgpt-export",
-        }),
-    })?;
-    service.store.record_policy_event(
+    Store::record_evidence_ledger_in_transaction(
+        tx,
+        &EvidenceLedgerEntry {
+            profile_id: profile.to_string(),
+            workspace_id: workspace.to_string(),
+            repo_id: None,
+            subject_key: None,
+            source_kind: "visible_turn".to_string(),
+            source_id: None,
+            source_path: Some(source_path),
+            source_hash,
+            safe_summary: ledger_safe_summary(&format!(
+                "rejected chatgpt export message {conversation_id}/{message_id}: {reason}"
+            )),
+            policy_state: code.to_string(),
+            metadata: json!({
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "source": "chatgpt-export",
+            }),
+        },
+    )?;
+    Store::record_policy_event_in_transaction(
+        tx,
         Some(profile),
         Some(workspace),
         "rejected_turn",
