@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -134,6 +135,10 @@ pub struct ChatgptExportResponse {
     pub skipped_existing: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
     pub members: Vec<ChatgptExportMemberReport>,
     pub conversations: Vec<ChatgptExportConversationReport>,
     pub skipped_conversations: Vec<ChatgptExportSkippedConversationReport>,
@@ -268,6 +273,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut skipped_existing = 0usize;
     let mut rejections = Vec::new();
     let mut skipped_conversations = Vec::new();
+    let mut selected_conversation_ids = Vec::new();
 
     if params.mode == ChatgptExportMode::Apply
         && total_conversations > LARGE_ARCHIVE_CONVERSATIONS
@@ -313,10 +319,29 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         eligible_only: params.selection.eligible_only,
     };
 
+    let manifest_path = import_manifest_path(&service.store.path_display());
+    let pending_manifest_path = pending_import_manifest_path(&manifest_path);
+    let mut pending_manifest_written = false;
     let mut staged_writes = 0usize;
-    let mut process_member = |member: &PayloadMember,
+    let mut process_member = |member: Option<&PayloadMember>,
                               transaction: Option<&rusqlite::Transaction<'_>>|
      -> Result<()> {
+        let Some(member) = member else {
+            let manifest = chatgpt_import_manifest(
+                &detected.payload_path,
+                &selected_conversation_ids,
+                created,
+                skipped_existing,
+                rejected_total,
+            );
+            let encoded = serde_json::to_vec_pretty(&manifest).map_err(|err| {
+                Error::internal(format!("serialize ChatGPT import manifest: {err}"))
+            })?;
+            pending_manifest_written = true;
+            write_pending_manifest(&pending_manifest_path, &encoded)?;
+            inject_chatgpt_after_pending_manifest_failure()?;
+            return Ok(());
+        };
         let payload_path = member.name().to_string();
         stream_conversations(member, |conversation| {
             if params
@@ -360,6 +385,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
                         )?;
                     }
                     rejections.extend(parsed.rejections);
+                    selected_conversation_ids.push(parsed.report.conversation_id.clone());
                     reports.push(parsed.report);
                     return Ok(());
                 }
@@ -458,21 +484,29 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             }
 
             rejections.extend(parsed.rejections);
+            selected_conversation_ids.push(parsed.report.conversation_id.clone());
             reports.push(parsed.report);
             Ok(())
         })?;
         Ok(())
     };
     if params.mode == ChatgptExportMode::Apply {
-        service.store.transaction(|tx| {
+        let apply_result = service.store.transaction(|tx| {
             for member in &detected.payloads {
-                process_member(member, Some(tx))?;
+                process_member(Some(member), Some(tx))?;
             }
+            process_member(None, Some(tx))?;
             Ok(())
-        })?;
+        });
+        if let Err(err) = apply_result {
+            if pending_manifest_written {
+                let _ = fs::remove_file(&pending_manifest_path);
+            }
+            return Err(err);
+        }
     } else {
         for member in &detected.payloads {
-            process_member(member, None)?;
+            process_member(Some(member), None)?;
         }
     }
 
@@ -481,8 +515,9 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         source_path,
         payload_path: detected.payload_path,
         conversation_count: total_conversations,
-        selected_conversations: reports.len(),
-        filtered_out_conversations: total_conversations.saturating_sub(reports.len()),
+        selected_conversations: selected_conversation_ids.len(),
+        filtered_out_conversations: total_conversations
+            .saturating_sub(selected_conversation_ids.len()),
         eligible_conversations: accepted_total,
         user_turns: user_total,
         assistant_turns: assistant_total,
@@ -491,29 +526,26 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         created,
         skipped_existing,
         manifest_path: None,
+        manifest_status: None,
+        manifest_warning: None,
         members,
         conversations: reports,
         skipped_conversations,
         rejections,
     };
     if params.mode == ChatgptExportMode::Apply {
-        let manifest_path = import_manifest_path(&service.store.path_display());
-        let manifest = json!({
-            "manifest_version": 1,
-            "source": "chatgpt-export",
-            "created_at": ids::now_rfc3339(),
-            "payload_path": manifest_payload_path(&response.payload_path),
-            "selected_source_ids": response.conversations.iter().map(|conversation| conversation.conversation_id.as_str()).collect::<Vec<_>>(),
-            "selected_conversations": response.selected_conversations,
-            "created": response.created,
-            "skipped_existing": response.skipped_existing,
-            "rejected_messages": response.rejected_messages,
-        });
-        let encoded = serde_json::to_vec_pretty(&manifest)
-            .map_err(|err| Error::internal(format!("serialize ChatGPT import manifest: {err}")))?;
-        fs::write(&manifest_path, encoded)
-            .map_err(|err| Error::storage(format!("write ChatGPT import manifest: {err}")))?;
-        response.manifest_path = Some(manifest_path.display().to_string());
+        match finalize_pending_manifest(&pending_manifest_path, &manifest_path) {
+            Ok(()) => {
+                response.manifest_path = Some(manifest_path.display().to_string());
+                response.manifest_status = Some("finalized".to_string());
+            }
+            Err(_) => {
+                response.manifest_status = Some("pending".to_string());
+                response.manifest_warning = Some(
+                    "ChatGPT import data is durable but manifest publication is pending; rerun the same apply command to finalize it.".to_string(),
+                );
+            }
+        }
     }
     Ok(response)
 }
@@ -550,6 +582,47 @@ fn import_manifest_path(store_path: &str) -> PathBuf {
     let mut path = PathBuf::from(store_path);
     path.set_extension("chatgpt-import-manifest.json");
     path
+}
+
+fn pending_import_manifest_path(manifest_path: &Path) -> PathBuf {
+    let mut path = manifest_path.to_path_buf();
+    path.set_extension("pending.json");
+    path
+}
+
+fn chatgpt_import_manifest(
+    payload_path: &str,
+    selected_conversation_ids: &[String],
+    created: usize,
+    skipped_existing: usize,
+    rejected_messages: usize,
+) -> Value {
+    json!({
+        "manifest_version": 1,
+        "source": "chatgpt-export",
+        "created_at": ids::now_rfc3339(),
+        "payload_path": manifest_payload_path(payload_path),
+        "selected_source_ids": selected_conversation_ids,
+        "selected_conversations": selected_conversation_ids.len(),
+        "created": created,
+        "skipped_existing": skipped_existing,
+        "rejected_messages": rejected_messages,
+    })
+}
+
+fn write_pending_manifest(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::File::create(path)
+        .map_err(|err| Error::storage(format!("write pending ChatGPT import manifest: {err}")))?;
+    file.write_all(bytes)
+        .map_err(|err| Error::storage(format!("write pending ChatGPT import manifest: {err}")))?;
+    file.sync_all()
+        .map_err(|err| Error::storage(format!("sync pending ChatGPT import manifest: {err}")))
+}
+
+fn finalize_pending_manifest(pending_path: &Path, manifest_path: &Path) -> Result<()> {
+    inject_chatgpt_manifest_finalization_failure()?;
+    fs::rename(pending_path, manifest_path)
+        .map_err(|err| Error::storage(format!("finalize ChatGPT import manifest: {err}")))
 }
 
 fn manifest_payload_path(payload_path: &str) -> String {
@@ -1206,6 +1279,34 @@ fn inject_chatgpt_apply_failure(staged_writes: &mut usize) -> Result<()> {
         .is_some_and(|target| *staged_writes >= target)
     {
         return Err(Error::storage("injected ChatGPT import write failure"));
+    }
+    Ok(())
+}
+
+fn inject_chatgpt_manifest_finalization_failure() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_MANIFEST_FINALIZE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(Error::storage(
+            "injected ChatGPT import manifest finalization failure",
+        ));
+    }
+    Ok(())
+}
+
+fn inject_chatgpt_after_pending_manifest_failure() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_PENDING_MANIFEST")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(Error::storage(
+            "injected ChatGPT import pending manifest failure",
+        ));
     }
     Ok(())
 }

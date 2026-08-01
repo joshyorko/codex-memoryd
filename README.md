@@ -451,18 +451,25 @@ Filters compose: repeat `--conversation-id`, use `--title-contains`, constrain
 updates with `--since` and `--until` (UTC date or RFC3339), limit results with
 `--max-conversations`, or use `--eligible-only`. Applying an archive over 100
 conversations requires a filter or explicit `--all` confirmation. Every apply
-writes a content-free manifest of the logical payload member, selected source
-IDs, and counts; locate its path through `codex-memoryd paths --format json` under
-`last_chatgpt_import_manifest`.
+publishes a content-free manifest of the logical payload member, selected source
+IDs, and counts; locate its final path through `codex-memoryd paths --format json`
+under `last_chatgpt_import_manifest`.
 
 Every import response includes a safe ordered `members` inventory with each
 member name and conversation count. Mixed legacy-plus-sharded exports, gaps or
 duplicates in shard numbering, duplicate conversation/message identities, and
 malformed members fail before apply writes anything. Preview and list write no
 state. Apply processes the complete logical export in one SQLite transaction:
-on failure it writes neither an import manifest nor partial sessions, sources,
-turns, ledger rows, or policy events, so a corrected export can be safely rerun.
-Conversation arrays are decoded incrementally. The importer rejects unsafe zip
+before its database commit it writes and fsyncs a same-directory pending
+sidecar, then atomically renames that sidecar to the final manifest after the
+commit. A transaction failure removes the pending sidecar and leaves no final
+manifest or import rows. If final publication fails after commit, the command
+still succeeds with `manifest_status: "pending"` and a safe rerun warning: the
+database import is durable, no final manifest is exposed, and rerunning the
+same idempotent apply finalizes the sidecar without duplicate rows. The rename
+is atomic only within the manifest directory's filesystem; a power-loss durable
+directory-entry guarantee remains filesystem-dependent. Conversation arrays are decoded incrementally.
+The importer rejects unsafe zip
 member paths and directory symlinks, more than 1,024 conversation members, a
 conversation member over 1 GiB, more than 100,000 conversations, or more than
 1,000,000 messages before completing an import.
