@@ -462,6 +462,10 @@ malformed members fail before apply writes anything. Preview and list write no
 state. Apply processes the complete logical export in one SQLite transaction:
 on failure it writes neither an import manifest nor partial sessions, sources,
 turns, ledger rows, or policy events, so a corrected export can be safely rerun.
+Conversation arrays are decoded incrementally. The importer rejects unsafe zip
+member paths and directory symlinks, more than 1,024 conversation members, a
+conversation member over 1 GiB, more than 100,000 conversations, or more than
+1,000,000 messages before completing an import.
 
 ### MCP read-only dogfood
 
