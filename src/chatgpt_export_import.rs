@@ -825,12 +825,22 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
                     .unwrap_or("conversations.json")
                     .to_string();
                 let size = fs::metadata(&payload)
-                    .map_err(|err| Error::invalid_request(format!("failed to inspect conversations payload: {err}")))?
+                    .map_err(|err| {
+                        Error::invalid_request(format!(
+                            "failed to inspect conversations payload: {err}"
+                        ))
+                    })?
                     .len();
-                if size > MAX_CONVERSATIONS_MEMBER_BYTES {
-                    return Err(Error::invalid_request(format!("conversations member exceeds {MAX_CONVERSATIONS_MEMBER_BYTES} bytes: {name}")));
+                let max_member_bytes = max_conversation_member_bytes();
+                if size > max_member_bytes {
+                    return Err(Error::invalid_request(format!(
+                        "conversations member exceeds {max_member_bytes} bytes: {name}"
+                    )));
                 }
-                Ok(PayloadMember::Directory { path: payload, name })
+                Ok(PayloadMember::Directory {
+                    path: payload,
+                    name,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         validate_payload_names(&mut payloads)?;
@@ -858,9 +868,10 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
             .map_err(|_| Error::invalid_request("failed to read zip entry from ChatGPT export"))?;
         let name = entry.name().to_string();
         validate_zip_member_path(&name)?;
-        if entry.size() > MAX_CONVERSATIONS_MEMBER_BYTES {
+        let max_member_bytes = max_conversation_member_bytes();
+        if entry.size() > max_member_bytes {
             return Err(Error::invalid_request(format!(
-                "archive member exceeds {MAX_CONVERSATIONS_MEMBER_BYTES} bytes: {name}"
+                "archive member exceeds {max_member_bytes} bytes: {name}"
             )));
         }
         if Path::new(&name)
@@ -1018,6 +1029,17 @@ fn max_conversation_members() -> usize {
         return limit;
     }
     MAX_CONVERSATION_MEMBERS
+}
+
+fn max_conversation_member_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBER_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    MAX_CONVERSATIONS_MEMBER_BYTES
 }
 
 fn validate_zip_member_path(name: &str) -> Result<()> {

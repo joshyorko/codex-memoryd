@@ -780,6 +780,26 @@ fn cli_chatgpt_export_rejects_member_count_above_test_limit_before_writes() {
 }
 
 #[test]
+fn cli_chatgpt_export_rejects_declared_member_size_above_test_limit_before_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = dir.path().join("chatgpt-member-size-limit");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(export_dir.join("conversations.json"), "[]").unwrap();
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_MAX_CONVERSATION_MEMBER_BYTES", "1")
+        .args(["import", "chatgpt-export", "--apply"])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conversations member exceeds"));
+    assert_eq!(count_table(&db, "sessions"), 0);
+}
+
+#[test]
 fn cli_chatgpt_export_rejects_incomplete_and_mixed_directory_shards_before_writes() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
