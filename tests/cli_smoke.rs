@@ -1585,12 +1585,134 @@ fn cli_chatgpt_export_apply_writes_manifest_with_selected_source_ids() {
 }
 
 #[test]
+fn cli_chatgpt_export_manifest_finalization_failure_is_pending_and_rerunnable() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-manifest-pending");
+    let mut manifest_path = db.clone();
+    manifest_path.set_extension("chatgpt-import-manifest.json");
+    let mut pending_manifest_path = db.clone();
+    pending_manifest_path.set_extension("chatgpt-import-manifest.pending.json");
+
+    let first = bin()
+        .arg("--db")
+        .arg(&db)
+        .env("CODEX_MEMORYD_TEST_FAIL_CHATGPT_MANIFEST_FINALIZE", "1")
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--conversation-id",
+            "conv-alpha",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        first.status.success(),
+        "post-commit manifest failure must retain a successful apply: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_report["manifest_status"], "pending");
+    assert!(first_report["manifest_warning"]
+        .as_str()
+        .expect("pending warning")
+        .contains("rerun"));
+    assert!(!manifest_path.exists(), "no false final manifest");
+    assert!(
+        pending_manifest_path.exists(),
+        "pending manifest is retained for recovery"
+    );
+    assert_eq!(count_table(&db, "sessions"), 1);
+    assert_eq!(count_table(&db, "memory_sources"), 2);
+    assert_eq!(count_table(&db, "visible_turns"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 3);
+
+    let second = bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--conversation-id",
+            "conv-alpha",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(second.status.success());
+    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_report["manifest_status"], "finalized");
+    assert!(manifest_path.exists(), "rerun publishes the final manifest");
+    assert!(
+        !pending_manifest_path.exists(),
+        "rerun finalizes pending sidecar"
+    );
+    assert_eq!(second_report["created"], 0);
+    assert_eq!(second_report["skipped_existing"], 2);
+    assert_eq!(count_table(&db, "sessions"), 1);
+    assert_eq!(count_table(&db, "memory_sources"), 2);
+    assert_eq!(count_table(&db, "visible_turns"), 2);
+    assert_eq!(count_table(&db, "evidence_ledger"), 3);
+}
+
+#[test]
+fn cli_chatgpt_export_precommit_manifest_failure_leaves_no_sidecar_or_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-precommit-manifest-failure");
+    let mut manifest_path = db.clone();
+    manifest_path.set_extension("chatgpt-import-manifest.json");
+    let mut pending_manifest_path = db.clone();
+    pending_manifest_path.set_extension("chatgpt-import-manifest.pending.json");
+
+    let output = bin()
+        .arg("--db")
+        .arg(&db)
+        .env(
+            "CODEX_MEMORYD_TEST_FAIL_CHATGPT_AFTER_PENDING_MANIFEST",
+            "1",
+        )
+        .args([
+            "import",
+            "chatgpt-export",
+            "--apply",
+            "--conversation-id",
+            "conv-alpha",
+        ])
+        .arg(&export_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "pre-commit failure must fail apply"
+    );
+    assert!(!manifest_path.exists(), "no false final manifest");
+    assert!(
+        !pending_manifest_path.exists(),
+        "pre-commit pending sidecar is cleaned"
+    );
+    assert_eq!(count_table(&db, "sessions"), 0);
+    assert_eq!(count_table(&db, "memory_sources"), 0);
+    assert_eq!(count_table(&db, "visible_turns"), 0);
+    assert_eq!(count_table(&db, "evidence_ledger"), 0);
+    assert_eq!(count_table(&db, "policy_events"), 0);
+}
+
+#[test]
 fn cli_chatgpt_export_apply_rolls_back_every_write_when_injected_failure_occurs() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let export_dir = write_chatgpt_export_dir(&dir, "chatgpt-export-atomic-failure");
     let mut manifest_path = db.clone();
     manifest_path.set_extension("chatgpt-import-manifest.json");
+    let mut pending_manifest_path = db.clone();
+    pending_manifest_path.set_extension("chatgpt-import-manifest.pending.json");
 
     let output = bin()
         .arg("--db")
@@ -1619,6 +1741,10 @@ fn cli_chatgpt_export_apply_rolls_back_every_write_when_injected_failure_occurs(
     assert!(
         !manifest_path.exists(),
         "failed apply must not write a manifest"
+    );
+    assert!(
+        !pending_manifest_path.exists(),
+        "failed apply must clean up its pending manifest"
     );
 }
 
