@@ -691,6 +691,13 @@ fn cli_chatgpt_export_preview_discovers_numbered_shards_in_numeric_order_without
     assert_eq!(report["selected_conversations"], 2);
     assert_eq!(report["conversations"][0]["conversation_id"], "conv-zero");
     assert_eq!(report["conversations"][1]["conversation_id"], "conv-one");
+    assert_eq!(
+        report["members"],
+        serde_json::json!([
+            {"name": "conversations-000.json", "conversation_count": 1},
+            {"name": "conversations-001.json", "conversation_count": 1}
+        ])
+    );
     assert_eq!(count_table(&db, "sessions"), 0);
     assert_eq!(count_table(&db, "visible_turns"), 0);
     assert_eq!(count_table(&db, "evidence_ledger"), 0);

@@ -432,7 +432,10 @@ to active memory records on its own.
 
 ### ChatGPT export selection and import
 
-Inspect an extracted ChatGPT export or zip before any writes. `--list` and
+Inspect an extracted ChatGPT export or zip before any writes. Legacy
+`conversations.json` and official contiguous `conversations-000.json` shard
+sets are discovered automatically in numeric order; do not rename, concatenate,
+split, or extract archive members yourself. `--list` and
 `--preview` emit stable, pretty JSON with each selected conversation's ID,
 title, timestamps, turn counts, eligibility, and selection reason. Preview
 also lists excluded conversations with the filter or limit that skipped them.
@@ -451,6 +454,14 @@ conversations requires a filter or explicit `--all` confirmation. Every apply
 writes a content-free manifest of the logical payload member, selected source
 IDs, and counts; locate its path through `codex-memoryd paths --format json` under
 `last_chatgpt_import_manifest`.
+
+Every import response includes a safe ordered `members` inventory with each
+member name and conversation count. Mixed legacy-plus-sharded exports, gaps or
+duplicates in shard numbering, duplicate conversation/message identities, and
+malformed members fail before apply writes anything. Preview and list write no
+state. Apply processes the complete logical export in one SQLite transaction:
+on failure it writes neither an import manifest nor partial sessions, sources,
+turns, ledger rows, or policy events, so a corrected export can be safely rerun.
 
 ### MCP read-only dogfood
 

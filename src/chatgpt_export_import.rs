@@ -102,6 +102,12 @@ pub struct ChatgptExportRejection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ChatgptExportMemberReport {
+    pub name: String,
+    pub conversation_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatgptExportResponse {
     pub mode: String,
     pub source_path: String,
@@ -118,6 +124,7 @@ pub struct ChatgptExportResponse {
     pub skipped_existing: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
+    pub members: Vec<ChatgptExportMemberReport>,
     pub conversations: Vec<ChatgptExportConversationReport>,
     pub skipped_conversations: Vec<ChatgptExportSkippedConversationReport>,
     pub rejections: Vec<ChatgptExportRejection>,
@@ -191,8 +198,11 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
     let mut total_messages = 0usize;
     let mut conversation_ids = HashSet::new();
     let mut message_ids = HashSet::new();
+    let mut members = Vec::new();
     for member in &detected.payloads {
+        let mut member_conversation_count = 0usize;
         stream_conversations(member, |conversation| {
+            member_conversation_count += 1;
             total_conversations = total_conversations.checked_add(1).ok_or_else(|| {
                 Error::invalid_request("ChatGPT export has too many conversations")
             })?;
@@ -232,6 +242,10 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
             }
             Ok(())
         })?;
+        members.push(ChatgptExportMemberReport {
+            name: member.name().to_string(),
+            conversation_count: member_conversation_count,
+        });
     }
 
     let mut reports = Vec::new();
@@ -478,6 +492,7 @@ pub fn run(service: &Service, params: ChatgptExportParams<'_>) -> Result<Chatgpt
         created,
         skipped_existing,
         manifest_path: None,
+        members,
         conversations: reports,
         skipped_conversations,
         rejections,
@@ -809,7 +824,11 @@ fn detect_payload(path: &Path) -> Result<DetectedPayload> {
         let mut payloads = payloads
             .into_iter()
             .map(|payload| {
-                let name = payload.display().to_string();
+                let name = payload
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("conversations.json")
+                    .to_string();
                 let size = fs::metadata(&payload)
                     .map_err(|err| Error::invalid_request(format!("failed to inspect conversations payload: {err}")))?
                     .len();
