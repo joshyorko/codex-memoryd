@@ -177,13 +177,43 @@ fn dream_worker_status(
     config: &Config,
     dream_scheduler: &ScheduledDreamStatus,
 ) -> DreamWorkerStatus {
+    let configured_adapter =
+        crate::protocol::DreamProviderAdapter::parse(&config.dream_provider.adapter)
+            .unwrap_or(crate::protocol::DreamProviderAdapter::Provider);
+    let model_enabled = config.dream_provider.enabled;
+    let mode = if model_enabled {
+        configured_adapter.as_str()
+    } else {
+        "deterministic"
+    };
+    let local_provider_configured =
+        model_enabled && configured_adapter == crate::protocol::DreamProviderAdapter::LocalModel;
+    let provider_configured =
+        model_enabled && configured_adapter == crate::protocol::DreamProviderAdapter::Provider;
+    let endpoint_configured = !config.dream_provider.endpoint.trim().is_empty();
+    let local_provider_ready = local_provider_configured
+        && endpoint_configured
+        && !config.dream_provider.model.trim().is_empty()
+        && parse_local_http_endpoint(&config.dream_provider.endpoint).is_some();
+    let provider_ready = provider_configured
+        && endpoint_configured
+        && !config.dream_provider.model.trim().is_empty()
+        && (config.dream_provider.endpoint.starts_with("http://")
+            || config.dream_provider.endpoint.starts_with("https://"))
+        && !config.dream_provider.endpoint.contains('@');
     DreamWorkerStatus {
         enabled: dream_scheduler.enabled,
-        mode: "deterministic".to_string(),
+        mode: mode.to_string(),
+        configured: !model_enabled || endpoint_configured,
+        active: false,
+        preview_only: true,
         automatic_apply: config.dream_scheduler.automatic_apply,
-        paid_provider_configured: config.dream_provider.enabled,
-        paid_provider_ready: config.dream_provider.enabled
-            && !config.dream_provider.endpoint.trim().is_empty(),
+        local_provider_configured,
+        local_provider_ready,
+        provider_configured,
+        provider_ready,
+        paid_provider_configured: provider_configured,
+        paid_provider_ready: provider_ready,
         last_run_at: dream_scheduler.last_run_at.clone(),
         last_status: dream_scheduler.last_status.clone(),
         last_error: dream_scheduler.last_error.clone(),
@@ -198,6 +228,14 @@ fn dream_worker_status(
             max_batch_size: config.dream_scheduler.max_batch_size,
             max_candidates: config.dream_scheduler.max_candidates,
             max_runtime_seconds: config.dream_scheduler.max_runtime_seconds,
+            max_input_tokens: 0,
+            max_output_tokens: 0,
+            max_input_bytes: 0,
+            max_output_bytes: config.dream_provider.max_response_bytes,
+            max_provider_calls: 1,
+            max_retries: 0,
+            max_cost_micros: 0,
+            daily_cost_ceiling_micros: config.dream_provider.daily_cost_ceiling_micros,
         },
     }
 }
@@ -316,8 +354,38 @@ mod tests {
         assert!(!configured.paid_provider_ready);
 
         cfg.dream_provider.endpoint = "http://localhost:4000/v1".to_string();
+        cfg.dream_provider.model = "remote-model".to_string();
         let ready = dream_worker_status(&cfg, &scheduler_status);
         assert!(ready.paid_provider_configured);
         assert!(ready.paid_provider_ready);
+    }
+
+    #[test]
+    fn dream_worker_status_reports_local_mode_and_loopback_readiness() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.enabled = true;
+        cfg.dream_provider.adapter = "local-model".to_string();
+        cfg.dream_provider.endpoint = "http://127.0.0.1:4000/v1".to_string();
+        cfg.dream_provider.model = "local-runtime".to_string();
+        let scheduler_status = ScheduledDreamStatus {
+            enabled: false,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_run_id: None,
+            last_watermark: None,
+            next_eligible_run: None,
+            degraded: false,
+        };
+
+        let status = dream_worker_status(&cfg, &scheduler_status);
+
+        assert_eq!(status.mode, "local-model");
+        assert!(!status.enabled);
+        assert!(!status.active);
+        assert!(status.preview_only);
+        assert!(status.local_provider_configured);
+        assert!(status.local_provider_ready);
+        assert!(!status.paid_provider_configured);
     }
 }

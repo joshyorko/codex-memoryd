@@ -167,13 +167,28 @@ pub struct DreamWorkerLimits {
     pub max_batch_size: usize,
     pub max_candidates: usize,
     pub max_runtime_seconds: u64,
+    pub max_input_tokens: usize,
+    pub max_output_tokens: usize,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+    pub max_provider_calls: usize,
+    pub max_retries: usize,
+    pub max_cost_micros: u64,
+    pub daily_cost_ceiling_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DreamWorkerStatus {
     pub enabled: bool,
     pub mode: String,
+    pub configured: bool,
+    pub active: bool,
+    pub preview_only: bool,
     pub automatic_apply: bool,
+    pub local_provider_configured: bool,
+    pub local_provider_ready: bool,
+    pub provider_configured: bool,
+    pub provider_ready: bool,
     pub paid_provider_configured: bool,
     pub paid_provider_ready: bool,
     pub last_run_at: Option<String>,
@@ -190,6 +205,79 @@ pub struct DreamJobBudget {
     pub max_runtime_seconds: u64,
     pub max_input_records: usize,
     pub max_candidates: usize,
+    #[serde(default)]
+    pub max_input_tokens: usize,
+    #[serde(default)]
+    pub max_output_tokens: usize,
+    #[serde(default)]
+    pub max_input_bytes: usize,
+    #[serde(default)]
+    pub max_output_bytes: usize,
+    #[serde(default)]
+    pub max_provider_calls: usize,
+    #[serde(default)]
+    pub max_retries: usize,
+    #[serde(default)]
+    pub max_cost_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cost_ceiling_micros: Option<u64>,
+}
+
+impl Default for DreamJobBudget {
+    fn default() -> Self {
+        Self {
+            max_runtime_seconds: 30,
+            max_input_records: 500,
+            max_candidates: 50,
+            max_input_tokens: 0,
+            max_output_tokens: 0,
+            max_input_bytes: 0,
+            max_output_bytes: 0,
+            max_provider_calls: 0,
+            max_retries: 0,
+            max_cost_micros: 0,
+            daily_cost_ceiling_micros: None,
+        }
+    }
+}
+
+/// Reviewed adapters are the only model-backed execution boundary. The
+/// deterministic adapter never performs network or subprocess work.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DreamProviderAdapter {
+    Deterministic,
+    LocalModel,
+    Provider,
+}
+
+impl Default for DreamProviderAdapter {
+    fn default() -> Self {
+        Self::Deterministic
+    }
+}
+
+impl DreamProviderAdapter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::LocalModel => "local-model",
+            Self::Provider => "provider",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "deterministic" => Some(Self::Deterministic),
+            "local-model" | "local" => Some(Self::LocalModel),
+            "provider" | "remote-provider" => Some(Self::Provider),
+            _ => None,
+        }
+    }
+
+    pub fn is_model_backed(self) -> bool {
+        !matches!(self, Self::Deterministic)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -199,6 +287,23 @@ pub struct DreamProviderCommand {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct DreamJobProvider {
+    /// The reviewed adapter name. `command` is retained only for backwards
+    /// compatibility with deterministic job records and is never executed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "mode",
+        alias = "type"
+    )]
+    pub adapter: Option<DreamProviderAdapter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<DreamProviderCommand>,
 }
@@ -1063,6 +1168,8 @@ pub struct DreamEvidenceSource {
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1088,6 +1195,30 @@ pub struct DreamEvidenceWindow {
     pub checkpoints: DreamEvidenceStream,
     pub imported_memories: DreamEvidenceStream,
     pub active_memory_records: DreamEvidenceStream,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DreamProviderProvenance {
+    pub schema_version: String,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub provider: String,
+    pub model: String,
+    pub request_hash: String,
+    pub input_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct DreamBudgetUsage {
+    pub input_records: usize,
+    pub input_tokens: usize,
+    pub input_bytes: usize,
+    pub output_candidates: usize,
+    pub output_tokens: usize,
+    pub output_bytes: usize,
+    pub provider_calls: usize,
+    pub retries: usize,
+    pub cost_micros: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1122,6 +1253,8 @@ pub struct DreamCandidate {
     pub promotion_reason: String,
     #[serde(skip_serializing)]
     pub apply_eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DreamProviderProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1215,6 +1348,8 @@ pub struct DreamResponse {
     pub archived: Vec<String>,
     pub created: Vec<String>,
     pub authority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DreamProviderProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1226,6 +1361,10 @@ pub struct DreamJobRunResponse {
     pub status: String,
     pub limits_hit: Vec<String>,
     pub preview: DreamResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DreamProviderProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usage: Option<DreamBudgetUsage>,
 }
 
 #[derive(Debug, Clone, Serialize)]

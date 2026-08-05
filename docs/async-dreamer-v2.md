@@ -1,96 +1,130 @@
-# Async Dreamer v2 MVP
+# Async Dreamer v2
 
-Status: first-PR design for issue #157. This slice adds an explicit local job
-primitive and keeps execution deterministic, preview-only, and bounded.
+Async Dreamer jobs are an explicit execution seam for bounded Dreamer preview
+runs. They do not start a background worker, apply patches, promote candidates,
+or write durable memory. The existing deterministic Dreamer path remains the
+default and does not require a model or network access.
 
-## Goals
+## Job modes
 
-- Define a durable job record for local Dreamer reasoning runs.
-- Reuse existing Dreamer preview logic and existing `dream_runs` audit rows.
-- Make budgets explicit in request/job data before any cloud or local-model work.
-- Keep all outputs previewable candidates and patches. No silent apply.
+`kind` is currently restricted to `dream_preview`. `mode` selects one reviewed
+adapter:
 
-## Non-goals in this PR
+- `deterministic` (default): runs the existing deterministic preview engine.
+  Any legacy `provider.command.argv` value is retained as inert data and is
+  never executed.
+- `local-model`: calls an explicitly supplied or configured loopback HTTP(S)
+  endpoint. The daemon never downloads a model.
+- `provider`: calls an explicitly supplied or enabled remote HTTP(S) provider.
+  This mode is opt-in and may incur cost.
 
-- No background worker loop.
-- No automatic apply.
-- No provider command execution.
-- No MCP or broad CLI wiring.
-- No dependency on eval work (#189) or runtime worker work (#183).
+Model-backed jobs use the typed `dream-preview-v1` JSON envelope. The HTTP
+adapter accepts the envelope directly or inside an OpenAI-compatible chat
+response. Shell commands, shell interpolation, arbitrary subprocesses, and
+provider calls during startup or status checks are not part of this boundary.
 
-## Job model
+## Runtime setup
 
-The long-term job taxonomy for Async Dreamer v2 is:
+Provider credentials are runtime-only configuration. They are read from
+`CODEX_MEMORYD_PROVIDER_API_KEY` and are never accepted in a job provider
+object, persisted job/run JSON, audit metadata, candidate provenance, logs, or
+responses. A minimal local setup is:
 
-- `summarize_evidence_window`
-- `detect_conflicts`
-- `propose_relations`
-- `propose_temporal_transitions`
-- `propose_procedures`
-- `compact_cards`
-- `compact_packs`
+```text
+CODEX_MEMORYD_PROVIDER_ENABLED=true
+CODEX_MEMORYD_PROVIDER_ADAPTER=local-model
+CODEX_MEMORYD_PROVIDER_ENDPOINT=http://127.0.0.1:8080/v1
+CODEX_MEMORYD_PROVIDER_MODEL=my-local-runtime
+```
 
-The MVP executable job shape is intentionally narrow:
+Remote setup uses `CODEX_MEMORYD_PROVIDER_ADAPTER=provider`, an HTTPS endpoint
+and an explicit model. Inline URL credentials are rejected. A request may
+provide an endpoint/model/provider override, but a remote request still needs
+an explicit provider mode and a positive `max_cost_micros` budget. Local
+endpoints must resolve to loopback addresses.
 
-- `kind`: only `dream_preview`
-- `mode`: only `deterministic`
-- `budget.max_runtime_seconds`
-- `budget.max_input_records`
-- `budget.max_candidates` (preview output-size cap in candidate units; each
-  proposal or policy rejection consumes one unit, while stale evidence notices
-  do not)
-- `provider.command.argv` as stored config/data only
+The provider configuration also supports:
 
-Jobs persist in `dream_jobs`. The row stores the explicit budget/provider shape,
-scope, last run id, last run time, and last error. This creates an audit seam
-for later schedulers or explicit CLI commands without introducing background
-writes now.
+- `CODEX_MEMORYD_PROVIDER_TIMEOUT_SECONDS`
+- `CODEX_MEMORYD_PROVIDER_MAX_RESPONSE_BYTES`
+- `CODEX_MEMORYD_PROVIDER_NAME`
+- `CODEX_MEMORYD_PROVIDER_COST_PER_1K_INPUT_MICROS`
+- `CODEX_MEMORYD_PROVIDER_COST_PER_1K_OUTPUT_MICROS`
+- `CODEX_MEMORYD_PROVIDER_DAILY_COST_CEILING_MICROS`
 
-## Run model
+No configuration above causes a call by itself. Deterministic jobs continue to
+work when all provider configuration is absent.
 
-Runs reuse the existing `dream_runs` table instead of inventing a second run
-ledger. A job run:
+## Budgets and cost
 
-1. Validates scope, timestamps, and deterministic-only constraints.
-2. Persists/updates the `dream_jobs` row as `running`.
-3. Calls the existing Dreamer preview engine with bounded `max_records` and
-   `max_candidates`.
-4. Stores the resulting Dreamer audit row in `dream_runs`.
-5. Updates the job row with `last_run_id`, `last_run_at`, final status, and any
-   safe error summary.
+Every job carries a typed budget:
 
-Failure outcomes also append an `error` run in `dream_runs` (same scope/window)
-so operators can audit failed attempts alongside successful preview passes.
+- `max_runtime_seconds`
+- `max_input_records`
+- `max_candidates`
+- `max_input_tokens` and `max_output_tokens`
+- `max_input_bytes` and `max_output_bytes`
+- `max_provider_calls` and `max_retries`
+- `max_cost_micros`
+- optional `daily_cost_ceiling_micros`
 
-This keeps run evidence aligned with current preview/apply reporting and avoids
-new hidden storage behavior.
+Zero leaves token/byte limits unconstrained; zero provider calls uses one
+compatibility call, and zero retries disables retries. A remote provider job
+must set a positive per-run cost ceiling. The
+adapter enforces timeout, response-size, input/output, call, retry, and cost
+limits before returning candidates. A configured daily ceiling is a rolling
+24-hour ceiling across audited provider runs; a replay of the same bounded run
+does not double-count its existing audit row. Exhaustion produces a terminal
+error audit and no durable-memory write.
 
-## Safety constraints
+## Trust boundary and candidate review
 
-- Deterministic only in this MVP.
-- Provider command data is persisted but never executed.
-- Preview only: no memory writes from job execution.
-- Existing evidence refs, candidate previews, and patch/apply workflow remain
-  unchanged.
-- Input and output remain bounded by explicit job budgets.
+Provider output is untrusted input. The daemon:
 
-## Failure states
+1. Requires the `dream-preview-v1` response schema and matching
+   profile/workspace/repository scope.
+2. Requires each proposed candidate to use a supported record type, a screened
+   content/subject/action/state value, and evidence references from the job's
+   evidence window.
+3. Applies deterministic policy classification and clamps provider confidence.
+4. Marks model-backed candidates `recall_not_authority`,
+   `provider_generated`, `provider_preview`, and `apply_eligible=false`.
+5. Adds provider/model/adapter version, request hash, and input hash
+   provenance to the preview.
 
-- Invalid `kind`
-- Invalid `mode`
-- Invalid RFC3339 `now`
-- Invalid RFC3339 `since`
-- Zero `max_input_records`
-- Zero `max_candidates`
-- Dreamer preview failure from existing store/policy/runtime paths
+Model-backed runs call only the deterministic Dreamer preview engine and the
+typed adapter. They do not call Dreamer apply, scheduled apply, patch apply,
+promotion, supersession, archival, or direct memory-write paths. Candidate
+`supersedes`/`retires` values are accepted only when they are evidence
+references, so they remain review metadata rather than mutation commands.
 
-Failures update the job row with `status=error` and `last_error`. They do not
-apply memory mutations.
+Review candidates through the existing Dreamer preview and memory-patch
+workflow. Applying a patch is a separate, explicit operator action; provider
+output is never authority for that action.
 
-## Follow-up path
+## Auditing and status
 
-- Add config-backed default job templates if the operator wants named jobs.
-- Add an explicit CLI surface only after the job/status contract is reviewed.
-- Add optional local-model or provider execution behind separate design review,
-  disabled by default, still preview-only, and still bounded by explicit
-  budgets.
+`dream_jobs` records the requested mode, scope, typed budget, safe provider
+identity, status, last run, and sanitized failure. `dream_runs` records the
+source window, candidate/policy outcomes, provider/model/adapter provenance,
+request/input hashes, and budget usage (records, tokens, bytes, calls,
+retries, candidates, and cost). No credential is included in either row.
+
+`/v1/status` reports the effective mode, scheduler enabled/active state,
+preview-only capability, local/provider configured state, and local/provider
+readiness. Readiness requires the endpoint and model; local readiness also
+requires a loopback endpoint. Status performs no provider call and exposes only
+safe budget/cost summaries.
+
+There is intentionally no Async Dreamer background loop or automatic retry
+lifecycle. A caller explicitly invokes the job execution seam, and then
+reviews the resulting bounded preview and audit record.
+
+## Failure behavior
+
+Malformed JSON or schema, scope mismatch, content-policy rejection, timeout,
+HTTP failure, response-cap exhaustion, cancellation/runtime exhaustion, and
+token/call/retry/cost budget exhaustion terminate safely. Errors are bounded
+and sanitized before they are returned or persisted. Failed runs still have a
+`dream_runs` error audit and a terminal `dream_jobs` status; durable memory
+remains unchanged.

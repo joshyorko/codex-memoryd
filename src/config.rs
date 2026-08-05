@@ -3,6 +3,7 @@
 //! variables → explicit CLI flags. Later sources win.
 
 use serde::Deserialize;
+use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -13,6 +14,7 @@ use crate::error::Result;
 use crate::hybrid_retrieval::{
     DEFAULT_HYBRID_BACKEND, DEFAULT_HYBRID_DIMS, DEFAULT_HYBRID_FUSION_K,
 };
+use crate::protocol::DreamProviderAdapter;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_MAX_RECALL_TOKENS: usize = 1200;
@@ -95,6 +97,17 @@ pub struct DreamSection {
     pub max_batch_size: Option<usize>,
     pub max_candidates: Option<usize>,
     pub max_runtime_seconds: Option<u64>,
+    pub provider_enabled: Option<bool>,
+    pub provider_adapter: Option<String>,
+    pub provider_endpoint: Option<String>,
+    pub provider_model: Option<String>,
+    pub provider_name: Option<String>,
+    pub provider_timeout_seconds: Option<u64>,
+    pub provider_max_response_bytes: Option<usize>,
+    pub provider_cost_per_1k_input_micros: Option<u64>,
+    pub provider_cost_per_1k_output_micros: Option<u64>,
+    pub provider_daily_cost_ceiling_micros: Option<u64>,
+    pub scheduled_provider_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,23 +121,56 @@ pub struct DreamSchedulerConfig {
     pub max_batch_size: usize,
     pub max_candidates: usize,
     pub max_runtime_seconds: u64,
+    pub scheduled_provider_enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DreamProviderConfig {
     pub enabled: bool,
+    pub adapter: String,
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    pub provider_name: String,
+    pub timeout_seconds: u64,
+    pub max_response_bytes: usize,
+    pub cost_per_1k_input_micros: u64,
+    pub cost_per_1k_output_micros: u64,
+    pub daily_cost_ceiling_micros: Option<u64>,
+}
+
+impl fmt::Debug for DreamProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DreamProviderConfig")
+            .field("enabled", &self.enabled)
+            .field("adapter", &self.adapter)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"[redacted]")
+            .field("model", &self.model)
+            .field("provider_name", &self.provider_name)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("cost_per_1k_input_micros", &self.cost_per_1k_input_micros)
+            .field("cost_per_1k_output_micros", &self.cost_per_1k_output_micros)
+            .field("daily_cost_ceiling_micros", &self.daily_cost_ceiling_micros)
+            .finish()
+    }
 }
 
 impl Default for DreamProviderConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            adapter: "provider".to_string(),
             endpoint: String::new(),
             api_key: String::new(),
             model: String::new(),
+            provider_name: "openai-compatible".to_string(),
+            timeout_seconds: 10,
+            max_response_bytes: 256 * 1024,
+            cost_per_1k_input_micros: 0,
+            cost_per_1k_output_micros: 0,
+            daily_cost_ceiling_micros: None,
         }
     }
 }
@@ -250,6 +296,7 @@ impl Default for Config {
                 max_batch_size: 500,
                 max_candidates: 50,
                 max_runtime_seconds: 30,
+                scheduled_provider_enabled: false,
             },
             dream_provider: DreamProviderConfig::default(),
             log_level: "info".to_string(),
@@ -482,6 +529,39 @@ impl Config {
         if let Some(seconds) = file.dream.max_runtime_seconds {
             self.dream_scheduler.max_runtime_seconds = seconds;
         }
+        if let Some(enabled) = file.dream.provider_enabled {
+            self.dream_provider.enabled = enabled;
+        }
+        if let Some(enabled) = file.dream.scheduled_provider_enabled {
+            self.dream_scheduler.scheduled_provider_enabled = enabled;
+        }
+        if let Some(adapter) = file.dream.provider_adapter {
+            self.dream_provider.adapter = adapter;
+        }
+        if let Some(endpoint) = file.dream.provider_endpoint {
+            self.dream_provider.endpoint = endpoint;
+        }
+        if let Some(model) = file.dream.provider_model {
+            self.dream_provider.model = model;
+        }
+        if let Some(name) = file.dream.provider_name {
+            self.dream_provider.provider_name = name;
+        }
+        if let Some(seconds) = file.dream.provider_timeout_seconds {
+            self.dream_provider.timeout_seconds = seconds;
+        }
+        if let Some(bytes) = file.dream.provider_max_response_bytes {
+            self.dream_provider.max_response_bytes = bytes;
+        }
+        if let Some(cost) = file.dream.provider_cost_per_1k_input_micros {
+            self.dream_provider.cost_per_1k_input_micros = cost;
+        }
+        if let Some(cost) = file.dream.provider_cost_per_1k_output_micros {
+            self.dream_provider.cost_per_1k_output_micros = cost;
+        }
+        if let Some(cost) = file.dream.provider_daily_cost_ceiling_micros {
+            self.dream_provider.daily_cost_ceiling_micros = Some(cost);
+        }
         if let Some(l) = file.log.level {
             self.log_level = l;
         }
@@ -525,6 +605,27 @@ impl Config {
         }
         if self.dream_scheduler.max_batch_size == 0 {
             return Err(Error::invalid_request("dream.max_batch_size must be > 0"));
+        }
+        if DreamProviderAdapter::parse(&self.dream_provider.adapter).is_none() {
+            return Err(Error::invalid_request(format!(
+                "dream.provider_adapter must be deterministic, local-model, or provider (got '{}')",
+                self.dream_provider.adapter
+            )));
+        }
+        if self.dream_provider.timeout_seconds == 0 {
+            return Err(Error::invalid_request(
+                "dream.provider_timeout_seconds must be > 0",
+            ));
+        }
+        if self.dream_provider.max_response_bytes == 0 {
+            return Err(Error::invalid_request(
+                "dream.provider_max_response_bytes must be > 0",
+            ));
+        }
+        if self.dream_provider.endpoint.contains('@') {
+            return Err(Error::secret(
+                "dream provider endpoint must not contain credentials",
+            ));
         }
         self.hybrid_recall.validate()?;
         Ok(())
@@ -619,6 +720,11 @@ where
     )? {
         config.dream_provider.enabled = enabled;
     }
+    if let Some(adapter) = get("CODEX_MEMORYD_PROVIDER_ADAPTER").and_then(clean_env_value) {
+        config.dream_provider.adapter = adapter;
+    } else if let Some(mode) = get("CODEX_MEMORYD_PROVIDER_MODE").and_then(clean_env_value) {
+        config.dream_provider.adapter = mode;
+    }
     if let Some(endpoint) = get("CODEX_MEMORYD_PROVIDER_ENDPOINT").and_then(clean_env_value) {
         config.dream_provider.endpoint = endpoint;
     }
@@ -627,6 +733,39 @@ where
     }
     if let Some(model) = get("CODEX_MEMORYD_PROVIDER_MODEL").and_then(clean_env_value) {
         config.dream_provider.model = model;
+    }
+    if let Some(name) = get("CODEX_MEMORYD_PROVIDER_NAME").and_then(clean_env_value) {
+        config.dream_provider.provider_name = name;
+    }
+    if let Some(seconds) = parse_u64_value(
+        "CODEX_MEMORYD_PROVIDER_TIMEOUT_SECONDS",
+        get("CODEX_MEMORYD_PROVIDER_TIMEOUT_SECONDS").and_then(clean_env_value),
+    )? {
+        config.dream_provider.timeout_seconds = seconds;
+    }
+    if let Some(bytes) = parse_usize_value(
+        "CODEX_MEMORYD_PROVIDER_MAX_RESPONSE_BYTES",
+        get("CODEX_MEMORYD_PROVIDER_MAX_RESPONSE_BYTES").and_then(clean_env_value),
+    )? {
+        config.dream_provider.max_response_bytes = bytes;
+    }
+    if let Some(cost) = parse_u64_value(
+        "CODEX_MEMORYD_PROVIDER_COST_PER_1K_INPUT_MICROS",
+        get("CODEX_MEMORYD_PROVIDER_COST_PER_1K_INPUT_MICROS").and_then(clean_env_value),
+    )? {
+        config.dream_provider.cost_per_1k_input_micros = cost;
+    }
+    if let Some(cost) = parse_u64_value(
+        "CODEX_MEMORYD_PROVIDER_COST_PER_1K_OUTPUT_MICROS",
+        get("CODEX_MEMORYD_PROVIDER_COST_PER_1K_OUTPUT_MICROS").and_then(clean_env_value),
+    )? {
+        config.dream_provider.cost_per_1k_output_micros = cost;
+    }
+    if let Some(cost) = parse_u64_value(
+        "CODEX_MEMORYD_PROVIDER_DAILY_COST_CEILING_MICROS",
+        get("CODEX_MEMORYD_PROVIDER_DAILY_COST_CEILING_MICROS").and_then(clean_env_value),
+    )? {
+        config.dream_provider.daily_cost_ceiling_micros = Some(cost);
     }
     if let Some(enabled) = parse_bool_value(
         "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED",
@@ -639,6 +778,12 @@ where
         get("CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY").and_then(clean_env_value),
     )? {
         config.dream_scheduler.automatic_apply = automatic_apply;
+    }
+    if let Some(enabled) = parse_bool_value(
+        "CODEX_MEMORYD_DREAM_SCHEDULED_PROVIDER_ENABLED",
+        get("CODEX_MEMORYD_DREAM_SCHEDULED_PROVIDER_ENABLED").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.scheduled_provider_enabled = enabled;
     }
     if let Some(seconds) = parse_u64_value(
         "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",
@@ -914,6 +1059,17 @@ mod tests {
         assert!(cfg.dream_provider.endpoint.is_empty());
         assert!(cfg.dream_provider.api_key.is_empty());
         assert!(cfg.dream_provider.model.is_empty());
+    }
+
+    #[test]
+    fn dream_provider_debug_redacts_runtime_credentials() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.api_key = "sk-sentinel-secret-123456789".to_string();
+
+        let debug = format!("{cfg:?}");
+
+        assert!(!debug.contains("sk-sentinel-secret-123456789"));
+        assert!(debug.contains("[redacted]"));
     }
 
     #[test]

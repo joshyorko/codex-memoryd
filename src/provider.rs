@@ -2,6 +2,15 @@ use anyhow::Result;
 use reqwest::blocking::Client;
 use serde_json::json;
 use serde_json::Value;
+use std::io::Read;
+use std::time::Duration;
+use std::time::Instant;
+
+use crate::error::Error;
+use crate::ids;
+use crate::protocol::DreamBudgetUsage;
+use crate::protocol::DreamJobBudget;
+use crate::protocol::DreamProviderAdapter;
 
 const SYSTEM_PROMPT: &str = r#"Extract durable memory observations from the supplied evidence.
 Return only a JSON array. Each item must match the codex-memoryd dream observation format and
@@ -63,6 +72,327 @@ pub fn generate_observations(
         .unwrap_or_default();
 
     Ok(observations)
+}
+
+pub const DREAM_PROVIDER_SCHEMA_VERSION: &str = "dream-preview-v1";
+pub const DREAM_PROVIDER_ADAPTER_VERSION: &str = "http-json-v1";
+
+/// Runtime-only provider call configuration. It deliberately contains the
+/// credential only in memory; callers must never persist or serialize it.
+pub struct DreamProviderRequest<'a> {
+    pub adapter: DreamProviderAdapter,
+    pub endpoint: &'a str,
+    pub api_key: &'a str,
+    pub model: &'a str,
+    pub provider_name: &'a str,
+    pub timeout: Duration,
+    pub max_response_bytes: usize,
+    pub max_provider_calls: usize,
+    pub max_retries: usize,
+    pub deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct DreamProviderCall {
+    pub values: Vec<Value>,
+    pub response_profile: Option<String>,
+    pub response_workspace: Option<String>,
+    pub response_repo_id: Option<String>,
+    pub response_repo_id_present: bool,
+    pub usage: DreamBudgetUsage,
+    pub reported_cost_micros: Option<u64>,
+    pub request_hash: String,
+    pub input_hash: String,
+}
+
+/// Execute the reviewed HTTP JSON adapter. The adapter accepts either the
+/// typed Dream preview envelope or an OpenAI-compatible chat response whose
+/// content contains that envelope. No subprocess or shell execution is
+/// involved.
+pub fn execute_preview(
+    request: &DreamProviderRequest<'_>,
+    profile: &str,
+    workspace: &str,
+    repo_id: Option<&str>,
+    model_input: &str,
+    budget: &DreamJobBudget,
+) -> crate::error::Result<DreamProviderCall> {
+    if !request.adapter.is_model_backed() {
+        return Err(Error::invalid_request(
+            "deterministic jobs must not invoke a model adapter",
+        ));
+    }
+    if request.endpoint.trim().is_empty() {
+        return Err(Error::invalid_request(
+            "model-backed Dream jobs require an explicit provider endpoint",
+        ));
+    }
+    if request.max_response_bytes == 0 {
+        return Err(Error::invalid_request(
+            "dream provider max response bytes must be > 0",
+        ));
+    }
+    if request.max_provider_calls == 0 {
+        return Err(Error::invalid_request(
+            "dream provider max_provider_calls must be > 0",
+        ));
+    }
+
+    let input_bytes = model_input.as_bytes().len();
+    let input_tokens = estimate_tokens(model_input);
+    let request_body = json!({
+        "schema_version": DREAM_PROVIDER_SCHEMA_VERSION,
+        "profile": profile,
+        "workspace": workspace,
+        "repo_id": repo_id,
+        "model": request.model,
+        "input": model_input,
+        "response_schema": {
+            "schema_version": DREAM_PROVIDER_SCHEMA_VERSION,
+            "profile": profile,
+            "workspace": workspace,
+            "repo_id": repo_id,
+            "candidates": "array"
+        }
+    });
+    let request_bytes = serde_json::to_vec(&request_body)
+        .map_err(|_| Error::internal("provider request could not be encoded"))?;
+    if budget.max_input_bytes > 0 && input_bytes > budget.max_input_bytes {
+        return Err(Error::internal(
+            "dream provider input byte budget exhausted",
+        ));
+    }
+    if budget.max_input_tokens > 0 && input_tokens > budget.max_input_tokens {
+        return Err(Error::internal(
+            "dream provider input token budget exhausted",
+        ));
+    }
+
+    let request_hash = ids::sha256_hex(&request_bytes);
+    let input_hash = ids::sha256_hex(model_input.as_bytes());
+    let max_calls = request.max_provider_calls;
+    let max_attempts = max_calls.min(request.max_retries.saturating_add(1));
+    let mut last_error = "provider request failed";
+
+    for attempt in 0..max_attempts {
+        if Instant::now() >= request.deadline {
+            return Err(Error::internal("dream provider runtime budget exhausted"));
+        }
+        let remaining = request
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(request.timeout);
+        if remaining.is_zero() {
+            return Err(Error::internal("dream provider runtime budget exhausted"));
+        }
+        match call_once(
+            request,
+            &request_body,
+            remaining,
+            request.max_response_bytes,
+        ) {
+            Ok((value, output_bytes, reported_cost_micros)) => {
+                let extracted = extract_response(value)?;
+                let output_tokens = extracted
+                    .usage
+                    .completion_tokens
+                    .unwrap_or_else(|| estimate_tokens_from_bytes(output_bytes));
+                let input_tokens = extracted.usage.prompt_tokens.unwrap_or(input_tokens);
+                let usage = DreamBudgetUsage {
+                    input_records: 0,
+                    input_tokens,
+                    input_bytes,
+                    output_candidates: extracted.values.len(),
+                    output_tokens,
+                    output_bytes,
+                    provider_calls: attempt + 1,
+                    retries: attempt,
+                    cost_micros: reported_cost_micros.unwrap_or(0),
+                };
+                return Ok(DreamProviderCall {
+                    values: extracted.values,
+                    response_profile: extracted.profile,
+                    response_workspace: extracted.workspace,
+                    response_repo_id: extracted.repo_id,
+                    response_repo_id_present: extracted.repo_id_present,
+                    usage,
+                    reported_cost_micros,
+                    request_hash,
+                    input_hash,
+                });
+            }
+            Err(error) => {
+                last_error = error;
+            }
+        }
+    }
+
+    if max_attempts < request.max_provider_calls && request.max_retries > 0 {
+        return Err(Error::internal("dream provider retry budget exhausted"));
+    }
+    Err(Error::internal(last_error))
+}
+
+struct ExtractedResponse {
+    values: Vec<Value>,
+    profile: Option<String>,
+    workspace: Option<String>,
+    repo_id: Option<String>,
+    repo_id_present: bool,
+    usage: ParsedUsage,
+}
+
+#[derive(Default)]
+struct ParsedUsage {
+    prompt_tokens: Option<usize>,
+    completion_tokens: Option<usize>,
+}
+
+fn call_once(
+    request: &DreamProviderRequest<'_>,
+    body: &Value,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> std::result::Result<(Value, usize, Option<u64>), &'static str> {
+    let endpoint = request.endpoint.trim_end_matches('/');
+    let url = if endpoint.ends_with("/chat/completions") {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}/chat/completions")
+    };
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "provider client unavailable")?;
+    let mut call = client.post(url).json(body);
+    if !request.api_key.trim().is_empty() {
+        call = call.bearer_auth(request.api_key);
+    }
+    let response = call.send().map_err(|error| {
+        if error.is_timeout() {
+            "provider request timed out"
+        } else {
+            "provider request failed"
+        }
+    })?;
+    if !response.status().is_success() {
+        return Err("provider returned an error status");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        return Err("provider output byte budget exhausted");
+    }
+    let read_limit = (max_response_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::with_capacity(max_response_bytes.min(8192));
+    response
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "provider response could not be read")?;
+    if bytes.len() > max_response_bytes {
+        return Err("provider output byte budget exhausted");
+    }
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| "provider response was not valid JSON")?;
+    let reported_cost_micros = value
+        .get("cost_micros")
+        .and_then(Value::as_u64)
+        .or_else(|| value.pointer("/usage/cost_micros").and_then(Value::as_u64));
+    Ok((value, bytes.len(), reported_cost_micros))
+}
+
+fn extract_response(value: Value) -> crate::error::Result<ExtractedResponse> {
+    let mut payload = value.clone();
+    let mut usage = parsed_usage(&value);
+    if let Some(content) = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+    {
+        let content = content
+            .trim()
+            .strip_prefix("```json")
+            .or_else(|| content.trim().strip_prefix("```"))
+            .unwrap_or(content.trim())
+            .strip_suffix("```")
+            .unwrap_or(content.trim())
+            .trim();
+        payload = serde_json::from_str(content)
+            .map_err(|_| Error::internal("provider response content was not valid JSON"))?;
+        usage = parsed_usage(&value);
+    }
+
+    let schema_version = payload
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::internal("provider response missing schema version"))?;
+    if schema_version != DREAM_PROVIDER_SCHEMA_VERSION {
+        return Err(Error::new(
+            crate::error::ErrorCode::UnsupportedVersion,
+            "provider response schema version is unsupported",
+        ));
+    }
+
+    let values = match &payload {
+        Value::Object(object) => object
+            .get("candidates")
+            .or_else(|| object.get("observations"))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| Error::internal("provider response had no candidate array"))?,
+        _ => return Err(Error::internal("provider response had an invalid schema")),
+    };
+    let profile = match payload.get("profile") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::internal("provider response had an invalid profile")),
+    };
+    let workspace = match payload.get("workspace") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(Error::internal(
+                "provider response had an invalid workspace",
+            ))
+        }
+    };
+    let repo_id_present = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("repo_id"));
+    let repo_id = match payload.get("repo_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::internal("provider response had an invalid repo_id")),
+    };
+    Ok(ExtractedResponse {
+        values,
+        profile,
+        workspace,
+        repo_id,
+        repo_id_present,
+        usage,
+    })
+}
+
+fn parsed_usage(value: &Value) -> ParsedUsage {
+    ParsedUsage {
+        prompt_tokens: value
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        completion_tokens: value
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+    }
+}
+
+fn estimate_tokens(value: &str) -> usize {
+    estimate_tokens_from_bytes(value.len())
+}
+
+fn estimate_tokens_from_bytes(bytes: usize) -> usize {
+    bytes.saturating_add(3) / 4
 }
 
 #[cfg(test)]
