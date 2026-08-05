@@ -397,9 +397,15 @@ real = connect(real_db)
 sandbox = connect(sandbox_db)
 real_record_ids = existing_ids(real, "memory_records")
 real_conclusion_ids = existing_ids(real, "conclusions")
+sandbox_tables = {
+    row[0]
+    for row in sandbox.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    )
+}
 
 new_memory_records = []
-if existing_ids(sandbox, "memory_records"):
+if "memory_records" in sandbox_tables:
     for row in sandbox.execute(
         """SELECT id, profile_id, workspace_id, repo_id, scope, type,
                   sensitivity, portability, confidence, content_hash,
@@ -426,7 +432,7 @@ if existing_ids(sandbox, "memory_records"):
         })
 
 new_conclusions = []
-if existing_ids(sandbox, "conclusions"):
+if "conclusions" in sandbox_tables:
     for row in sandbox.execute(
         """SELECT id, profile_id, workspace_id, repo_id, target, content, source_id, created_at
            FROM conclusions
@@ -446,13 +452,7 @@ if existing_ids(sandbox, "conclusions"):
         })
 
 policy_states = {}
-tables = {
-    row[0]
-    for row in sandbox.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-    )
-}
-if "evidence_ledger" in tables:
+if "evidence_ledger" in sandbox_tables:
     for row in sandbox.execute(
         "SELECT policy_state, count(*) AS n FROM evidence_ledger GROUP BY policy_state ORDER BY policy_state"
     ):
