@@ -246,14 +246,60 @@ require_json "$RUN_DIR/eval-substrate.json" '.status == "pass"' "substrate eval 
 log "10. read-only MCP canary"
 MCP_REQ="$RUN_DIR/mcp.requests.jsonl"
 MCP_RESP="$RUN_DIR/mcp.responses.jsonl"
-cat >"$MCP_REQ" <<'JSON'
-{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"codex-memoryd-fixture-demo","version":"1"}}}
-{"jsonrpc":"2.0","id":"tools","method":"tools/list","params":{}}
-{"jsonrpc":"2.0","id":"status","method":"tools/call","params":{"name":"memory_status","arguments":{}}}
-{"jsonrpc":"2.0","id":"recall","method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"fixture release demo","profile":"personal","workspace":"fixture-demo"}}}
-{"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"memory_search","arguments":{"query":"fixture demo","profile":"personal","workspace":"fixture-demo","limit":3}}}
-{"jsonrpc":"2.0","id":"conclude","method":"tools/call","params":{"name":"memory_conclude","arguments":{"query":"canary"}}}
-JSON
+python3 - "$MCP_REQ" "$PROFILE" "$WORKSPACE" <<'PY'
+import json
+import sys
+
+req_path, profile, workspace = sys.argv[1:4]
+requests = [
+    {
+        "jsonrpc": "2.0",
+        "id": "init",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "clientInfo": {
+                "name": "codex-memoryd-fixture-demo",
+                "version": "1",
+            },
+        },
+    },
+    {"jsonrpc": "2.0", "id": "tools", "method": "tools/list", "params": {}},
+    {"jsonrpc": "2.0", "id": "status", "method": "tools/call", "params": {"name": "memory_status", "arguments": {}}},
+    {
+        "jsonrpc": "2.0",
+        "id": "recall",
+        "method": "tools/call",
+        "params": {
+            "name": "memory_recall",
+            "arguments": {
+                "query": "fixture release demo",
+                "profile": profile,
+                "workspace": workspace,
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": "search",
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {
+                "query": "fixture demo",
+                "profile": profile,
+                "workspace": workspace,
+                "limit": 3,
+            },
+        },
+    },
+    {"jsonrpc": "2.0", "id": "conclude", "method": "tools/call", "params": {"name": "memory_conclude", "arguments": {"query": "canary"}}},
+]
+with open(req_path, "w", encoding="utf-8") as handle:
+    for request in requests:
+        handle.write(json.dumps(request))
+        handle.write("\n")
+PY
 timeout 20s "$BIN" --db "$DB" mcp stdio --read-only <"$MCP_REQ" >"$MCP_RESP"
 python3 - "$MCP_RESP" <<'PY'
 import json
