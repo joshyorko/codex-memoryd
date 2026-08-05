@@ -195,7 +195,12 @@ fn dream_worker_status(
         && endpoint_configured
         && !config.dream_provider.model.trim().is_empty()
         && parse_local_http_endpoint(&config.dream_provider.endpoint).is_some();
-    let provider_ready = provider_configured && endpoint_configured;
+    let provider_ready = provider_configured
+        && endpoint_configured
+        && !config.dream_provider.model.trim().is_empty()
+        && (config.dream_provider.endpoint.starts_with("http://")
+            || config.dream_provider.endpoint.starts_with("https://"))
+        && !config.dream_provider.endpoint.contains('@');
     DreamWorkerStatus {
         enabled: dream_scheduler.enabled,
         mode: mode.to_string(),
@@ -349,8 +354,38 @@ mod tests {
         assert!(!configured.paid_provider_ready);
 
         cfg.dream_provider.endpoint = "http://localhost:4000/v1".to_string();
+        cfg.dream_provider.model = "remote-model".to_string();
         let ready = dream_worker_status(&cfg, &scheduler_status);
         assert!(ready.paid_provider_configured);
         assert!(ready.paid_provider_ready);
+    }
+
+    #[test]
+    fn dream_worker_status_reports_local_mode_and_loopback_readiness() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.enabled = true;
+        cfg.dream_provider.adapter = "local-model".to_string();
+        cfg.dream_provider.endpoint = "http://127.0.0.1:4000/v1".to_string();
+        cfg.dream_provider.model = "local-runtime".to_string();
+        let scheduler_status = ScheduledDreamStatus {
+            enabled: false,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_run_id: None,
+            last_watermark: None,
+            next_eligible_run: None,
+            degraded: false,
+        };
+
+        let status = dream_worker_status(&cfg, &scheduler_status);
+
+        assert_eq!(status.mode, "local-model");
+        assert!(!status.enabled);
+        assert!(!status.active);
+        assert!(status.preview_only);
+        assert!(status.local_provider_configured);
+        assert!(status.local_provider_ready);
+        assert!(!status.paid_provider_configured);
     }
 }

@@ -2049,13 +2049,12 @@ impl Service {
         )?;
         let mut usage = call.usage;
         usage.input_records = input_records;
-        let cost_micros = call.reported_cost_micros.unwrap_or_else(|| {
-            estimate_provider_cost(
-                &usage,
-                provider.cost_per_1k_input_micros,
-                provider.cost_per_1k_output_micros,
-            )
-        });
+        let estimated_cost = estimate_provider_cost(
+            &usage,
+            provider.cost_per_1k_input_micros,
+            provider.cost_per_1k_output_micros,
+        );
+        let cost_micros = call.reported_cost_micros.unwrap_or(0).max(estimated_cost);
         usage.cost_micros = cost_micros;
         let final_run_id = format!(
             "dream_{}",
@@ -2082,7 +2081,7 @@ impl Service {
                 ));
             }
         }
-        if cost_micros > budget.max_cost_micros && adapter == DreamProviderAdapter::Provider {
+        if budget.max_cost_micros > 0 && cost_micros > budget.max_cost_micros {
             return Err(Error::internal("dream provider cost budget exhausted"));
         }
         if budget.max_output_bytes > 0 && usage.output_bytes > budget.max_output_bytes {

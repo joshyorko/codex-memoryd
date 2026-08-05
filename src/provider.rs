@@ -2,6 +2,7 @@ use anyhow::Result;
 use reqwest::blocking::Client;
 use serde_json::json;
 use serde_json::Value;
+use std::io::Read;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -277,8 +278,17 @@ fn call_once(
     if !response.status().is_success() {
         return Err("provider returned an error status");
     }
-    let bytes = response
-        .bytes()
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        return Err("provider output byte budget exhausted");
+    }
+    let read_limit = (max_response_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::with_capacity(max_response_bytes.min(8192));
+    response
+        .take(read_limit)
+        .read_to_end(&mut bytes)
         .map_err(|_| "provider response could not be read")?;
     if bytes.len() > max_response_bytes {
         return Err("provider output byte budget exhausted");
@@ -336,21 +346,28 @@ fn extract_response(value: Value) -> crate::error::Result<ExtractedResponse> {
         return Err(Error::internal("provider response contained no candidates"));
     }
 
-    let profile = payload
-        .get("profile")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let workspace = payload
-        .get("workspace")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let profile = match payload.get("profile") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::internal("provider response had an invalid profile")),
+    };
+    let workspace = match payload.get("workspace") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(Error::internal(
+                "provider response had an invalid workspace",
+            ))
+        }
+    };
     let repo_id_present = payload
         .as_object()
         .is_some_and(|object| object.contains_key("repo_id"));
-    let repo_id = payload
-        .get("repo_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let repo_id = match payload.get("repo_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::internal("provider response had an invalid repo_id")),
+    };
     Ok(ExtractedResponse {
         values,
         profile,

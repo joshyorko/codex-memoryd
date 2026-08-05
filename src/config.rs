@@ -1050,6 +1050,17 @@ mod tests {
     }
 
     #[test]
+    fn dream_provider_debug_redacts_runtime_credentials() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.api_key = "sk-sentinel-secret-123456789".to_string();
+
+        let debug = format!("{cfg:?}");
+
+        assert!(!debug.contains("sk-sentinel-secret-123456789"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
     fn dream_provider_env_configures_openai_compatible_endpoint() {
         let mut cfg = Config::default();
         apply_dream_env_from(&mut cfg, |key| match key {
