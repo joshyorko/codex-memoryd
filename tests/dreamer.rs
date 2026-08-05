@@ -1216,6 +1216,7 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
                 endpoint: format!("http://{address}/v1"),
                 api_key: String::new(),
                 model: "test-model".to_string(),
+                ..DreamProviderConfig::default()
             },
             ..Default::default()
         },
