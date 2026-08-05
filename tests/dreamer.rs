@@ -47,6 +47,7 @@ fn scheduler_config() -> DreamSchedulerConfig {
         max_batch_size: 500,
         max_candidates: 50,
         max_runtime_seconds: 30,
+        scheduled_provider_enabled: false,
         automatic_apply: false,
     }
 }

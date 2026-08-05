@@ -342,10 +342,6 @@ fn extract_response(value: Value) -> crate::error::Result<ExtractedResponse> {
             .ok_or_else(|| Error::internal("provider response had no candidate array"))?,
         _ => return Err(Error::internal("provider response had an invalid schema")),
     };
-    if values.is_empty() {
-        return Err(Error::internal("provider response contained no candidates"));
-    }
-
     let profile = match payload.get("profile") {
         None => None,
         Some(Value::String(value)) => Some(value.clone()),

@@ -107,6 +107,7 @@ pub struct DreamSection {
     pub provider_cost_per_1k_input_micros: Option<u64>,
     pub provider_cost_per_1k_output_micros: Option<u64>,
     pub provider_daily_cost_ceiling_micros: Option<u64>,
+    pub scheduled_provider_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +121,7 @@ pub struct DreamSchedulerConfig {
     pub max_batch_size: usize,
     pub max_candidates: usize,
     pub max_runtime_seconds: u64,
+    pub scheduled_provider_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -294,6 +296,7 @@ impl Default for Config {
                 max_batch_size: 500,
                 max_candidates: 50,
                 max_runtime_seconds: 30,
+                scheduled_provider_enabled: false,
             },
             dream_provider: DreamProviderConfig::default(),
             log_level: "info".to_string(),
@@ -528,6 +531,9 @@ impl Config {
         }
         if let Some(enabled) = file.dream.provider_enabled {
             self.dream_provider.enabled = enabled;
+        }
+        if let Some(enabled) = file.dream.scheduled_provider_enabled {
+            self.dream_scheduler.scheduled_provider_enabled = enabled;
         }
         if let Some(adapter) = file.dream.provider_adapter {
             self.dream_provider.adapter = adapter;
@@ -772,6 +778,12 @@ where
         get("CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY").and_then(clean_env_value),
     )? {
         config.dream_scheduler.automatic_apply = automatic_apply;
+    }
+    if let Some(enabled) = parse_bool_value(
+        "CODEX_MEMORYD_DREAM_SCHEDULED_PROVIDER_ENABLED",
+        get("CODEX_MEMORYD_DREAM_SCHEDULED_PROVIDER_ENABLED").and_then(clean_env_value),
+    )? {
+        config.dream_scheduler.scheduled_provider_enabled = enabled;
     }
     if let Some(seconds) = parse_u64_value(
         "CODEX_MEMORYD_DREAM_SCHEDULER_INTERVAL_SECONDS",

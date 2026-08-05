@@ -1933,6 +1933,15 @@ impl Service {
                 "local-model adapter requires a loopback http(s) endpoint",
             ));
         }
+        let uses_configured_endpoint = configured.endpoint.trim() == endpoint;
+        if adapter == DreamProviderAdapter::Provider && !endpoint.starts_with("https://") {
+            return Err(Error::invalid_request("provider adapter requires an https endpoint"));
+        }
+        if !uses_configured_endpoint && !configured.api_key.trim().is_empty() {
+            return Err(Error::secret(
+                "job-supplied provider endpoints cannot use configured credentials",
+            ));
+        }
 
         let model = provider
             .model
@@ -1966,7 +1975,7 @@ impl Service {
         Ok(Some(ResolvedDreamProvider {
             adapter,
             endpoint: endpoint.to_string(),
-            api_key: configured.api_key.clone(),
+            api_key: uses_configured_endpoint.then(|| configured.api_key.clone()).unwrap_or_default(),
             model,
             provider_name,
             timeout: StdDuration::from_secs(configured.timeout_seconds),
@@ -1979,9 +1988,11 @@ impl Service {
             max_retries: budget.max_retries,
             cost_per_1k_input_micros: configured.cost_per_1k_input_micros,
             cost_per_1k_output_micros: configured.cost_per_1k_output_micros,
-            daily_cost_ceiling_micros: budget
-                .daily_cost_ceiling_micros
-                .or(configured.daily_cost_ceiling_micros),
+            daily_cost_ceiling_micros: match (budget.daily_cost_ceiling_micros, configured.daily_cost_ceiling_micros) {
+                (Some(requested), Some(configured)) => Some(requested.min(configured)),
+                (Some(requested), None) => Some(requested),
+                (None, configured) => configured,
+            },
         }))
     }
 
@@ -2020,7 +2031,30 @@ impl Service {
                 "provider jobs require max_cost_micros > 0",
             ));
         }
+        if response.candidates.len() + response.rejected.len() >= budget.max_candidates {
+            let output_candidates = response.candidates.len() + response.rejected.len();
+            return Ok((
+                response,
+                true,
+                None,
+                Some(DreamBudgetUsage {
+                    input_records,
+                    output_candidates,
+                    ..DreamBudgetUsage::default()
+                }),
+            ));
+        }
         let model_input = dream_provider_context(&response)?;
+        if adapter == DreamProviderAdapter::Provider {
+            if let Some(limit) = provider.daily_cost_ceiling_micros {
+                let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+                if self.store.dream_provider_cost_since(&daily_start, None)? >= limit {
+                    return Err(Error::internal("dream provider daily cost ceiling exhausted"));
+                }
+            }
+        }
         let call = crate::provider::execute_preview(
             &crate::provider::DreamProviderRequest {
                 adapter,
@@ -2054,6 +2088,13 @@ impl Service {
             provider.cost_per_1k_input_micros,
             provider.cost_per_1k_output_micros,
         );
+        if adapter == DreamProviderAdapter::Provider
+            && call.reported_cost_micros.is_none()
+            && provider.cost_per_1k_input_micros == 0
+            && provider.cost_per_1k_output_micros == 0
+        {
+            return Err(Error::internal("provider response did not report a measurable cost"));
+        }
         let cost_micros = call.reported_cost_micros.unwrap_or(0).max(estimated_cost);
         usage.cost_micros = cost_micros;
         let final_run_id = format!(
@@ -2369,7 +2410,10 @@ impl Service {
         match result {
             Ok((mut run, mut max_candidates_hit)) => {
                 let provider_config = &self.config.dream_provider;
-                if provider_config.enabled && !provider_config.endpoint.trim().is_empty() {
+                if self.config.dream_scheduler.scheduled_provider_enabled
+                    && provider_config.enabled
+                    && !provider_config.endpoint.trim().is_empty()
+                {
                     if let Ok(context) = scheduled_dream_provider_context(
                         &self.store,
                         profile.as_str(),
@@ -3135,12 +3179,32 @@ fn evidence_window_count(window: &DreamEvidenceWindow) -> usize {
 }
 
 fn dream_provider_context(response: &DreamResponse) -> Result<String> {
+    let evidence_content = response
+        .evidence_window
+        .visible_turns
+        .sources
+        .iter()
+        .chain(response.evidence_window.conclusions.sources.iter())
+        .chain(response.evidence_window.checkpoints.sources.iter())
+        .chain(response.evidence_window.imported_memories.sources.iter())
+        .chain(response.evidence_window.active_memory_records.sources.iter())
+        .filter_map(|source| {
+            source.content.as_deref().map(|content| {
+                json!({"id": source.id, "kind": source.kind, "content":
+                    match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                        PolicyDecision::Accept(value) => value,
+                        PolicyDecision::Reject { .. } => "[screened]".to_string(),
+                    }})
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::to_string(&json!({
         "schema_version": crate::provider::DREAM_PROVIDER_SCHEMA_VERSION,
         "profile": response.profile,
         "workspace": response.workspace,
         "repo_id": response.repo_id,
         "evidence_window": response.evidence_window,
+        "evidence_content": evidence_content,
     }))
     .map_err(Error::from)
 }
@@ -3399,10 +3463,12 @@ fn provider_candidate_from_value(
             .get("expires_at")
             .or_else(|| value.get("valid_until"))
             .and_then(Value::as_str)
+            .filter(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
             .map(str::to_string),
         valid_until: value
             .get("valid_until")
             .and_then(Value::as_str)
+            .filter(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
             .map(str::to_string),
         historical_reason: None,
         supersedes: supersedes.clone(),
@@ -4416,6 +4482,7 @@ mod imported_provenance_tests {
             state: None,
             source_path: None,
             summary: None,
+            content: None,
             conversation_id: Some("`conv]\n- injected: *boom*`".to_string()),
             conversation_title: Some("Title\n`tick` [link](url) *bold*".to_string()),
             message_id: Some("msg[\r\n_bad_".to_string()),
@@ -4669,6 +4736,7 @@ mod scheduled_dream_mode_tests {
                 state: None,
                 source_path: None,
                 summary: None,
+                content: None,
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,
@@ -4684,6 +4752,7 @@ mod scheduled_dream_mode_tests {
                 state: None,
                 source_path: None,
                 summary: None,
+                content: None,
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,

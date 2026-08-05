@@ -1168,6 +1168,8 @@ pub struct DreamEvidenceSource {
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

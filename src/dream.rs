@@ -824,6 +824,7 @@ fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
                         .as_ref()
                         .map(ImportedChatgptProvenance::summary)
                         .or_else(|| Some("visible_turn".to_string())),
+                    content: Some(record.content.clone()),
                     conversation_id: provenance.as_ref().and_then(|p| p.conversation_id.clone()),
                     conversation_title: provenance
                         .as_ref()
@@ -851,6 +852,7 @@ fn stream_from_conclusions(records: &[Conclusion]) -> DreamEvidenceStream {
                 state: None,
                 source_path: record.source_id.clone(),
                 summary: Some("conclusion".to_string()),
+                content: Some(record.content.clone()),
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,
@@ -878,6 +880,7 @@ fn stream_from_checkpoints(records: &[Checkpoint]) -> DreamEvidenceStream {
                     .as_ref()
                     .map(|session_id| format!("session:{session_id}")),
                 summary: Some("checkpoint".to_string()),
+                content: Some(record.summary.clone()),
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,
@@ -902,6 +905,7 @@ fn stream_from_sources(records: &[MemorySource]) -> DreamEvidenceStream {
                 state: None,
                 source_path: record.source_path.clone(),
                 summary: Some(record.kind.clone()),
+                content: None,
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,
@@ -930,6 +934,7 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
                     record.record_type.as_str(),
                     state_for_record(record)
                 )),
+                content: Some(record.content.clone()),
                 conversation_id: None,
                 conversation_title: None,
                 message_id: None,
@@ -1461,6 +1466,7 @@ fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
         },
         created_at: record.created_at.clone(),
         updated_at: Some(record.updated_at.clone()),
+        content: Some(record.content.clone()),
         actor: record
             .metadata
             .get("actor")
