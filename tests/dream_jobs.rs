@@ -3,11 +3,14 @@ use codex_memoryd::domain::{Portability, RecordType, RepoIdentity, Scope, Sensit
 use codex_memoryd::ids;
 use codex_memoryd::protocol::{
     CheckpointRequest, ConclusionsRequest, DreamJobBudget, DreamJobProvider, DreamJobRunRequest,
-    DreamProviderCommand,
+    DreamProviderAdapter, DreamProviderCommand,
 };
 use codex_memoryd::service::Service;
 use codex_memoryd::store::{NewRecord, Store};
 use serde_json::json;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread::JoinHandle;
 
 fn service() -> Service {
     let store = Store::open(":memory:").expect("open store");
@@ -64,9 +67,74 @@ fn base_request() -> DreamJobRunRequest {
             max_runtime_seconds: 30,
             max_input_records: 500,
             max_candidates: 5,
+            ..Default::default()
         },
         provider: None,
     }
+}
+
+fn fake_provider() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+    let address = listener.local_addr().expect("provider address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = stream.read(&mut chunk).expect("read provider request");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower.strip_prefix("content-length:").map(str::to_string)
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    let body = &request[header_end + 4..header_end + 4 + content_length];
+                    let body: serde_json::Value =
+                        serde_json::from_slice(body).expect("provider request json");
+                    let input: serde_json::Value =
+                        serde_json::from_str(body["input"].as_str().expect("provider input"))
+                            .expect("provider input json");
+                    let source_id = input["evidence_window"]
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|streams| streams.values())
+                        .filter_map(|stream| stream.get("sources"))
+                        .flat_map(|sources| sources.as_array().into_iter().flatten())
+                        .find_map(|source| source.get("id").and_then(|id| id.as_str()))
+                        .expect("provider request evidence id");
+                    let response = json!({
+                        "schema_version": "dream-preview-v1",
+                        "profile": body["profile"],
+                        "workspace": body["workspace"],
+                        "repo_id": body["repo_id"],
+                        "candidates": [{
+                            "type": "preference",
+                            "content": "Use concise commit messages.",
+                            "subject_key": "commit-style",
+                            "confidence": 0.82,
+                            "evidence_refs": [source_id]
+                        }]
+                    })
+                    .to_string();
+                    write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .expect("write provider response");
+                    break;
+                }
+            }
+        }
+    });
+    (format!("http://{address}/v1"), server)
 }
 
 #[test]
@@ -95,11 +163,13 @@ fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
                 max_runtime_seconds: 30,
                 max_input_records: 500,
                 max_candidates: 5,
+                ..Default::default()
             },
             provider: Some(DreamJobProvider {
                 command: Some(DreamProviderCommand {
                     argv: vec!["/bin/false".to_string(), "--never-run".to_string()],
                 }),
+                ..Default::default()
             }),
         })
         .unwrap();
@@ -147,6 +217,7 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
                 max_runtime_seconds: 30,
                 max_input_records: 500,
                 max_candidates: 1,
+                ..Default::default()
             },
             provider: None,
         })
@@ -326,4 +397,50 @@ fn deterministic_job_run_preview_preserves_evidence_refs() {
         has_candidate_refs,
         "preview candidates should preserve evidence refs"
     );
+}
+
+#[test]
+fn local_model_job_is_typed_preview_only_and_audits_provenance() {
+    let svc = service();
+    conclude(&svc, "I prefer concise commit messages.");
+    let before = svc.store.count_records().unwrap();
+    let (endpoint, server) = fake_provider();
+    let mut req = base_request();
+    req.job_id = Some("job_local_model".to_string());
+    req.mode = Some("local-model".to_string());
+    req.provider = Some(DreamJobProvider {
+        adapter: Some(DreamProviderAdapter::LocalModel),
+        endpoint: Some(endpoint),
+        model: Some("fake-local".to_string()),
+        provider: Some("fake-local-runtime".to_string()),
+        ..Default::default()
+    });
+    req.budget.max_input_bytes = 64 * 1024;
+    req.budget.max_input_tokens = 16 * 1024;
+    req.budget.max_output_bytes = 64 * 1024;
+    req.budget.max_output_tokens = 16 * 1024;
+    req.budget.max_provider_calls = 1;
+
+    let run = svc.run_dream_job(req).expect("local model preview");
+    server.join().expect("provider server");
+
+    assert_eq!(run.status, "ok");
+    assert_eq!(run.preview.mode, "preview");
+    assert_eq!(run.preview.authority, "recall_not_authority");
+    let candidate = run
+        .preview
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provenance.is_some())
+        .expect("model candidate");
+    assert!(!candidate.evidence_refs.is_empty());
+    assert!(!candidate.apply_eligible);
+    assert_eq!(
+        candidate.provenance.as_ref().unwrap().adapter,
+        "local-model"
+    );
+    assert_eq!(svc.store.count_records().unwrap(), before);
+    let job = svc.store.get_dream_job("job_local_model").unwrap().unwrap();
+    assert_eq!(job.provider.model.as_deref(), Some("fake-local"));
+    assert_eq!(job.provider.adapter, Some(DreamProviderAdapter::LocalModel));
 }

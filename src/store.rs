@@ -3025,6 +3025,34 @@ impl Store {
         Ok(())
     }
 
+    pub fn dream_provider_cost_since(
+        &self,
+        started_after: &str,
+        exclude_run_id: Option<&str>,
+    ) -> Result<u64> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT candidate_counts
+             FROM dream_runs
+             WHERE started_at >= ?1
+               AND (?2 IS NULL OR id != ?2)",
+        )?;
+        let rows = statement.query_map(params![started_after, exclude_run_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut total = 0_u64;
+        for row in rows {
+            let counts = row?;
+            let cost = serde_json::from_str::<serde_json::Value>(&counts)
+                .ok()
+                .and_then(|value| value.get("budget_usage").cloned())
+                .and_then(|value| value.get("cost_micros").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            total = total.saturating_add(cost);
+        }
+        Ok(total)
+    }
+
     pub fn dream_watermark(
         &self,
         profile_id: &str,
@@ -3137,6 +3165,7 @@ impl Store {
                             max_runtime_seconds: 0,
                             max_input_records: 0,
                             max_candidates: 0,
+                            ..DreamJobBudget::default()
                         }),
                         provider: serde_json::from_str(&provider_json).unwrap_or_default(),
                         created_at: row.get(9)?,

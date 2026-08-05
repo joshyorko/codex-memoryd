@@ -599,6 +599,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             archived,
             created,
             authority: "recall_not_authority".to_string(),
+            provenance: None,
         },
         max_candidates_hit,
     ))
@@ -1419,6 +1420,7 @@ fn push_candidate_with_score(
                 promotion_reason,
                 apply_eligible: score.apply_eligible
                     && apply_eligible(evidence, evidence_count, assistant_evidence_count),
+                provenance: None,
             })
         }
         PolicyDecision::Reject { reason, .. } => {

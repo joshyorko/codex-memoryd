@@ -1635,14 +1635,12 @@ impl Service {
         let workspace = self.resolve_workspace(&req.workspace);
         let repo_id = self.register_repo(&req.repo)?;
         let mode = req.mode.unwrap_or_else(|| "deterministic".to_string());
-        if mode != "deterministic" {
-            return Err(Error::invalid_request(
-                "dream job mode must be deterministic in this MVP",
-            ));
-        }
+        let adapter = DreamProviderAdapter::parse(&mode).ok_or_else(|| {
+            Error::invalid_request("dream job mode must be deterministic, local-model, or provider")
+        })?;
         if req.kind != "dream_preview" {
             return Err(Error::invalid_request(
-                "dream job kind must be dream_preview in this MVP",
+                "dream job kind must be dream_preview",
             ));
         }
         if req.budget.max_input_records == 0 {
@@ -1685,6 +1683,8 @@ impl Service {
         };
         let job_id = req.job_id.unwrap_or_else(|| ids::new_id("dream_job"));
         let provider = req.provider.unwrap_or_default();
+        let resolved_provider = self.resolve_dream_provider(adapter, &provider, &req.budget)?;
+        let persisted_provider = persisted_dream_provider(&provider, resolved_provider.as_ref());
         let explicit_since = req.since.is_some();
         let source_window_start = match req.since.as_ref() {
             Some(since) => Some(since.clone()),
@@ -1702,7 +1702,7 @@ impl Service {
             mode: mode.clone(),
             status: "running".to_string(),
             budget: req.budget.clone(),
-            provider: provider.clone(),
+            provider: persisted_provider.clone(),
             created_at: started_at.clone(),
             updated_at: started_at.clone(),
             last_run_id: None,
@@ -1725,7 +1725,17 @@ impl Service {
                 patch_run_id: None,
                 deadline: Some(deadline),
             },
-        );
+        )
+        .and_then(|(resp, max_candidates_hit)| {
+            self.augment_model_dream_preview(
+                resp,
+                max_candidates_hit,
+                adapter,
+                resolved_provider.as_ref(),
+                &req.budget,
+                deadline,
+            )
+        });
         if started.elapsed().as_secs() >= req.budget.max_runtime_seconds && result.is_ok() {
             let completed_at = ids::now_rfc3339();
             let summary = sanitize_error_summary("dream job exceeded max_runtime_seconds");
@@ -1750,7 +1760,7 @@ impl Service {
                 mode,
                 status: "error".to_string(),
                 budget: req.budget,
-                provider,
+                provider: persisted_provider.clone(),
                 created_at: completed_at.clone(),
                 updated_at: completed_at.clone(),
                 last_run_id: Some(run_id),
@@ -1761,7 +1771,7 @@ impl Service {
         }
 
         match result {
-            Ok((resp, max_candidates_hit)) => {
+            Ok((resp, max_candidates_hit, provenance, budget_usage)) => {
                 let mut limits_hit = Vec::new();
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
@@ -1790,9 +1800,16 @@ impl Service {
                     fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
                     source_window_start,
                     source_window_end: Some(now),
-                    source_counts: serde_json::to_value(&resp.evidence_window)
-                        .unwrap_or_else(|_| json!({})),
-                    candidate_counts: dream::candidate_counts(&resp),
+                    source_counts: dream_audit_source_counts(
+                        &resp,
+                        provenance.as_ref(),
+                        budget_usage.as_ref(),
+                    ),
+                    candidate_counts: dream_audit_candidate_counts(
+                        &resp,
+                        provenance.as_ref(),
+                        budget_usage.as_ref(),
+                    ),
                     created_count: resp.created.len() as i64,
                     archived_count: resp.archived.len() as i64,
                     rejected_count: resp.rejected.len() as i64,
@@ -1807,7 +1824,7 @@ impl Service {
                     mode: mode.clone(),
                     status: status.clone(),
                     budget: req.budget,
-                    provider,
+                    provider: persisted_provider.clone(),
                     created_at: completed_at.clone(),
                     updated_at: completed_at.clone(),
                     last_run_id: Some(resp.run_id.clone()),
@@ -1822,6 +1839,8 @@ impl Service {
                     status,
                     limits_hit,
                     preview: resp,
+                    provenance,
+                    budget_usage,
                 })
             }
             Err(err) => {
@@ -1848,7 +1867,7 @@ impl Service {
                     mode,
                     status: "error".to_string(),
                     budget: req.budget,
-                    provider,
+                    provider: persisted_provider,
                     created_at: completed_at.clone(),
                     updated_at: completed_at.clone(),
                     last_run_id: Some(run_id),
@@ -1858,6 +1877,260 @@ impl Service {
                 Err(err)
             }
         }
+    }
+
+    fn resolve_dream_provider(
+        &self,
+        adapter: DreamProviderAdapter,
+        provider: &DreamJobProvider,
+        budget: &DreamJobBudget,
+    ) -> Result<Option<ResolvedDreamProvider>> {
+        validate_dream_provider_metadata(provider)?;
+        if let Some(requested) = provider.adapter {
+            if requested != adapter {
+                return Err(Error::invalid_request(
+                    "dream job provider adapter does not match mode",
+                ));
+            }
+        }
+        if !adapter.is_model_backed() {
+            if provider
+                .adapter
+                .is_some_and(DreamProviderAdapter::is_model_backed)
+            {
+                return Err(Error::invalid_request(
+                    "deterministic jobs cannot select a model adapter",
+                ));
+            }
+            return Ok(None);
+        }
+
+        let configured = &self.config.dream_provider;
+        let endpoint = provider
+            .endpoint
+            .as_deref()
+            .or_else(|| {
+                (!configured.endpoint.trim().is_empty()).then_some(configured.endpoint.as_str())
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::invalid_request(
+                    "model-backed Dream jobs require an explicit provider endpoint",
+                )
+            })?;
+        if endpoint.contains('@')
+            || !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+        {
+            return Err(Error::invalid_request(
+                "dream provider endpoint must be an http(s) URL without credentials",
+            ));
+        }
+        if adapter == DreamProviderAdapter::LocalModel
+            && crate::config::parse_local_http_endpoint(endpoint).is_none()
+        {
+            return Err(Error::invalid_request(
+                "local-model adapter requires a loopback http(s) endpoint",
+            ));
+        }
+
+        let model = provider
+            .model
+            .as_deref()
+            .or_else(|| (!configured.model.trim().is_empty()).then_some(configured.model.as_str()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::invalid_request(
+                    "model-backed Dream jobs require an explicit model/runtime name",
+                )
+            })?;
+        let model = screen_persisted_string("provider.model", model)?;
+        let provider_name = provider
+            .provider
+            .as_deref()
+            .or_else(|| Some(configured.provider_name.as_str()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("model-provider");
+        let provider_name = screen_persisted_string("provider.name", provider_name)?;
+        if adapter == DreamProviderAdapter::Provider
+            && !configured.enabled
+            && provider.endpoint.is_none()
+        {
+            return Err(Error::invalid_request(
+                "remote provider jobs require enabled runtime provider configuration",
+            ));
+        }
+
+        Ok(Some(ResolvedDreamProvider {
+            adapter,
+            endpoint: endpoint.to_string(),
+            api_key: configured.api_key.clone(),
+            model,
+            provider_name,
+            timeout: StdDuration::from_secs(configured.timeout_seconds),
+            max_response_bytes: configured.max_response_bytes,
+            max_provider_calls: if budget.max_provider_calls == 0 {
+                1
+            } else {
+                budget.max_provider_calls
+            },
+            max_retries: budget.max_retries,
+            cost_per_1k_input_micros: configured.cost_per_1k_input_micros,
+            cost_per_1k_output_micros: configured.cost_per_1k_output_micros,
+            daily_cost_ceiling_micros: budget
+                .daily_cost_ceiling_micros
+                .or(configured.daily_cost_ceiling_micros),
+        }))
+    }
+
+    fn augment_model_dream_preview(
+        &self,
+        mut response: DreamResponse,
+        mut max_candidates_hit: bool,
+        adapter: DreamProviderAdapter,
+        provider: Option<&ResolvedDreamProvider>,
+        budget: &DreamJobBudget,
+        deadline: Instant,
+    ) -> Result<(
+        DreamResponse,
+        bool,
+        Option<DreamProviderProvenance>,
+        Option<DreamBudgetUsage>,
+    )> {
+        let input_records = evidence_window_count(&response.evidence_window);
+        if !adapter.is_model_backed() {
+            let output_candidates = response.candidates.len() + response.rejected.len();
+            return Ok((
+                response,
+                max_candidates_hit,
+                None,
+                Some(DreamBudgetUsage {
+                    input_records,
+                    output_candidates,
+                    ..DreamBudgetUsage::default()
+                }),
+            ));
+        }
+        let provider = provider
+            .ok_or_else(|| Error::internal("model-backed Dream provider was not resolved"))?;
+        if adapter == DreamProviderAdapter::Provider && budget.max_cost_micros == 0 {
+            return Err(Error::invalid_request(
+                "provider jobs require max_cost_micros > 0",
+            ));
+        }
+        let model_input = dream_provider_context(&response)?;
+        let call = crate::provider::execute_preview(
+            &crate::provider::DreamProviderRequest {
+                adapter,
+                endpoint: &provider.endpoint,
+                api_key: &provider.api_key,
+                model: &provider.model,
+                provider_name: &provider.provider_name,
+                timeout: provider.timeout,
+                max_response_bytes: provider.max_response_bytes,
+                max_provider_calls: provider.max_provider_calls,
+                max_retries: provider.max_retries,
+                deadline,
+            },
+            &response.profile,
+            &response.workspace,
+            response.repo_id.as_deref(),
+            &model_input,
+            budget,
+        )?;
+        validate_provider_scope(
+            &response,
+            call.response_profile.as_deref(),
+            call.response_workspace.as_deref(),
+            call.response_repo_id.as_deref(),
+            call.response_repo_id_present,
+        )?;
+        let mut usage = call.usage;
+        usage.input_records = input_records;
+        let cost_micros = call.reported_cost_micros.unwrap_or_else(|| {
+            estimate_provider_cost(
+                &usage,
+                provider.cost_per_1k_input_micros,
+                provider.cost_per_1k_output_micros,
+            )
+        });
+        usage.cost_micros = cost_micros;
+        let final_run_id = format!(
+            "dream_{}",
+            ids::sha256_hex(format!("{}:{}", response.run_id, call.input_hash).as_bytes())
+        );
+        if adapter == DreamProviderAdapter::Provider {
+            if let Some(limit) = provider.daily_cost_ceiling_micros {
+                let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+                let prior_cost = self
+                    .store
+                    .dream_provider_cost_since(&daily_start, Some(&final_run_id))?;
+                if prior_cost.saturating_add(cost_micros) > limit {
+                    return Err(Error::internal(
+                        "dream provider daily cost ceiling exhausted",
+                    ));
+                }
+            }
+        } else if let Some(limit) = provider.daily_cost_ceiling_micros {
+            if cost_micros > limit {
+                return Err(Error::internal(
+                    "dream provider daily cost ceiling exhausted",
+                ));
+            }
+        }
+        if cost_micros > budget.max_cost_micros && adapter == DreamProviderAdapter::Provider {
+            return Err(Error::internal("dream provider cost budget exhausted"));
+        }
+        if budget.max_output_bytes > 0 && usage.output_bytes > budget.max_output_bytes {
+            return Err(Error::internal(
+                "dream provider output byte budget exhausted",
+            ));
+        }
+        if budget.max_output_tokens > 0 && usage.output_tokens > budget.max_output_tokens {
+            return Err(Error::internal(
+                "dream provider output token budget exhausted",
+            ));
+        }
+
+        let provenance = DreamProviderProvenance {
+            schema_version: crate::provider::DREAM_PROVIDER_SCHEMA_VERSION.to_string(),
+            adapter: adapter.as_str().to_string(),
+            adapter_version: crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+            provider: provider.provider_name.clone(),
+            model: provider.model.clone(),
+            request_hash: call.request_hash,
+            input_hash: call.input_hash,
+        };
+        for candidate in &mut response.candidates {
+            candidate.apply_eligible = false;
+            candidate.provenance = Some(provenance.clone());
+        }
+        for observation in &mut response.observations {
+            observation.apply_eligible = false;
+        }
+        let (provider_hit, provider_rejections) = append_provider_candidates(
+            &mut response,
+            call.values,
+            &provenance,
+            budget.max_candidates,
+        );
+        max_candidates_hit |= provider_hit;
+        usage.output_candidates = response.candidates.len() + response.rejected.len();
+        response.provenance = Some(provenance.clone());
+        response.run_id = final_run_id;
+        Ok((
+            response,
+            max_candidates_hit,
+            Some(provenance),
+            Some(DreamBudgetUsage {
+                output_candidates: usage.output_candidates.max(provider_rejections),
+                ..usage
+            }),
+        ))
     }
 
     fn dream_with_patch_binding(
@@ -2789,6 +3062,404 @@ fn extract_evidence_refs(metadata: &Value) -> Vec<DreamEvidenceSource> {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
+}
+
+struct ResolvedDreamProvider {
+    adapter: DreamProviderAdapter,
+    endpoint: String,
+    api_key: String,
+    model: String,
+    provider_name: String,
+    timeout: StdDuration,
+    max_response_bytes: usize,
+    max_provider_calls: usize,
+    max_retries: usize,
+    cost_per_1k_input_micros: u64,
+    cost_per_1k_output_micros: u64,
+    daily_cost_ceiling_micros: Option<u64>,
+}
+
+fn validate_dream_provider_metadata(provider: &DreamJobProvider) -> Result<()> {
+    if let Some(endpoint) = provider.endpoint.as_deref() {
+        if endpoint.contains('@') {
+            return Err(Error::secret(
+                "dream provider endpoint must not contain credentials",
+            ));
+        }
+        screen_persisted_string("provider.endpoint", endpoint)?;
+    }
+    for (field, value) in [
+        ("provider.model", provider.model.as_deref()),
+        ("provider.name", provider.provider.as_deref()),
+        (
+            "provider.adapter_version",
+            provider.adapter_version.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            screen_persisted_string(field, value)?;
+        }
+    }
+    if let Some(command) = &provider.command {
+        for (index, arg) in command.argv.iter().enumerate() {
+            screen_persisted_string(&format!("provider.command.argv[{index}]"), arg)?;
+        }
+    }
+    Ok(())
+}
+
+fn persisted_dream_provider(
+    provider: &DreamJobProvider,
+    resolved: Option<&ResolvedDreamProvider>,
+) -> DreamJobProvider {
+    let mut persisted = provider.clone();
+    if let Some(resolved) = resolved {
+        persisted.adapter = Some(resolved.adapter);
+        persisted.adapter_version =
+            Some(crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string());
+        if persisted.model.is_none() {
+            persisted.model = Some(resolved.model.clone());
+        }
+        if persisted.provider.is_none() {
+            persisted.provider = Some(resolved.provider_name.clone());
+        }
+    }
+    persisted
+}
+
+fn evidence_window_count(window: &DreamEvidenceWindow) -> usize {
+    window.visible_turns.count
+        + window.conclusions.count
+        + window.checkpoints.count
+        + window.imported_memories.count
+        + window.active_memory_records.count
+}
+
+fn dream_provider_context(response: &DreamResponse) -> Result<String> {
+    serde_json::to_string(&json!({
+        "schema_version": crate::provider::DREAM_PROVIDER_SCHEMA_VERSION,
+        "profile": response.profile,
+        "workspace": response.workspace,
+        "repo_id": response.repo_id,
+        "evidence_window": response.evidence_window,
+    }))
+    .map_err(Error::from)
+}
+
+fn validate_provider_scope(
+    response: &DreamResponse,
+    profile: Option<&str>,
+    workspace: Option<&str>,
+    repo_id: Option<&str>,
+    repo_id_present: bool,
+) -> Result<()> {
+    if profile.is_some_and(|value| value != response.profile)
+        || workspace.is_some_and(|value| value != response.workspace)
+        || (repo_id_present && repo_id != response.repo_id.as_deref())
+    {
+        return Err(Error::profile_boundary(
+            "provider response scope does not match Dream job scope",
+        ));
+    }
+    Ok(())
+}
+
+fn estimate_provider_cost(usage: &DreamBudgetUsage, input_rate: u64, output_rate: u64) -> u64 {
+    let input_units = usage.input_tokens.saturating_add(999) / 1000;
+    let output_units = usage.output_tokens.saturating_add(999) / 1000;
+    (input_units as u64)
+        .saturating_mul(input_rate)
+        .saturating_add((output_units as u64).saturating_mul(output_rate))
+}
+
+fn provider_value_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn provider_value_ids(value: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    Value::String(value) => Some(value.trim().to_string()),
+                    Value::Object(object) => object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|value| value.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn append_provider_candidates(
+    response: &mut DreamResponse,
+    values: Vec<Value>,
+    provenance: &DreamProviderProvenance,
+    max_candidates: usize,
+) -> (bool, usize) {
+    let mut max_candidates_hit = false;
+    let mut provider_rejections = 0;
+    let total_values = values.len();
+    let mut processed_values = 0;
+    for value in values {
+        if response.candidates.len() + response.rejected.len() >= max_candidates {
+            max_candidates_hit = true;
+            break;
+        }
+        processed_values += 1;
+        match provider_candidate_from_value(response, &value, provenance) {
+            Ok((candidate, observation)) => {
+                response.candidates.push(candidate);
+                response.observations.push(observation);
+            }
+            Err(reason) => {
+                provider_rejections += 1;
+                response.rejected.push(DreamRejection {
+                    reason: reason.to_string(),
+                    supersedes: vec![],
+                });
+            }
+        }
+    }
+    if processed_values < total_values {
+        max_candidates_hit = true;
+    }
+    (max_candidates_hit, provider_rejections)
+}
+
+fn provider_candidate_from_value(
+    response: &DreamResponse,
+    raw: &Value,
+    provenance: &DreamProviderProvenance,
+) -> std::result::Result<(DreamCandidate, DreamObservation), &'static str> {
+    let value = raw.get("candidate").unwrap_or(raw);
+    if value
+        .get("profile")
+        .is_some_and(|profile| profile.as_str() != Some(response.profile.as_str()))
+        || value
+            .get("workspace")
+            .is_some_and(|workspace| workspace.as_str() != Some(response.workspace.as_str()))
+    {
+        return Err("provider candidate scope does not match the Dream job");
+    }
+    if let Some(repo_id) = value.get("repo_id") {
+        let matches = repo_id
+            .as_str()
+            .map(|repo_id| response.repo_id.as_deref() == Some(repo_id))
+            .unwrap_or_else(|| repo_id.is_null() && response.repo_id.is_none());
+        if !matches {
+            return Err("provider candidate scope does not match the Dream job");
+        }
+    }
+    let content = provider_value_string(value, &["content", "summary"])
+        .ok_or("provider candidate is missing content")?;
+    let content = match policy::screen_content(&content, policy::MAX_RECORD_CHARS) {
+        PolicyDecision::Accept(content) => content,
+        PolicyDecision::Reject { .. } => return Err("provider candidate failed content policy"),
+    };
+    let proposed_type = provider_value_string(value, &["type", "proposed_type", "category"])
+        .ok_or("provider candidate is missing type")?;
+    let proposed_type = RecordType::parse(&proposed_type)
+        .ok_or("provider candidate has an unsupported type")?
+        .as_str()
+        .to_string();
+    let profile =
+        Profile::parse(&response.profile).ok_or("provider candidate has invalid profile")?;
+    let classification = policy::classify_as(
+        &content,
+        profile,
+        response.repo_id.is_some(),
+        RecordType::parse(&proposed_type).ok_or("provider candidate has invalid type")?,
+    );
+    let subject_key = provider_value_string(value, &["subject_key", "key"])
+        .ok_or("provider candidate is missing subject_key")?;
+    let subject_key = match policy::screen_content(&subject_key, 512) {
+        PolicyDecision::Accept(value) => value,
+        PolicyDecision::Reject { .. } => return Err("provider candidate failed subject policy"),
+    };
+    let evidence_ids = provider_value_ids(value, &["evidence_refs", "evidence_ids"]);
+    if evidence_ids.is_empty() {
+        return Err("provider candidate is missing evidence_refs");
+    }
+    let sources = [
+        &response.evidence_window.visible_turns.sources,
+        &response.evidence_window.conclusions.sources,
+        &response.evidence_window.checkpoints.sources,
+        &response.evidence_window.imported_memories.sources,
+        &response.evidence_window.active_memory_records.sources,
+    ];
+    let evidence_refs = evidence_ids
+        .iter()
+        .filter_map(|id| {
+            sources
+                .iter()
+                .flat_map(|sources| sources.iter())
+                .find(|source| source.id == *id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if evidence_refs.len() != evidence_ids.len() {
+        return Err("provider candidate references evidence outside the job scope");
+    }
+    let supersedes = provider_value_ids(value, &["supersedes", "retires"]);
+    if supersedes
+        .iter()
+        .any(|id| !evidence_ids.iter().any(|evidence_id| evidence_id == id))
+    {
+        return Err("provider candidate references an invalid retirement");
+    }
+    let action = provider_value_string(value, &["action"]).unwrap_or_else(|| "propose".to_string());
+    let action = match policy::screen_content(&action, 64) {
+        PolicyDecision::Accept(value) => value,
+        PolicyDecision::Reject { .. } => return Err("provider candidate failed action policy"),
+    };
+    let state = provider_value_string(value, &["state"]).unwrap_or_else(|| "active".to_string());
+    let state = match policy::screen_content(&state, 64) {
+        PolicyDecision::Accept(value) => value,
+        PolicyDecision::Reject { .. } => return Err("provider candidate failed state policy"),
+    };
+    let confidence = value
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.5);
+    if !confidence.is_finite() {
+        return Err("provider candidate confidence is invalid");
+    }
+    let confidence = confidence.clamp(0.0, classification.confidence);
+    let first_seen_at = evidence_refs
+        .iter()
+        .map(|source| source.created_at.as_str())
+        .min()
+        .unwrap_or(response.now.as_str())
+        .to_string();
+    let last_seen_at = evidence_refs
+        .iter()
+        .map(|source| source.updated_at.as_deref().unwrap_or(&source.created_at))
+        .max()
+        .unwrap_or(response.now.as_str())
+        .to_string();
+    let id = format!(
+        "dream_provider_{}",
+        ids::sha256_hex(
+            format!("{}:{}:{}", provenance.input_hash, subject_key, content).as_bytes()
+        )
+    );
+    let evidence_count = evidence_ids.len();
+    let observation = DreamObservation {
+        id: id.clone(),
+        key: subject_key.clone(),
+        kind: "dream_observation".to_string(),
+        marker_kind: None,
+        marker_type: None,
+        operational_valence: None,
+        intensity: None,
+        decayed_intensity: None,
+        confidence,
+        confidence_delta: None,
+        decay_half_life_days: None,
+        category: proposed_type.clone(),
+        subject_key: subject_key.clone(),
+        summary: content.clone(),
+        content: content.clone(),
+        state: state.clone(),
+        trigger: None,
+        trigger_json: None,
+        outcome: None,
+        outcome_json: None,
+        recovery: None,
+        recovery_json: None,
+        future_guidance: None,
+        evidence_refs: evidence_refs.clone(),
+        retires: supersedes.clone(),
+        counter_evidence_refs: vec![],
+        retired_at: None,
+        first_seen_at: first_seen_at.clone(),
+        last_seen_at: last_seen_at.clone(),
+        authority: "recall_not_authority".to_string(),
+        policy: "provider_generated".to_string(),
+        apply_eligible: false,
+    };
+    let candidate = DreamCandidate {
+        action,
+        proposed_type,
+        content,
+        confidence,
+        state,
+        drift_prone: false,
+        expires_at: value
+            .get("expires_at")
+            .or_else(|| value.get("valid_until"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        valid_until: value
+            .get("valid_until")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        historical_reason: None,
+        supersedes: supersedes.clone(),
+        policy: "provider_generated".to_string(),
+        candidate_state: "provider_preview".to_string(),
+        subject_key,
+        threshold_reason: "provider_preview_validated".to_string(),
+        evidence_weight: 0.0,
+        evidence_classes: vec!["provider_generated".to_string()],
+        evidence_ids,
+        evidence_refs,
+        retires: supersedes,
+        evidence_count,
+        user_evidence_count: 0,
+        assistant_evidence_count: 0,
+        first_seen_at,
+        last_seen_at,
+        promotion_reason: "provider_preview_only".to_string(),
+        apply_eligible: false,
+        provenance: Some(provenance.clone()),
+    };
+    Ok((candidate, observation))
+}
+
+fn dream_audit_source_counts(
+    response: &DreamResponse,
+    provenance: Option<&DreamProviderProvenance>,
+    usage: Option<&DreamBudgetUsage>,
+) -> Value {
+    let mut counts = serde_json::to_value(&response.evidence_window).unwrap_or_else(|_| json!({}));
+    if let Value::Object(object) = &mut counts {
+        if let Some(provenance) = provenance {
+            object.insert("provider".to_string(), json!(provenance));
+        }
+        if let Some(usage) = usage {
+            object.insert("budget_usage".to_string(), json!(usage));
+        }
+    }
+    counts
+}
+
+fn dream_audit_candidate_counts(
+    response: &DreamResponse,
+    provenance: Option<&DreamProviderProvenance>,
+    usage: Option<&DreamBudgetUsage>,
+) -> Value {
+    let mut counts = dream::candidate_counts(response);
+    if let Value::Object(object) = &mut counts {
+        if let Some(provenance) = provenance {
+            object.insert("provider".to_string(), json!(provenance));
+        }
+        if let Some(usage) = usage {
+            object.insert("budget_usage".to_string(), json!(usage));
+        }
+    }
+    counts
 }
 
 #[allow(clippy::too_many_arguments)]
