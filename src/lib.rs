@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod native_runtime;
 pub mod perf;
 pub mod policy;
+pub mod portable_bundle;
 pub mod proc_eval;
 pub mod protocol;
 pub mod provider;

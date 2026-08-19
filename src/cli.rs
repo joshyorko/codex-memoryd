@@ -33,6 +33,8 @@ use codex_memoryd::native_runtime;
 use codex_memoryd::native_runtime::InitMode;
 use codex_memoryd::native_runtime::RuntimeKind;
 use codex_memoryd::native_runtime::RuntimeOptions;
+use codex_memoryd::portable_bundle;
+use codex_memoryd::portable_bundle::{BundleExportOptions, BundleImportOptions};
 use codex_memoryd::protocol::*;
 use codex_memoryd::semantic_import;
 use codex_memoryd::semantic_import::SemanticImportRequest;
@@ -243,6 +245,11 @@ pub enum Command {
         format: String,
         #[arg(long)]
         target_profile: Option<String>,
+    },
+    /// Export, inspect, and import selective portable memory bundles.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
     },
     /// Show a generated card snapshot.
     Card {
@@ -490,6 +497,57 @@ pub enum ProcedureCommand {
         /// Counter-evidence count at which the procedure is quarantined.
         #[arg(long, default_value_t = 2)]
         quarantine_threshold: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BundleCommand {
+    /// Select reviewed memories and emit a portable bundle.
+    Export {
+        /// Validate selection and print a report without creating a file.
+        #[arg(long, conflicts_with = "write")]
+        preview: bool,
+        /// Atomically write one owner-only bundle file.
+        #[arg(long, value_name = "FILE", conflicts_with = "preview")]
+        write: Option<PathBuf>,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        repo_id: Option<String>,
+        #[arg(long = "record-id")]
+        record_ids: Vec<String>,
+        #[arg(long)]
+        include_archived: bool,
+        #[arg(long)]
+        target_profile: String,
+        #[arg(long)]
+        target_workspace: Option<String>,
+        #[arg(long)]
+        target_repo_id: Option<String>,
+    },
+    /// Verify and inspect a bundle without configuration or database access.
+    Inspect {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Preview or apply a bundle to a local destination database.
+    Import {
+        #[arg(long, conflicts_with = "apply")]
+        preview: bool,
+        #[arg(long, conflicts_with = "preview")]
+        apply: bool,
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        #[arg(long = "to-profile")]
+        to_profile: String,
+        #[arg(long = "to-workspace")]
+        to_workspace: String,
+        #[arg(long = "to-repo-id")]
+        to_repo_id: Option<String>,
+        #[arg(long)]
+        plan_id: Option<String>,
     },
 }
 
@@ -1742,6 +1800,105 @@ fn dispatch(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Command::Bundle { command } => match command {
+            BundleCommand::Inspect { file } => {
+                let report = portable_bundle::inspect(file)?;
+                print_json(&report)?;
+                Ok(())
+            }
+            BundleCommand::Export {
+                preview,
+                write,
+                profile,
+                workspace,
+                repo_id,
+                record_ids,
+                include_archived,
+                target_profile,
+                target_workspace,
+                target_repo_id,
+            } => {
+                if !cli.local {
+                    return Err(error::Error::new(
+                        error::ErrorCode::BundleLocalOnly,
+                        "bundle export is local/admin-only; rerun with --local",
+                    ));
+                }
+                if *preview == write.is_some() {
+                    return Err(error::Error::invalid_request(
+                        "bundle export requires exactly one of --preview or --write",
+                    ));
+                }
+                let service = cli.open_service(None)?;
+                let options = BundleExportOptions {
+                    profile: profile.clone(),
+                    workspace: workspace.clone(),
+                    repo_id: repo_id.clone(),
+                    record_ids: record_ids.clone(),
+                    include_archived: *include_archived,
+                    target_profile: target_profile.clone(),
+                    target_workspace: target_workspace.clone(),
+                    target_repo_id: target_repo_id.clone(),
+                    created_at: None,
+                };
+                let report = if let Some(path) = write {
+                    portable_bundle::export_write(&service.store, &options, path)?
+                } else {
+                    portable_bundle::export_preview(&service.store, &options)?
+                };
+                print_json(&report)?;
+                Ok(())
+            }
+            BundleCommand::Import {
+                preview,
+                apply,
+                file,
+                to_profile,
+                to_workspace,
+                to_repo_id,
+                plan_id,
+            } => {
+                if !cli.local {
+                    return Err(error::Error::new(
+                        error::ErrorCode::BundleLocalOnly,
+                        "bundle import is local/admin-only; rerun with --local",
+                    ));
+                }
+                if *preview == *apply {
+                    return Err(error::Error::invalid_request(
+                        "bundle import requires exactly one of --preview or --apply",
+                    ));
+                }
+                if *preview && plan_id.is_some() {
+                    return Err(error::Error::invalid_request(
+                        "--plan-id is only valid with bundle import --apply",
+                    ));
+                }
+                if *apply && plan_id.is_none() {
+                    return Err(error::Error::invalid_request(
+                        "bundle import --apply requires --plan-id from a prior preview",
+                    ));
+                }
+                let service = cli.open_service(None)?;
+                let options = BundleImportOptions {
+                    profile: to_profile.clone(),
+                    workspace: to_workspace.clone(),
+                    repo_id: to_repo_id.clone(),
+                };
+                let report = if *apply {
+                    portable_bundle::import_apply(
+                        &service.store,
+                        file,
+                        &options,
+                        plan_id.as_deref().expect("validated plan id"),
+                    )?
+                } else {
+                    portable_bundle::import_preview(&service.store, file, &options)?
+                };
+                print_json(&report)?;
+                Ok(())
+            }
+        },
         Command::Card { command } => {
             let service = cli.open_service(None)?;
             match command {

@@ -771,7 +771,17 @@ fn service_error(id: Value, err: error::Error) -> RpcResponse {
         | error::ErrorCode::PolicyDenied
         | error::ErrorCode::ProfileBoundaryDenied
         | error::ErrorCode::SyncSourceInvalid
-        | error::ErrorCode::UnsupportedVersion => -32602,
+        | error::ErrorCode::UnsupportedVersion
+        | error::ErrorCode::BundleIntegrityFailed
+        | error::ErrorCode::BundleSchemaUnsupported
+        | error::ErrorCode::BundleRequiredFeatureUnsupported
+        | error::ErrorCode::BundleUnsafeMember
+        | error::ErrorCode::BundleDuplicateIdentity
+        | error::ErrorCode::BundleMissingDependency
+        | error::ErrorCode::BundleLimitExceeded
+        | error::ErrorCode::BundlePolicyDenied
+        | error::ErrorCode::BundlePlanStale
+        | error::ErrorCode::BundleLocalOnly => -32602,
         error::ErrorCode::AuthMissing => -32001,
         error::ErrorCode::StorageUnavailable | error::ErrorCode::InternalError => -32603,
     };

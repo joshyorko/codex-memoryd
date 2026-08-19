@@ -25,6 +25,16 @@ pub enum ErrorCode {
     SyncSourceInvalid,
     NotFound,
     UnsupportedVersion,
+    BundleIntegrityFailed,
+    BundleSchemaUnsupported,
+    BundleRequiredFeatureUnsupported,
+    BundleUnsafeMember,
+    BundleDuplicateIdentity,
+    BundleMissingDependency,
+    BundleLimitExceeded,
+    BundlePolicyDenied,
+    BundlePlanStale,
+    BundleLocalOnly,
     InternalError,
 }
 
@@ -45,6 +55,18 @@ impl ErrorCode {
             ErrorCode::SyncSourceInvalid => "sync_source_invalid",
             ErrorCode::NotFound => "not_found",
             ErrorCode::UnsupportedVersion => "unsupported_version",
+            ErrorCode::BundleIntegrityFailed => "bundle_integrity_failed",
+            ErrorCode::BundleSchemaUnsupported => "bundle_schema_unsupported",
+            ErrorCode::BundleRequiredFeatureUnsupported => {
+                "bundle_required_feature_unsupported"
+            }
+            ErrorCode::BundleUnsafeMember => "bundle_unsafe_member",
+            ErrorCode::BundleDuplicateIdentity => "bundle_duplicate_identity",
+            ErrorCode::BundleMissingDependency => "bundle_missing_dependency",
+            ErrorCode::BundleLimitExceeded => "bundle_limit_exceeded",
+            ErrorCode::BundlePolicyDenied => "bundle_policy_denied",
+            ErrorCode::BundlePlanStale => "bundle_plan_stale",
+            ErrorCode::BundleLocalOnly => "bundle_local_only",
             ErrorCode::InternalError => "internal_error",
         }
     }
@@ -62,6 +84,16 @@ impl ErrorCode {
             | ErrorCode::ProfileBoundaryDenied => 422,
             ErrorCode::SyncSourceInvalid => 400,
             ErrorCode::UnsupportedVersion => 400,
+            ErrorCode::BundleIntegrityFailed
+            | ErrorCode::BundleSchemaUnsupported
+            | ErrorCode::BundleRequiredFeatureUnsupported
+            | ErrorCode::BundleUnsafeMember
+            | ErrorCode::BundleDuplicateIdentity
+            | ErrorCode::BundleMissingDependency
+            | ErrorCode::BundleLimitExceeded
+            | ErrorCode::BundlePolicyDenied
+            | ErrorCode::BundlePlanStale
+            | ErrorCode::BundleLocalOnly => 422,
             ErrorCode::StorageUnavailable => 503,
             ErrorCode::InternalError => 500,
         }
