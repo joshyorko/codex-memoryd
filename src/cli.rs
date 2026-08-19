@@ -1032,13 +1032,20 @@ fn validate_runtime_environment() -> Result<()> {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
-    if cli.runtime.is_none() {
+    let database_free_inspect = matches!(
+        cli.command,
+        Command::Bundle {
+            command: BundleCommand::Inspect { .. }
+        }
+    );
+    if cli.runtime.is_none() && !database_free_inspect {
         validate_runtime_environment()?;
     }
 
     if client_url_is_present(&cli)
         && cli.db.is_some()
         && !cli.local
+        && !database_free_inspect
         && !matches!(
             cli.command,
             Command::Serve { .. }

@@ -641,12 +641,18 @@ pub fn export_write(
                 "bundle self-verification changed the logical artifact",
             ));
         }
-        if destination.exists() {
-            return Err(Error::invalid_request(
-                "bundle destination appeared during export; refusing to overwrite",
-            ));
-        }
-        fs::rename(&temp, destination)?;
+        // A hard link publishes atomically without rename(2)'s replacement
+        // semantics. It fails if another writer created the destination.
+        fs::hard_link(&temp, destination).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::invalid_request(
+                    "bundle destination appeared during export; refusing to overwrite",
+                )
+            } else {
+                Error::from(err)
+            }
+        })?;
+        fs::remove_file(&temp)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1591,7 +1597,7 @@ fn validate_payload_objects(
                 "unsupported subject kind",
             )
         })?;
-        sanitized_scalar(&subject.body.display_name, 512)?;
+        screened_string(&subject.body.display_name, 512)?;
         validate_safe_metadata(&subject.body.metadata)?;
         validate_timestamp(&subject.body.created_at)?;
         validate_timestamp(&subject.body.updated_at)?;
@@ -1934,8 +1940,10 @@ fn validate_timestamp(value: &str) -> Result<()> {
 
 fn write_zip(mut file: File, payload: &BundlePayload) -> Result<()> {
     let mut writer = ZipWriter::new(&mut file);
+    // Stored members always remain within the reader's compression-ratio
+    // ceiling, even when valid payload text is extremely repetitive.
     let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
+        .compression_method(CompressionMethod::Stored)
         .unix_permissions(0o600);
     writer.start_file(MANIFEST_MEMBER, options).map_err(|err| {
         bundle_error(
@@ -2201,7 +2209,10 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             if !linked_to_source && !linked_to_subject {
                 continue;
             }
-            if evidence.trust_state == "quarantined" {
+            if options.repo_id.is_some() && evidence.repo_id != options.repo_id {
+                continue;
+            }
+            if evidence.trust_state != "trusted" {
                 counts.omitted_quarantined += 1;
                 continue;
             }
@@ -2236,6 +2247,13 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     }
     sort_envelopes(&mut evidence_objects);
 
+    let selected_memory_refs = roots
+        .iter()
+        .map(|record| {
+            preferred_export_ref(store, ObjectKind::Memory, &record.id)
+                .map(|reference| (record.id.clone(), reference))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut memory_objects = Vec::new();
     for record in &roots {
         let body = memory_body(
@@ -2244,6 +2262,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             &episode_refs,
             &source_refs,
             &root_ids,
+            &selected_memory_refs,
             store,
             &instance_id,
             &mut counts,
@@ -2251,10 +2270,16 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         let digest = body_digest(&body)?;
         counts.external_references += body.external_refs.len();
         let reference = choose_export_ref(store, ObjectKind::Memory, &record.id, digest.clone())?;
+        let aliases = selected_memory_refs
+            .get(&record.id)
+            .filter(|preferred| **preferred != reference)
+            .cloned()
+            .into_iter()
+            .collect();
         memory_objects.push(ObjectEnvelope {
             schema: ObjectKind::Memory.schema().to_string(),
             portable_ref: reference,
-            aliases: Vec::new(),
+            aliases,
             digest,
             body,
         });
@@ -2267,7 +2292,9 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         + episode_objects.len()
         + source_objects.len()
         + evidence_objects.len();
-    if counts.external_references > MAX_OBJECTS {
+    if counts.root_memories + counts.dependency_objects > MAX_OBJECTS
+        || counts.external_references > MAX_OBJECTS
+    {
         return Err(bundle_error(
             ErrorCode::BundleLimitExceeded,
             "portable external-reference limit exceeded",
@@ -2282,6 +2309,16 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         counts,
     };
     let members = graph_members(&graph)?;
+    if members
+        .values()
+        .any(|member| member.len() > MAX_MEMBER_BYTES)
+        || members.values().map(Vec::len).sum::<usize>() > MAX_TOTAL_BYTES
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "portable bundle member-size limit exceeded",
+        ));
+    }
     let descriptors = descriptors_for(&members)?;
     let created_at = options.created_at.clone().unwrap_or_else(ids::now_rfc3339);
     validate_timestamp(&created_at)?;
@@ -2491,6 +2528,7 @@ fn memory_body(
     episode_refs: &BTreeMap<String, PortableRef>,
     source_refs: &BTreeMap<String, PortableRef>,
     selected_ids: &BTreeSet<String>,
+    selected_memory_refs: &BTreeMap<String, PortableRef>,
     store: &Store,
     instance_id: &str,
     counts: &mut BundleManifestCounts,
@@ -2567,11 +2605,12 @@ fn memory_body(
     let mut supersedes = Vec::new();
     for id in &record.supersedes {
         if selected_ids.contains(id) {
-            supersedes.push(PortableRef {
-                origin_instance_id: instance_id.to_string(),
-                kind: "memory".to_string(),
-                id: ids::public_handle(PublicHandleKind::MemoryRef, id),
-            });
+            supersedes.push(
+                selected_memory_refs
+                    .get(id)
+                    .cloned()
+                    .expect("selected memory ref"),
+            );
         } else {
             external_refs.push(PortableRef {
                 origin_instance_id: instance_id.to_string(),
@@ -2580,13 +2619,10 @@ fn memory_body(
             });
         }
     }
-    let superseded_by = record.superseded_by.as_ref().and_then(|id| {
-        selected_ids.contains(id).then(|| PortableRef {
-            origin_instance_id: instance_id.to_string(),
-            kind: "memory".to_string(),
-            id: ids::public_handle(PublicHandleKind::MemoryRef, id),
-        })
-    });
+    let superseded_by = record
+        .superseded_by
+        .as_ref()
+        .and_then(|id| selected_memory_refs.get(id).cloned());
     if let Some(id) = &record.superseded_by {
         if !selected_ids.contains(id) {
             external_refs.push(PortableRef {
@@ -2914,6 +2950,32 @@ fn choose_export_ref(
     })
 }
 
+fn preferred_export_ref(store: &Store, kind: ObjectKind, local_id: &str) -> Result<PortableRef> {
+    if let Some(origin) = store
+        .portable_origins_for_local(kind.as_str(), local_id)?
+        .into_iter()
+        .find(|origin| origin.canonical)
+    {
+        return Ok(PortableRef {
+            origin_instance_id: origin.origin_instance_id,
+            kind: kind.as_str().to_string(),
+            id: origin.origin_object_id,
+        });
+    }
+    let handle_kind = match kind {
+        ObjectKind::Memory => PublicHandleKind::MemoryRef,
+        ObjectKind::Subject => PublicHandleKind::SubjectRef,
+        ObjectKind::Episode => PublicHandleKind::EpisodeRef,
+        ObjectKind::Source => PublicHandleKind::SourceRef,
+        ObjectKind::Evidence => PublicHandleKind::EvidenceRef,
+    };
+    Ok(PortableRef {
+        origin_instance_id: store.instance_id()?,
+        kind: kind.as_str().to_string(),
+        id: ids::public_handle(handle_kind, local_id),
+    })
+}
+
 fn sort_envelopes<T>(values: &mut [ObjectEnvelope<T>]) {
     values.sort_by(|a, b| a.portable_ref.cmp(&b.portable_ref));
 }
@@ -2989,11 +3051,10 @@ fn validate_memory_body(body: &MemoryBody) -> Result<()> {
             "invalid memory sensitivity",
         )
     })?;
-    if body.sensitivity == Sensitivity::SecretBlocked.as_str() || body.trust_state == "quarantined"
-    {
+    if body.sensitivity == Sensitivity::SecretBlocked.as_str() || body.trust_state != "trusted" {
         return Err(bundle_error(
             ErrorCode::BundlePolicyDenied,
-            "secret-blocked or quarantined memory is not portable",
+            "only non-secret, trusted memories are portable",
         ));
     }
     Portability::parse(&body.portability).ok_or_else(|| {
@@ -3205,6 +3266,23 @@ fn plan_import(
         "objects/memories.jsonl",
         ObjectKind::Memory,
     )?;
+    let source =
+        Profile::parse(&payload.manifest.intent.source_profile).expect("validated profile");
+    let target =
+        Profile::parse(&payload.manifest.intent.target_profile).expect("validated profile");
+    if !matches!(
+        policy::export_boundary(source, target),
+        BoundaryDecision::Allow
+    ) && (!subjects.is_empty()
+        || !episodes.is_empty()
+        || !sources.is_empty()
+        || !evidence.is_empty())
+    {
+        return Err(bundle_error(
+            ErrorCode::BundlePolicyDenied,
+            "cross-profile bundles may not carry dependency objects",
+        ));
+    }
     let mut objects = Vec::new();
     let mut subject_ids = BTreeMap::new();
     let mut episode_ids = BTreeMap::new();
@@ -3245,7 +3323,12 @@ fn plan_import(
             ));
         }
         if let Some(id) = &destination_id {
-            subject_ids.insert(ref_key(&envelope.portable_ref), id.clone());
+            insert_reference_aliases(
+                &mut subject_ids,
+                &envelope.portable_ref,
+                &envelope.aliases,
+                id,
+            );
         }
         objects.push(PlanObject {
             kind: ObjectKind::Subject,
@@ -3278,7 +3361,12 @@ fn plan_import(
             ));
         }
         if let Some(id) = &destination_id {
-            source_ids.insert(ref_key(&envelope.portable_ref), id.clone());
+            insert_reference_aliases(
+                &mut source_ids,
+                &envelope.portable_ref,
+                &envelope.aliases,
+                id,
+            );
         }
         objects.push(PlanObject {
             kind: ObjectKind::Source,
@@ -3318,7 +3406,12 @@ fn plan_import(
             ));
         }
         if let Some(id) = &destination_id {
-            episode_ids.insert(ref_key(&envelope.portable_ref), id.clone());
+            insert_reference_aliases(
+                &mut episode_ids,
+                &envelope.portable_ref,
+                &envelope.aliases,
+                id,
+            );
         }
         objects.push(PlanObject {
             kind: ObjectKind::Episode,
@@ -3396,7 +3489,12 @@ fn plan_import(
             ));
         }
         if let Some(id) = &destination_id {
-            memory_ids.insert(ref_key(&envelope.portable_ref), id.clone());
+            insert_reference_aliases(
+                &mut memory_ids,
+                &envelope.portable_ref,
+                &envelope.aliases,
+                id,
+            );
         }
         counts.external_reference += body.external_refs.len();
         objects.push(PlanObject {
@@ -3548,6 +3646,18 @@ fn subject_ref_can_resolve(
         || objects
             .iter()
             .any(|object| object.kind == ObjectKind::Subject && object.portable_ref == *reference)
+}
+
+fn insert_reference_aliases(
+    ids: &mut BTreeMap<String, String>,
+    primary: &PortableRef,
+    aliases: &[PortableRef],
+    local_id: &str,
+) {
+    ids.insert(ref_key(primary), local_id.to_string());
+    for alias in aliases {
+        ids.insert(ref_key(alias), local_id.to_string());
+    }
 }
 
 fn plan_subject(
@@ -3783,9 +3893,9 @@ fn plan_memory(
     body: &MemoryBody,
     options: &BundleImportOptions,
     intent: &BundleIntent,
-    _subject_ids: &BTreeMap<String, String>,
-    _episode_ids: &BTreeMap<String, String>,
-    _source_ids: &BTreeMap<String, String>,
+    subject_ids: &BTreeMap<String, String>,
+    episode_ids: &BTreeMap<String, String>,
+    source_ids: &BTreeMap<String, String>,
 ) -> Result<(String, String, Option<String>, Option<String>)> {
     if let Some(origin) = lookup_origin(store, tx, reference)? {
         if origin.imported_object_digest != digest {
@@ -3796,9 +3906,19 @@ fn plan_memory(
                 Some(origin.imported_object_digest),
             ));
         }
+        if let Some(existing) = lookup_memory_by_id(store, tx, &origin.local_object_id)? {
+            if memory_graph_matches(&existing, body, subject_ids, episode_ids, source_ids) {
+                return Ok((
+                    "reuse_identity_exact".to_string(),
+                    "same portable origin and digest already mapped".to_string(),
+                    Some(origin.local_object_id),
+                    Some(origin.imported_object_digest),
+                ));
+            }
+        }
         return Ok((
-            "reuse_identity_exact".to_string(),
-            "same portable origin and digest already mapped".to_string(),
+            "conflict_origin_state".to_string(),
+            "mapped destination memory is missing or has changed".to_string(),
             Some(origin.local_object_id),
             Some(origin.imported_object_digest),
         ));
@@ -3813,11 +3933,7 @@ fn plan_memory(
         &body.content,
     );
     if let Some(existing) = lookup_memory_by_hash(store, tx, &content_hash)? {
-        if existing.record_type != body.record_type
-            || existing.scope != body.scope
-            || existing.sensitivity != body.sensitivity
-            || existing.temporal_state != body.temporal_state
-        {
+        if !memory_graph_matches(&existing, body, subject_ids, episode_ids, source_ids) {
             return Ok((
                 "conflict_content_semantics".to_string(),
                 "destination content hash matches incompatible memory semantics".to_string(),
@@ -3858,14 +3974,7 @@ fn validate_destination_memory(
         )
     })?;
     if portability == Portability::ProfileOnly && options.profile != intent.source_profile {
-        let generic = RecordType::parse(&body.record_type)
-            .zip(Sensitivity::parse(&body.sensitivity))
-            .is_some_and(|(record_type, sensitivity)| {
-                policy::is_generic_preference(record_type, sensitivity)
-            });
-        if !generic {
-            return Ok(Some("profile_only_cross_profile".to_string()));
-        }
+        return Ok(Some("profile_only_cross_profile".to_string()));
     }
     if portability == Portability::WorkspaceOnly && options.workspace != intent.source_workspace {
         return Ok(Some("workspace_only_cross_workspace".to_string()));
@@ -4102,6 +4211,12 @@ struct ExistingMemory {
     sensitivity: String,
     temporal_state: String,
     content_hash: String,
+    subject_id: Option<String>,
+    episode_id: Option<String>,
+    source_ids: Vec<String>,
+    supersedes: Vec<String>,
+    superseded_by: Option<String>,
+    portability: String,
 }
 
 fn lookup_memory_by_hash(
@@ -4112,7 +4227,8 @@ fn lookup_memory_by_hash(
     if let Some(tx) = tx {
         return tx
             .query_row(
-                "SELECT id, type, scope, sensitivity, temporal_state, content_hash
+                "SELECT id, type, scope, sensitivity, temporal_state, content_hash,
+                        subject_id, episode_id, source_ids, supersedes, superseded_by, portability
                  FROM memory_records WHERE content_hash = ?1",
                 params![content_hash],
                 |row| {
@@ -4123,6 +4239,12 @@ fn lookup_memory_by_hash(
                         sensitivity: row.get(3)?,
                         temporal_state: row.get(4)?,
                         content_hash: row.get(5)?,
+                        subject_id: row.get(6)?,
+                        episode_id: row.get(7)?,
+                        source_ids: json_string_list(row.get(8)?),
+                        supersedes: json_string_list(row.get(9)?),
+                        superseded_by: row.get(10)?,
+                        portability: row.get(11)?,
                     })
                 },
             )
@@ -4137,8 +4259,108 @@ fn lookup_memory_by_hash(
             sensitivity: record.sensitivity.as_str().to_string(),
             temporal_state: record.temporal_state.as_str().to_string(),
             content_hash: record.content_hash,
+            subject_id: record.subject_id,
+            episode_id: record.episode_id,
+            source_ids: record.source_ids,
+            supersedes: record.supersedes,
+            superseded_by: record.superseded_by,
+            portability: record.portability.as_str().to_string(),
         })
     })
+}
+
+fn json_string_list(value: String) -> Vec<String> {
+    serde_json::from_str(&value).unwrap_or_default()
+}
+
+fn lookup_memory_by_id(
+    store: &Store,
+    tx: Option<&Transaction<'_>>,
+    id: &str,
+) -> Result<Option<ExistingMemory>> {
+    if let Some(tx) = tx {
+        return tx
+            .query_row(
+                "SELECT id, type, scope, sensitivity, temporal_state, content_hash,
+                    subject_id, episode_id, source_ids, supersedes, superseded_by, portability
+             FROM memory_records WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(ExistingMemory {
+                        id: row.get(0)?,
+                        record_type: row.get(1)?,
+                        scope: row.get(2)?,
+                        sensitivity: row.get(3)?,
+                        temporal_state: row.get(4)?,
+                        content_hash: row.get(5)?,
+                        subject_id: row.get(6)?,
+                        episode_id: row.get(7)?,
+                        source_ids: json_string_list(row.get(8)?),
+                        supersedes: json_string_list(row.get(9)?),
+                        superseded_by: row.get(10)?,
+                        portability: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::from);
+    }
+    store.get_record(id).map(|record| {
+        record.map(|record| ExistingMemory {
+            id: record.id,
+            record_type: record.record_type.as_str().to_string(),
+            scope: record.scope.as_str().to_string(),
+            sensitivity: record.sensitivity.as_str().to_string(),
+            temporal_state: record.temporal_state.as_str().to_string(),
+            content_hash: record.content_hash,
+            subject_id: record.subject_id,
+            episode_id: record.episode_id,
+            source_ids: record.source_ids,
+            supersedes: record.supersedes,
+            superseded_by: record.superseded_by,
+            portability: record.portability.as_str().to_string(),
+        })
+    })
+}
+
+fn memory_graph_matches(
+    existing: &ExistingMemory,
+    body: &MemoryBody,
+    subjects: &BTreeMap<String, String>,
+    episodes: &BTreeMap<String, String>,
+    sources: &BTreeMap<String, String>,
+) -> bool {
+    let mut expected_sources: Vec<_> = body
+        .source_refs
+        .iter()
+        .filter_map(|reference| sources.get(&ref_key(reference)).cloned())
+        .collect();
+    let mut actual_sources = existing.source_ids.clone();
+    expected_sources.sort();
+    actual_sources.sort();
+    existing.record_type == body.record_type
+        && existing.scope == body.scope
+        && existing.sensitivity == body.sensitivity
+        && existing.temporal_state == body.temporal_state
+        && existing.portability == body.portability
+        && existing.subject_id
+            == body
+                .subject_ref
+                .as_ref()
+                .and_then(|r| subjects.get(&ref_key(r)).cloned())
+        && existing.episode_id
+            == body
+                .episode_ref
+                .as_ref()
+                .and_then(|r| episodes.get(&ref_key(r)).cloned())
+        && actual_sources == expected_sources
+        // Memory-to-memory links cannot be considered exact until every
+        // referenced memory has a destination id. Conservatively refuse
+        // content reuse whenever either side carries such links.
+        && body.supersedes.is_empty()
+        && existing.supersedes.is_empty()
+        && body.superseded_by.is_none()
+        && existing.superseded_by.is_none()
 }
 
 fn metadata_value(metadata: &SafeMetadata) -> Value {
@@ -4198,14 +4420,8 @@ fn lookup_receipt(
                 applied_at: row.get(2)?,
                 destination_instance_id: row.get(3)?,
                 counts: BundleCounts {
-                    discovered: created_count
-                        + reused_identity_count
-                        + reused_content_count
-                        + external_reference_count,
-                    validated: created_count
-                        + reused_identity_count
-                        + reused_content_count
-                        + external_reference_count,
+                    discovered: created_count + reused_identity_count + reused_content_count,
+                    validated: created_count + reused_identity_count + reused_content_count,
                     create: created_count,
                     reuse_identity_exact: reused_identity_count,
                     reuse_content_exact: reused_content_count,
@@ -4362,7 +4578,12 @@ fn apply_plan(
             };
             Store::insert_subject_in_transaction(tx, &subject)?;
         }
-        subject_ids.insert(ref_key(&envelope.portable_ref), local_id.clone());
+        insert_reference_aliases(
+            &mut subject_ids,
+            &envelope.portable_ref,
+            &envelope.aliases,
+            &local_id,
+        );
         insert_origin(
             tx,
             &envelope.portable_ref,
@@ -4399,7 +4620,12 @@ fn apply_plan(
             };
             Store::insert_source_in_transaction(tx, &source)?;
         }
-        source_ids.insert(ref_key(&envelope.portable_ref), local_id.clone());
+        insert_reference_aliases(
+            &mut source_ids,
+            &envelope.portable_ref,
+            &envelope.aliases,
+            &local_id,
+        );
         insert_origin(
             tx,
             &envelope.portable_ref,
@@ -4451,7 +4677,12 @@ fn apply_plan(
             };
             Store::insert_episode_in_transaction(tx, &episode)?;
         }
-        episode_ids.insert(ref_key(&envelope.portable_ref), local_id.clone());
+        insert_reference_aliases(
+            &mut episode_ids,
+            &envelope.portable_ref,
+            &envelope.aliases,
+            &local_id,
+        );
         insert_origin(
             tx,
             &envelope.portable_ref,
@@ -4492,8 +4723,8 @@ fn apply_plan(
                 safe_summary: body.safe_summary,
                 policy_state: body.policy_state,
                 created_at: body.created_at,
-                trust_state: "trusted".to_string(),
-                trust_score: 1.0,
+                trust_state: body.trust_state,
+                trust_score: body.trust_score,
                 metadata: metadata_value(&body.metadata),
             };
             local_id = Store::insert_evidence_ledger_record_in_transaction(
@@ -4524,7 +4755,12 @@ fn apply_plan(
             .destination_id
             .clone()
             .unwrap_or_else(|| ids::new_id("mem"));
-        memory_ids.insert(ref_key(&envelope.portable_ref), local_id);
+        insert_reference_aliases(
+            &mut memory_ids,
+            &envelope.portable_ref,
+            &envelope.aliases,
+            &local_id,
+        );
     }
     for envelope in memories {
         let object = plan_object(plan, &envelope.portable_ref)?;
