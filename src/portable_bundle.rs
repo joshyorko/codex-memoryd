@@ -11,10 +11,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path};
 
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::de::{DeserializeOwned, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
-use rusqlite::{params, OptionalExtension, Transaction};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use zip::write::SimpleFileOptions;
@@ -557,8 +557,9 @@ impl BundleExportOptions {
 
 impl BundleImportOptions {
     fn validate(&self) -> Result<()> {
-        Profile::parse(&self.profile)
-            .ok_or_else(|| Error::invalid_request("bundle import destination profile is unsupported"))?;
+        Profile::parse(&self.profile).ok_or_else(|| {
+            Error::invalid_request("bundle import destination profile is unsupported")
+        })?;
         validate_scalar(&self.profile, "to-profile")?;
         validate_scalar(&self.workspace, "to-workspace")?;
         if let Some(value) = &self.repo_id {
@@ -645,13 +646,7 @@ pub fn import_preview(
     let mut file = File::open(path)?;
     let payload = read_bundle_from_reader(&mut file)?;
     let destination_instance_id = store.instance_id()?;
-    let plan = plan_import(
-        store,
-        &payload,
-        options,
-        None,
-        &destination_instance_id,
-    )?;
+    let plan = plan_import(store, &payload, options, None, &destination_instance_id)?;
     Ok(plan.report)
 }
 
@@ -665,7 +660,9 @@ pub fn import_apply(
 ) -> Result<BundleReport> {
     options.validate()?;
     if !expected_plan_id.starts_with("sha256:") {
-        return Err(Error::invalid_request("bundle --plan-id must be a sha256 digest"));
+        return Err(Error::invalid_request(
+            "bundle --plan-id must be a sha256 digest",
+        ));
     }
     let mut file = File::open(path)?;
     let payload = read_bundle_from_reader(&mut file)?;
@@ -684,13 +681,7 @@ pub fn import_apply(
             report.warnings.push("already_applied".to_string());
             return Ok(report);
         }
-        let plan = plan_import(
-            store,
-            &payload,
-            options,
-            Some(tx),
-            &destination_instance_id,
-        )?;
+        let plan = plan_import(store, &payload, options, Some(tx), &destination_instance_id)?;
         if plan.report.plan_id.as_deref() != Some(expected_plan_id) {
             return Err(bundle_error(
                 ErrorCode::BundlePlanStale,
@@ -745,9 +736,15 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) -> Result<()> {
                 }
                 out.extend_from_slice(serde_json::to_string(*key)?.as_bytes());
                 out.push(b':');
-                write_canonical(values.get(*key).ok_or_else(|| {
-                    bundle_error(ErrorCode::BundleIntegrityFailed, "canonical object key missing")
-                })?, out)?;
+                write_canonical(
+                    values.get(*key).ok_or_else(|| {
+                        bundle_error(
+                            ErrorCode::BundleIntegrityFailed,
+                            "canonical object key missing",
+                        )
+                    })?,
+                    out,
+                )?;
             }
             out.push(b'}');
         }
@@ -796,7 +793,11 @@ fn canonical_number(number: &Number) -> Result<String> {
     let abs_digits = if decimal_pos <= 0 {
         format!("0.{}{}", "0".repeat((-decimal_pos) as usize), digits)
     } else if decimal_pos >= digits.len() as i32 {
-        format!("{}{}", digits, "0".repeat((decimal_pos - digits.len() as i32) as usize))
+        format!(
+            "{}{}",
+            digits,
+            "0".repeat((decimal_pos - digits.len() as i32) as usize)
+        )
     } else {
         let at = decimal_pos as usize;
         format!("{}.{}", &digits[..at], &digits[at..])
@@ -833,17 +834,29 @@ fn canonical_number(number: &Number) -> Result<String> {
     result.push('e');
     result.push_str(if scientific_exp >= 0 { "+" } else { "" });
     result.push_str(&scientific_exp.to_string());
-    Ok(if negative { format!("-{result}") } else { result })
+    Ok(if negative {
+        format!("-{result}")
+    } else {
+        result
+    })
 }
 
 fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = deserializer
         .deserialize_any(NoDuplicateValueVisitor)
-        .map_err(|err| bundle_error(ErrorCode::BundleIntegrityFailed, format!("invalid JSON: {err}")))?;
-    deserializer
-        .end()
-        .map_err(|err| bundle_error(ErrorCode::BundleIntegrityFailed, format!("trailing JSON: {err}")))?;
+        .map_err(|err| {
+            bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                format!("invalid JSON: {err}"),
+            )
+        })?;
+    deserializer.end().map_err(|err| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            format!("trailing JSON: {err}"),
+        )
+    })?;
     validate_json_limits(&value, 0)?;
     serde_json::from_value(value).map_err(|err| {
         bundle_error(
@@ -1047,10 +1060,9 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
         }
         members.insert(name, bytes);
     }
-    let manifest_bytes = members
-        .get(MANIFEST_MEMBER)
-        .cloned()
-        .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "manifest.json is missing"))?;
+    let manifest_bytes = members.get(MANIFEST_MEMBER).cloned().ok_or_else(|| {
+        bundle_error(ErrorCode::BundleIntegrityFailed, "manifest.json is missing")
+    })?;
     if manifest_bytes.len() > MAX_MANIFEST_BYTES {
         return Err(bundle_error(
             ErrorCode::BundleLimitExceeded,
@@ -1058,12 +1070,13 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
         ));
     }
     let manifest_value: Value = parse_json(&manifest_bytes)?;
-    let manifest: BundleManifest = serde_json::from_value(manifest_value.clone()).map_err(|err| {
-        bundle_error(
-            ErrorCode::BundleSchemaUnsupported,
-            format!("manifest schema validation failed: {err}"),
-        )
-    })?;
+    let manifest: BundleManifest =
+        serde_json::from_value(manifest_value.clone()).map_err(|err| {
+            bundle_error(
+                ErrorCode::BundleSchemaUnsupported,
+                format!("manifest schema validation failed: {err}"),
+            )
+        })?;
     validate_manifest(&manifest)?;
     let canonical_manifest = canonical_json(&manifest_value)?;
     if canonical_manifest != manifest_bytes {
@@ -1096,8 +1109,18 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
         }
     }
     let expected_names: BTreeSet<String> = std::iter::once(MANIFEST_MEMBER.to_string())
-        .chain(manifest.descriptors.iter().map(|descriptor| descriptor.path.clone()))
-        .chain(members.keys().filter(|name| *name == SIGNATURE_MEMBER).cloned())
+        .chain(
+            manifest
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.path.clone()),
+        )
+        .chain(
+            members
+                .keys()
+                .filter(|name| *name == SIGNATURE_MEMBER)
+                .cloned(),
+        )
         .collect();
     if names != expected_names {
         return Err(bundle_error(
@@ -1233,7 +1256,10 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
     }
     for descriptor in &manifest.descriptors {
         let kind = kind_for_member(&descriptor.path).ok_or_else(|| {
-            bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported bundle member")
+            bundle_error(
+                ErrorCode::BundleSchemaUnsupported,
+                "unsupported bundle member",
+            )
         })?;
         if !descriptor.required
             || descriptor.media_type != kind.media_type()
@@ -1250,7 +1276,12 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
         .counts
         .root_memories
         .checked_add(manifest.counts.dependency_objects)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleLimitExceeded, "bundle object count overflow"))?;
+        .ok_or_else(|| {
+            bundle_error(
+                ErrorCode::BundleLimitExceeded,
+                "bundle object count overflow",
+            )
+        })?;
     let count_values = [
         manifest.counts.root_memories,
         manifest.counts.dependency_objects,
@@ -1360,8 +1391,7 @@ fn validate_payload_objects(
             *member_counts.entry(kind).or_default() += 1;
         }
     }
-    if member_counts.get(&ObjectKind::Memory).copied().unwrap_or(0)
-        != manifest.counts.root_memories
+    if member_counts.get(&ObjectKind::Memory).copied().unwrap_or(0) != manifest.counts.root_memories
         || member_counts
             .get(&ObjectKind::Subject)
             .copied()
@@ -1383,20 +1413,25 @@ fn validate_payload_objects(
             "manifest object counts do not match the payload",
         ));
     }
-    let subjects = parse_member::<SubjectBody>(members, "objects/subjects.jsonl", ObjectKind::Subject)?;
+    let subjects =
+        parse_member::<SubjectBody>(members, "objects/subjects.jsonl", ObjectKind::Subject)?;
     for subject in subjects {
         sanitized_scalar(&subject.body.profile, 128)?;
         sanitized_scalar(&subject.body.workspace, 512)?;
         sanitized_scalar(&subject.body.subject_key, 512)?;
         SubjectKind::parse(&subject.body.kind).ok_or_else(|| {
-            bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported subject kind")
+            bundle_error(
+                ErrorCode::BundleSchemaUnsupported,
+                "unsupported subject kind",
+            )
         })?;
         sanitized_scalar(&subject.body.display_name, 512)?;
         validate_safe_metadata(&subject.body.metadata)?;
         validate_timestamp(&subject.body.created_at)?;
         validate_timestamp(&subject.body.updated_at)?;
     }
-    let episodes = parse_member::<EpisodeBody>(members, "objects/episodes.jsonl", ObjectKind::Episode)?;
+    let episodes =
+        parse_member::<EpisodeBody>(members, "objects/episodes.jsonl", ObjectKind::Episode)?;
     for episode in episodes {
         episode.body.subject_ref.validate(Some("subject"))?;
         validate_timestamp(&episode.body.created_at)?;
@@ -1424,7 +1459,8 @@ fn validate_payload_objects(
         validate_timestamp(&source.body.ingested_at)?;
         validate_safe_metadata(&source.body.metadata)?;
     }
-    let evidence = parse_member::<EvidenceBody>(members, "objects/evidence.jsonl", ObjectKind::Evidence)?;
+    let evidence =
+        parse_member::<EvidenceBody>(members, "objects/evidence.jsonl", ObjectKind::Evidence)?;
     for entry in &evidence {
         sanitized_scalar(&entry.body.profile, 128)?;
         sanitized_scalar(&entry.body.workspace, 512)?;
@@ -1488,13 +1524,23 @@ fn validate_payload_objects(
         validate_safe_metadata(&entry.body.metadata)?;
         validate_timestamp(&entry.body.created_at)?;
     }
-    let memories = parse_member::<MemoryBody>(members, "objects/memories.jsonl", ObjectKind::Memory)?;
+    let memories =
+        parse_member::<MemoryBody>(members, "objects/memories.jsonl", ObjectKind::Memory)?;
     let external_reference_count = memories
         .iter()
         .map(|memory| memory.body.external_refs.len())
-        .chain(evidence.iter().map(|evidence| evidence.body.external_refs.len()))
+        .chain(
+            evidence
+                .iter()
+                .map(|evidence| evidence.body.external_refs.len()),
+        )
         .try_fold(0usize, |total, count| total.checked_add(count))
-        .ok_or_else(|| bundle_error(ErrorCode::BundleLimitExceeded, "external-reference count overflow"))?;
+        .ok_or_else(|| {
+            bundle_error(
+                ErrorCode::BundleLimitExceeded,
+                "external-reference count overflow",
+            )
+        })?;
     let memory_ids: BTreeSet<String> = memories
         .iter()
         .map(|memory| memory.portable_ref.id.clone())
@@ -1557,9 +1603,12 @@ fn parse_member<T: DeserializeOwned>(
     path: &str,
     kind: ObjectKind,
 ) -> Result<Vec<ObjectEnvelope<T>>> {
-    let bytes = members
-        .get(path)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleMissingDependency, "required member missing"))?;
+    let bytes = members.get(path).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleMissingDependency,
+            "required member missing",
+        )
+    })?;
     let mut result = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         if line.len() <= 1 {
@@ -1592,7 +1641,12 @@ fn manifest_digest_without_id_value(value: &Value) -> Result<String> {
     let mut value = value.clone();
     value
         .as_object_mut()
-        .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "manifest is not an object"))?
+        .ok_or_else(|| {
+            bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "manifest is not an object",
+            )
+        })?
         .remove("bundle_id");
     Ok(ids::sha256_hex(&canonical_json(&value)?))
 }
@@ -1620,8 +1674,12 @@ fn validate_scalar(value: &str, label: &str) -> Result<()> {
 }
 
 fn validate_timestamp(value: &str) -> Result<()> {
-    let parsed = OffsetDateTime::parse(value, &Rfc3339)
-        .map_err(|_| bundle_error(ErrorCode::BundleIntegrityFailed, "invalid RFC3339 timestamp"))?;
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "invalid RFC3339 timestamp",
+        )
+    })?;
     if parsed.offset().whole_seconds() != 0 || !value.ends_with('Z') {
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
@@ -1636,19 +1694,28 @@ fn write_zip(mut file: File, payload: &BundlePayload) -> Result<()> {
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o600);
-    writer
-        .start_file(MANIFEST_MEMBER, options)
-        .map_err(|err| bundle_error(ErrorCode::BundleIntegrityFailed, format!("zip write: {err}")))?;
+    writer.start_file(MANIFEST_MEMBER, options).map_err(|err| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            format!("zip write: {err}"),
+        )
+    })?;
     writer.write_all(&payload.manifest_bytes)?;
     for name in OBJECT_MEMBERS {
-        writer
-            .start_file(name, options)
-            .map_err(|err| bundle_error(ErrorCode::BundleIntegrityFailed, format!("zip write: {err}")))?;
+        writer.start_file(name, options).map_err(|err| {
+            bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                format!("zip write: {err}"),
+            )
+        })?;
         writer.write_all(payload.members.get(name).expect("object member exists"))?;
     }
-    writer
-        .finish()
-        .map_err(|err| bundle_error(ErrorCode::BundleIntegrityFailed, format!("zip write: {err}")))?;
+    writer.finish().map_err(|err| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            format!("zip write: {err}"),
+        )
+    })?;
     file.sync_all()?;
     Ok(())
 }
@@ -1690,8 +1757,10 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         .target_repo_id
         .as_deref()
         .or(options.repo_id.as_deref());
-    let dependencies_portable =
-        matches!(policy::export_boundary(source_profile, target_profile), BoundaryDecision::Allow);
+    let dependencies_portable = matches!(
+        policy::export_boundary(source_profile, target_profile),
+        BoundaryDecision::Allow
+    );
 
     for record in records {
         let public_id = ids::public_handle(PublicHandleKind::MemoryRef, &record.id);
@@ -1719,15 +1788,13 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             counts.omitted_portability += 1;
             continue;
         }
-        if record.portability == Portability::WorkspaceOnly
-            && options.workspace != target_workspace
+        if record.portability == Portability::WorkspaceOnly && options.workspace != target_workspace
         {
             counts.omitted_portability += 1;
             continue;
         }
         if record.scope == Scope::Repo
-            && (record.repo_id.as_deref() != options.repo_id.as_deref()
-                || target_repo.is_none())
+            && (record.repo_id.as_deref() != options.repo_id.as_deref() || target_repo.is_none())
         {
             counts.omitted_portability += 1;
             continue;
@@ -1767,7 +1834,9 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             continue;
         }
         if let Some(id) = &record.subject_id {
-            if let Some(subject) = store.get_subject(&record.profile_id, &record.workspace_id, id)? {
+            if let Some(subject) =
+                store.get_subject(&record.profile_id, &record.workspace_id, id)?
+            {
                 if export_scope_matches(&subject.profile_id, &subject.workspace_id, options)
                     && safe_subject(&subject).is_ok()
                 {
@@ -1781,7 +1850,9 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             }
         }
         if let Some(id) = &record.episode_id {
-            if let Some(episode) = store.get_episode(&record.profile_id, &record.workspace_id, id)? {
+            if let Some(episode) =
+                store.get_episode(&record.profile_id, &record.workspace_id, id)?
+            {
                 if subjects.contains_key(&episode.subject_id)
                     && export_scope_matches(&episode.profile_id, &episode.workspace_id, options)
                     && safe_episode(&episode).is_ok()
@@ -1816,12 +1887,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     for subject in subjects.values() {
         let body = subject_body(subject)?;
         let digest = body_digest(&body)?;
-        let reference = choose_export_ref(
-            store,
-            ObjectKind::Subject,
-            &subject.id,
-            digest.clone(),
-        )?;
+        let reference = choose_export_ref(store, ObjectKind::Subject, &subject.id, digest.clone())?;
         subject_refs.insert(subject.id.clone(), reference.clone());
         subject_objects.push(ObjectEnvelope {
             schema: ObjectKind::Subject.schema().to_string(),
@@ -1837,8 +1903,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     for source in sources.values() {
         let body = source_body(source)?;
         let digest = body_digest(&body)?;
-        let reference =
-            choose_export_ref(store, ObjectKind::Source, &source.id, digest.clone())?;
+        let reference = choose_export_ref(store, ObjectKind::Source, &source.id, digest.clone())?;
         source_refs.insert(source.id.clone(), reference.clone());
         source_objects.push(ObjectEnvelope {
             schema: ObjectKind::Source.schema().to_string(),
@@ -1854,8 +1919,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     for episode in episodes.values() {
         let body = episode_body(episode, subject_refs.get(&episode.subject_id))?;
         let digest = body_digest(&body)?;
-        let reference =
-            choose_export_ref(store, ObjectKind::Episode, &episode.id, digest.clone())?;
+        let reference = choose_export_ref(store, ObjectKind::Episode, &episode.id, digest.clone())?;
         episode_refs.insert(episode.id.clone(), reference.clone());
         episode_objects.push(ObjectEnvelope {
             schema: ObjectKind::Episode.schema().to_string(),
@@ -1867,8 +1931,10 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     }
 
     let included_source_ids: BTreeSet<String> = sources.keys().cloned().collect();
-    let included_subject_keys: BTreeSet<String> =
-        subjects.values().map(|subject| subject.subject_key.clone()).collect();
+    let included_subject_keys: BTreeSet<String> = subjects
+        .values()
+        .map(|subject| subject.subject_key.clone())
+        .collect();
     let subject_key_refs: BTreeMap<String, PortableRef> = subjects
         .values()
         .filter_map(|subject| {
@@ -1941,8 +2007,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         )?;
         let digest = body_digest(&body)?;
         counts.external_references += body.external_refs.len();
-        let reference =
-            choose_export_ref(store, ObjectKind::Memory, &record.id, digest.clone())?;
+        let reference = choose_export_ref(store, ObjectKind::Memory, &record.id, digest.clone())?;
         memory_objects.push(ObjectEnvelope {
             schema: ObjectKind::Memory.schema().to_string(),
             portable_ref: reference,
@@ -1975,10 +2040,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     };
     let members = graph_members(&graph)?;
     let descriptors = descriptors_for(&members)?;
-    let created_at = options
-        .created_at
-        .clone()
-        .unwrap_or_else(ids::now_rfc3339);
+    let created_at = options.created_at.clone().unwrap_or_else(ids::now_rfc3339);
     validate_timestamp(&created_at)?;
     let boundary_decision = match policy::export_boundary(source_profile, target_profile) {
         BoundaryDecision::Allow => "allow",
@@ -2037,10 +2099,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
 fn export_scope_matches(profile: &str, workspace: &str, options: &BundleExportOptions) -> bool {
     profile == options.profile
         && workspace == options.workspace
-        && options
-            .repo_id
-            .as_deref()
-            .is_none_or(|_| true)
+        && options.repo_id.as_deref().is_none_or(|_| true)
 }
 
 fn subject_body(subject: &Subject) -> Result<SubjectBody> {
@@ -2058,10 +2117,7 @@ fn subject_body(subject: &Subject) -> Result<SubjectBody> {
     })
 }
 
-fn episode_body(
-    episode: &Episode,
-    subject_ref: Option<&PortableRef>,
-) -> Result<EpisodeBody> {
+fn episode_body(episode: &Episode, subject_ref: Option<&PortableRef>) -> Result<EpisodeBody> {
     let subject_ref = subject_ref.ok_or_else(|| {
         bundle_error(
             ErrorCode::BundleMissingDependency,
@@ -2307,7 +2363,12 @@ fn memory_body(
     }
     validate_timestamp(&record.created_at)?;
     validate_timestamp(&record.updated_at)?;
-    for value in [&record.observed_at, &record.valid_from, &record.valid_until, &record.invalidated_at] {
+    for value in [
+        &record.observed_at,
+        &record.valid_from,
+        &record.valid_until,
+        &record.invalidated_at,
+    ] {
         if let Some(value) = value {
             validate_timestamp(value)?;
         }
@@ -2573,7 +2634,9 @@ fn valid_repo_path(path: &str) -> bool {
 }
 
 fn body_digest<T: Serialize>(body: &T) -> Result<String> {
-    Ok(ids::sha256_hex(&canonical_json(&serde_json::to_value(body)?)?))
+    Ok(ids::sha256_hex(&canonical_json(&serde_json::to_value(
+        body,
+    )?)?))
 }
 
 fn choose_export_ref(
@@ -2662,18 +2725,31 @@ fn descriptors_for(members: &BTreeMap<String, Vec<u8>>) -> Result<Vec<Descriptor
 }
 
 fn validate_memory_body(body: &MemoryBody) -> Result<()> {
-    Profile::parse(&body.profile)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory profile"))?;
+    Profile::parse(&body.profile).ok_or_else(|| {
+        bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory profile")
+    })?;
     Scope::parse(&body.scope)
         .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory scope"))?;
     RecordType::parse(&body.record_type)
         .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory type"))?;
-    Sensitivity::parse(&body.sensitivity)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory sensitivity"))?;
-    Portability::parse(&body.portability)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory portability"))?;
-    TemporalState::parse(&body.temporal_state)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory temporal state"))?;
+    Sensitivity::parse(&body.sensitivity).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "invalid memory sensitivity",
+        )
+    })?;
+    Portability::parse(&body.portability).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "invalid memory portability",
+        )
+    })?;
+    TemporalState::parse(&body.temporal_state).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "invalid memory temporal state",
+        )
+    })?;
     if !body.confidence.is_finite()
         || !body.trust_score.is_finite()
         || body.related_files.len() > MAX_FILES
@@ -2719,10 +2795,19 @@ fn export_report(payload: &BundlePayload, mode: BundleMode) -> BundleReport {
     };
     let mut omissions = BTreeMap::new();
     omissions.insert("secret_blocked".to_string(), manifest.counts.omitted_secret);
-    omissions.insert("quarantined".to_string(), manifest.counts.omitted_quarantined);
-    omissions.insert("portability".to_string(), manifest.counts.omitted_portability);
+    omissions.insert(
+        "quarantined".to_string(),
+        manifest.counts.omitted_quarantined,
+    );
+    omissions.insert(
+        "portability".to_string(),
+        manifest.counts.omitted_portability,
+    );
     omissions.insert("boundary".to_string(), manifest.counts.omitted_boundary);
-    omissions.insert("unsafe_path".to_string(), manifest.counts.omitted_unsafe_path);
+    omissions.insert(
+        "unsafe_path".to_string(),
+        manifest.counts.omitted_unsafe_path,
+    );
     omissions.insert(
         "external_reference".to_string(),
         manifest.counts.external_references,
@@ -2798,13 +2883,13 @@ struct StoredReceipt {
 fn inspect_report(payload: &BundlePayload) -> BundleReport {
     let mut report = export_report(payload, BundleMode::Inspect);
     report.mode = "inspect".to_string();
-    report.warnings.push(
-        if payload.signature_status == "absent" {
+    report
+        .warnings
+        .push(if payload.signature_status == "absent" {
             "authenticity_unverified".to_string()
         } else {
             "signature_present_unverified".to_string()
-        },
-    );
+        });
     report
 }
 
@@ -2863,8 +2948,16 @@ fn plan_import(
     let mut source_ids = BTreeMap::new();
     let mut memory_ids = BTreeMap::new();
     let mut counts = BundleCounts {
-        discovered: subjects.len() + episodes.len() + sources.len() + evidence.len() + memories.len(),
-        validated: subjects.len() + episodes.len() + sources.len() + evidence.len() + memories.len(),
+        discovered: subjects.len()
+            + episodes.len()
+            + sources.len()
+            + evidence.len()
+            + memories.len(),
+        validated: subjects.len()
+            + episodes.len()
+            + sources.len()
+            + evidence.len()
+            + memories.len(),
         ..BundleCounts::default()
     };
     let mut blocking = Vec::new();
@@ -2987,6 +3080,7 @@ fn plan_import(
             options,
             &subject_ids,
             &source_ids,
+            &objects,
         )?;
         update_plan_counts(&mut counts, &decision, &reason);
         if decision.starts_with("conflict_") || decision == "reject_destination_policy" {
@@ -3011,30 +3105,24 @@ fn plan_import(
     }
     for envelope in memories {
         let body = envelope.body;
-        let (decision, reason, destination_id, destination_digest) =
-            if let Some(reason) =
-                validate_destination_memory(&body, &payload.manifest.intent, options)?
-            {
-                (
-                    "reject_destination_policy".to_string(),
-                    reason,
-                    None,
-                    None,
-                )
-            } else {
-                plan_memory(
-                    store,
-                    tx,
-                    &envelope.portable_ref,
-                    &envelope.digest,
-                    &body,
-                    options,
-                    &payload.manifest.intent,
-                    &subject_ids,
-                    &episode_ids,
-                    &source_ids,
-                )?
-            };
+        let (decision, reason, destination_id, destination_digest) = if let Some(reason) =
+            validate_destination_memory(&body, &payload.manifest.intent, options)?
+        {
+            ("reject_destination_policy".to_string(), reason, None, None)
+        } else {
+            plan_memory(
+                store,
+                tx,
+                &envelope.portable_ref,
+                &envelope.digest,
+                &body,
+                options,
+                &payload.manifest.intent,
+                &subject_ids,
+                &episode_ids,
+                &source_ids,
+            )?
+        };
         update_plan_counts(&mut counts, &decision, &reason);
         if decision.starts_with("conflict_") || decision == "reject_destination_policy" {
             blocking.push(decision_detail(
@@ -3129,10 +3217,7 @@ fn plan_import(
     })
 }
 
-fn validate_import_mapping(
-    payload: &BundlePayload,
-    options: &BundleImportOptions,
-) -> Result<()> {
+fn validate_import_mapping(payload: &BundlePayload, options: &BundleImportOptions) -> Result<()> {
     let intent = &payload.manifest.intent;
     if options.profile != intent.target_profile {
         return Err(bundle_error(
@@ -3154,7 +3239,11 @@ fn validate_import_mapping(
         .target_repo_id
         .as_deref()
         .or(intent.source_repo_id.as_deref());
-    if options.repo_id.as_deref().is_some_and(|repo| Some(repo) != expected_repo) {
+    if options
+        .repo_id
+        .as_deref()
+        .is_some_and(|repo| Some(repo) != expected_repo)
+    {
         return Err(bundle_error(
             ErrorCode::BundlePolicyDenied,
             "destination repository does not match the explicit bundle mapping",
@@ -3169,10 +3258,9 @@ fn subject_ref_can_resolve(
     subject_ids: &BTreeMap<String, String>,
 ) -> bool {
     subject_ids.contains_key(&ref_key(reference))
-        || objects.iter().any(|object| {
-            object.kind == ObjectKind::Subject
-                && object.portable_ref == *reference
-        })
+        || objects
+            .iter()
+            .any(|object| object.kind == ObjectKind::Subject && object.portable_ref == *reference)
 }
 
 fn plan_subject(
@@ -3184,7 +3272,10 @@ fn plan_subject(
     options: &BundleImportOptions,
 ) -> Result<(String, String, Option<String>, Option<String>)> {
     let kind = SubjectKind::parse(&body.kind).ok_or_else(|| {
-        bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported subject kind")
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported subject kind",
+        )
     })?;
     let existing_origin = lookup_origin(store, tx, reference)?;
     if let Some(origin) = existing_origin {
@@ -3213,13 +3304,12 @@ fn plan_subject(
                 None,
             ));
         }
-        let reason = if display_name != body.display_name
-            || metadata != metadata_value(&body.metadata)
-        {
-            "subject metadata differs; destination values win".to_string()
-        } else {
-            "same destination subject key and kind".to_string()
-        };
+        let reason =
+            if display_name != body.display_name || metadata != metadata_value(&body.metadata) {
+                "subject metadata differs; destination values win".to_string()
+            } else {
+                "same destination subject key and kind".to_string()
+            };
         return Ok((
             "reuse_subject_destination_wins".to_string(),
             if reason.starts_with("subject metadata") {
@@ -3330,6 +3420,7 @@ fn plan_evidence(
     options: &BundleImportOptions,
     subject_ids: &BTreeMap<String, String>,
     source_ids: &BTreeMap<String, String>,
+    objects: &[PlanObject],
 ) -> Result<(String, String, Option<String>, Option<String>)> {
     if body.profile != intent.source_profile || body.workspace != intent.source_workspace {
         return Err(bundle_error(
@@ -3342,7 +3433,13 @@ fn plan_evidence(
     }
     if let Some(source_ref) = &body.source_ref {
         if !source_ids.contains_key(&ref_key(source_ref))
-            && !body.external_refs.iter().any(|external| external == source_ref)
+            && !objects.iter().any(|object| {
+                object.kind == ObjectKind::Source && object.portable_ref == *source_ref
+            })
+            && !body
+                .external_refs
+                .iter()
+                .any(|external| external == source_ref)
         {
             return Err(bundle_error(
                 ErrorCode::BundleMissingDependency,
@@ -3352,7 +3449,13 @@ fn plan_evidence(
     }
     if let Some(subject_ref) = &body.subject_ref {
         if !subject_ids.contains_key(&ref_key(subject_ref))
-            && !body.external_refs.iter().any(|external| external == subject_ref)
+            && !objects.iter().any(|object| {
+                object.kind == ObjectKind::Subject && object.portable_ref == *subject_ref
+            })
+            && !body
+                .external_refs
+                .iter()
+                .any(|external| external == subject_ref)
         {
             return Err(bundle_error(
                 ErrorCode::BundleMissingDependency,
@@ -3461,8 +3564,12 @@ fn validate_destination_memory(
             "memory scope does not match the bundle source intent",
         ));
     }
-    let portability = Portability::parse(&body.portability)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported portability"))?;
+    let portability = Portability::parse(&body.portability).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported portability",
+        )
+    })?;
     if portability == Portability::ProfileOnly && options.profile != intent.source_profile {
         let generic = RecordType::parse(&body.record_type)
             .zip(Sensitivity::parse(&body.sensitivity))
@@ -3509,15 +3616,14 @@ fn policy_rejection_for_boundary(intent: &BundleIntent, _content: &str) -> Optio
     let target = Profile::parse(&intent.target_profile)?;
     match policy::export_boundary(source, target) {
         BoundaryDecision::Allow => None,
-        BoundaryDecision::AllowGenericPreferencesOnly => Some("generic_preferences_only".to_string()),
+        BoundaryDecision::AllowGenericPreferencesOnly => {
+            Some("generic_preferences_only".to_string())
+        }
         BoundaryDecision::Deny { .. } => Some("profile_boundary_denied".to_string()),
     }
 }
 
-fn destination_repo_id(
-    intent: &BundleIntent,
-    options: &BundleImportOptions,
-) -> Option<String> {
+fn destination_repo_id(intent: &BundleIntent, options: &BundleImportOptions) -> Option<String> {
     options
         .repo_id
         .clone()
@@ -3530,7 +3636,9 @@ fn mapped_repo_id(
     intent: &BundleIntent,
     options: &BundleImportOptions,
 ) -> Option<String> {
-    source_repo.map(|_| destination_repo_id(intent, options)).flatten()
+    source_repo
+        .map(|_| destination_repo_id(intent, options))
+        .flatten()
 }
 
 fn update_plan_counts(counts: &mut BundleCounts, decision: &str, reason: &str) {
@@ -3734,18 +3842,16 @@ fn lookup_memory_by_hash(
             .optional()
             .map_err(Error::from);
     }
-    store
-        .find_by_content_hash(content_hash)
-        .map(|record| {
-            record.map(|record| ExistingMemory {
-                id: record.id,
-                record_type: record.record_type.as_str().to_string(),
-                scope: record.scope.as_str().to_string(),
-                sensitivity: record.sensitivity.as_str().to_string(),
-                temporal_state: record.temporal_state.as_str().to_string(),
-                content_hash: record.content_hash,
-            })
+    store.find_by_content_hash(content_hash).map(|record| {
+        record.map(|record| ExistingMemory {
+            id: record.id,
+            record_type: record.record_type.as_str().to_string(),
+            scope: record.scope.as_str().to_string(),
+            sensitivity: record.sensitivity.as_str().to_string(),
+            temporal_state: record.temporal_state.as_str().to_string(),
+            content_hash: record.content_hash,
         })
+    })
 }
 
 fn metadata_value(metadata: &SafeMetadata) -> Value {
@@ -3957,7 +4063,10 @@ fn apply_plan(
                 workspace_id: options.workspace.clone(),
                 subject_key: body.subject_key,
                 kind: SubjectKind::parse(&body.kind).ok_or_else(|| {
-                    bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported subject kind")
+                    bundle_error(
+                        ErrorCode::BundleSchemaUnsupported,
+                        "unsupported subject kind",
+                    )
                 })?,
                 display_name: body.display_name,
                 created_at: body.created_at,
@@ -4135,7 +4244,9 @@ fn apply_plan(
         let local_id = memory_ids
             .get(&ref_key(&envelope.portable_ref))
             .cloned()
-            .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "memory plan id missing"))?;
+            .ok_or_else(|| {
+                bundle_error(ErrorCode::BundleIntegrityFailed, "memory plan id missing")
+            })?;
         if object.decision == "create" {
             let body = envelope.body;
             let record = memory_record_from_body(
@@ -4166,7 +4277,12 @@ fn plan_object<'a>(plan: &'a ImportPlan, reference: &PortableRef) -> Result<&'a 
     plan.objects
         .iter()
         .find(|object| object.portable_ref == *reference)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "object missing from import plan"))
+        .ok_or_else(|| {
+            bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "object missing from import plan",
+            )
+        })
 }
 
 fn mapped_local_id(
@@ -4197,18 +4313,42 @@ fn memory_record_from_body(
     sources: &BTreeMap<String, String>,
     memories: &BTreeMap<String, String>,
 ) -> Result<MemoryRecord> {
-    Profile::parse(&body.profile)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported memory profile"))?;
-    let scope = Scope::parse(&body.scope)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported memory scope"))?;
-    let record_type = RecordType::parse(&body.record_type)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported memory type"))?;
-    let sensitivity = Sensitivity::parse(&body.sensitivity)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported sensitivity"))?;
-    let portability = Portability::parse(&body.portability)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported portability"))?;
-    let temporal_state = TemporalState::parse(&body.temporal_state)
-        .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported temporal state"))?;
+    Profile::parse(&body.profile).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported memory profile",
+        )
+    })?;
+    let scope = Scope::parse(&body.scope).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported memory scope",
+        )
+    })?;
+    let record_type = RecordType::parse(&body.record_type).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported memory type",
+        )
+    })?;
+    let sensitivity = Sensitivity::parse(&body.sensitivity).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported sensitivity",
+        )
+    })?;
+    let portability = Portability::parse(&body.portability).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported portability",
+        )
+    })?;
+    let temporal_state = TemporalState::parse(&body.temporal_state).ok_or_else(|| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            "unsupported temporal state",
+        )
+    })?;
     let repo_id = mapped_repo_id(body.repo_id.as_deref(), intent, options);
     let source_ids = body
         .source_refs
@@ -4308,8 +4448,8 @@ mod tests {
             }"#,
         )
         .expect("RFC 8785 fixture parses");
-        let canonical = String::from_utf8(canonical_json(&value).expect("canonical bytes"))
-            .expect("UTF-8");
+        let canonical =
+            String::from_utf8(canonical_json(&value).expect("canonical bytes")).expect("UTF-8");
         assert_eq!(
             canonical,
             r#"{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\\\"/"}"#
@@ -4328,8 +4468,8 @@ mod tests {
 
     #[test]
     fn canonicalizes_object_keys_by_utf16_code_units() {
-        let value: Value = parse_json(br#"{"\ue000":1,"\ud83d\ude00":2}"#)
-            .expect("Unicode object parses");
+        let value: Value =
+            parse_json(br#"{"\ue000":1,"\ud83d\ude00":2}"#).expect("Unicode object parses");
         assert_eq!(
             String::from_utf8(canonical_json(&value).expect("canonical bytes")).expect("UTF-8"),
             r#"{"😀":2,"":1}"#

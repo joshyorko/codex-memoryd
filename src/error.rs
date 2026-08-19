@@ -57,9 +57,7 @@ impl ErrorCode {
             ErrorCode::UnsupportedVersion => "unsupported_version",
             ErrorCode::BundleIntegrityFailed => "bundle_integrity_failed",
             ErrorCode::BundleSchemaUnsupported => "bundle_schema_unsupported",
-            ErrorCode::BundleRequiredFeatureUnsupported => {
-                "bundle_required_feature_unsupported"
-            }
+            ErrorCode::BundleRequiredFeatureUnsupported => "bundle_required_feature_unsupported",
             ErrorCode::BundleUnsafeMember => "bundle_unsafe_member",
             ErrorCode::BundleDuplicateIdentity => "bundle_duplicate_identity",
             ErrorCode::BundleMissingDependency => "bundle_missing_dependency",

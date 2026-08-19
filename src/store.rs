@@ -56,8 +56,7 @@ const MIGRATION_SEMANTIC_RELATIONS: &str =
     include_str!("../migrations/0009_semantic_relations.sql");
 const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
 const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.sql");
-const MIGRATION_PORTABLE_BUNDLES: &str =
-    include_str!("../migrations/0012_portable_bundles.sql");
+const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -667,7 +666,10 @@ impl Store {
              ORDER BY canonical DESC, origin_instance_id, origin_object_id",
         )?;
         let result = statement
-            .query_map(params![object_kind, local_object_id], row_to_portable_origin)?
+            .query_map(
+                params![object_kind, local_object_id],
+                row_to_portable_origin,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from);
         result

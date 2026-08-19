@@ -16,7 +16,7 @@ It does not promise long-term API stability beyond what is written here.
 | Surface | Contract | Enforced by |
 | --- | --- | --- |
 | HTTP `/v1` responses | Response envelope + documented body keys | `tests/contract_snapshots.rs`, `tests/contract_fixtures.rs`, `tests/http_smoke.rs` |
-| CLI flags / output | Subcommand names, flags, and JSON shapes | `tests/cli_smoke.rs`, `tests/contract_snapshots.rs` |
+| CLI flags / output | Subcommand names, flags, and JSON shapes | `tests/cli_smoke.rs`, `tests/contract_snapshots.rs`, `docs/portable-memory-bundles.md` |
 | MCP tool registry | Read-only and write tool name sets + schemas | `tests/contract_snapshots.rs` (`mcp::READ_ONLY_TOOL_NAMES` / `WRITE_TOOL_NAMES`), `tests/mcp_stdio.rs` |
 | Eval reports | `eval substrate`, `eval substrate --compare`, `eval procedures` JSON | `tests/contract_snapshots.rs` |
 | Adapter export | JSON/Markdown metadata + context-pack budget | `tests/contract_snapshots.rs`, `tests/adapter_conformance.rs`, `tests/conformance.rs` |
@@ -56,7 +56,7 @@ These break existing consumers and must not land silently:
   (profile boundary deny-by-default, quarantine withholding, secret rejection).
   These are load-bearing and are not negotiable additive surface.
 - **Making public memory handles carry location or authority.** Public `mr_*`,
-  `msrc_*`, `msub_*`, `mep_*`, and `mcp_*` values are opaque presentation
+  `msrc_*`, `msub_*`, `mep_*`, `mev_*`, and `mcp_*` values are opaque presentation
   handles only. They must not embed filesystem paths, URLs, tenants, object
   keys, query fragments, class names, or secret selectors.
 
@@ -94,7 +94,7 @@ a read-only tool is a deliberate one-line update rather than a silent change.
 `codex-memoryd` now treats outbound memory pointers as a security boundary:
 
 - Public memory-facing IDs use a fixed opaque grammar with allowlisted
-  prefixes: `mr_`, `msrc_`, `msub_`, `mep_`, and `mcp_`.
+  prefixes: `mr_`, `msrc_`, `msub_`, `mep_`, `mev_`, and `mcp_`.
 - The suffix is a deterministic one-way digest over a server-side identifier.
   Clients may validate the grammar, but they cannot derive storage location or
   authority from the handle itself.
