@@ -482,7 +482,7 @@ struct ExportGraph {
     counts: BundleManifestCounts,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ObjectKind {
     Subject,
     Episode,
@@ -1134,6 +1134,44 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
     }
     validate_timestamp(&manifest.created_at)?;
     validate_scalar(&manifest.producer.instance_id, "instance_id")?;
+    if !manifest
+        .producer
+        .instance_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "instance_id contains an unsafe character",
+        ));
+    }
+    validate_scalar(&manifest.producer.tool_version, "tool_version")?;
+    validate_scalar(&manifest.intent.source_profile, "source_profile")?;
+    validate_scalar(&manifest.intent.source_workspace, "source_workspace")?;
+    validate_scalar(&manifest.intent.target_profile, "target_profile")?;
+    if let Some(value) = &manifest.intent.source_repo_id {
+        validate_scalar(value, "source_repo_id")?;
+    }
+    if let Some(value) = &manifest.intent.target_workspace {
+        validate_scalar(value, "target_workspace")?;
+    }
+    if let Some(value) = &manifest.intent.target_repo_id {
+        validate_scalar(value, "target_repo_id")?;
+    }
+    validate_scalar(&manifest.policy.ruleset_version, "ruleset_version")?;
+    validate_scalar(&manifest.policy.boundary_decision, "boundary_decision")?;
+    for feature in &manifest.required_features {
+        validate_scalar(feature, "required_feature")?;
+    }
+    for record_id in &manifest.selection.record_ids {
+        validate_scalar(record_id, "selection record id")?;
+        if ids::parse_public_handle(record_id) != Some(PublicHandleKind::MemoryRef) {
+            return Err(bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "selection contains a non-memory public handle",
+            ));
+        }
+    }
     if manifest.producer.storage_schema_version < 0
         || manifest.descriptors.len() != OBJECT_MEMBERS.len()
         || !manifest.required_features.is_empty()
@@ -1163,7 +1201,8 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
         let kind = kind_for_member(&descriptor.path).ok_or_else(|| {
             bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported bundle member")
         })?;
-        if descriptor.media_type != kind.media_type()
+        if !descriptor.required
+            || descriptor.media_type != kind.media_type()
             || descriptor.size_bytes > MAX_MEMBER_BYTES as u64
             || descriptor.object_count > MAX_OBJECTS
         {
@@ -1173,8 +1212,24 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
             ));
         }
     }
+    let object_count = manifest
+        .counts
+        .root_memories
+        .checked_add(manifest.counts.dependency_objects)
+        .ok_or_else(|| bundle_error(ErrorCode::BundleLimitExceeded, "bundle object count overflow"))?;
+    let count_values = [
+        manifest.counts.root_memories,
+        manifest.counts.dependency_objects,
+        manifest.counts.omitted_secret,
+        manifest.counts.omitted_quarantined,
+        manifest.counts.omitted_portability,
+        manifest.counts.omitted_boundary,
+        manifest.counts.omitted_unsafe_path,
+        manifest.counts.external_references,
+    ];
     if manifest.counts.root_memories > MAX_ROOT_MEMORIES
-        || manifest.counts.root_memories + manifest.counts.dependency_objects > MAX_OBJECTS
+        || object_count > MAX_OBJECTS
+        || count_values.iter().any(|value| *value > MAX_OBJECTS)
     {
         return Err(bundle_error(
             ErrorCode::BundleLimitExceeded,
@@ -1196,6 +1251,7 @@ fn validate_payload_objects(
 ) -> Result<()> {
     let mut refs = BTreeSet::new();
     let mut present = BTreeSet::new();
+    let mut member_counts = BTreeMap::<ObjectKind, usize>::new();
     for descriptor in &manifest.descriptors {
         let kind = kind_for_member(&descriptor.path).expect("manifest checked");
         let bytes = members.get(&descriptor.path).expect("member checked");
@@ -1261,7 +1317,84 @@ fn validate_payload_objects(
             }
             previous = Some(envelope.portable_ref.clone());
             present.insert(envelope_ref_key);
+            *member_counts.entry(kind).or_default() += 1;
         }
+    }
+    if member_counts.get(&ObjectKind::Memory).copied().unwrap_or(0)
+        != manifest.counts.root_memories
+        || member_counts
+            .get(&ObjectKind::Subject)
+            .copied()
+            .unwrap_or(0)
+            + member_counts
+                .get(&ObjectKind::Episode)
+                .copied()
+                .unwrap_or(0)
+            + member_counts.get(&ObjectKind::Source).copied().unwrap_or(0)
+            + member_counts
+                .get(&ObjectKind::Evidence)
+                .copied()
+                .unwrap_or(0)
+            != manifest.counts.dependency_objects
+        || manifest.selection.record_ids.len() != manifest.counts.root_memories
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "manifest object counts do not match the payload",
+        ));
+    }
+    let subjects = parse_member::<SubjectBody>(members, "objects/subjects.jsonl", ObjectKind::Subject)?;
+    for subject in subjects {
+        sanitized_scalar(&subject.body.profile, 128)?;
+        sanitized_scalar(&subject.body.workspace, 512)?;
+        sanitized_scalar(&subject.body.subject_key, 512)?;
+        SubjectKind::parse(&subject.body.kind).ok_or_else(|| {
+            bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported subject kind")
+        })?;
+        sanitized_scalar(&subject.body.display_name, 512)?;
+        validate_timestamp(&subject.body.created_at)?;
+        validate_timestamp(&subject.body.updated_at)?;
+    }
+    let episodes = parse_member::<EpisodeBody>(members, "objects/episodes.jsonl", ObjectKind::Episode)?;
+    for episode in episodes {
+        episode.body.subject_ref.validate(Some("subject"))?;
+        validate_timestamp(&episode.body.created_at)?;
+        validate_timestamp(&episode.body.updated_at)?;
+        for value in [&episode.body.started_at, &episode.body.ended_at] {
+            if let Some(value) = value {
+                validate_timestamp(value)?;
+            }
+        }
+        screened_string(&episode.body.summary, MAX_RECORD_CHARS)?;
+    }
+    let sources = parse_member::<SourceBody>(members, "objects/sources.jsonl", ObjectKind::Source)?;
+    for source in sources {
+        if let Some(path) = &source.body.source_path {
+            if !valid_repo_path(path) {
+                return Err(bundle_error(
+                    ErrorCode::BundleIntegrityFailed,
+                    "source contains an unsafe repository-relative path",
+                ));
+            }
+        }
+        validate_timestamp(&source.body.created_at)?;
+        validate_timestamp(&source.body.ingested_at)?;
+    }
+    let evidence = parse_member::<EvidenceBody>(members, "objects/evidence.jsonl", ObjectKind::Evidence)?;
+    for entry in evidence {
+        if let Some(reference) = &entry.body.source_ref {
+            reference.validate(Some("source"))?;
+        }
+        if let Some(path) = &entry.body.source_path {
+            if !valid_repo_path(path) {
+                return Err(bundle_error(
+                    ErrorCode::BundleIntegrityFailed,
+                    "evidence contains an unsafe repository-relative path",
+                ));
+            }
+        }
+        screened_string(&entry.body.safe_summary, MAX_RECORD_CHARS)?;
+        validate_timestamp(&entry.body.created_at)?;
     }
     let memories = parse_member::<MemoryBody>(members, "objects/memories.jsonl", ObjectKind::Memory)?;
     for memory in memories {
@@ -1274,6 +1407,7 @@ fn validate_payload_objects(
             .chain(memory.body.source_refs.iter())
             .chain(memory.body.supersedes.iter())
             .chain(memory.body.superseded_by.iter())
+            .chain(memory.body.external_refs.iter())
         {
             reference.validate(None)?;
             if !present.contains(&ref_key(reference))
@@ -1283,6 +1417,9 @@ fn validate_payload_objects(
                     ErrorCode::BundleMissingDependency,
                     "memory references a missing dependency",
                 ));
+            }
+            for reference in &memory.body.external_refs {
+                reference.validate(None)?;
             }
         }
     }
@@ -1427,6 +1564,8 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         .target_repo_id
         .as_deref()
         .or(options.repo_id.as_deref());
+    let dependencies_portable =
+        matches!(policy::export_boundary(source_profile, target_profile), BoundaryDecision::Allow);
 
     for record in records {
         let public_id = ids::public_handle(PublicHandleKind::MemoryRef, &record.id);
@@ -1497,6 +1636,13 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     let mut episodes = BTreeMap::new();
     let mut sources = BTreeMap::new();
     for record in &roots {
+        if !dependencies_portable {
+            let dependency_count = record.subject_id.iter().count()
+                + record.episode_id.iter().count()
+                + record.source_ids.len();
+            counts.external_references += dependency_count;
+            continue;
+        }
         if let Some(id) = &record.subject_id {
             if let Some(subject) = store.get_subject(&record.profile_id, &record.workspace_id, id)? {
                 if export_scope_matches(&subject.profile_id, &subject.workspace_id, options)
@@ -1515,7 +1661,8 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         }
         if let Some(id) = &record.episode_id {
             if let Some(episode) = store.get_episode(&record.profile_id, &record.workspace_id, id)? {
-                if export_scope_matches(&episode.profile_id, &episode.workspace_id, options)
+                if subjects.contains_key(&episode.subject_id)
+                    && export_scope_matches(&episode.profile_id, &episode.workspace_id, options)
                     && safe_episode(&episode).is_ok()
                 {
                     episodes.insert(episode.id.clone(), episode);
@@ -1928,7 +2075,9 @@ fn memory_body(
 }
 
 fn safe_subject(subject: &Subject) -> Result<()> {
-    let _ = subject_body(subject)?;
+    let body = subject_body(subject)?;
+    screened_string(&body.subject_key, 512)?;
+    screened_string(&body.display_name, 512)?;
     Ok(())
 }
 
@@ -2414,18 +2563,30 @@ fn plan_import(
     }
     for envelope in memories {
         let body = envelope.body;
-        validate_destination_memory(&body, &payload.manifest.intent, options)?;
-        let (decision, reason, destination_id, destination_digest) = plan_memory(
-            store,
-            tx,
-            &envelope.portable_ref,
-            &envelope.digest,
-            &body,
-            options,
-            &subject_ids,
-            &episode_ids,
-            &source_ids,
-        )?;
+        let (decision, reason, destination_id, destination_digest) =
+            if let Some(reason) =
+                validate_destination_memory(&body, &payload.manifest.intent, options)?
+            {
+                (
+                    "reject_destination_policy".to_string(),
+                    reason,
+                    None,
+                    None,
+                )
+            } else {
+                plan_memory(
+                    store,
+                    tx,
+                    &envelope.portable_ref,
+                    &envelope.digest,
+                    &body,
+                    options,
+                    &payload.manifest.intent,
+                    &subject_ids,
+                    &episode_ids,
+                    &source_ids,
+                )?
+            };
         update_plan_counts(&mut counts, &decision, &reason);
         if decision.starts_with("conflict_") || decision == "reject_destination_policy" {
             blocking.push(decision_detail(
@@ -2475,14 +2636,7 @@ fn plan_import(
     let destination_scope = ScopeSummary {
         profile: options.profile.clone(),
         workspace: options.workspace.clone(),
-        repo_id: options.repo_id.clone().or_else(|| {
-            payload
-                .manifest
-                .intent
-                .target_repo_id
-                .clone()
-                .or(payload.manifest.intent.source_repo_id.clone())
-        }),
+        repo_id: destination_repo_id(&payload.manifest.intent, options),
     };
     let mut report = BundleReport {
         mode: "import_preview".to_string(),
@@ -2552,7 +2706,7 @@ fn validate_import_mapping(
         .target_repo_id
         .as_deref()
         .or(intent.source_repo_id.as_deref());
-    if options.repo_id.as_deref() != expected_repo {
+    if options.repo_id.as_deref().is_some_and(|repo| Some(repo) != expected_repo) {
         return Err(bundle_error(
             ErrorCode::BundlePolicyDenied,
             "destination repository does not match the explicit bundle mapping",
@@ -2570,8 +2724,6 @@ fn subject_ref_can_resolve(
         || objects.iter().any(|object| {
             object.kind == ObjectKind::Subject
                 && object.portable_ref == *reference
-                && !object.decision.starts_with("conflict_")
-                && object.decision != "reject_destination_policy"
         })
 }
 
@@ -2727,6 +2879,7 @@ fn plan_memory(
     digest: &str,
     body: &MemoryBody,
     options: &BundleImportOptions,
+    intent: &BundleIntent,
     _subject_ids: &BTreeMap<String, String>,
     _episode_ids: &BTreeMap<String, String>,
     _source_ids: &BTreeMap<String, String>,
@@ -2747,7 +2900,7 @@ fn plan_memory(
             Some(origin.imported_object_digest),
         ));
     }
-    let repo_id = mapped_repo_id(body.repo_id.as_deref(), options);
+    let repo_id = mapped_repo_id(body.repo_id.as_deref(), intent, options);
     let content_hash = ids::content_hash(
         &options.profile,
         &options.workspace,
@@ -2788,7 +2941,7 @@ fn validate_destination_memory(
     body: &MemoryBody,
     intent: &BundleIntent,
     options: &BundleImportOptions,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if body.profile != intent.source_profile || body.workspace != intent.source_workspace {
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
@@ -2798,16 +2951,17 @@ fn validate_destination_memory(
     let portability = Portability::parse(&body.portability)
         .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported portability"))?;
     if portability == Portability::ProfileOnly && options.profile != intent.source_profile {
-        return Err(bundle_error(
-            ErrorCode::BundlePolicyDenied,
-            "profile-only memory cannot cross profile boundaries",
-        ));
+        let generic = RecordType::parse(&body.record_type)
+            .zip(Sensitivity::parse(&body.sensitivity))
+            .is_some_and(|(record_type, sensitivity)| {
+                policy::is_generic_preference(record_type, sensitivity)
+            });
+        if !generic {
+            return Ok(Some("profile_only_cross_profile".to_string()));
+        }
     }
     if portability == Portability::WorkspaceOnly && options.workspace != intent.source_workspace {
-        return Err(bundle_error(
-            ErrorCode::BundlePolicyDenied,
-            "workspace-only memory cannot cross workspace boundaries",
-        ));
+        return Ok(Some("workspace_only_cross_workspace".to_string()));
     }
     if body.scope == "repo" {
         let source_repo = intent.source_repo_id.as_deref();
@@ -2817,24 +2971,33 @@ fn validate_destination_memory(
                 "repo-scoped memory does not match source repository intent",
             ));
         }
-        if mapped_repo_id(body.repo_id.as_deref(), options).is_none() {
-            return Err(bundle_error(
-                ErrorCode::BundlePolicyDenied,
-                "repo-scoped memory has no destination repository mapping",
-            ));
+        if mapped_repo_id(body.repo_id.as_deref(), intent, options).is_none() {
+            return Ok(Some("repo_mapping_required".to_string()));
         }
     }
     match policy::screen_content(&body.content, MAX_RECORD_CHARS) {
-        PolicyDecision::Accept(_) => Ok(()),
-        PolicyDecision::Reject { .. } => Err(bundle_error(
-            ErrorCode::BundlePolicyDenied,
-            "destination policy rejected memory content",
-        )),
+        PolicyDecision::Accept(_) => Ok(None),
+        PolicyDecision::Reject { code, .. } => Ok(Some(code)),
     }
 }
 
-fn mapped_repo_id(source_repo: Option<&str>, options: &BundleImportOptions) -> Option<String> {
-    source_repo.map(|_| options.repo_id.clone()).flatten()
+fn destination_repo_id(
+    intent: &BundleIntent,
+    options: &BundleImportOptions,
+) -> Option<String> {
+    options
+        .repo_id
+        .clone()
+        .or_else(|| intent.target_repo_id.clone())
+        .or_else(|| intent.source_repo_id.clone())
+}
+
+fn mapped_repo_id(
+    source_repo: Option<&str>,
+    intent: &BundleIntent,
+    options: &BundleImportOptions,
+) -> Option<String> {
+    source_repo.map(|_| destination_repo_id(intent, options)).flatten()
 }
 
 fn update_plan_counts(counts: &mut BundleCounts, decision: &str, reason: &str) {
@@ -3141,7 +3304,7 @@ fn receipt_report(
     report.destination_scope = Some(ScopeSummary {
         profile: options.profile.clone(),
         workspace: options.workspace.clone(),
-        repo_id: options.repo_id.clone(),
+        repo_id: destination_repo_id(&payload.manifest.intent, options),
     });
     report.mapping_digest = mapping_digest(options, &payload.manifest).ok();
     report.safe_to_apply = Some(true);
@@ -3395,6 +3558,7 @@ fn apply_plan(
                 &body,
                 &local_id,
                 options,
+                &payload.manifest.intent,
                 &subject_ids,
                 &episode_ids,
                 &source_ids,
@@ -3443,6 +3607,7 @@ fn memory_record_from_body(
     body: &MemoryBody,
     id: &str,
     options: &BundleImportOptions,
+    intent: &BundleIntent,
     subjects: &BTreeMap<String, String>,
     episodes: &BTreeMap<String, String>,
     sources: &BTreeMap<String, String>,
@@ -3460,7 +3625,7 @@ fn memory_record_from_body(
         .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported portability"))?;
     let temporal_state = TemporalState::parse(&body.temporal_state)
         .ok_or_else(|| bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported temporal state"))?;
-    let repo_id = mapped_repo_id(body.repo_id.as_deref(), options);
+    let repo_id = mapped_repo_id(body.repo_id.as_deref(), intent, options);
     let source_ids = body
         .source_refs
         .iter()
@@ -3518,7 +3683,7 @@ fn memory_record_from_body(
         content_hash: ids::content_hash(
             &options.profile,
             &options.workspace,
-            mapped_repo_id(body.repo_id.as_deref(), options).as_deref(),
+            mapped_repo_id(body.repo_id.as_deref(), intent, options).as_deref(),
             &body.record_type,
             &body.scope,
             &body.content,
