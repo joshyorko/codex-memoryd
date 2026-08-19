@@ -1935,7 +1935,9 @@ impl Service {
         }
         let uses_configured_endpoint = configured.endpoint.trim() == endpoint;
         if adapter == DreamProviderAdapter::Provider && !endpoint.starts_with("https://") {
-            return Err(Error::invalid_request("provider adapter requires an https endpoint"));
+            return Err(Error::invalid_request(
+                "provider adapter requires an https endpoint",
+            ));
         }
         if !uses_configured_endpoint && !configured.api_key.trim().is_empty() {
             return Err(Error::secret(
@@ -1975,7 +1977,9 @@ impl Service {
         Ok(Some(ResolvedDreamProvider {
             adapter,
             endpoint: endpoint.to_string(),
-            api_key: uses_configured_endpoint.then(|| configured.api_key.clone()).unwrap_or_default(),
+            api_key: uses_configured_endpoint
+                .then(|| configured.api_key.clone())
+                .unwrap_or_default(),
             model,
             provider_name,
             timeout: StdDuration::from_secs(configured.timeout_seconds),
@@ -1988,7 +1992,10 @@ impl Service {
             max_retries: budget.max_retries,
             cost_per_1k_input_micros: configured.cost_per_1k_input_micros,
             cost_per_1k_output_micros: configured.cost_per_1k_output_micros,
-            daily_cost_ceiling_micros: match (budget.daily_cost_ceiling_micros, configured.daily_cost_ceiling_micros) {
+            daily_cost_ceiling_micros: match (
+                budget.daily_cost_ceiling_micros,
+                configured.daily_cost_ceiling_micros,
+            ) {
                 (Some(requested), Some(configured)) => Some(requested.min(configured)),
                 (Some(requested), None) => Some(requested),
                 (None, configured) => configured,
@@ -2051,7 +2058,9 @@ impl Service {
                     .format(&Rfc3339)
                     .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
                 if self.store.dream_provider_cost_since(&daily_start, None)? >= limit {
-                    return Err(Error::internal("dream provider daily cost ceiling exhausted"));
+                    return Err(Error::internal(
+                        "dream provider daily cost ceiling exhausted",
+                    ));
                 }
             }
         }
@@ -2093,7 +2102,9 @@ impl Service {
             && provider.cost_per_1k_input_micros == 0
             && provider.cost_per_1k_output_micros == 0
         {
-            return Err(Error::internal("provider response did not report a measurable cost"));
+            return Err(Error::internal(
+                "provider response did not report a measurable cost",
+            ));
         }
         let cost_micros = call.reported_cost_micros.unwrap_or(0).max(estimated_cost);
         usage.cost_micros = cost_micros;
@@ -3187,14 +3198,20 @@ fn dream_provider_context(response: &DreamResponse) -> Result<String> {
         .chain(response.evidence_window.conclusions.sources.iter())
         .chain(response.evidence_window.checkpoints.sources.iter())
         .chain(response.evidence_window.imported_memories.sources.iter())
-        .chain(response.evidence_window.active_memory_records.sources.iter())
+        .chain(
+            response
+                .evidence_window
+                .active_memory_records
+                .sources
+                .iter(),
+        )
         .filter_map(|source| {
             source.content.as_deref().map(|content| {
                 json!({"id": source.id, "kind": source.kind, "content":
-                    match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
-                        PolicyDecision::Accept(value) => value,
-                        PolicyDecision::Reject { .. } => "[screened]".to_string(),
-                    }})
+                match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                    PolicyDecision::Accept(value) => value,
+                    PolicyDecision::Reject { .. } => "[screened]".to_string(),
+                }})
             })
         })
         .collect::<Vec<_>>();

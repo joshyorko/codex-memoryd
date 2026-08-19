@@ -300,11 +300,23 @@ pub struct EvidenceBody {
     pub source_hash: String,
     pub safe_summary: String,
     pub policy_state: String,
+    #[serde(default = "default_trust_state")]
+    pub trust_state: String,
+    #[serde(default = "default_trust_score")]
+    pub trust_score: f64,
     pub created_at: String,
     #[serde(default)]
     pub metadata: SafeMetadata,
     #[serde(default)]
     pub external_refs: Vec<PortableRef>,
+}
+
+fn default_trust_state() -> String {
+    "trusted".to_string()
+}
+
+fn default_trust_score() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +559,21 @@ impl BundleExportOptions {
         }
         if let Some(created_at) = &self.created_at {
             validate_timestamp(created_at)?;
+        }
+        if self.record_ids.len() > MAX_ROOT_MEMORIES {
+            return Err(bundle_error(
+                ErrorCode::BundleLimitExceeded,
+                "bundle selection limit exceeded",
+            ));
+        }
+        let mut record_ids = BTreeSet::new();
+        for record_id in &self.record_ids {
+            validate_scalar(record_id, "record-id")?;
+            if !record_ids.insert(record_id) {
+                return Err(Error::invalid_request(
+                    "bundle export record ids must be unique",
+                ));
+            }
         }
         if let BoundaryDecision::Deny { reason } = policy::export_boundary(source, target) {
             return Err(bundle_error(ErrorCode::BundlePolicyDenied, reason));
@@ -992,6 +1019,12 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
     let mut names = BTreeSet::new();
     let mut members = BTreeMap::new();
     let mut total = 0usize;
+    if archive.len() > OBJECT_MEMBERS.len() + 2 {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "bundle member count limit exceeded",
+        ));
+    }
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| {
             bundle_error(
@@ -1143,7 +1176,8 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
             ));
         }
     }
-    let signature_status = if members.contains_key(SIGNATURE_MEMBER) {
+    let signature_status = if let Some(signature) = members.get(SIGNATURE_MEMBER) {
+        validate_signature_member(signature, &manifest_bytes)?;
         "present_unverified".to_string()
     } else {
         "absent".to_string()
@@ -1155,6 +1189,131 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
         members,
         signature_status,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DsseEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: String,
+    payload: String,
+    signatures: Vec<DsseSignature>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DsseSignature {
+    #[serde(default)]
+    keyid: Option<String>,
+    sig: String,
+}
+
+fn validate_signature_member(bytes: &[u8], manifest_bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_MEMBER_BYTES {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "signature metadata size limit exceeded",
+        ));
+    }
+    let envelope: DsseEnvelope = parse_json(bytes).map_err(|_| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "signature metadata is not a valid DSSE envelope",
+        )
+    })?;
+    sanitized_scalar(&envelope.payload_type, 256)?;
+    if envelope.payload_type.is_empty() || envelope.signatures.is_empty() {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "signature metadata is incomplete",
+        ));
+    }
+    if decode_base64(&envelope.payload)
+        .map_err(|_| bundle_error(ErrorCode::BundleIntegrityFailed, "invalid DSSE payload"))?
+        != manifest_bytes
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "DSSE payload does not match the canonical manifest",
+        ));
+    }
+    for signature in envelope.signatures {
+        if let Some(keyid) = signature.keyid {
+            sanitized_scalar(&keyid, 512)?;
+        }
+        if signature.sig.is_empty() || decode_base64(&signature.sig).is_err() {
+            return Err(bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "DSSE signature is not valid base64",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>> {
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "invalid base64",
+        ));
+    }
+    if value.len() % 4 == 1 {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "invalid base64 length",
+        ));
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        let chunk_len = remaining.min(4);
+        let mut chunk = [b'='; 4];
+        chunk[..chunk_len].copy_from_slice(&bytes[offset..offset + chunk_len]);
+        if chunk[0] == b'='
+            || chunk[1] == b'='
+            || (offset + chunk_len < bytes.len() && chunk[..chunk_len].contains(&b'='))
+        {
+            return Err(bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "invalid base64 padding",
+            ));
+        }
+        let values = chunk.map(|character| match character {
+            b'=' => Ok(0),
+            _ => Ok(match character {
+                b'A'..=b'Z' => character - b'A',
+                b'a'..=b'z' => character - b'a' + 26,
+                b'0'..=b'9' => character - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return Err(()),
+            }),
+        });
+        let values = values
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| {
+                bundle_error(ErrorCode::BundleIntegrityFailed, "invalid base64 character")
+            })?;
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return Err(bundle_error(
+                ErrorCode::BundleIntegrityFailed,
+                "invalid base64 padding",
+            ));
+        }
+        output.push((values[0] << 2) | (values[1] >> 4));
+        if chunk[2] != b'=' {
+            output.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((values[2] << 6) | values[3]);
+        }
+        offset += chunk_len;
+    }
+    Ok(output)
 }
 
 fn validate_member_name(name: &str) -> Result<()> {
@@ -1379,6 +1538,7 @@ fn validate_payload_objects(
                         "duplicate portable alias identity",
                     ));
                 }
+                present.insert(ref_key(alias));
             }
             if previous.is_some_and(|prior: PortableRef| prior >= envelope.portable_ref) {
                 return Err(bundle_error(
@@ -1416,6 +1576,12 @@ fn validate_payload_objects(
     let subjects =
         parse_member::<SubjectBody>(members, "objects/subjects.jsonl", ObjectKind::Subject)?;
     for subject in subjects {
+        validate_object_scope(
+            &subject.body.profile,
+            &subject.body.workspace,
+            &manifest.intent,
+            "subject",
+        )?;
         sanitized_scalar(&subject.body.profile, 128)?;
         sanitized_scalar(&subject.body.workspace, 512)?;
         sanitized_scalar(&subject.body.subject_key, 512)?;
@@ -1433,7 +1599,23 @@ fn validate_payload_objects(
     let episodes =
         parse_member::<EpisodeBody>(members, "objects/episodes.jsonl", ObjectKind::Episode)?;
     for episode in episodes {
+        validate_object_scope(
+            &episode.body.profile,
+            &episode.body.workspace,
+            &manifest.intent,
+            "episode",
+        )?;
+        sanitized_scalar(&episode.body.profile, 128)?;
+        sanitized_scalar(&episode.body.workspace, 512)?;
         episode.body.subject_ref.validate(Some("subject"))?;
+        sanitized_scalar(&episode.body.source_kind, 128)?;
+        sanitized_scalar(&episode.body.source_ref, 512)?;
+        if let Some(status) = &episode.body.status {
+            sanitized_scalar(status, 128)?;
+        }
+        if let Some(trust_level) = &episode.body.trust_level {
+            sanitized_scalar(trust_level, 128)?;
+        }
         validate_timestamp(&episode.body.created_at)?;
         validate_timestamp(&episode.body.updated_at)?;
         for value in [&episode.body.started_at, &episode.body.ended_at] {
@@ -1447,6 +1629,16 @@ fn validate_payload_objects(
     }
     let sources = parse_member::<SourceBody>(members, "objects/sources.jsonl", ObjectKind::Source)?;
     for source in sources {
+        validate_object_scope(
+            &source.body.profile,
+            &source.body.workspace,
+            &manifest.intent,
+            "source",
+        )?;
+        sanitized_scalar(&source.body.profile, 128)?;
+        sanitized_scalar(&source.body.workspace, 512)?;
+        sanitized_scalar(&source.body.kind, 128)?;
+        sanitized_scalar(&source.body.source_hash, 256)?;
         if let Some(path) = &source.body.source_path {
             if !valid_repo_path(path) {
                 return Err(bundle_error(
@@ -1462,6 +1654,12 @@ fn validate_payload_objects(
     let evidence =
         parse_member::<EvidenceBody>(members, "objects/evidence.jsonl", ObjectKind::Evidence)?;
     for entry in &evidence {
+        validate_object_scope(
+            &entry.body.profile,
+            &entry.body.workspace,
+            &manifest.intent,
+            "evidence",
+        )?;
         sanitized_scalar(&entry.body.profile, 128)?;
         sanitized_scalar(&entry.body.workspace, 512)?;
         if let Some(repo_id) = &entry.body.repo_id {
@@ -1473,6 +1671,8 @@ fn validate_payload_objects(
         sanitized_scalar(&entry.body.source_kind, 128)?;
         sanitized_scalar(&entry.body.source_hash, 256)?;
         sanitized_scalar(&entry.body.policy_state, 128)?;
+        sanitized_scalar(&entry.body.trust_state, 128)?;
+        bounded_score(entry.body.trust_score, "evidence trust score")?;
         if let Some(subject_ref) = &entry.body.subject_ref {
             subject_ref.validate(Some("subject"))?;
             if !present.contains(&ref_key(subject_ref))
@@ -1512,6 +1712,7 @@ fn validate_payload_objects(
         for external in &entry.body.external_refs {
             external.validate(None)?;
         }
+        validate_external_refs(&entry.body.external_refs, &present)?;
         if let Some(path) = &entry.body.source_path {
             if !valid_repo_path(path) {
                 return Err(bundle_error(
@@ -1556,6 +1757,12 @@ fn validate_payload_objects(
         ));
     }
     for memory in memories {
+        validate_object_scope(
+            &memory.body.profile,
+            &memory.body.workspace,
+            &manifest.intent,
+            "memory",
+        )?;
         validate_memory_body(&memory.body)?;
         validate_safe_metadata(&memory.body.metadata)?;
         if let Some(reference) = &memory.body.subject_ref {
@@ -1576,6 +1783,26 @@ fn validate_payload_objects(
         for reference in &memory.body.external_refs {
             reference.validate(None)?;
         }
+        validate_external_refs(&memory.body.external_refs, &present)?;
+    }
+    Ok(())
+}
+
+fn validate_external_refs(references: &[PortableRef], present: &BTreeSet<String>) -> Result<()> {
+    if references.len() > MAX_REFS {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "external-reference limit exceeded",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for reference in references {
+        if !seen.insert(ref_key(reference)) || present.contains(&ref_key(reference)) {
+            return Err(bundle_error(
+                ErrorCode::BundleDuplicateIdentity,
+                "external references must be unique and omitted from the payload",
+            ));
+        }
     }
     Ok(())
 }
@@ -1593,6 +1820,22 @@ fn validate_reference_present(
         return Err(bundle_error(
             ErrorCode::BundleMissingDependency,
             "portable object references a missing dependency",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_object_scope(
+    profile: &str,
+    workspace: &str,
+    intent: &BundleIntent,
+    kind: &str,
+) -> Result<()> {
+    if profile != intent.source_profile || workspace != intent.source_workspace {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            format!("{kind} scope does not match the bundle source intent"),
         ));
     }
     Ok(())
@@ -2097,9 +2340,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
 }
 
 fn export_scope_matches(profile: &str, workspace: &str, options: &BundleExportOptions) -> bool {
-    profile == options.profile
-        && workspace == options.workspace
-        && options.repo_id.as_deref().is_none_or(|_| true)
+    profile == options.profile && workspace == options.workspace
 }
 
 fn subject_body(subject: &Subject) -> Result<SubjectBody> {
@@ -2236,6 +2477,8 @@ fn evidence_body(
         source_hash: sanitized_scalar(&evidence.source_hash, 256)?,
         safe_summary,
         policy_state: sanitized_scalar(&evidence.policy_state, 128)?,
+        trust_state: sanitized_scalar(&evidence.trust_state, 128)?,
+        trust_score: bounded_score(evidence.trust_score, "evidence trust score")?,
         created_at: evidence.created_at.clone(),
         metadata,
         external_refs,
@@ -2373,12 +2616,8 @@ fn memory_body(
             validate_timestamp(value)?;
         }
     }
-    if !record.confidence.is_finite() || !record.trust_score.is_finite() {
-        return Err(bundle_error(
-            ErrorCode::BundleIntegrityFailed,
-            "memory confidence or trust score is non-finite",
-        ));
-    }
+    let confidence = bounded_score(record.confidence, "memory confidence")?;
+    let trust_score = bounded_score(record.trust_score, "memory trust score")?;
     if source_ref_values.len() > MAX_REFS
         || supersedes.len() > MAX_REFS
         || external_refs.len() > MAX_REFS
@@ -2400,7 +2639,7 @@ fn memory_body(
         tags,
         sensitivity: record.sensitivity.as_str().to_string(),
         portability: record.portability.as_str().to_string(),
-        confidence: record.confidence.clamp(0.0, 1.0),
+        confidence,
         subject_ref,
         episode_ref,
         source_refs: source_ref_values,
@@ -2415,11 +2654,21 @@ fn memory_body(
         archived: record.archived,
         temporal_state: record.temporal_state.as_str().to_string(),
         trust_state: record.trust_state.clone(),
-        trust_score: record.trust_score.clamp(0.0, 1.0),
+        trust_score,
         historical_reason: record.historical_reason.clone(),
         metadata: safe_metadata(&record.metadata),
         external_refs,
     })
+}
+
+fn bounded_score(value: f64, label: &str) -> Result<f64> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            format!("{label} must be a finite value between zero and one"),
+        ));
+    }
+    Ok(value)
 }
 
 fn portable_external_refs_from_metadata(metadata: &Value) -> Result<Vec<PortableRef>> {
@@ -2619,13 +2868,10 @@ fn valid_repo_path(path: &str) -> bool {
     let mut depth = 0i32;
     for component in path.split('/') {
         if component.is_empty() || component == "." {
-            continue;
+            return false;
         }
         if component == ".." {
-            depth -= 1;
-            if depth < 0 {
-                return false;
-            }
+            return false;
         } else {
             depth += 1;
         }
@@ -2725,6 +2971,11 @@ fn descriptors_for(members: &BTreeMap<String, Vec<u8>>) -> Result<Vec<Descriptor
 }
 
 fn validate_memory_body(body: &MemoryBody) -> Result<()> {
+    sanitized_scalar(&body.profile, 128)?;
+    sanitized_scalar(&body.workspace, 512)?;
+    if let Some(repo_id) = &body.repo_id {
+        sanitized_scalar(repo_id, 512)?;
+    }
     Profile::parse(&body.profile).ok_or_else(|| {
         bundle_error(ErrorCode::BundleSchemaUnsupported, "invalid memory profile")
     })?;
@@ -2738,6 +2989,13 @@ fn validate_memory_body(body: &MemoryBody) -> Result<()> {
             "invalid memory sensitivity",
         )
     })?;
+    if body.sensitivity == Sensitivity::SecretBlocked.as_str() || body.trust_state == "quarantined"
+    {
+        return Err(bundle_error(
+            ErrorCode::BundlePolicyDenied,
+            "secret-blocked or quarantined memory is not portable",
+        ));
+    }
     Portability::parse(&body.portability).ok_or_else(|| {
         bundle_error(
             ErrorCode::BundleSchemaUnsupported,
@@ -2750,9 +3008,10 @@ fn validate_memory_body(body: &MemoryBody) -> Result<()> {
             "invalid memory temporal state",
         )
     })?;
-    if !body.confidence.is_finite()
-        || !body.trust_score.is_finite()
-        || body.related_files.len() > MAX_FILES
+    bounded_score(body.confidence, "memory confidence")?;
+    bounded_score(body.trust_score, "memory trust score")?;
+    sanitized_scalar(&body.trust_state, 128)?;
+    if body.related_files.len() > MAX_FILES
         || body.tags.len() > MAX_TAGS
         || body.source_refs.len() > MAX_REFS
         || body.supersedes.len() > MAX_REFS
@@ -2771,6 +3030,10 @@ fn validate_memory_body(body: &MemoryBody) -> Result<()> {
             ));
         }
     }
+    for tag in &body.tags {
+        sanitized_scalar(tag, 256)?;
+    }
+    screened_string(&body.content, MAX_RECORD_CHARS)?;
     validate_timestamp(&body.created_at)?;
     validate_timestamp(&body.updated_at)?;
     for value in [
@@ -3248,6 +3511,30 @@ fn validate_import_mapping(payload: &BundlePayload, options: &BundleImportOption
             ErrorCode::BundlePolicyDenied,
             "destination repository does not match the explicit bundle mapping",
         ));
+    }
+    if payload
+        .manifest
+        .descriptors
+        .iter()
+        .any(|descriptor| descriptor.path == "objects/memories.jsonl")
+        && expected_repo.is_some()
+        && options.repo_id.is_none()
+        && intent.target_repo_id.is_none()
+    {
+        // A source repository id is not sufficient evidence that two machines
+        // refer to the same repository. A destination must repeat the scalar
+        // id or the exporter must provide an explicit target mapping.
+        let memories = parse_member::<MemoryBody>(
+            &payload.members,
+            "objects/memories.jsonl",
+            ObjectKind::Memory,
+        )?;
+        if memories.iter().any(|memory| memory.body.scope == "repo") {
+            return Err(bundle_error(
+                ErrorCode::BundlePolicyDenied,
+                "repo-scoped bundle import requires an explicit destination repository mapping",
+            ));
+        }
     }
     Ok(())
 }
