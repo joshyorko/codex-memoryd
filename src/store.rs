@@ -41,7 +41,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 11;
+pub const STORAGE_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -77,6 +77,26 @@ pub struct EvidenceLedgerEntry {
     pub source_hash: String,
     pub safe_summary: String,
     pub policy_state: String,
+    pub metadata: Value,
+}
+
+/// Sanitized evidence-ledger data used by portability projections.
+#[derive(Debug, Clone)]
+pub struct EvidenceLedgerRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub subject_key: Option<String>,
+    pub source_kind: String,
+    pub source_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_hash: String,
+    pub safe_summary: String,
+    pub policy_state: String,
+    pub created_at: String,
+    pub trust_state: String,
+    pub trust_score: f64,
     pub metadata: Value,
 }
 
@@ -3462,6 +3482,105 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// List evidence rows for a source scope. Callers must apply portability
+    /// and content policy before projecting these rows across an instance
+    /// boundary.
+    pub fn list_evidence_ledger(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+    ) -> Result<Vec<EvidenceLedgerRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, repo_id, subject_key,
+                    source_kind, source_id, source_path, source_hash, safe_summary,
+                    policy_state, created_at, trust_state, trust_score, metadata
+             FROM evidence_ledger
+             WHERE profile_id = ?1 AND workspace_id = ?2
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![profile_id, workspace_id], |row| {
+                let metadata: String = row.get(14)?;
+                Ok(EvidenceLedgerRecord {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    repo_id: row.get(3)?,
+                    subject_key: row.get(4)?,
+                    source_kind: row.get(5)?,
+                    source_id: row.get(6)?,
+                    source_path: row.get(7)?,
+                    source_hash: row.get(8)?,
+                    safe_summary: row.get(9)?,
+                    policy_state: row.get(10)?,
+                    created_at: row.get(11)?,
+                    trust_state: row.get(12)?,
+                    trust_score: row.get(13)?,
+                    metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert a portability-projected evidence row while preserving its
+    /// sanitized source timestamp and trust state.
+    pub fn insert_evidence_ledger_record_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        record: &EvidenceLedgerRecord,
+        source_id: Option<&str>,
+        metadata: &Value,
+    ) -> Result<String> {
+        let event_key = ids::sha256_hex(
+            format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                record.profile_id,
+                record.workspace_id,
+                record.repo_id.as_deref().unwrap_or(""),
+                record.subject_key.as_deref().unwrap_or(""),
+                record.source_kind,
+                source_id.unwrap_or(""),
+                record.source_path.as_deref().unwrap_or(""),
+                record.source_hash,
+                record.policy_state,
+            )
+            .as_bytes(),
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO evidence_ledger(
+                id, event_key, profile_id, workspace_id, repo_id, subject_key,
+                source_kind, source_id, source_path, source_hash, safe_summary,
+                policy_state, created_at, trust_state, trust_score, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                &record.id,
+                event_key,
+                &record.profile_id,
+                &record.workspace_id,
+                &record.repo_id,
+                &record.subject_key,
+                &record.source_kind,
+                source_id,
+                &record.source_path,
+                &record.source_hash,
+                &record.safe_summary,
+                &record.policy_state,
+                &record.created_at,
+                &record.trust_state,
+                record.trust_score,
+                metadata.to_string(),
+            ],
+        )?;
+        tx.query_row(
+            "SELECT id FROM evidence_ledger WHERE event_key = ?1",
+            params![event_key],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
     }
 
     pub fn count_policy_denials(&self) -> Result<i64> {

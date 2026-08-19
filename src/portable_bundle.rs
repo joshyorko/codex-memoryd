@@ -99,6 +99,7 @@ impl PortableRef {
             "subject" => PublicHandleKind::SubjectRef,
             "episode" => PublicHandleKind::EpisodeRef,
             "source" => PublicHandleKind::SourceRef,
+            "evidence" => PublicHandleKind::EvidenceRef,
             _ => {
                 return Err(bundle_error(
                     ErrorCode::BundleSchemaUnsupported,
@@ -293,6 +294,8 @@ pub struct EvidenceBody {
     #[serde(default)]
     pub source_ref: Option<PortableRef>,
     #[serde(default)]
+    pub subject_ref: Option<PortableRef>,
+    #[serde(default)]
     pub source_path: Option<String>,
     pub source_hash: String,
     pub safe_summary: String,
@@ -300,6 +303,8 @@ pub struct EvidenceBody {
     pub created_at: String,
     #[serde(default)]
     pub metadata: SafeMetadata,
+    #[serde(default)]
+    pub external_refs: Vec<PortableRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -756,7 +761,13 @@ fn utf16_cmp(a: &str, b: &str) -> Ordering {
 }
 
 fn canonical_number(number: &Number) -> Result<String> {
-    let raw = number.to_string();
+    let value = number
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "non-I-JSON number"))?;
+    let raw = Number::from_f64(value)
+        .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "non-I-JSON number"))?
+        .to_string();
     if raw == "-0" || raw == "-0.0" {
         return Ok("0".to_string());
     }
@@ -782,7 +793,6 @@ fn canonical_number(number: &Number) -> Result<String> {
     while digits.ends_with('0') && digits.len() > 1 {
         digits.pop();
     }
-    let magnitude = decimal_pos - digits.len() as i32;
     let abs_digits = if decimal_pos <= 0 {
         format!("0.{}{}", "0".repeat((-decimal_pos) as usize), digits)
     } else if decimal_pos >= digits.len() as i32 {
@@ -791,7 +801,14 @@ fn canonical_number(number: &Number) -> Result<String> {
         let at = decimal_pos as usize;
         format!("{}.{}", &digits[..at], &digits[at..])
     };
-    let abs_value = abs_digits.trim_end_matches('0').trim_end_matches('.').to_string();
+    let abs_value = if abs_digits.contains('.') {
+        abs_digits
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    } else {
+        abs_digits
+    };
     let abs_value = if abs_value.is_empty() {
         "0".to_string()
     } else {
@@ -977,15 +994,19 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
                 "duplicate ZIP member name",
             ));
         }
-        if file.is_dir()
-            || file.encrypted()
-            || file
-                .unix_mode()
-                .is_some_and(|mode| (mode & 0o170000) == 0o120000)
-        {
+        if file.is_dir() || file.encrypted() {
             return Err(bundle_error(
                 ErrorCode::BundleUnsafeMember,
                 "directory, encrypted, or symlink ZIP members are not allowed",
+            ));
+        }
+        if file
+            .unix_mode()
+            .is_some_and(|mode| (mode & 0o170000) != 0 && (mode & 0o170000) != 0o100000)
+        {
+            return Err(bundle_error(
+                ErrorCode::BundleUnsafeMember,
+                "only regular ZIP members are allowed",
             ));
         }
         if !matches!(
@@ -1036,16 +1057,22 @@ fn read_bundle_from_reader<R: Read + Seek>(reader: &mut R) -> Result<BundlePaylo
             "manifest size limit exceeded",
         ));
     }
-    let manifest: BundleManifest = parse_json(&manifest_bytes)?;
+    let manifest_value: Value = parse_json(&manifest_bytes)?;
+    let manifest: BundleManifest = serde_json::from_value(manifest_value.clone()).map_err(|err| {
+        bundle_error(
+            ErrorCode::BundleSchemaUnsupported,
+            format!("manifest schema validation failed: {err}"),
+        )
+    })?;
     validate_manifest(&manifest)?;
-    let canonical_manifest = canonical_json(&serde_json::to_value(&manifest)?)?;
+    let canonical_manifest = canonical_json(&manifest_value)?;
     if canonical_manifest != manifest_bytes {
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
             "manifest is not RFC 8785 canonical JSON",
         ));
     }
-    let expected_bundle_id = manifest_digest_without_id(&manifest)?;
+    let expected_bundle_id = manifest_digest_without_id_value(&manifest_value)?;
     if expected_bundle_id != manifest.bundle_id {
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
@@ -1191,7 +1218,14 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<()> {
         .iter()
         .map(|descriptor| descriptor.path.as_str())
         .collect();
-    if actual_paths != expected_paths {
+    if actual_paths != expected_paths
+        || manifest
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.path.as_str())
+            .collect::<Vec<_>>()
+            != OBJECT_MEMBERS.as_slice()
+    {
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
             "manifest descriptors do not match the fixed bundle member set",
@@ -1261,6 +1295,12 @@ fn validate_payload_objects(
                 return Err(bundle_error(
                     ErrorCode::BundleIntegrityFailed,
                     "JSONL member must end each object with a newline",
+                ));
+            }
+            if line.len() == 1 {
+                return Err(bundle_error(
+                    ErrorCode::BundleIntegrityFailed,
+                    "JSONL member contains an empty line",
                 ));
             }
             let json_bytes = &line[..line.len() - 1];
@@ -1352,6 +1392,7 @@ fn validate_payload_objects(
             bundle_error(ErrorCode::BundleSchemaUnsupported, "unsupported subject kind")
         })?;
         sanitized_scalar(&subject.body.display_name, 512)?;
+        validate_safe_metadata(&subject.body.metadata)?;
         validate_timestamp(&subject.body.created_at)?;
         validate_timestamp(&subject.body.updated_at)?;
     }
@@ -1366,6 +1407,8 @@ fn validate_payload_objects(
             }
         }
         screened_string(&episode.body.summary, MAX_RECORD_CHARS)?;
+        validate_safe_metadata(&episode.body.source_metadata)?;
+        validate_safe_metadata(&episode.body.metadata)?;
     }
     let sources = parse_member::<SourceBody>(members, "objects/sources.jsonl", ObjectKind::Source)?;
     for source in sources {
@@ -1379,11 +1422,59 @@ fn validate_payload_objects(
         }
         validate_timestamp(&source.body.created_at)?;
         validate_timestamp(&source.body.ingested_at)?;
+        validate_safe_metadata(&source.body.metadata)?;
     }
     let evidence = parse_member::<EvidenceBody>(members, "objects/evidence.jsonl", ObjectKind::Evidence)?;
-    for entry in evidence {
+    for entry in &evidence {
+        sanitized_scalar(&entry.body.profile, 128)?;
+        sanitized_scalar(&entry.body.workspace, 512)?;
+        if let Some(repo_id) = &entry.body.repo_id {
+            sanitized_scalar(repo_id, 512)?;
+        }
+        if let Some(subject_key) = &entry.body.subject_key {
+            sanitized_scalar(subject_key, 512)?;
+        }
+        sanitized_scalar(&entry.body.source_kind, 128)?;
+        sanitized_scalar(&entry.body.source_hash, 256)?;
+        sanitized_scalar(&entry.body.policy_state, 128)?;
+        if let Some(subject_ref) = &entry.body.subject_ref {
+            subject_ref.validate(Some("subject"))?;
+            if !present.contains(&ref_key(subject_ref))
+                && !entry
+                    .body
+                    .external_refs
+                    .iter()
+                    .any(|external| external == subject_ref)
+            {
+                return Err(bundle_error(
+                    ErrorCode::BundleMissingDependency,
+                    "evidence references a missing subject",
+                ));
+            }
+        }
         if let Some(reference) = &entry.body.source_ref {
             reference.validate(Some("source"))?;
+            if !present.contains(&ref_key(reference))
+                && !entry
+                    .body
+                    .external_refs
+                    .iter()
+                    .any(|external| external == reference)
+            {
+                return Err(bundle_error(
+                    ErrorCode::BundleMissingDependency,
+                    "evidence references a missing source",
+                ));
+            }
+        }
+        if entry.body.external_refs.len() > MAX_REFS {
+            return Err(bundle_error(
+                ErrorCode::BundleLimitExceeded,
+                "evidence external-reference limit exceeded",
+            ));
+        }
+        for external in &entry.body.external_refs {
+            external.validate(None)?;
         }
         if let Some(path) = &entry.body.source_path {
             if !valid_repo_path(path) {
@@ -1394,34 +1485,69 @@ fn validate_payload_objects(
             }
         }
         screened_string(&entry.body.safe_summary, MAX_RECORD_CHARS)?;
+        validate_safe_metadata(&entry.body.metadata)?;
         validate_timestamp(&entry.body.created_at)?;
     }
     let memories = parse_member::<MemoryBody>(members, "objects/memories.jsonl", ObjectKind::Memory)?;
+    let external_reference_count = memories
+        .iter()
+        .map(|memory| memory.body.external_refs.len())
+        .chain(evidence.iter().map(|evidence| evidence.body.external_refs.len()))
+        .try_fold(0usize, |total, count| total.checked_add(count))
+        .ok_or_else(|| bundle_error(ErrorCode::BundleLimitExceeded, "external-reference count overflow"))?;
+    let memory_ids: BTreeSet<String> = memories
+        .iter()
+        .map(|memory| memory.portable_ref.id.clone())
+        .collect();
+    let selection_ids: BTreeSet<String> = manifest.selection.record_ids.iter().cloned().collect();
+    if selection_ids.len() != manifest.selection.record_ids.len()
+        || selection_ids != memory_ids
+        || external_reference_count != manifest.counts.external_references
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "manifest selection or external-reference counts do not match the payload",
+        ));
+    }
     for memory in memories {
         validate_memory_body(&memory.body)?;
-        for reference in memory
-            .body
-            .subject_ref
-            .iter()
-            .chain(memory.body.episode_ref.iter())
-            .chain(memory.body.source_refs.iter())
-            .chain(memory.body.supersedes.iter())
-            .chain(memory.body.superseded_by.iter())
-            .chain(memory.body.external_refs.iter())
-        {
-            reference.validate(None)?;
-            if !present.contains(&ref_key(reference))
-                && !memory.body.external_refs.iter().any(|external| external == reference)
-            {
-                return Err(bundle_error(
-                    ErrorCode::BundleMissingDependency,
-                    "memory references a missing dependency",
-                ));
-            }
-            for reference in &memory.body.external_refs {
-                reference.validate(None)?;
-            }
+        validate_safe_metadata(&memory.body.metadata)?;
+        if let Some(reference) = &memory.body.subject_ref {
+            validate_reference_present(reference, "subject", &present, &memory.body.external_refs)?;
         }
+        if let Some(reference) = &memory.body.episode_ref {
+            validate_reference_present(reference, "episode", &present, &memory.body.external_refs)?;
+        }
+        for reference in &memory.body.source_refs {
+            validate_reference_present(reference, "source", &present, &memory.body.external_refs)?;
+        }
+        for reference in &memory.body.supersedes {
+            validate_reference_present(reference, "memory", &present, &memory.body.external_refs)?;
+        }
+        if let Some(reference) = &memory.body.superseded_by {
+            validate_reference_present(reference, "memory", &present, &memory.body.external_refs)?;
+        }
+        for reference in &memory.body.external_refs {
+            reference.validate(None)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reference_present(
+    reference: &PortableRef,
+    expected_kind: &str,
+    present: &BTreeSet<String>,
+    external_refs: &[PortableRef],
+) -> Result<()> {
+    reference.validate(Some(expected_kind))?;
+    if !present.contains(&ref_key(reference))
+        && !external_refs.iter().any(|external| external == reference)
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleMissingDependency,
+            "portable object references a missing dependency",
+        ));
     }
     Ok(())
 }
@@ -1462,8 +1588,8 @@ fn kind_for_member(path: &str) -> Option<ObjectKind> {
     }
 }
 
-fn manifest_digest_without_id(manifest: &BundleManifest) -> Result<String> {
-    let mut value = serde_json::to_value(manifest)?;
+fn manifest_digest_without_id_value(value: &Value) -> Result<String> {
+    let mut value = value.clone();
     value
         .as_object_mut()
         .ok_or_else(|| bundle_error(ErrorCode::BundleIntegrityFailed, "manifest is not an object"))?
@@ -1600,7 +1726,8 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             continue;
         }
         if record.scope == Scope::Repo
-            && (record.repo_id.as_deref() != target_repo || target_repo.is_none())
+            && (record.repo_id.as_deref() != options.repo_id.as_deref()
+                || target_repo.is_none())
         {
             counts.omitted_portability += 1;
             continue;
@@ -1637,10 +1764,6 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     let mut sources = BTreeMap::new();
     for record in &roots {
         if !dependencies_portable {
-            let dependency_count = record.subject_id.iter().count()
-                + record.episode_id.iter().count()
-                + record.source_ids.len();
-            counts.external_references += dependency_count;
             continue;
         }
         if let Some(id) = &record.subject_id {
@@ -1649,8 +1772,6 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
                     && safe_subject(&subject).is_ok()
                 {
                     subjects.insert(subject.id.clone(), subject);
-                } else {
-                    counts.external_references += 1;
                 }
             } else {
                 return Err(bundle_error(
@@ -1666,8 +1787,6 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
                     && safe_episode(&episode).is_ok()
                 {
                     episodes.insert(episode.id.clone(), episode);
-                } else {
-                    counts.external_references += 1;
                 }
             } else {
                 return Err(bundle_error(
@@ -1682,8 +1801,6 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
                     && safe_source(&source).is_ok()
                 {
                     sources.insert(source.id.clone(), source);
-                } else {
-                    counts.external_references += 1;
                 }
             } else {
                 return Err(bundle_error(
@@ -1749,6 +1866,67 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         });
     }
 
+    let included_source_ids: BTreeSet<String> = sources.keys().cloned().collect();
+    let included_subject_keys: BTreeSet<String> =
+        subjects.values().map(|subject| subject.subject_key.clone()).collect();
+    let subject_key_refs: BTreeMap<String, PortableRef> = subjects
+        .values()
+        .filter_map(|subject| {
+            subject_refs
+                .get(&subject.id)
+                .cloned()
+                .map(|reference| (subject.subject_key.clone(), reference))
+        })
+        .collect();
+    let mut evidence_objects = Vec::new();
+    if dependencies_portable {
+        for evidence in store.list_evidence_ledger(&options.profile, &options.workspace)? {
+            let linked_to_source = evidence
+                .source_id
+                .as_ref()
+                .is_some_and(|source_id| included_source_ids.contains(source_id));
+            let linked_to_subject = evidence
+                .subject_key
+                .as_ref()
+                .is_some_and(|subject_key| included_subject_keys.contains(subject_key));
+            if !linked_to_source && !linked_to_subject {
+                continue;
+            }
+            if evidence.trust_state == "quarantined" {
+                counts.omitted_quarantined += 1;
+                continue;
+            }
+            if evidence.policy_state != "accepted"
+                || matches!(
+                    policy::screen_content(&evidence.safe_summary, MAX_RECORD_CHARS),
+                    PolicyDecision::Reject { .. }
+                )
+            {
+                counts.omitted_boundary += 1;
+                continue;
+            }
+            let body = evidence_body(
+                &evidence,
+                &source_refs,
+                &subject_key_refs,
+                &instance_id,
+                &mut counts,
+            )?;
+            let digest = body_digest(&body)?;
+            counts.external_references += body.external_refs.len();
+            let reference =
+                choose_export_ref(store, ObjectKind::Evidence, &evidence.id, digest.clone())?;
+            evidence_objects.push(ObjectEnvelope {
+                schema: ObjectKind::Evidence.schema().to_string(),
+                portable_ref: reference,
+                aliases: Vec::new(),
+                digest,
+                body,
+            });
+        }
+    }
+    sort_envelopes(&mut evidence_objects);
+
     let mut memory_objects = Vec::new();
     for record in &roots {
         let body = memory_body(
@@ -1762,6 +1940,7 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
             &mut counts,
         )?;
         let digest = body_digest(&body)?;
+        counts.external_references += body.external_refs.len();
         let reference =
             choose_export_ref(store, ObjectKind::Memory, &record.id, digest.clone())?;
         memory_objects.push(ObjectEnvelope {
@@ -1775,19 +1954,22 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
     sort_envelopes(&mut subject_objects);
     sort_envelopes(&mut episode_objects);
     sort_envelopes(&mut source_objects);
-    sort_envelopes(&mut episode_objects);
     memory_objects.sort_by(|a, b| a.portable_ref.cmp(&b.portable_ref));
     counts.dependency_objects = subject_objects.len()
         + episode_objects.len()
         + source_objects.len()
-        + memory_objects.len()
-        - memory_objects.len();
-    counts.external_references = counts.external_references.min(MAX_OBJECTS);
+        + evidence_objects.len();
+    if counts.external_references > MAX_OBJECTS {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "portable external-reference limit exceeded",
+        ));
+    }
     let graph = ExportGraph {
         subjects: subject_objects,
         episodes: episode_objects,
         sources: source_objects,
-        evidence: Vec::new(),
+        evidence: evidence_objects,
         memories: memory_objects,
         counts,
     };
@@ -1839,8 +2021,11 @@ fn build_export_payload(store: &Store, options: &BundleExportOptions) -> Result<
         extensions: BTreeMap::new(),
     };
     let mut manifest = manifest;
-    manifest.bundle_id = manifest_digest_without_id(&manifest)?;
-    let manifest_bytes = canonical_json(&serde_json::to_value(&manifest)?)?;
+    let mut manifest_value = serde_json::to_value(&manifest)?;
+    let bundle_id = manifest_digest_without_id_value(&manifest_value)?;
+    manifest.bundle_id = bundle_id;
+    manifest_value = serde_json::to_value(&manifest)?;
+    let manifest_bytes = canonical_json(&manifest_value)?;
     Ok(BundlePayload {
         manifest,
         manifest_bytes,
@@ -1926,12 +2111,78 @@ fn source_body(source: &MemorySource) -> Result<SourceBody> {
         source_path: source
             .source_path
             .as_deref()
-            .filter(|path| valid_repo_path(path))
-            .map(ToOwned::to_owned),
+            .map(|path| {
+                if valid_repo_path(path) {
+                    Ok(path.to_string())
+                } else {
+                    Err(bundle_error(
+                        ErrorCode::BundleIntegrityFailed,
+                        "source contains an unsafe repository-relative path",
+                    ))
+                }
+            })
+            .transpose()?,
         source_hash: sanitized_scalar(&source.source_hash, 256)?,
         created_at: source.created_at.clone(),
         ingested_at: source.ingested_at.clone(),
         metadata: safe_metadata(&source.metadata),
+    })
+}
+
+fn evidence_body(
+    evidence: &store::EvidenceLedgerRecord,
+    source_refs: &BTreeMap<String, PortableRef>,
+    subject_refs: &BTreeMap<String, PortableRef>,
+    instance_id: &str,
+    counts: &mut BundleManifestCounts,
+) -> Result<EvidenceBody> {
+    let source_ref = evidence
+        .source_id
+        .as_ref()
+        .and_then(|source_id| source_refs.get(source_id))
+        .cloned();
+    let mut external_refs = Vec::new();
+    if let Some(source_id) = &evidence.source_id {
+        if source_ref.is_none() {
+            external_refs.push(PortableRef {
+                origin_instance_id: instance_id.to_string(),
+                kind: "source".to_string(),
+                id: ids::public_handle(PublicHandleKind::SourceRef, source_id),
+            });
+        }
+    }
+    let subject_ref = evidence
+        .subject_key
+        .as_ref()
+        .and_then(|subject_key| subject_refs.get(subject_key))
+        .cloned();
+    let source_path = if let Some(path) = &evidence.source_path {
+        if valid_repo_path(path) {
+            Some(path.clone())
+        } else {
+            counts.omitted_unsafe_path += 1;
+            None
+        }
+    } else {
+        None
+    };
+    let safe_summary = screened_string(&evidence.safe_summary, MAX_RECORD_CHARS)?;
+    let metadata = safe_metadata(&evidence.metadata);
+    Ok(EvidenceBody {
+        profile: evidence.profile_id.clone(),
+        workspace: evidence.workspace_id.clone(),
+        repo_id: evidence.repo_id.clone(),
+        subject_key: evidence.subject_key.clone(),
+        source_kind: sanitized_scalar(&evidence.source_kind, 128)?,
+        source_ref,
+        subject_ref,
+        source_path,
+        source_hash: sanitized_scalar(&evidence.source_hash, 256)?,
+        safe_summary,
+        policy_state: sanitized_scalar(&evidence.policy_state, 128)?,
+        created_at: evidence.created_at.clone(),
+        metadata,
+        external_refs,
     })
 }
 
@@ -1947,6 +2198,12 @@ fn memory_body(
 ) -> Result<MemoryBody> {
     let content = screened_string(&record.content, MAX_RECORD_CHARS)?;
     let mut related_files = Vec::new();
+    if record.related_files.len() > MAX_FILES {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "memory related-file limit exceeded",
+        ));
+    }
     for path in &record.related_files {
         if valid_repo_path(path) {
             related_files.push(path.clone());
@@ -1954,13 +2211,17 @@ fn memory_body(
             counts.omitted_unsafe_path += 1;
         }
     }
-    related_files.truncate(MAX_FILES);
+    if record.tags.len() > MAX_TAGS {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "memory tag limit exceeded",
+        ));
+    }
     let tags = record
         .tags
         .iter()
-        .filter_map(|tag| sanitized_scalar(tag, 256).ok())
-        .take(MAX_TAGS)
-        .collect();
+        .map(|tag| sanitized_scalar(tag, 256))
+        .collect::<Result<Vec<_>>>()?;
     let mut source_ref_values = Vec::new();
     let mut external_refs = Vec::new();
     for id in &record.source_ids {
@@ -2027,6 +2288,23 @@ fn memory_body(
             id: ids::public_handle(PublicHandleKind::MemoryRef, id),
         })
     });
+    if let Some(id) = &record.superseded_by {
+        if !selected_ids.contains(id) {
+            external_refs.push(PortableRef {
+                origin_instance_id: instance_id.to_string(),
+                kind: "memory".to_string(),
+                id: ids::public_handle(PublicHandleKind::MemoryRef, id),
+            });
+        }
+    }
+    for reference in portable_external_refs_from_metadata(&record.metadata)? {
+        if !external_refs
+            .iter()
+            .any(|existing: &PortableRef| existing == &reference)
+        {
+            external_refs.push(reference);
+        }
+    }
     validate_timestamp(&record.created_at)?;
     validate_timestamp(&record.updated_at)?;
     for value in [&record.observed_at, &record.valid_from, &record.valid_until, &record.invalidated_at] {
@@ -2038,6 +2316,15 @@ fn memory_body(
         return Err(bundle_error(
             ErrorCode::BundleIntegrityFailed,
             "memory confidence or trust score is non-finite",
+        ));
+    }
+    if source_ref_values.len() > MAX_REFS
+        || supersedes.len() > MAX_REFS
+        || external_refs.len() > MAX_REFS
+    {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "memory portable-reference limit exceeded",
         ));
     }
     let _ = store; // retained in the signature for future dependency screening.
@@ -2074,6 +2361,31 @@ fn memory_body(
     })
 }
 
+fn portable_external_refs_from_metadata(metadata: &Value) -> Result<Vec<PortableRef>> {
+    let Some(value) = metadata
+        .as_object()
+        .and_then(|object| object.get("portable_external_refs"))
+    else {
+        return Ok(Vec::new());
+    };
+    let references: Vec<PortableRef> = serde_json::from_value(value.clone()).map_err(|_| {
+        bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "stored portable external references are invalid",
+        )
+    })?;
+    if references.len() > MAX_REFS {
+        return Err(bundle_error(
+            ErrorCode::BundleLimitExceeded,
+            "stored portable external-reference limit exceeded",
+        ));
+    }
+    for reference in &references {
+        reference.validate(None)?;
+    }
+    Ok(references)
+}
+
 fn safe_subject(subject: &Subject) -> Result<()> {
     let body = subject_body(subject)?;
     screened_string(&body.subject_key, 512)?;
@@ -2091,19 +2403,116 @@ fn safe_source(source: &MemorySource) -> Result<()> {
     Ok(())
 }
 
+fn validate_safe_metadata(metadata: &SafeMetadata) -> Result<()> {
+    let value = serde_json::to_value(metadata)?;
+    if sanitize_metadata_value(&value).is_none() {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "portable metadata contains an unsafe value",
+        ));
+    }
+    Ok(())
+}
+
 fn safe_metadata(value: &Value) -> SafeMetadata {
     let Some(object) = value.as_object() else {
         return SafeMetadata::default();
     };
     SafeMetadata {
-        origin: object.get("origin").cloned(),
-        state: object.get("state").cloned(),
-        candidate_state: object.get("candidate_state").cloned(),
-        historical_reason: object.get("historical_reason").cloned(),
-        temporal_state: object.get("temporal_state").cloned(),
-        redaction_state: object.get("redaction_state").cloned(),
-        raw_artifact_stored: object.get("raw_artifact_stored").cloned(),
+        origin: object.get("origin").and_then(sanitize_metadata_value),
+        state: object.get("state").and_then(sanitize_metadata_value),
+        candidate_state: object
+            .get("candidate_state")
+            .and_then(sanitize_metadata_value),
+        historical_reason: object
+            .get("historical_reason")
+            .and_then(sanitize_metadata_value),
+        temporal_state: object
+            .get("temporal_state")
+            .and_then(sanitize_metadata_value),
+        redaction_state: object
+            .get("redaction_state")
+            .and_then(sanitize_metadata_value),
+        raw_artifact_stored: object
+            .get("raw_artifact_stored")
+            .and_then(sanitize_metadata_value),
     }
+}
+
+fn sanitize_metadata_value(value: &Value) -> Option<Value> {
+    let bytes = serde_json::to_vec(value).ok()?;
+    if bytes.len() > 64 * 1024 || validate_json_limits(value, 0).is_err() {
+        return None;
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
+        Value::String(text) => {
+            if matches!(
+                policy::screen_content(text, MAX_RECORD_CHARS),
+                PolicyDecision::Reject { .. }
+            ) || !valid_metadata_string(text)
+            {
+                None
+            } else {
+                Some(Value::String(text.clone()))
+            }
+        }
+        Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(sanitize_metadata_value)
+                .collect::<Option<Vec<_>>>()?;
+            Some(Value::Array(values))
+        }
+        Value::Object(values) => {
+            if values.len() > 128 {
+                return None;
+            }
+            let mut sanitized = Map::new();
+            for (key, value) in values {
+                if unsafe_metadata_key(key) {
+                    return None;
+                }
+                sanitized.insert(key.clone(), sanitize_metadata_value(value)?);
+            }
+            Some(Value::Object(sanitized))
+        }
+    }
+}
+
+fn valid_metadata_string(value: &str) -> bool {
+    !value.contains('\0')
+        && !value.starts_with('/')
+        && !value.starts_with('~')
+        && !value.starts_with("//")
+        && !value.contains("://")
+        && !value
+            .chars()
+            .nth(1)
+            .is_some_and(|character| character == ':')
+}
+
+fn unsafe_metadata_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "path",
+        "root",
+        "url",
+        "remote",
+        "token",
+        "secret",
+        "credential",
+        "password",
+        "loader",
+        "query",
+        "sql",
+        "code",
+        "command",
+        "env",
+        "file",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
 }
 
 fn screened_string(value: &str, max_chars: usize) -> Result<String> {
@@ -2187,7 +2596,7 @@ fn choose_export_ref(
         ObjectKind::Episode => PublicHandleKind::EpisodeRef,
         ObjectKind::Source => PublicHandleKind::SourceRef,
         ObjectKind::Memory => PublicHandleKind::MemoryRef,
-        ObjectKind::Evidence => PublicHandleKind::SourceRef,
+        ObjectKind::Evidence => PublicHandleKind::EvidenceRef,
     };
     Ok(PortableRef {
         origin_instance_id: store.instance_id()?,
@@ -2438,6 +2847,11 @@ fn plan_import(
         "objects/sources.jsonl",
         ObjectKind::Source,
     )?;
+    let evidence = parse_member::<EvidenceBody>(
+        &payload.members,
+        "objects/evidence.jsonl",
+        ObjectKind::Evidence,
+    )?;
     let memories = parse_member::<MemoryBody>(
         &payload.members,
         "objects/memories.jsonl",
@@ -2449,8 +2863,8 @@ fn plan_import(
     let mut source_ids = BTreeMap::new();
     let mut memory_ids = BTreeMap::new();
     let mut counts = BundleCounts {
-        discovered: subjects.len() + episodes.len() + sources.len() + memories.len(),
-        validated: subjects.len() + episodes.len() + sources.len() + memories.len(),
+        discovered: subjects.len() + episodes.len() + sources.len() + evidence.len() + memories.len(),
+        validated: subjects.len() + episodes.len() + sources.len() + evidence.len() + memories.len(),
         ..BundleCounts::default()
     };
     let mut blocking = Vec::new();
@@ -2552,6 +2966,40 @@ fn plan_import(
         }
         objects.push(PlanObject {
             kind: ObjectKind::Episode,
+            portable_ref: envelope.portable_ref,
+            digest: envelope.digest,
+            body: serde_json::to_value(body)?,
+            decision,
+            reason_code: reason,
+            destination_id,
+            destination_digest,
+        });
+    }
+    for envelope in evidence {
+        let body = envelope.body;
+        let (decision, reason, destination_id, destination_digest) = plan_evidence(
+            store,
+            tx,
+            &envelope.portable_ref,
+            &envelope.digest,
+            &body,
+            &payload.manifest.intent,
+            options,
+            &subject_ids,
+            &source_ids,
+        )?;
+        update_plan_counts(&mut counts, &decision, &reason);
+        if decision.starts_with("conflict_") || decision == "reject_destination_policy" {
+            blocking.push(decision_detail(
+                &envelope.portable_ref,
+                decision.clone(),
+                reason.clone(),
+                destination_id.clone(),
+            ));
+        }
+        counts.external_reference += body.external_refs.len();
+        objects.push(PlanObject {
+            kind: ObjectKind::Evidence,
             portable_ref: envelope.portable_ref,
             digest: envelope.digest,
             body: serde_json::to_value(body)?,
@@ -2872,6 +3320,71 @@ fn plan_episode(
     ))
 }
 
+fn plan_evidence(
+    store: &Store,
+    tx: Option<&Transaction<'_>>,
+    reference: &PortableRef,
+    digest: &str,
+    body: &EvidenceBody,
+    intent: &BundleIntent,
+    options: &BundleImportOptions,
+    subject_ids: &BTreeMap<String, String>,
+    source_ids: &BTreeMap<String, String>,
+) -> Result<(String, String, Option<String>, Option<String>)> {
+    if body.profile != intent.source_profile || body.workspace != intent.source_workspace {
+        return Err(bundle_error(
+            ErrorCode::BundleIntegrityFailed,
+            "evidence scope does not match the bundle source intent",
+        ));
+    }
+    if let Some(reason) = policy_rejection_for_boundary(intent, body.safe_summary.as_str()) {
+        return Ok(("reject_destination_policy".to_string(), reason, None, None));
+    }
+    if let Some(source_ref) = &body.source_ref {
+        if !source_ids.contains_key(&ref_key(source_ref))
+            && !body.external_refs.iter().any(|external| external == source_ref)
+        {
+            return Err(bundle_error(
+                ErrorCode::BundleMissingDependency,
+                "evidence source is not resolvable during import planning",
+            ));
+        }
+    }
+    if let Some(subject_ref) = &body.subject_ref {
+        if !subject_ids.contains_key(&ref_key(subject_ref))
+            && !body.external_refs.iter().any(|external| external == subject_ref)
+        {
+            return Err(bundle_error(
+                ErrorCode::BundleMissingDependency,
+                "evidence subject is not resolvable during import planning",
+            ));
+        }
+    }
+    if let Some(origin) = lookup_origin(store, tx, reference)? {
+        if origin.imported_object_digest != digest {
+            return Ok((
+                "conflict_origin_revision".to_string(),
+                "evidence origin digest differs from the existing canonical mapping".to_string(),
+                Some(origin.local_object_id),
+                Some(origin.imported_object_digest),
+            ));
+        }
+        return Ok((
+            "reuse_identity_exact".to_string(),
+            "same portable origin and digest already mapped".to_string(),
+            Some(origin.local_object_id),
+            Some(origin.imported_object_digest),
+        ));
+    }
+    let _ = options;
+    Ok((
+        "create".to_string(),
+        "no matching destination evidence".to_string(),
+        None,
+        None,
+    ))
+}
+
 fn plan_memory(
     store: &Store,
     tx: Option<&Transaction<'_>>,
@@ -2975,9 +3488,29 @@ fn validate_destination_memory(
             return Ok(Some("repo_mapping_required".to_string()));
         }
     }
+    if let Some(reason) = policy_rejection_for_boundary(intent, &body.content) {
+        let generic = RecordType::parse(&body.record_type)
+            .zip(Sensitivity::parse(&body.sensitivity))
+            .is_some_and(|(record_type, sensitivity)| {
+                policy::is_generic_preference(record_type, sensitivity)
+            });
+        if reason != "generic_preferences_only" || !generic {
+            return Ok(Some(reason));
+        }
+    }
     match policy::screen_content(&body.content, MAX_RECORD_CHARS) {
         PolicyDecision::Accept(_) => Ok(None),
         PolicyDecision::Reject { code, .. } => Ok(Some(code)),
+    }
+}
+
+fn policy_rejection_for_boundary(intent: &BundleIntent, _content: &str) -> Option<String> {
+    let source = Profile::parse(&intent.source_profile)?;
+    let target = Profile::parse(&intent.target_profile)?;
+    match policy::export_boundary(source, target) {
+        BoundaryDecision::Allow => None,
+        BoundaryDecision::AllowGenericPreferencesOnly => Some("generic_preferences_only".to_string()),
+        BoundaryDecision::Deny { .. } => Some("profile_boundary_denied".to_string()),
     }
 }
 
@@ -3533,6 +4066,57 @@ fn apply_plan(
         )?;
     }
 
+    let evidence = parse_member::<EvidenceBody>(
+        &payload.members,
+        "objects/evidence.jsonl",
+        ObjectKind::Evidence,
+    )?;
+    for envelope in evidence {
+        let object = plan_object(plan, &envelope.portable_ref)?;
+        let mut local_id = object
+            .destination_id
+            .clone()
+            .unwrap_or_else(|| ids::new_id("led"));
+        if object.decision == "create" {
+            let body = envelope.body;
+            let source_id = body
+                .source_ref
+                .as_ref()
+                .and_then(|reference| source_ids.get(&ref_key(reference)).cloned());
+            let record = store::EvidenceLedgerRecord {
+                id: local_id.clone(),
+                profile_id: options.profile.clone(),
+                workspace_id: options.workspace.clone(),
+                repo_id: mapped_repo_id(body.repo_id.as_deref(), &payload.manifest.intent, options),
+                subject_key: body.subject_key,
+                source_kind: body.source_kind,
+                source_id: source_id.clone(),
+                source_path: body.source_path,
+                source_hash: body.source_hash,
+                safe_summary: body.safe_summary,
+                policy_state: body.policy_state,
+                created_at: body.created_at,
+                trust_state: "trusted".to_string(),
+                trust_score: 1.0,
+                metadata: metadata_value(&body.metadata),
+            };
+            local_id = Store::insert_evidence_ledger_record_in_transaction(
+                tx,
+                &record,
+                source_id.as_deref(),
+                &record.metadata,
+            )?;
+        }
+        insert_origin(
+            tx,
+            &envelope.portable_ref,
+            &local_id,
+            &envelope.digest,
+            &payload.manifest.bundle_id,
+            true,
+        )?;
+    }
+
     let memories = parse_member::<MemoryBody>(
         &payload.members,
         "objects/memories.jsonl",
@@ -3707,4 +4291,55 @@ fn memory_record_from_body(
         temporal_state,
         metadata,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalizes_the_rfc8785_primitive_vector() {
+        let value: Value = parse_json(
+            br#"{
+              "numbers": [333333333.33333329, 1E30, 4.50,
+                          2e-3, 0.000000000000000000000000001],
+              "string": "\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/",
+              "literals": [null, true, false]
+            }"#,
+        )
+        .expect("RFC 8785 fixture parses");
+        let canonical = String::from_utf8(canonical_json(&value).expect("canonical bytes"))
+            .expect("UTF-8");
+        assert_eq!(
+            canonical,
+            r#"{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\\\"/"}"#
+        );
+    }
+
+    #[test]
+    fn canonicalizes_number_boundaries_and_negative_zero() {
+        let value: Value =
+            parse_json(br#"[1e-6,1e-7,1e20,1e21,-0,9007199254740993]"#).expect("numbers parse");
+        assert_eq!(
+            String::from_utf8(canonical_json(&value).expect("canonical bytes")).expect("UTF-8"),
+            "[0.000001,1e-7,100000000000000000000,1e+21,0,9007199254740992]"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_object_keys_by_utf16_code_units() {
+        let value: Value = parse_json(br#"{"\ue000":1,"\ud83d\ude00":2}"#)
+            .expect("Unicode object parses");
+        assert_eq!(
+            String::from_utf8(canonical_json(&value).expect("canonical bytes")).expect("UTF-8"),
+            r#"{"😀":2,"":1}"#
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_json_object_keys() {
+        let error = parse_json::<Value>(br#"{"duplicate":1,"duplicate":2}"#)
+            .expect_err("duplicate keys must fail");
+        assert_eq!(error.code, ErrorCode::BundleIntegrityFailed);
+    }
 }

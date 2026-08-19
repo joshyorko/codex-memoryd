@@ -14,6 +14,7 @@ pub enum PublicHandleKind {
     SourceRef,
     SubjectRef,
     EpisodeRef,
+    EvidenceRef,
     CheckpointRef,
 }
 
@@ -24,6 +25,7 @@ impl PublicHandleKind {
             PublicHandleKind::SourceRef => "msrc_",
             PublicHandleKind::SubjectRef => "msub_",
             PublicHandleKind::EpisodeRef => "mep_",
+            PublicHandleKind::EvidenceRef => "mev_",
             PublicHandleKind::CheckpointRef => "mcp_",
         }
     }
@@ -84,6 +86,7 @@ pub fn parse_public_handle(value: &str) -> Option<PublicHandleKind> {
         PublicHandleKind::SourceRef,
         PublicHandleKind::SubjectRef,
         PublicHandleKind::EpisodeRef,
+        PublicHandleKind::EvidenceRef,
         PublicHandleKind::CheckpointRef,
     ] {
         if let Some(suffix) = value.strip_prefix(kind.prefix()) {
