@@ -41,7 +41,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 10;
+pub const STORAGE_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -56,6 +56,7 @@ const MIGRATION_SEMANTIC_RELATIONS: &str =
     include_str!("../migrations/0009_semantic_relations.sql");
 const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
 const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.sql");
+const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -75,6 +76,26 @@ pub struct EvidenceLedgerEntry {
     pub source_hash: String,
     pub safe_summary: String,
     pub policy_state: String,
+    pub metadata: Value,
+}
+
+/// Sanitized evidence-ledger data used by portability projections.
+#[derive(Debug, Clone)]
+pub struct EvidenceLedgerRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub subject_key: Option<String>,
+    pub source_kind: String,
+    pub source_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_hash: String,
+    pub safe_summary: String,
+    pub policy_state: String,
+    pub created_at: String,
+    pub trust_state: String,
+    pub trust_score: f64,
     pub metadata: Value,
 }
 
@@ -246,6 +267,19 @@ pub enum UpsertOutcome {
     Skipped(String),
 }
 
+/// Durable source identity carried by a portable bundle origin mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableObjectOrigin {
+    pub origin_instance_id: String,
+    pub object_kind: String,
+    pub origin_object_id: String,
+    pub local_object_id: String,
+    pub imported_object_digest: String,
+    pub canonical: bool,
+    pub first_bundle_id: String,
+    pub imported_at: String,
+}
+
 impl UpsertOutcome {
     pub fn id(&self) -> &str {
         match self {
@@ -372,6 +406,20 @@ impl Store {
     ) -> Result<T> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        let value = operation(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Run a logical import under SQLite's immediate write lock. Portable
+    /// bundle apply uses this to make its revalidation and writes one atomic
+    /// destination operation.
+    pub fn transaction_immediate<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let value = operation(&tx)?;
         tx.commit()?;
         Ok(value)
@@ -550,6 +598,8 @@ impl Store {
         conn.execute_batch(MIGRATION_TEMPORAL_RECORDS)?;
         ensure_temporal_columns(&conn)?;
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
+        conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
+        ensure_instance_metadata(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
         // build lacks FTS5, this errors; we then fall back to LIKE search.
@@ -569,6 +619,60 @@ impl Store {
 
     pub fn path_display(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// Public, non-secret identity for this logical store. It is stable across
+    /// reopen and is copied by the existing SQLite backup path.
+    pub fn instance_id(&self) -> Result<String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT instance_id FROM instance_metadata WHERE singleton_key = 'default'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
+    }
+
+    pub fn portable_origin(
+        &self,
+        origin_instance_id: &str,
+        object_kind: &str,
+        origin_object_id: &str,
+    ) -> Result<Option<PortableObjectOrigin>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT origin_instance_id, object_kind, origin_object_id, local_object_id,
+                    imported_object_digest, canonical, first_bundle_id, imported_at
+             FROM portable_object_origins
+             WHERE origin_instance_id = ?1 AND object_kind = ?2 AND origin_object_id = ?3",
+            params![origin_instance_id, object_kind, origin_object_id],
+            row_to_portable_origin,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    pub fn portable_origins_for_local(
+        &self,
+        object_kind: &str,
+        local_object_id: &str,
+    ) -> Result<Vec<PortableObjectOrigin>> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT origin_instance_id, object_kind, origin_object_id, local_object_id,
+                    imported_object_digest, canonical, first_bundle_id, imported_at
+             FROM portable_object_origins
+             WHERE object_kind = ?1 AND local_object_id = ?2
+             ORDER BY canonical DESC, origin_instance_id, origin_object_id",
+        )?;
+        let result = statement
+            .query_map(
+                params![object_kind, local_object_id],
+                row_to_portable_origin,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from);
+        result
     }
 
     pub fn fts_enabled(&self) -> bool {
@@ -907,6 +1011,139 @@ impl Store {
                 episode.created_at,
                 episode.updated_at,
                 episode.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_subject_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        subject: &Subject,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO subjects(
+                id, profile_id, workspace_id, subject_key, kind, display_name,
+                created_at, updated_at, metadata
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                subject.id,
+                subject.profile_id,
+                subject.workspace_id,
+                subject.subject_key,
+                subject.kind.as_str(),
+                subject.display_name,
+                subject.created_at,
+                subject.updated_at,
+                subject.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_episode_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        episode: &Episode,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO episodes(
+                id, profile_id, workspace_id, subject_id, source_kind, source_ref,
+                started_at, ended_at, status, summary, trust_level, source_metadata,
+                created_at, updated_at, metadata
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                episode.id,
+                episode.profile_id,
+                episode.workspace_id,
+                episode.subject_id,
+                episode.source_kind,
+                episode.source_ref,
+                episode.started_at,
+                episode.ended_at,
+                episode.status,
+                episode.summary,
+                episode.trust_level,
+                episode.source_metadata.to_string(),
+                episode.created_at,
+                episode.updated_at,
+                episode.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_source_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        source: &MemorySource,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO memory_sources(
+                id, profile_id, workspace_id, kind, source_path, source_hash,
+                created_at, ingested_at, metadata
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                source.id,
+                source.profile_id,
+                source.workspace_id,
+                source.kind,
+                source.source_path,
+                source.source_hash,
+                source.created_at,
+                source.ingested_at,
+                source.metadata.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_record_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        record: &MemoryRecord,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO memory_records(
+                id, profile_id, workspace_id, repo_id, subject_id, episode_id,
+                scope, type, content, related_files, tags, sensitivity,
+                portability, confidence, source_ids, content_hash, supersedes,
+                created_at, updated_at, last_used_at, archived, trust_state, trust_score,
+                quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until,
+                observed_at, invalidated_at, superseded_by, historical_reason, temporal_state,
+                metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
+            params![
+                record.id,
+                record.profile_id,
+                record.workspace_id,
+                record.repo_id,
+                record.subject_id,
+                record.episode_id,
+                record.scope.as_str(),
+                record.record_type.as_str(),
+                record.content,
+                serde_json::to_string(&record.related_files)?,
+                serde_json::to_string(&record.tags)?,
+                record.sensitivity.as_str(),
+                record.portability.as_str(),
+                record.confidence,
+                serde_json::to_string(&record.source_ids)?,
+                record.content_hash,
+                serde_json::to_string(&record.supersedes)?,
+                record.created_at,
+                record.updated_at,
+                record.last_used_at,
+                record.archived,
+                record.trust_state,
+                record.trust_score,
+                record.quarantine_reason,
+                record.quarantined_at,
+                record.promoted_at,
+                record.valid_from,
+                record.valid_until,
+                record.observed_at,
+                record.invalidated_at,
+                record.superseded_by,
+                record.historical_reason,
+                record.temporal_state.as_str(),
+                record.metadata.to_string(),
             ],
         )?;
         Ok(())
@@ -1674,6 +1911,19 @@ impl Store {
             )
             .optional()?;
         Ok(result)
+    }
+
+    pub fn get_source(&self, id: &str) -> Result<Option<MemorySource>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT id, profile_id, workspace_id, kind, source_path, source_hash,
+                    created_at, ingested_at, metadata
+             FROM memory_sources WHERE id = ?1",
+            params![id],
+            row_to_source,
+        )
+        .optional()
+        .map_err(Error::from)
     }
 
     // ------------------------------------------------------------------
@@ -3236,6 +3486,105 @@ impl Store {
         Ok(())
     }
 
+    /// List evidence rows for a source scope. Callers must apply portability
+    /// and content policy before projecting these rows across an instance
+    /// boundary.
+    pub fn list_evidence_ledger(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+    ) -> Result<Vec<EvidenceLedgerRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, profile_id, workspace_id, repo_id, subject_key,
+                    source_kind, source_id, source_path, source_hash, safe_summary,
+                    policy_state, created_at, trust_state, trust_score, metadata
+             FROM evidence_ledger
+             WHERE profile_id = ?1 AND workspace_id = ?2
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![profile_id, workspace_id], |row| {
+                let metadata: String = row.get(14)?;
+                Ok(EvidenceLedgerRecord {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    repo_id: row.get(3)?,
+                    subject_key: row.get(4)?,
+                    source_kind: row.get(5)?,
+                    source_id: row.get(6)?,
+                    source_path: row.get(7)?,
+                    source_hash: row.get(8)?,
+                    safe_summary: row.get(9)?,
+                    policy_state: row.get(10)?,
+                    created_at: row.get(11)?,
+                    trust_state: row.get(12)?,
+                    trust_score: row.get(13)?,
+                    metadata: serde_json::from_str(&metadata).unwrap_or(Value::Null),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert a portability-projected evidence row while preserving its
+    /// sanitized source timestamp and trust state.
+    pub fn insert_evidence_ledger_record_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        record: &EvidenceLedgerRecord,
+        source_id: Option<&str>,
+        metadata: &Value,
+    ) -> Result<String> {
+        let event_key = ids::sha256_hex(
+            format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                record.profile_id,
+                record.workspace_id,
+                record.repo_id.as_deref().unwrap_or(""),
+                record.subject_key.as_deref().unwrap_or(""),
+                record.source_kind,
+                source_id.unwrap_or(""),
+                record.source_path.as_deref().unwrap_or(""),
+                record.source_hash,
+                record.policy_state,
+            )
+            .as_bytes(),
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO evidence_ledger(
+                id, event_key, profile_id, workspace_id, repo_id, subject_key,
+                source_kind, source_id, source_path, source_hash, safe_summary,
+                policy_state, created_at, trust_state, trust_score, metadata
+             )
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                &record.id,
+                event_key,
+                &record.profile_id,
+                &record.workspace_id,
+                &record.repo_id,
+                &record.subject_key,
+                &record.source_kind,
+                source_id,
+                &record.source_path,
+                &record.source_hash,
+                &record.safe_summary,
+                &record.policy_state,
+                &record.created_at,
+                &record.trust_state,
+                record.trust_score,
+                metadata.to_string(),
+            ],
+        )?;
+        tx.query_row(
+            "SELECT id FROM evidence_ledger WHERE event_key = ?1",
+            params![event_key],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
+    }
+
     pub fn count_policy_denials(&self) -> Result<i64> {
         let conn = self.conn()?;
         let n: i64 = conn.query_row(
@@ -3826,6 +4175,37 @@ fn json_str_list(raw: &str) -> Vec<String> {
 
 fn json_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+fn ensure_instance_metadata(conn: &rusqlite::Connection) -> Result<()> {
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT instance_id FROM instance_metadata WHERE singleton_key = 'default'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        conn.execute(
+            "INSERT INTO instance_metadata(singleton_key, instance_id, created_at)
+             VALUES ('default', ?1, ?2)",
+            params![ids::new_id("cmi"), ids::now_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+fn row_to_portable_origin(row: &Row) -> rusqlite::Result<PortableObjectOrigin> {
+    Ok(PortableObjectOrigin {
+        origin_instance_id: row.get(0)?,
+        object_kind: row.get(1)?,
+        origin_object_id: row.get(2)?,
+        local_object_id: row.get(3)?,
+        imported_object_digest: row.get(4)?,
+        canonical: row.get::<_, i64>(5)? != 0,
+        first_bundle_id: row.get(6)?,
+        imported_at: row.get(7)?,
+    })
 }
 
 fn dedupe_strings(values: Vec<String>) -> Vec<String> {
