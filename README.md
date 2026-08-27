@@ -6,6 +6,8 @@ heartbeat, adapter exports, and MCP stdio are delivery modes. Memory is recall,
 not authority: retrieved context can inform a turn, but it never overrides the
 current user, repo, or policy state.
 
+For the shortest install-to-first-recall path, see [`docs/getting-started.md`](./docs/getting-started.md).
+
 ## Current Surface
 
 This is the landed MVP surface today:
