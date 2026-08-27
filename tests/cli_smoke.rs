@@ -55,6 +55,9 @@ fn clear_runtime_env(command: &mut Command) {
         "CODEX_MEMORYD_IMAGE",
         "CODEX_MEMORYD_UID",
         "CODEX_MEMORYD_GID",
+        "CODEX_MEMORYD_PROFILE",
+        "CODEX_MEMORYD_WORKSPACE",
+        "CODEX_MEMORYD_LOG",
     ] {
         command.env_remove(key);
     }
@@ -6572,6 +6575,12 @@ fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_determinist
     let codex_home = codex_home_path(&dir);
     let db_dir = dir.path().join("database");
     fs::create_dir_all(&db_dir).unwrap();
+    fs::create_dir_all(&memoryd_home).unwrap();
+    fs::write(
+        memoryd_home.join("runtime.env"),
+        "CODEX_MEMORYD_PROFILE=work\nCODEX_MEMORYD_WORKSPACE=launcher-test\nCODEX_MEMORYD_LOG=debug\n",
+    )
+    .unwrap();
     let db = db_dir.join("memory.db");
     let docker = fake_container_runtime_named(dir.path(), "docker");
     let podman = fake_container_runtime_named(dir.path(), "podman");
@@ -6615,6 +6624,12 @@ fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_determinist
             "1234:5678",
             "--volume",
             format!("{}:/data", db_dir.canonicalize().unwrap().display()),
+            "--env",
+            "CODEX_MEMORYD_PROFILE=work",
+            "--env",
+            "CODEX_MEMORYD_WORKSPACE=launcher-test",
+            "--env",
+            "CODEX_MEMORYD_LOG=debug",
             "ghcr.io/example/codex-memoryd:test",
             "--db",
             "/data/memory.db",
@@ -6640,10 +6655,9 @@ fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_determinist
         podman_output["resolved"]["command"],
         podman.to_string_lossy().as_ref()
     );
-    assert_eq!(
-        podman_output["resolved"]["args"],
-        docker_before["resolved"]["args"]
-    );
+    let podman_args = podman_output["resolved"]["args"].as_array().unwrap();
+    assert!(podman_args.iter().any(|arg| arg == "--userns=keep-id"));
+    assert!(!podman_args.iter().any(|arg| arg == "--user"));
     assert_ne!(podman_output["snippet"], docker_before["snippet"]);
     assert!(podman_output["snippet"]
         .as_str()

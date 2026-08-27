@@ -2590,33 +2590,30 @@ fn codex_mcp_resolved(runtime: &RuntimeOptions) -> Result<CodexMcpResolved> {
                 ))
             })?;
             let (database_parent, database_filename) = container_mcp_database(runtime)?;
-            let uid = container_mcp_id(
-                runtime.uid.as_deref(),
-                "CODEX_MEMORYD_UID",
-                "id -u",
-            )?;
-            let gid = container_mcp_id(
-                runtime.gid.as_deref(),
-                "CODEX_MEMORYD_GID",
-                "id -g",
-            )?;
 
-            let args = vec![
+            let mut args = vec![
                 "run".to_string(),
                 "--rm".to_string(),
                 "-i".to_string(),
                 "--pull=missing".to_string(),
-                "--user".to_string(),
-                format!("{uid}:{gid}"),
+            ];
+            args.extend(container_mcp_identity_args(&command, runtime)?);
+            args.extend([
                 "--volume".to_string(),
                 format!("{database_parent}:/data"),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_PROFILE={}", runtime.profile),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_WORKSPACE={}", runtime.workspace),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_LOG={}", runtime.log_level),
                 runtime.image.clone(),
                 "--db".to_string(),
                 format!("/data/{database_filename}"),
                 "mcp".to_string(),
                 "stdio".to_string(),
                 "--read-only".to_string(),
-            ];
+            ]);
 
             Ok(CodexMcpResolved {
                 command,
@@ -2628,6 +2625,21 @@ fn codex_mcp_resolved(runtime: &RuntimeOptions) -> Result<CodexMcpResolved> {
             })
         }
     }
+}
+
+fn container_mcp_identity_args(command: &str, runtime: &RuntimeOptions) -> Result<Vec<String>> {
+    let engine = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .trim_end_matches(".exe");
+    if engine.eq_ignore_ascii_case("podman") {
+        return Ok(vec!["--userns=keep-id".to_string()]);
+    }
+
+    let uid = container_mcp_id(runtime.uid.as_deref(), "CODEX_MEMORYD_UID", "id -u")?;
+    let gid = container_mcp_id(runtime.gid.as_deref(), "CODEX_MEMORYD_GID", "id -g")?;
+    Ok(vec!["--user".to_string(), format!("{uid}:{gid}")])
 }
 
 fn container_mcp_id(value: Option<&str>, variable: &str, fallback: &str) -> Result<String> {
