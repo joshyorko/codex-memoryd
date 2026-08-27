@@ -785,7 +785,7 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
     ok.then_some(pid)
 }
 
-fn container_runtime(opts: &RuntimeOptions) -> Result<String> {
+pub fn container_runtime(opts: &RuntimeOptions) -> Result<String> {
     if let Some(runtime) = &opts.container_runtime {
         if runtime.trim().eq_ignore_ascii_case("auto") {
             // Fall through to discovery below.
