@@ -52,9 +52,29 @@ fn clear_runtime_env(command: &mut Command) {
         "CODEX_MEMORYD_BIND",
         "CODEX_MEMORYD_DB",
         "CODEX_MEMORYD_CONTAINER_RUNTIME",
+        "CODEX_MEMORYD_IMAGE",
+        "CODEX_MEMORYD_UID",
+        "CODEX_MEMORYD_GID",
+        "CODEX_MEMORYD_PROFILE",
+        "CODEX_MEMORYD_WORKSPACE",
+        "CODEX_MEMORYD_LOG",
     ] {
         command.env_remove(key);
     }
+}
+
+#[cfg(unix)]
+fn fake_container_runtime_named(root: &std::path::Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    fs::write(
+        &path,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 #[cfg(unix)]
@@ -76,6 +96,24 @@ fn fake_container_runtime(root: &std::path::Path, running: bool) -> PathBuf {
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+#[cfg(unix)]
+fn fake_container_runtime_with_log(root: &std::path::Path) -> (PathBuf, PathBuf) {
+    let path = root.join("fake-container-runtime-log");
+    let log = root.join("container-runtime-invocations.log");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    (path, log)
 }
 
 fn sentinel_listener() -> (
@@ -6400,6 +6438,34 @@ fn readme_keeps_first_run_path_documented() {
 }
 
 #[test]
+fn getting_started_documents_the_full_mcp_onboarding_and_retention_path() {
+    let readme = include_str!("../README.md");
+    let guide = include_str!("../docs/getting-started.md");
+    assert!(readme.contains("docs/getting-started.md"));
+    for required in [
+        "brew install joshyorko/tools/codex-memoryd",
+        "codex-memoryd mcp codex apply",
+        "codex-memoryd mcp codex status",
+        "Restart Codex",
+        "memory_status",
+        "codex-memoryd mcp codex preview --runtime container",
+        "codex-memoryd mcp codex apply --runtime container",
+        "codex-memoryd mcp codex status --runtime container",
+        "--runtime native",
+        "codex-memoryd mcp codex remove",
+        "brew uninstall codex-memoryd",
+        "does not delete the persistent memory database",
+        "Source-build fallback",
+        "release artifacts are not published yet",
+    ] {
+        assert!(
+            guide.contains(required),
+            "getting-started.md missing {required:?}"
+        );
+    }
+}
+
+#[test]
 fn local_runtime_helper_documents_safe_runtime_contract() {
     let helper = include_str!("../scripts/codex-memoryd-local-runtime.sh");
     let runbook = include_str!("../docs/dogfood-local.md");
@@ -6439,7 +6505,9 @@ fn cli_mcp_codex_preview_reports_snippet_without_writing() {
     let codex_home = codex_home_path(&dir);
     let codex_config = codex_config_path(&dir);
 
-    let output = bin()
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
         .env("CODEX_MEMORYD_HOME", &memoryd_home)
         .env("CODEX_HOME", &codex_home)
         .args(["mcp", "codex", "preview"])
@@ -6465,6 +6533,578 @@ fn cli_mcp_codex_preview_reports_snippet_without_writing() {
 
     assert!(!codex_config.exists(), "preview must not write config.toml");
     assert!(!codex_home.exists(), "preview must not create CODEX_HOME");
+}
+
+#[test]
+fn cli_mcp_codex_native_output_remains_byte_for_byte_compatible() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db = dir.path().join("memory.db");
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_RUNTIME", "container")
+        .arg("--db")
+        .arg(&db)
+        .args(["--runtime", "native", "mcp", "codex", "preview"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    let command = json["resolved"]["command"].as_str().unwrap();
+    let expected = format!(
+        "[mcp_servers.codex_memoryd]\ncommand = {:?}\nargs = [\"--db\", {:?}, \"mcp\", \"stdio\", \"--read-only\"]\nenabled_tools = [\"memory_status\", \"memory_recall\", \"memory_search\"]\ndefault_tools_approval_mode = \"approve\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 30\n",
+        command,
+        db.display().to_string(),
+    );
+    assert_eq!(json["snippet"].as_str(), Some(expected.as_str()));
+    let _: toml::Value = toml::from_str(&expected).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    fs::create_dir_all(&memoryd_home).unwrap();
+    fs::write(
+        memoryd_home.join("runtime.env"),
+        "CODEX_MEMORYD_PROFILE=work\nCODEX_MEMORYD_WORKSPACE=launcher-test\nCODEX_MEMORYD_LOG=debug\n",
+    )
+    .unwrap();
+    let db = db_dir.join("memory.db");
+    let docker = fake_container_runtime_named(dir.path(), "docker");
+    let podman = fake_container_runtime_named(dir.path(), "podman");
+
+    let run = |runtime: &std::path::Path, before_subcommand: bool| {
+        let mut command = bin();
+        clear_runtime_env(&mut command);
+        command
+            .env("CODEX_MEMORYD_HOME", &memoryd_home)
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_MEMORYD_CONTAINER_RUNTIME", runtime)
+            .env("CODEX_MEMORYD_IMAGE", "ghcr.io/example/codex-memoryd:test")
+            .env("CODEX_MEMORYD_UID", "1234")
+            .env("CODEX_MEMORYD_GID", "5678")
+            .arg("--db")
+            .arg(&db);
+        if before_subcommand {
+            command.args(["--runtime", "container", "mcp", "codex", "preview"]);
+        } else {
+            command.args(["mcp", "codex", "preview", "--runtime", "container"]);
+        }
+        let output = command.assert().success().get_output().stdout.clone();
+        serde_json::from_slice::<Value>(&output).unwrap()
+    };
+
+    let docker_before = run(&docker, true);
+    let docker_after = run(&docker, false);
+    assert_eq!(docker_before, docker_after);
+    assert_eq!(
+        docker_before["resolved"]["command"],
+        docker.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        docker_before["resolved"]["args"],
+        serde_json::json!([
+            "run",
+            "--rm",
+            "-i",
+            "--pull=missing",
+            "--user",
+            "1234:5678",
+            "--volume",
+            format!("{}:/data", db_dir.canonicalize().unwrap().display()),
+            "--env",
+            "CODEX_MEMORYD_PROFILE=work",
+            "--env",
+            "CODEX_MEMORYD_WORKSPACE=launcher-test",
+            "--env",
+            "CODEX_MEMORYD_LOG=debug",
+            "ghcr.io/example/codex-memoryd:test",
+            "--db",
+            "/data/memory.db",
+            "mcp",
+            "stdio",
+            "--read-only"
+        ])
+    );
+    assert_eq!(
+        docker_before["resolved"]["enabled_tools"],
+        serde_json::json!(["memory_status", "memory_recall", "memory_search"])
+    );
+    assert_eq!(
+        docker_before["resolved"]["default_tools_approval_mode"],
+        "approve"
+    );
+    assert_eq!(docker_before["resolved"]["startup_timeout_sec"], 30);
+    assert_eq!(docker_before["resolved"]["tool_timeout_sec"], 30);
+    let _: toml::Value = toml::from_str(docker_before["snippet"].as_str().unwrap()).unwrap();
+
+    let podman_output = run(&podman, true);
+    assert_eq!(
+        podman_output["resolved"]["command"],
+        podman.to_string_lossy().as_ref()
+    );
+    let podman_args = podman_output["resolved"]["args"].as_array().unwrap();
+    assert!(podman_args.iter().any(|arg| arg == "--userns=keep-id"));
+    assert!(!podman_args.iter().any(|arg| arg == "--user"));
+    assert_ne!(podman_output["snippet"], docker_before["snippet"]);
+    assert!(podman_output["snippet"]
+        .as_str()
+        .unwrap()
+        .contains(&format!(
+            "command = {:?}",
+            podman.to_string_lossy().to_string()
+        )));
+    let _: toml::Value = toml::from_str(podman_output["snippet"].as_str().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_each_action_accepts_both_global_runtime_placements() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("memory.db");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+
+    for action in ["preview", "apply", "status", "remove"] {
+        let codex_home = dir.path().join(format!("codex-home-{action}"));
+        let codex_config = codex_home.join("config.toml");
+        if action != "preview" {
+            fs::create_dir_all(&codex_home).unwrap();
+            fs::write(
+                &codex_config,
+                "[mcp_servers.codex_memoryd]\ncommand = \"/old\"\n",
+            )
+            .unwrap();
+        }
+
+        for before_subcommand in [true, false] {
+            let mut command = bin();
+            clear_runtime_env(&mut command);
+            command
+                .env("CODEX_MEMORYD_HOME", &memoryd_home)
+                .env("CODEX_HOME", &codex_home)
+                .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+                .env("CODEX_MEMORYD_UID", "1001")
+                .env("CODEX_MEMORYD_GID", "1002")
+                .arg("--db")
+                .arg(&db);
+            if before_subcommand {
+                command.args(["--runtime", "container", "mcp", "codex", action]);
+            } else {
+                command.args(["mcp", "codex", action, "--runtime", "container"]);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{action} before={before_subcommand}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_toml_round_trips_spaces_quotes_backslashes_and_image_values() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join(r#"data "quoted" \slash"#);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join(r#"memory "file" \name.db"#);
+    let runtime = fake_container_runtime_named(dir.path(), r#"runtime "quoted" \slash"#);
+    let image = r#"registry.example/memory "image" \tag"#;
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_IMAGE", image)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    let parsed: toml::Value = toml::from_str(json["snippet"].as_str().unwrap()).unwrap();
+    let server = parsed
+        .get("mcp_servers")
+        .and_then(|value| value.get("codex_memoryd"))
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert_eq!(
+        server.get("command").and_then(toml::Value::as_str),
+        runtime.to_str()
+    );
+    let args = server
+        .get("args")
+        .and_then(toml::Value::as_array)
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "-i".to_string(),
+            "--pull=missing".to_string(),
+            "--user".to_string(),
+            "1001:1002".to_string(),
+            "--volume".to_string(),
+            format!("{}:/data", db_dir.canonicalize().unwrap().display()),
+            image.to_string(),
+            "--db".to_string(),
+            r#"/data/memory "file" \name.db"#.to_string(),
+            "mcp".to_string(),
+            "stdio".to_string(),
+            "--read-only".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn cli_mcp_codex_help_exposes_one_global_runtime_option() {
+    let output = bin().args(["mcp", "codex", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(help.matches("--runtime").count(), 1, "{help}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_missing_runtime_fails_before_config_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("memory.db");
+    let missing_runtime = dir.path().join("missing-container-runtime");
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &missing_runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("available Docker or Podman runtime"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("CODEX_MEMORYD_CONTAINER_RUNTIME"),
+        "{stderr}"
+    );
+    assert!(
+        !codex_home.exists(),
+        "validation must precede config mutation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_invalid_database_parent_fails_before_config_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+    let missing_parent_db = dir.path().join("missing").join("memory.db");
+
+    let mut missing_parent = bin();
+    clear_runtime_env(&mut missing_parent);
+    let missing_output = missing_parent
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&missing_parent_db)
+        .args(["mcp", "codex", "apply", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!missing_output.status.success());
+    let missing_stderr = String::from_utf8_lossy(&missing_output.stderr);
+    assert!(missing_stderr.contains("parent directory does not exist"));
+    assert!(missing_stderr.contains("mkdir -p"));
+    assert!(
+        !codex_home.exists(),
+        "invalid parent must not create CODEX_HOME"
+    );
+
+    let non_directory = dir.path().join("not-a-directory");
+    fs::write(&non_directory, "not a directory").unwrap();
+    let non_directory_db = non_directory.join("memory.db");
+    let mut non_directory_command = bin();
+    clear_runtime_env(&mut non_directory_command);
+    let non_directory_output = non_directory_command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&non_directory_db)
+        .args(["mcp", "codex", "status", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!non_directory_output.status.success());
+    let non_directory_stderr = String::from_utf8_lossy(&non_directory_output.stderr);
+    assert!(non_directory_stderr.contains("parent is not a directory"));
+    assert!(
+        !codex_home.exists(),
+        "invalid parent must not create CODEX_HOME"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_unsafe_mount_path_fails_before_config_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let unsafe_parent = dir.path().join("unsafe:mount");
+    fs::create_dir_all(&unsafe_parent).unwrap();
+    let db = unsafe_parent.join("memory.db");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be represented safely"), "{stderr}");
+    assert!(stderr.contains("--volume"), "{stderr}");
+    assert!(
+        !codex_home.exists(),
+        "unsafe mount must not create CODEX_HOME"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_unusable_database_filename_fails_before_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db_without_filename = PathBuf::from("/");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db_without_filename)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("database path must name"), "{stderr}");
+    assert!(stderr.contains("CODEX_MEMORYD_DB"), "{stderr}");
+    assert!(!codex_home.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_control_character_filename_fails_before_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("memory\n.db");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db)
+        .args(["mcp", "codex", "apply", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("control characters"), "{stderr}");
+    assert!(!codex_home.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_missing_and_invalid_uid_gid_fail_before_mutation() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    let empty_path = dir.path().join("empty-bin");
+    fs::create_dir_all(&db_dir).unwrap();
+    fs::create_dir_all(&empty_path).unwrap();
+    let db = db_dir.join("memory.db");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+
+    let run = |uid: Option<&str>, gid: Option<&str>, path: Option<&std::path::Path>| {
+        let mut command = bin();
+        clear_runtime_env(&mut command);
+        command
+            .env("CODEX_MEMORYD_HOME", &memoryd_home)
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+            .arg("--db")
+            .arg(&db)
+            .args(["mcp", "codex", "preview", "--runtime", "container"]);
+        if let Some(uid) = uid {
+            command.env("CODEX_MEMORYD_UID", uid);
+        }
+        if let Some(gid) = gid {
+            command.env("CODEX_MEMORYD_GID", gid);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
+    };
+
+    let missing_uid = run(None, None, Some(&empty_path));
+    assert!(!missing_uid.status.success());
+    let missing_uid_stderr = String::from_utf8_lossy(&missing_uid.stderr);
+    assert!(missing_uid_stderr.contains("CODEX_MEMORYD_UID"));
+    assert!(missing_uid_stderr.contains("id -u"));
+
+    let missing_gid = run(Some("1001"), None, Some(&empty_path));
+    assert!(!missing_gid.status.success());
+    let missing_gid_stderr = String::from_utf8_lossy(&missing_gid.stderr);
+    assert!(missing_gid_stderr.contains("CODEX_MEMORYD_GID"));
+    assert!(missing_gid_stderr.contains("id -g"));
+
+    let invalid_uid = run(Some("not-a-number"), Some("1002"), None);
+    assert!(!invalid_uid.status.success());
+    assert!(String::from_utf8_lossy(&invalid_uid.stderr)
+        .contains("valid numeric value for CODEX_MEMORYD_UID"));
+
+    let invalid_gid = run(Some("1001"), Some("-1"), None);
+    assert!(!invalid_gid.status.success());
+    assert!(String::from_utf8_lossy(&invalid_gid.stderr)
+        .contains("valid numeric value for CODEX_MEMORYD_GID"));
+    assert!(
+        !codex_home.exists(),
+        "invalid IDs must not create CODEX_HOME"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_preview_and_status_write_nothing() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("memory.db");
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+
+    for operation in ["preview", "status"] {
+        let mut command = bin();
+        clear_runtime_env(&mut command);
+        let output = command
+            .env("CODEX_MEMORYD_HOME", &memoryd_home)
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+            .env("CODEX_MEMORYD_UID", "1001")
+            .env("CODEX_MEMORYD_GID", "1002")
+            .arg("--db")
+            .arg(&db)
+            .args(["mcp", "codex", operation, "--runtime", "container"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !codex_home.exists(),
+            "{operation} must not create CODEX_HOME"
+        );
+        assert!(
+            !codex_home.join("config.toml").exists(),
+            "{operation} must not write config.toml"
+        );
+    }
+}
+
+#[test]
+fn cli_mcp_codex_native_status_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .args(["--runtime", "native", "mcp", "codex", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !codex_home.exists(),
+        "native status must not create CODEX_HOME"
+    );
 }
 
 #[test]
@@ -6510,6 +7150,41 @@ fn cli_mcp_codex_apply_creates_config_and_is_idempotent() {
     assert_eq!(second_json["status"], "managed");
     assert_eq!(fs::read_to_string(&codex_config).unwrap(), created);
     assert!(backup_files(&codex_config).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_apply_only_checks_runtime_and_does_not_pull_or_start() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let db_dir = dir.path().join("database");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("memory.db");
+    let (runtime, invocations) = fake_container_runtime_with_log(dir.path());
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&db)
+        .args(["mcp", "codex", "apply", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(invocations).unwrap(), "--version\n");
+    assert!(fs::read_to_string(codex_config_path(&dir))
+        .unwrap()
+        .contains("[mcp_servers.codex_memoryd]"));
 }
 
 #[test]
@@ -6619,6 +7294,54 @@ args = ["hello"]
     assert!(updated.contains("[memories]\nbackend = \"provider\""));
     assert!(updated.contains("[mcp_servers.other]\ncommand = \"/bin/echo\""));
     assert!(!updated.contains("[mcp_servers.codex_memoryd]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_remove_works_when_previous_container_runtime_is_unavailable() {
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let codex_config = codex_config_path(&dir);
+    let missing_runtime = dir.path().join("runtime-no-longer-installed");
+    let missing_db = dir.path().join("old-data").join("memory.db");
+    fs::create_dir_all(&codex_home).unwrap();
+    let original = r#"[mcp_servers.codex_memoryd]
+command = "/old/docker"
+args = ["run", "--rm", "old-image", "mcp", "stdio", "--read-only"]
+
+[mcp_servers.other]
+command = "/bin/echo"
+args = ["preserve me"]
+"#;
+    fs::write(&codex_config, original).unwrap();
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &missing_runtime)
+        .env("CODEX_MEMORYD_DB", &missing_db)
+        .args(["mcp", "codex", "remove", "--runtime", "container"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["status"], "removed");
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["resolved"], Value::Null);
+    let updated = fs::read_to_string(&codex_config).unwrap();
+    assert!(!updated.contains("[mcp_servers.codex_memoryd]"));
+    assert!(updated.contains("[mcp_servers.other]"));
+    assert_eq!(
+        fs::read_to_string(&backup_files(&codex_config)[0]).unwrap(),
+        original
+    );
 }
 
 #[test]

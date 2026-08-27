@@ -4,6 +4,7 @@
 //! launches the daemon; `doctor` runs self-checks.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -2406,7 +2407,7 @@ struct CodexMcpConfigReport {
     server_name: &'static str,
     backup_file: Option<String>,
     snippet: String,
-    resolved: CodexMcpResolved,
+    resolved: Option<CodexMcpResolved>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2427,14 +2428,28 @@ fn manage_codex_mcp_config(
     let config_path = codex_config_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_config_path);
-    let desired = render_codex_mcp_snippet(runtime);
-    let raw = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let (desired, resolved) = if matches!(command, CodexMcpCommand::Remove) {
+        removal_payload(runtime)
+    } else {
+        let resolved = codex_mcp_resolved(runtime)?;
+        let desired = render_codex_mcp_snippet(&resolved)?;
+        (desired, Some(resolved))
+    };
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(error::Error::invalid_request(format!(
+            "cannot read Codex config {}: {err}; check --codex-config or CODEX_HOME permissions",
+            config_path.display()
+        )))
+        }
+    };
     let config_exists = config_path.exists();
     let section = find_codex_mcp_section(&raw);
     let matches_desired = section
         .as_ref()
         .is_some_and(|(start, end)| raw[*start..*end].trim_end() == desired.trim_end());
-    let resolved = codex_mcp_resolved(runtime);
     let status = match (section.is_some(), matches_desired) {
         (false, _) => "missing",
         (true, true) => "managed",
@@ -2531,7 +2546,20 @@ fn manage_codex_mcp_config(
     }
 }
 
-fn codex_mcp_resolved(runtime: &RuntimeOptions) -> CodexMcpResolved {
+fn removal_payload(runtime: &RuntimeOptions) -> (String, Option<CodexMcpResolved>) {
+    if runtime.runtime == RuntimeKind::Container {
+        // Removal must remain available when the old Docker/Podman executable
+        // has been uninstalled. There is no useful resolved launcher to report
+        // without resolving that executable, so omit it from this report.
+        return (String::new(), None);
+    }
+
+    let resolved = native_codex_mcp_resolved(runtime);
+    let desired = render_codex_mcp_snippet(&resolved).unwrap_or_default();
+    (desired, Some(resolved))
+}
+
+fn native_codex_mcp_resolved(runtime: &RuntimeOptions) -> CodexMcpResolved {
     CodexMcpResolved {
         command: runtime.binary.display().to_string(),
         args: vec![
@@ -2548,13 +2576,240 @@ fn codex_mcp_resolved(runtime: &RuntimeOptions) -> CodexMcpResolved {
     }
 }
 
-fn render_codex_mcp_snippet(runtime: &RuntimeOptions) -> String {
-    format!(
-        "{header}\ncommand = {command:?}\nargs = [\"--db\", {db:?}, \"mcp\", \"stdio\", \"--read-only\"]\nenabled_tools = [\"memory_status\", \"memory_recall\", \"memory_search\"]\ndefault_tools_approval_mode = \"approve\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 30\n",
+fn codex_mcp_resolved(runtime: &RuntimeOptions) -> Result<CodexMcpResolved> {
+    match runtime.runtime {
+        RuntimeKind::Native | RuntimeKind::Auto => Ok(native_codex_mcp_resolved(runtime)),
+        RuntimeKind::ComposeDev => Err(error::Error::invalid_request(
+            "Codex MCP does not support --runtime compose-dev; choose --runtime native or --runtime container",
+        )),
+        RuntimeKind::Container => {
+            let command = native_runtime::container_runtime(runtime).map_err(|err| {
+                error::Error::invalid_request(format!(
+                    "container MCP requires an available Docker or Podman runtime: {}. Install Docker or Podman, or set CODEX_MEMORYD_CONTAINER_RUNTIME to an executable path",
+                    err.message
+                ))
+            })?;
+            let (database_parent, database_filename) = container_mcp_database(runtime)?;
+
+            let mut args = vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "-i".to_string(),
+                "--pull=missing".to_string(),
+            ];
+            args.extend(container_mcp_identity_args(&command, runtime)?);
+            args.extend([
+                "--volume".to_string(),
+                format!("{database_parent}:/data"),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_PROFILE={}", runtime.profile),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_WORKSPACE={}", runtime.workspace),
+                "--env".to_string(),
+                format!("CODEX_MEMORYD_LOG={}", runtime.log_level),
+                runtime.image.clone(),
+                "--db".to_string(),
+                format!("/data/{database_filename}"),
+                "mcp".to_string(),
+                "stdio".to_string(),
+                "--read-only".to_string(),
+            ]);
+
+            Ok(CodexMcpResolved {
+                command,
+                args,
+                enabled_tools: CODEX_MCP_READ_ONLY_TOOLS.to_vec(),
+                default_tools_approval_mode: "approve",
+                startup_timeout_sec: 30,
+                tool_timeout_sec: 30,
+            })
+        }
+    }
+}
+
+fn container_mcp_identity_args(command: &str, runtime: &RuntimeOptions) -> Result<Vec<String>> {
+    let engine = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .trim_end_matches(".exe");
+    if engine.eq_ignore_ascii_case("podman") {
+        return Ok(vec!["--userns=keep-id".to_string()]);
+    }
+
+    let uid = container_mcp_id(runtime.uid.as_deref(), "CODEX_MEMORYD_UID", "id -u")?;
+    let gid = container_mcp_id(runtime.gid.as_deref(), "CODEX_MEMORYD_GID", "id -g")?;
+    Ok(vec!["--user".to_string(), format!("{uid}:{gid}")])
+}
+
+fn container_mcp_id(value: Option<&str>, variable: &str, fallback: &str) -> Result<String> {
+    let Some(value) = value else {
+        return Err(error::Error::invalid_request(format!(
+            "container MCP requires a host UID/GID; set {variable}=<numeric-id> or make {fallback} available"
+        )));
+    };
+    let value = value.trim();
+    if value.is_empty()
+        || !value.chars().all(|character| character.is_ascii_digit())
+        || value.parse::<u32>().is_err()
+    {
+        return Err(error::Error::invalid_request(format!(
+            "container MCP requires a valid numeric value for {variable}; set {variable}=<numeric-id> or make {fallback} available"
+        )));
+    }
+    Ok(value
+        .parse::<u32>()
+        .expect("validated numeric id")
+        .to_string())
+}
+
+fn container_mcp_database(runtime: &RuntimeOptions) -> Result<(String, String)> {
+    if runtime.db.as_os_str().is_empty() {
+        return Err(error::Error::invalid_request(
+            "container MCP database path must name a file; set CODEX_MEMORYD_DB=/path/to/memory.db",
+        ));
+    }
+    let database = if runtime.db.is_absolute() {
+        runtime.db.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                error::Error::invalid_request(format!(
+                    "container MCP cannot resolve relative database path {}: {err}; set CODEX_MEMORYD_DB to an absolute path",
+                    runtime.db.display()
+                ))
+            })?
+            .join(&runtime.db)
+    };
+    let filename = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| {
+            error::Error::invalid_request(format!(
+                "container MCP database path must name a UTF-8 file: {}; set CODEX_MEMORYD_DB=/path/to/memory.db",
+                database.display()
+            ))
+        })?;
+    if filename.chars().any(char::is_control) {
+        return Err(error::Error::invalid_request(
+            "container MCP database filename contains control characters and cannot be represented safely; set CODEX_MEMORYD_DB to a normal filename",
+        ));
+    }
+
+    let parent = database.parent().ok_or_else(|| {
+        error::Error::invalid_request(format!(
+            "container MCP database path has no usable parent directory: {}; set CODEX_MEMORYD_DB=/path/to/memory.db",
+            database.display()
+        ))
+    })?;
+    let metadata = std::fs::metadata(parent).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            error::Error::invalid_request(format!(
+                "container MCP database parent directory does not exist: {}; create it with mkdir -p {} or set CODEX_MEMORYD_DB to an existing directory",
+                parent.display(),
+                parent.display()
+            ))
+        } else {
+            error::Error::invalid_request(format!(
+                "container MCP database parent directory is not usable: {} ({err}); check permissions or set CODEX_MEMORYD_DB to an accessible directory",
+                parent.display()
+            ))
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err(error::Error::invalid_request(format!(
+            "container MCP database parent is not a directory: {}; set CODEX_MEMORYD_DB to a file inside an existing directory",
+            parent.display()
+        )));
+    }
+
+    let parent = std::fs::canonicalize(parent).map_err(|err| {
+        error::Error::invalid_request(format!(
+            "container MCP database parent cannot be resolved safely: {} ({err}); set CODEX_MEMORYD_DB to an accessible absolute path",
+            parent.display()
+        ))
+    })?;
+    if parent == Path::new("/") {
+        return Err(error::Error::invalid_request(
+            "container MCP refuses to mount the host root as the database parent; set CODEX_MEMORYD_DB inside a dedicated data directory",
+        ));
+    }
+    let parent = parent.to_str().ok_or_else(|| {
+        error::Error::invalid_request(
+            "container MCP database parent is not valid UTF-8 and cannot be represented safely; set CODEX_MEMORYD_DB to a UTF-8 path",
+        )
+    })?;
+    if parent.contains(':') || parent.chars().any(char::is_control) {
+        return Err(error::Error::invalid_request(format!(
+            "container MCP database parent cannot be represented safely in a Docker/Podman --volume mount: {parent}; use a path without ':' or control characters, or set CODEX_MEMORYD_DB to a safe directory"
+        )));
+    }
+    Ok((parent.to_string(), filename.to_string()))
+}
+
+fn toml_basic_string(value: &str, label: &str) -> Result<String> {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for character in value.chars() {
+        match character {
+            '\0' => {
+                return Err(error::Error::invalid_request(format!(
+                    "generated Codex MCP TOML cannot represent {label} containing NUL safely; set the corresponding CODEX_MEMORYD_* override to ordinary text"
+                )))
+            }
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            character if character.is_control() => {
+                let codepoint = character as u32;
+                if codepoint <= 0xffff {
+                    write!(&mut escaped, "\\u{codepoint:04X}")
+                        .expect("writing String cannot fail");
+                } else {
+                    write!(&mut escaped, "\\U{codepoint:08X}")
+                        .expect("writing String cannot fail");
+                }
+            }
+            character => escaped.push(character),
+        }
+    }
+    Ok(format!("\"{escaped}\""))
+}
+
+fn render_codex_mcp_snippet(resolved: &CodexMcpResolved) -> Result<String> {
+    let command = toml_basic_string(&resolved.command, "the MCP command")?;
+    let args = resolved
+        .args
+        .iter()
+        .map(|arg| toml_basic_string(arg, "an MCP argument"))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let enabled_tools = resolved
+        .enabled_tools
+        .iter()
+        .map(|tool| toml_basic_string(tool, "an enabled MCP tool"))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let approval_mode = toml_basic_string(
+        resolved.default_tools_approval_mode,
+        "the MCP approval mode",
+    )?;
+    let snippet = format!(
+        "{header}\ncommand = {command}\nargs = [{args}]\nenabled_tools = [{enabled_tools}]\ndefault_tools_approval_mode = {approval_mode}\nstartup_timeout_sec = {startup_timeout_sec}\ntool_timeout_sec = {tool_timeout_sec}\n",
         header = CODEX_MCP_SECTION_HEADER,
-        command = runtime.binary.display().to_string(),
-        db = runtime.db.display().to_string(),
-    )
+        startup_timeout_sec = resolved.startup_timeout_sec,
+        tool_timeout_sec = resolved.tool_timeout_sec,
+    );
+    toml::from_str::<toml::Value>(&snippet).map_err(|err| {
+        error::Error::invalid_request(format!(
+            "generated Codex MCP configuration is not valid TOML: {err}; choose representable runtime, image, and database values"
+        ))
+    })?;
+    Ok(snippet)
 }
 
 fn default_codex_config_path() -> PathBuf {
@@ -3440,4 +3695,30 @@ fn render_card_markdown(card: &CardShowResponse) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_basic_string_round_trips_toml_sensitive_values() {
+        let original = "spaces \"quotes\" \\backslashes\nand\tcontrols\u{0001}\u{007f}";
+        let encoded = toml_basic_string(original, "test value").unwrap();
+        assert!(encoded.contains("\\u0001"));
+        assert!(encoded.contains("\\u007F"));
+        assert!(!encoded.contains("\\u{"));
+        let document: toml::Value = toml::from_str(&format!("value = {encoded}\n")).unwrap();
+        assert_eq!(
+            document.get("value").and_then(toml::Value::as_str),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn toml_basic_string_rejects_nul() {
+        let error = toml_basic_string("unsafe\0value", "test value").unwrap_err();
+        assert!(error.message.contains("cannot represent"));
+        assert!(error.message.contains("NUL"));
+    }
 }
