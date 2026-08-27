@@ -2652,6 +2652,11 @@ fn container_mcp_id(value: Option<&str>, variable: &str, fallback: &str) -> Resu
 }
 
 fn container_mcp_database(runtime: &RuntimeOptions) -> Result<(String, String)> {
+    if runtime.db.as_os_str().is_empty() {
+        return Err(error::Error::invalid_request(
+            "container MCP database path must name a file; set CODEX_MEMORYD_DB=/path/to/memory.db",
+        ));
+    }
     let database = if runtime.db.is_absolute() {
         runtime.db.clone()
     } else {
@@ -3678,4 +3683,30 @@ fn render_card_markdown(card: &CardShowResponse) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_basic_string_round_trips_toml_sensitive_values() {
+        let original = "spaces \"quotes\" \\backslashes\nand\tcontrols\u{0001}\u{007f}";
+        let encoded = toml_basic_string(original, "test value").unwrap();
+        assert!(encoded.contains("\\u0001"));
+        assert!(encoded.contains("\\u007F"));
+        assert!(!encoded.contains("\\u{"));
+        let document: toml::Value = toml::from_str(&format!("value = {encoded}\n")).unwrap();
+        assert_eq!(
+            document.get("value").and_then(toml::Value::as_str),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn toml_basic_string_rejects_nul() {
+        let error = toml_basic_string("unsafe\0value", "test value").unwrap_err();
+        assert!(error.message.contains("cannot represent"));
+        assert!(error.message.contains("NUL"));
+    }
 }
