@@ -1,0 +1,43 @@
+{
+  "shim_id": "codex-memoryd-jit-seam-v1",
+  "upstream_base_sha": "df9f537a6e105ac7e457f2e4ebc7431d8614393e",
+  "owned_files": [
+    "codex-rs/ext/memoryd/Cargo.toml",
+    "codex-rs/ext/memoryd/src/lib.rs",
+    "codex-rs/ext/memoryd/src/config.rs",
+    "codex-rs/ext/memoryd/src/client.rs",
+    "codex-rs/ext/memoryd/src/recall.rs",
+    "codex-rs/ext/memoryd/src/writeback.rs",
+    "codex-rs/ext/memoryd/tests/conformance.rs"
+  ],
+  "owned_upstream_symbols": [
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "ContextContributor" },
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "TurnInputContributor" },
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "TurnLifecycleContributor" },
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "TurnItemContributor" },
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "ThreadLifecycleContributor" },
+    { "path": "codex-rs/ext/extension-api/src/contributors.rs", "symbol": "ConfigContributor" },
+    { "path": "codex-rs/ext/extension-api/src/registry.rs", "symbol": "turn_input_contributor" },
+    { "path": "codex-rs/ext/extension-api/src/registry.rs", "symbol": "turn_lifecycle_contributor" },
+    { "path": "codex-rs/ext/extension-api/src/registry.rs", "symbol": "turn_item_contributor" },
+    { "path": "codex-rs/ext/extension-api/src/registry.rs", "symbol": "config_contributor" },
+    { "path": "codex-rs/ext/memories/src/extension.rs", "symbol": "pub fn install" }
+  ],
+  "expected_extension_seams": [
+    "codex-rs/ext/extension-api/src/contributors.rs",
+    "codex-rs/ext/extension-api/src/registry.rs",
+    "codex-rs/ext/memories/src/extension.rs"
+  ],
+  "config_keys": ["enabled", "base_url", "profile", "workspace"],
+  "protocol": {
+    "name": "temporary-memoryd-http",
+    "version": "v1",
+    "required_capabilities": ["recall", "visible_turn_writeback"],
+    "endpoints": ["POST /v1/recall", "POST /v1/turns"],
+    "security": ["fail-open", "visible-content-only", "bounded-timeout"]
+  },
+  "focused_verification": [
+    "cargo test --manifest-path codex-rs/ext/memoryd/Cargo.toml",
+    "cargo test --manifest-path codex-rs/ext/memoryd/Cargo.toml --test conformance"
+  ]
+}
