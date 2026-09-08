@@ -21,6 +21,25 @@ def test_bootstrap_is_once_per_destination_and_retries_failed_posts(tmp_path):
         httpd.shutdown(); httpd.server_close()
 
 
+def test_bootstrap_resolves_active_home_when_keyword_is_omitted(tmp_path, monkeypatch):
+    home = tmp_path / 'active-profile'
+    (home / 'memories').mkdir(parents=True)
+    (home / 'memories/MEMORY.md').write_text('Synthetic environment-resolved origin')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    httpd = server()
+    try:
+        provider = CodexMemoryDProvider({'endpoint': f'http://127.0.0.1:{httpd.server_port}'})
+        provider.initialize('environment-home')
+        posts = [payload for path, payload in MemoryDHandler.requests if path == '/v1/conclusions']
+        assert len(posts) == 1
+        assert posts[0]['conclusions'] == ['Synthetic environment-resolved origin']
+        provider.initialize('second-session')
+        assert len(MemoryDHandler.requests) == 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_recall_renders_protocol_provenance():
     httpd = server()
     try:

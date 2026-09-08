@@ -118,7 +118,7 @@ class CodexMemoryDProvider(MemoryProvider):
         self._session_id = session_id
         self._agent = "agent:" + str(kwargs.get("agent_identity", "friday"))
         if self._truthy(self._config.get("bootstrap_origin", True)):
-            self._bootstrap_origin(kwargs.get("hermes_home"))
+            self._bootstrap_origin(str(self._hermes_home))
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self._session_id = new_session_id
