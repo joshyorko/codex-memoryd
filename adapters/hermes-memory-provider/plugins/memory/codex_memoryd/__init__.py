@@ -7,6 +7,9 @@ Install this directory as ``$HERMES_HOME/plugins/codex_memoryd``.
 from __future__ import annotations
 
 import json
+from http.client import HTTPException, HTTPConnection, HTTPSConnection, HTTPResponse
+import io
+import ipaddress
 import hashlib
 import sqlite3
 import time
@@ -14,9 +17,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from agent.memory_provider import MemoryProvider, RecallStatus
+from agent.model_metadata import estimate_tokens_rough
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,32 @@ def _config() -> dict:
         return {}
 
 
+class _DeadlineReader(io.RawIOBase):
+    """Re-arm the remaining wall-clock budget for every underlying recv."""
+
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MemoryD response deadline exceeded")
+        self.sock.settimeout(remaining)
+        return self.sock.recv_into(buffer)
+
+
+class _ResponseSocket:
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def makefile(self, mode):
+        return io.BufferedReader(_DeadlineReader(self.sock, self.deadline))
+
+
 class CodexMemoryDProvider(MemoryProvider):
     """Small HTTP bridge preserving MemoryD's provenance and scope model."""
 
@@ -51,6 +81,7 @@ class CodexMemoryDProvider(MemoryProvider):
         self._last_status: RecallStatus | None = None
         self._health_checked_at = float("-inf")
         self._healthy = False
+        self._hermes_home: Path | None = None
 
     @property
     def name(self) -> str:
@@ -63,9 +94,9 @@ class CodexMemoryDProvider(MemoryProvider):
         if now - self._health_checked_at < 2.0:
             return self._healthy
         try:
-            with urlopen(self._endpoint + "/healthz", timeout=min(self._timeout, 0.5)) as response:
-                self._healthy = response.status == 200
-        except (OSError, URLError, ValueError, TimeoutError):
+            status, _ = self._request("GET", "/healthz", None, min(self._timeout, 0.5))
+            self._healthy = status == 200
+        except (OSError, URLError, ValueError, TimeoutError, HTTPException):
             self._healthy = False
         self._health_checked_at = time.monotonic()
         return self._healthy
@@ -82,6 +113,8 @@ class CodexMemoryDProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        from hermes_constants import get_hermes_home
+        self._hermes_home = Path(kwargs.get("hermes_home") or get_hermes_home())
         self._session_id = session_id
         self._agent = "agent:" + str(kwargs.get("agent_identity", "friday"))
         if self._truthy(self._config.get("bootstrap_origin", True)):
@@ -107,17 +140,19 @@ class CodexMemoryDProvider(MemoryProvider):
         lanes = (("ABOUT JOSH", "josh"), ("FRIDAY SELF", "self"),
                  ("SHARED HISTORY", "relationship"), ("CURRENT WORK", "evidence"))
         rendered: list[str] = []
+        budget = max(0, int(self._config.get("max_tokens", 1200)))
         deadline = time.monotonic() + self._timeout
         for label, lane in lanes:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            tokens_left = budget - estimate_tokens_rough("\n".join(rendered))
+            if remaining <= 0 or tokens_left <= 0:
                 break
             data = self._post("/v1/recall", {
                 "profile": self._profile,
                 "workspace": self._workspaces[lane],
                 "session": {"id": session_id or self._session_id, "source": "hermes"},
                 "query": query,
-                "max_tokens": int(self._config.get("max_tokens", 1200)),
+                "max_tokens": tokens_left,
                 "pack_mode": "active_task",
                 "metadata": {"agent": self._agent, "source_kind": "hermes_prefetch", "lane": lane},
             }, timeout=remaining)
@@ -126,8 +161,8 @@ class CodexMemoryDProvider(MemoryProvider):
             facts = ((data.get("data") or {}).get("facts") or [])
             if not facts:
                 continue
-            self._last_count += len(facts)
-            rendered.append("[" + label + " — recalled, not authority; recall_not_authority]")
+            header = "[" + label + " — recalled, not authority; recall_not_authority]"
+            lane_started = False
             for fact in facts:
                 content = fact.get("content")
                 if not content:
@@ -143,7 +178,12 @@ class CodexMemoryDProvider(MemoryProvider):
                 if refs:
                     labels.append("evidence: " + ", ".join(dict.fromkeys(refs)))
                 prefix = "[" + "; ".join(labels) + "] " if labels else ""
-                rendered.append("- " + prefix + str(content))
+                addition = ([] if lane_started else [header]) + ["- " + prefix + str(content)]
+                if estimate_tokens_rough("\n".join(rendered + addition)) > budget:
+                    continue
+                rendered.extend(addition)
+                lane_started = True
+                self._last_count += 1
         if not rendered:
             return ""
         self._last_status = RecallStatus("codex-memoryd", self._last_count, "🧠")
@@ -172,11 +212,61 @@ class CodexMemoryDProvider(MemoryProvider):
         return []
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Dict[str, Any] | None = None) -> None:
-        if action != "add" or not content:
+        if action not in {"add", "remove", "replace"} or target not in {"memory", "user"}:
+            return
+        if self._hermes_home is None:
             return
         metadata = metadata or {}
+        content = content.strip()
+        old_text = str(metadata.get("old_text") or "").strip()
+        workspace = self._workspaces["self" if target == "memory" else "josh"]
+        destination = json.dumps([self._endpoint, self._profile, workspace, target])
+        try:
+            state = self._hermes_home / "state" / "codex_memoryd"
+            state.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(state / "mirrors.sqlite3", timeout=0.1) as db:
+                db.execute("CREATE TABLE IF NOT EXISTS mirrors (destination TEXT, content TEXT, ids TEXT, PRIMARY KEY(destination, content))")
+                db.execute("BEGIN IMMEDIATE")
+                if action in {"remove", "replace"}:
+                    if not old_text:
+                        return
+                    matches = [(text, ids) for text, ids in db.execute(
+                        "SELECT content, ids FROM mirrors WHERE destination = ?", (destination,)) if old_text in text]
+                    # Hermes matches a unique substring, not a record number.
+                    # Never guess when older mappings are ambiguous or absent.
+                    if len(matches) > 1:
+                        logger.warning("codex-memoryd mirror mutation is ambiguous")
+                        return
+                    if matches:
+                        text, encoded_ids = matches[0]
+                        if action == "replace" and text == content:
+                            return
+                        ids = json.loads(encoded_ids)
+                        if ids:
+                            result = self._post("/v1/forget", {
+                                "profile": self._profile, "workspace": workspace,
+                                "ids": ids, "mode": "archive",
+                            })
+                            data = (result or {}).get("data") or {}
+                            if not result or data.get("errors") or not set(ids) <= set(data.get("archived", []) + data.get("not_found", [])):
+                                return
+                        db.execute("DELETE FROM mirrors WHERE destination = ? AND content = ?", (destination, text))
+                if action == "remove" or not content:
+                    return
+                if db.execute("SELECT 1 FROM mirrors WHERE destination = ? AND content = ?", (destination, content)).fetchone():
+                    return
+                result = self._write_conclusion(target, content, metadata)
+                if result and (result.get("data") or {}).get("created"):
+                    # Only newly created record_ids confer ownership. A dedup hit
+                    # may belong to an origin import or another writer: never adopt it.
+                    ids = (result.get("data") or {}).get("record_ids") or []
+                    db.execute("INSERT INTO mirrors VALUES (?, ?, ?)", (destination, content, json.dumps(ids)))
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("codex-memoryd mirror skipped: %s", exc)
+
+    def _write_conclusion(self, target, content, metadata):
         source_kind = metadata.get("source_kind", "friday_self_memory" if target == "memory" else "hermes_builtin_memory_import")
-        self._post("/v1/conclusions", {
+        return self._post("/v1/conclusions", {
             "profile": self._profile,
             "workspace": self._workspaces["self" if target == "memory" else "josh"],
             "target": "assistant" if target == "memory" else "user",
@@ -229,13 +319,45 @@ class CodexMemoryDProvider(MemoryProvider):
         except (OSError, UnicodeError, sqlite3.Error) as exc:
             logger.warning("codex-memoryd bootstrap skipped: %s", exc)
 
+    def _request(self, method, path, payload, timeout):
+        deadline = time.monotonic() + timeout
+        url = urlsplit(self._endpoint + path)
+        # This is a local-daemon adapter. Avoid unbounded DNS lookup entirely;
+        # localhost is a fixed loopback alias, otherwise require a numeric IP.
+        host = "127.0.0.1" if url.hostname == "localhost" else str(ipaddress.ip_address(url.hostname))
+        connection_type = {"http": HTTPConnection, "https": HTTPSConnection}.get(url.scheme)
+        if connection_type is None:
+            raise ValueError("MemoryD endpoint must use HTTP or HTTPS")
+        connection = connection_type(host, url.port, timeout=timeout)
+        try:
+            connection.connect()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("MemoryD request deadline exceeded")
+            connection.sock.settimeout(remaining)
+            body = None if payload is None else json.dumps(payload).encode()
+            connection.request(method, url.path, body=body, headers={"Content-Type": "application/json"})
+            with HTTPResponse(_ResponseSocket(connection.sock, deadline), method=method) as response:
+                response.begin()
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise ValueError("MemoryD response exceeds size limit")
+                if response.length not in (None, 0):
+                    raise HTTPException("Truncated MemoryD response")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("MemoryD response deadline exceeded")
+                return response.status, raw
+        finally:
+            connection.close()
+
     def _post(self, path: str, payload: dict, *, timeout: float | None = None) -> dict | None:
         try:
-            request = Request(self._endpoint + path, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
-            with urlopen(request, timeout=self._timeout if timeout is None else timeout) as response:
-                body = json.loads(response.read().decode())
-            return body if body.get("ok") else None
-        except (OSError, URLError, ValueError, TimeoutError) as exc:
+            status, raw = self._request("POST", path, payload, self._timeout if timeout is None else timeout)
+            if status != 200:
+                return None
+            body = json.loads(raw.decode())
+            return body if isinstance(body, dict) and body.get("ok") else None
+        except (OSError, URLError, ValueError, TimeoutError, HTTPException) as exc:
             logger.warning("codex-memoryd unavailable: %s", exc)
             return None
 
