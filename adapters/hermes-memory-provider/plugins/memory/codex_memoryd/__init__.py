@@ -2,11 +2,14 @@
 
 This is intentionally a context-only provider: durable writes use MemoryD's
 existing conclusions/turns endpoints, while recall is advisory and fail-open.
-Install this directory as ``$HERMES_HOME/plugins/memory/codex_memoryd``.
+Install this directory as ``$HERMES_HOME/plugins/codex_memoryd``.
 """
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
+import time
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -46,16 +49,29 @@ class CodexMemoryDProvider(MemoryProvider):
         self._agent = "agent:friday"
         self._last_count = 0
         self._last_status: RecallStatus | None = None
+        self._health_checked_at = float("-inf")
+        self._healthy = False
 
     @property
     def name(self) -> str:
         return "codex_memoryd"
 
     def is_available(self) -> bool:
-        return bool(self._endpoint)
+        if not self._endpoint:
+            return False
+        now = time.monotonic()
+        if now - self._health_checked_at < 2.0:
+            return self._healthy
+        try:
+            with urlopen(self._endpoint + "/healthz", timeout=min(self._timeout, 0.5)) as response:
+                self._healthy = response.status == 200
+        except (OSError, URLError, ValueError, TimeoutError):
+            self._healthy = False
+        self._health_checked_at = time.monotonic()
+        return self._healthy
 
     def unavailable_reason(self) -> str:
-        return "configure plugins.codex_memoryd.endpoint or start codex-memoryd"
+        return "codex-memoryd unavailable; check plugins.codex_memoryd.endpoint and daemon health"
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -91,7 +107,11 @@ class CodexMemoryDProvider(MemoryProvider):
         lanes = (("ABOUT JOSH", "josh"), ("FRIDAY SELF", "self"),
                  ("SHARED HISTORY", "relationship"), ("CURRENT WORK", "evidence"))
         rendered: list[str] = []
+        deadline = time.monotonic() + self._timeout
         for label, lane in lanes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             data = self._post("/v1/recall", {
                 "profile": self._profile,
                 "workspace": self._workspaces[lane],
@@ -100,7 +120,7 @@ class CodexMemoryDProvider(MemoryProvider):
                 "max_tokens": int(self._config.get("max_tokens", 1200)),
                 "pack_mode": "active_task",
                 "metadata": {"agent": self._agent, "source_kind": "hermes_prefetch", "lane": lane},
-            })
+            }, timeout=remaining)
             if not data:
                 continue
             facts = ((data.get("data") or {}).get("facts") or [])
@@ -113,8 +133,16 @@ class CodexMemoryDProvider(MemoryProvider):
                 if not content:
                     continue
                 provenance = ((fact.get("policy") or {}).get("provenance") or {})
-                source_kind = provenance.get("source_kind") or provenance.get("source")
-                prefix = f"[source: {source_kind}] " if source_kind else ""
+                labels = [f"record: {fact['id']}"] if fact.get("id") else []
+                for key in ("profile_id", "workspace_id", "trust_level"):
+                    if provenance.get(key):
+                        labels.append(f"{key}: {provenance[key]}")
+                refs = list(provenance.get("evidence_refs") or [])
+                refs.extend(c["source_id"] for c in (data.get("data") or {}).get("citations", [])
+                            if c.get("memory_id") == fact.get("id") and c.get("source_id"))
+                if refs:
+                    labels.append("evidence: " + ", ".join(dict.fromkeys(refs)))
+                prefix = "[" + "; ".join(labels) + "] " if labels else ""
                 rendered.append("- " + prefix + str(content))
         if not rendered:
             return ""
@@ -165,30 +193,46 @@ class CodexMemoryDProvider(MemoryProvider):
             return
         path = Path(hermes_home) / "memories" / "MEMORY.md"
         try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            return
-        if not content:
-            return
-        self._post("/v1/conclusions", {
-            "profile": self._profile,
-            "workspace": self._workspaces["self"],
-            "target": "assistant",
-            "type": "identity",
-            "conclusions": [content],
-            "metadata": {
-                "actor": "agent:friday",
-                "source_kind": "hermes_builtin_memory_import",
-                "source_path": str(path),
-                "source": "friday-origin",
-                "preserve_exact": True,
-            },
-        })
+            raw = path.read_bytes()
+            content = raw.decode("utf-8")
+            if not content.strip():
+                return
+            state_dir = Path(hermes_home) / "state" / "codex_memoryd"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            destination = json.dumps([self._endpoint, self._profile, self._workspaces["self"]])
+            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+            # Serialize concurrent initializations; store only an acknowledgement,
+            # never the private memory text. A changed MEMORY.md is not a new origin.
+            with sqlite3.connect(state_dir / "bootstrap.sqlite3", timeout=0.1) as db:
+                db.execute("CREATE TABLE IF NOT EXISTS imports (destination TEXT PRIMARY KEY, digest TEXT NOT NULL)")
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("SELECT 1 FROM imports WHERE destination = ?", (destination,)).fetchone():
+                    return
+                result = self._post("/v1/conclusions", {
+                    "profile": self._profile,
+                    "workspace": self._workspaces["self"],
+                    "target": "assistant",
+                    "type": "identity",
+                    "conclusions": [content],
+                    "metadata": {
+                        "actor": "agent:friday",
+                        "source_kind": "hermes_builtin_memory_import",
+                        "source_path": str(path),
+                        "source": "friday-origin",
+                        "origin_id": "friday-origin",
+                        "origin_digest": digest,
+                        "content_semantics": "normalized_conclusion_not_exact_archive",
+                    },
+                })
+                if result and (result.get("data") or {}).get("created"):
+                    db.execute("INSERT INTO imports VALUES (?, ?)", (destination, digest))
+        except (OSError, UnicodeError, sqlite3.Error) as exc:
+            logger.warning("codex-memoryd bootstrap skipped: %s", exc)
 
-    def _post(self, path: str, payload: dict) -> dict | None:
+    def _post(self, path: str, payload: dict, *, timeout: float | None = None) -> dict | None:
         try:
             request = Request(self._endpoint + path, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
-            with urlopen(request, timeout=self._timeout) as response:
+            with urlopen(request, timeout=self._timeout if timeout is None else timeout) as response:
                 body = json.loads(response.read().decode())
             return body if body.get("ok") else None
         except (OSError, URLError, ValueError, TimeoutError) as exc:

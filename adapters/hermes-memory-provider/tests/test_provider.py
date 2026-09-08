@@ -26,6 +26,8 @@ class MemoryDHandler(BaseHTTPRequestHandler):
                 "summary": None, "withheld": [], "truncated": False,
                 "authority": "recall_not_authority", "policy": {}, "pack": {},
             }, "warnings": []}
+        elif self.path == "/v1/conclusions":
+            body = {"ok": True, "data": {"created": ["synthetic-conclusion"], "record_ids": ["synthetic-record"], "rejected": 0}}
         else:
             body = {"ok": True, "data": {"accepted": 1, "rejected": 0,
                     "rejections": [], "source_ids": [], "derived_record_ids": []},
@@ -99,7 +101,8 @@ def test_origin_bootstrap_sends_builtin_record_without_rewriting_it(tmp_path):
     assert request["conclusions"] == [origin]
     assert request["metadata"]["source_kind"] == "hermes_builtin_memory_import"
     assert request["metadata"]["source"] == "friday-origin"
-    assert request["metadata"]["preserve_exact"] is True
+    assert request["metadata"]["content_semantics"] == "normalized_conclusion_not_exact_archive"
+    assert "preserve_exact" not in request["metadata"]
     httpd.shutdown()
 
 

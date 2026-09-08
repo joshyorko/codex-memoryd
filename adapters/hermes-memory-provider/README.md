@@ -35,12 +35,31 @@ The provider uses four MemoryD workspaces by default:
 - `josh-friday`: explicit shared decisions and relationship history
 - `friday-evidence`: scoped world/work evidence and visible-turn writeback
 
-Recall performs bounded calls for each lane and labels every injected block as
-`recall_not_authority`. Built-in `MEMORY.md` writes are mirrored with actor and
-source metadata. On first initialization, the existing profile
-`memories/MEMORY.md` is sent byte-for-byte as an `identity` conclusion with
-`source_kind=hermes_builtin_memory_import`; MemoryD deduplication makes restart
-bootstrap idempotent. No Codex, ChatGPT, or prior-assistant archive is imported.
+Recall shares one `timeout_seconds` deadline across all four lanes and labels
+injected blocks `recall_not_authority`. Provenance uses the protocol's record ID,
+profile/workspace, trust level, evidence references and response citations; it
+does not invent source-kind fields that recall does not return. Availability
+checks `/healthz` with a timeout capped at 0.5 seconds and caches the result for
+two seconds. Prefetch remains independently fail-open and can recover later.
+
+Built-in `MEMORY.md` writes are mirrored with actor/source metadata. With
+`bootstrap_origin` enabled, the first acknowledged bootstrap for an endpoint,
+profile and self-workspace is recorded in profile-local
+`state/codex_memoryd/bootstrap.sqlite3`. Concurrent initializations serialize
+before posting; later MEMORY.md edits are not reinterpreted as a new origin.
+The receipt stores a SHA-256 digest of the original bytes, not memory contents.
+Back up this receipt with the profile when relocating the same service. A new
+endpoint is a new destination; review bootstrap configuration before relocation.
+
+Bootstrap submits UTF-8 text without newline conversion, but `/v1/conclusions`
+normalizes whitespace and may truncate to MemoryD's record limit. This is a
+**normalized recall snapshot, not an exact identity archive**. Original bytes
+remain in the built-in file; the digest is provenance, not a claim that recall
+preserves them. The adapter does not change that file. Disable bootstrap when
+an exact import is required or the destination already contains the origin.
+An unacknowledged request is retryable; a connection lost after server commit
+can still duplicate a conclusion because the daemon has no idempotency key.
+No Codex, ChatGPT, or prior-assistant archive is imported.
 
 All network failures fail open: normal Hermes operation continues with empty
 external recall. The provider exposes no model tools; writes happen through
