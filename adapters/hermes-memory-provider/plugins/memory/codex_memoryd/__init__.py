@@ -71,6 +71,11 @@ class CodexMemoryDProvider(MemoryProvider):
         if self._truthy(self._config.get("bootstrap_origin", True)):
             self._bootstrap_origin(kwargs.get("hermes_home"))
 
+    def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+        self._session_id = new_session_id
+        self._last_count = 0
+        self._last_status = None
+
     def system_prompt_block(self) -> str:
         return (
             "# codex-memoryd memory\n"
@@ -187,7 +192,7 @@ class CodexMemoryDProvider(MemoryProvider):
                 body = json.loads(response.read().decode())
             return body if body.get("ok") else None
         except (OSError, URLError, ValueError, TimeoutError) as exc:
-            logger.debug("codex-memoryd unavailable: %s", exc)
+            logger.warning("codex-memoryd unavailable: %s", exc)
             return None
 
     @staticmethod
