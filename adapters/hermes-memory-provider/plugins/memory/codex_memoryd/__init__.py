@@ -169,7 +169,8 @@ class CodexMemoryDProvider(MemoryProvider):
                     continue
                 provenance = ((fact.get("policy") or {}).get("provenance") or {})
                 labels = [f"record: {fact['id']}"] if fact.get("id") else []
-                for key in ("profile_id", "workspace_id", "trust_level"):
+                for key in ("profile_id", "workspace_id", "trust_level", "origin", "target",
+                            "source_kind", "actor", "write_origin", "session_id"):
                     if provenance.get(key):
                         labels.append(f"{key}: {provenance[key]}")
                 refs = list(provenance.get("evidence_refs") or [])
@@ -265,7 +266,7 @@ class CodexMemoryDProvider(MemoryProvider):
             logger.warning("codex-memoryd mirror skipped: %s", exc)
 
     def _write_conclusion(self, target, content, metadata):
-        source_kind = metadata.get("source_kind", "friday_self_memory" if target == "memory" else "hermes_builtin_memory_import")
+        source_kind = metadata.get("source_kind", "friday_self_memory" if target == "memory" else "hermes_native_memory")
         return self._post("/v1/conclusions", {
             "profile": self._profile,
             "workspace": self._workspaces["self" if target == "memory" else "josh"],

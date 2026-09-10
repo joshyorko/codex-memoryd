@@ -39,7 +39,11 @@ Recall shares one `timeout_seconds` deadline across all four lanes, including
 HTTP headers and body reads, and labels
 injected blocks `recall_not_authority`. Provenance uses the protocol's record ID,
 profile/workspace, trust level, evidence references and response citations; it
-does not invent source-kind fields that recall does not return. Availability
+also renders conclusion origin, target, source kind, actor, write origin and
+session metadata when the protocol returns them. Agent-authored conclusions
+keep empty evidence references when no independent source exists; the adapter
+does not invent external source IDs or source-kind fields that recall does not
+return. Availability
 checks `/healthz` with a timeout capped at 0.5 seconds and caches the result for
 two seconds. Prefetch remains independently fail-open and can recover later.
 The transport uses numeric IP endpoints (or `localhost`, mapped to IPv4 loopback)
