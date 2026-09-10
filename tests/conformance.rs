@@ -489,6 +489,82 @@ fn conclusion_creates_memory_record() {
 }
 
 #[test]
+fn conclusion_recall_preserves_native_provenance_without_external_source() {
+    let svc = service();
+    let response = svc
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".to_string()),
+            workspace: Some("ws".to_string()),
+            repo: None,
+            target: Some("assistant".to_string()),
+            conclusions: Some(vec![
+                "Synthetic corrected fact: the amber route is current.".to_string(),
+            ]),
+            metadata: Some(json!({
+                "source_kind": "hermes_native_memory",
+                "actor": "agent:friday",
+                "write_origin": "assistant_tool",
+                "execution_context": "foreground",
+                "session_id": "synthetic-writer",
+                "source_path": "/private/should-not-propagate",
+                "old_text": "Synthetic stale fact",
+            })),
+            record_type: None,
+        })
+        .expect("native conclusion");
+    assert_eq!(response.record_ids.len(), 1);
+
+    let record = svc
+        .store
+        .get_record(&response.record_ids[0])
+        .expect("record lookup")
+        .expect("record exists");
+    assert!(
+        record.source_ids.is_empty(),
+        "agent-authored conclusions must not fabricate external source IDs"
+    );
+    let record_provenance = record
+        .metadata
+        .get("provenance")
+        .expect("conclusion provenance should be retained");
+    assert_eq!(record_provenance["source_kind"], "hermes_native_memory");
+    assert_eq!(record_provenance["actor"], "agent:friday");
+    assert_eq!(record_provenance["write_origin"], "assistant_tool");
+    assert_eq!(record_provenance["session_id"], "synthetic-writer");
+    assert!(record_provenance.get("source_path").is_none());
+    assert!(record_provenance.get("old_text").is_none());
+
+    let recall = svc
+        .recall(recall_req("personal", "ws", "amber route"))
+        .expect("recall corrected conclusion");
+    let fact = recall
+        .facts
+        .iter()
+        .find(|fact| fact.content.contains("amber route"))
+        .expect("corrected fact should be recalled");
+    let provenance = serde_json::to_value(&fact.policy.provenance).expect("provenance JSON");
+    assert_eq!(provenance["origin"], "conclusion");
+    assert_eq!(provenance["target"], "assistant");
+    assert_eq!(provenance["source_kind"], "hermes_native_memory");
+    assert_eq!(provenance["actor"], "agent:friday");
+    assert_eq!(provenance["write_origin"], "assistant_tool");
+    assert_eq!(provenance["session_id"], "synthetic-writer");
+    assert!(
+        provenance
+            .get("evidence_refs")
+            .map(|value| value.as_array().map_or(false, Vec::is_empty))
+            .unwrap_or(true),
+        "agent-authored conclusion must not fabricate evidence references"
+    );
+    let citation = recall
+        .citations
+        .iter()
+        .find(|citation| citation.memory_id == fact.id)
+        .expect("fact citation");
+    assert!(citation.source_id.is_none());
+}
+
+#[test]
 fn writeback_rejects_secret_in_turns() {
     let svc = service();
     let req = TurnsRequest {

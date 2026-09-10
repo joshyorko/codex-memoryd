@@ -175,6 +175,13 @@ fn sanitize_export_metadata(metadata: &Value) -> Value {
         }
     }
 
+    if let Some(provenance) = object
+        .get("provenance")
+        .and_then(crate::portable_bundle::safe_provenance)
+    {
+        sanitized.insert("provenance".to_string(), provenance);
+    }
+
     if sanitized.is_empty() {
         Value::Null
     } else {

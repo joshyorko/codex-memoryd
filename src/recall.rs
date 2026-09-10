@@ -657,6 +657,7 @@ fn normalized_policy_value(value: &str) -> String {
 
 fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
     let (source_risk, trust_level) = recall_source_diagnostics(record);
+    let record_provenance = record.metadata.get("provenance");
     RecallProvenance {
         profile_id: record.profile_id.clone(),
         workspace_id: record.workspace_id.clone(),
@@ -677,6 +678,17 @@ fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
         source_risk,
         trust_level,
         trust_score: Some(record.trust_score),
+        origin: metadata_string(&record.metadata, "origin"),
+        target: metadata_string(&record.metadata, "target"),
+        source_kind: record_provenance
+            .and_then(|metadata| metadata_string(metadata, "source_kind"))
+            .or_else(|| metadata_string(&record.metadata, "source_kind")),
+        actor: record_provenance
+            .and_then(|metadata| metadata_string(metadata, "actor"))
+            .or_else(|| metadata_string(&record.metadata, "actor")),
+        write_origin: record_provenance
+            .and_then(|metadata| metadata_string(metadata, "write_origin")),
+        session_id: record_provenance.and_then(|metadata| metadata_string(metadata, "session_id")),
     }
 }
 

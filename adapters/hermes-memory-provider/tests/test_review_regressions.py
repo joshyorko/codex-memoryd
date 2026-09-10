@@ -52,3 +52,20 @@ def test_recall_renders_protocol_provenance():
     finally:
         MemoryDHandler.recall_facts = []
         httpd.shutdown(); httpd.server_close()
+
+
+def test_recall_label_injection_and_top_level_actor_fallback():
+    httpd = server()
+    try:
+        MemoryDHandler.recall_facts = [
+            {'id': 'record-1', 'content': 'safe\ncontent', 'policy': {'provenance': {'actor': 'bad]actor\nnext', 'target': 'user'}}},
+            {'id': 'record-2', 'actor': 'agent:top', 'content': 'fallback content', 'policy': {'provenance': {'target': 'assistant'}}},
+        ]
+        provider = CodexMemoryDProvider({'endpoint': f'http://127.0.0.1:{httpd.server_port}'})
+        rendered = provider.prefetch('synthetic')
+        assert 'bad actor next' in rendered
+        assert '\nnext]' not in rendered
+        assert 'actor: agent:top' in rendered
+    finally:
+        MemoryDHandler.recall_facts = []
+        httpd.shutdown(); httpd.server_close()

@@ -291,6 +291,71 @@ impl UpsertOutcome {
     }
 }
 
+fn merge_allowlisted_metadata(
+    existing: &MemoryRecord,
+    incoming: &NewRecord,
+    original: &Value,
+) -> Value {
+    let Some(existing_object) = existing.metadata.as_object() else {
+        return existing.metadata.clone();
+    };
+    let Some(incoming_object) = incoming.metadata.as_object() else {
+        return existing.metadata.clone();
+    };
+    // A content-hash collision is not proof that two writers described the
+    // same conclusion. Only legacy conclusion records with the same identity
+    // tuple may receive provenance backfill.
+    if existing_object.get("origin").and_then(Value::as_str) != Some("conclusion")
+        || incoming_object.get("origin").and_then(Value::as_str) != Some("conclusion")
+        || existing_object.get("target") != incoming_object.get("target")
+        || existing.scope != incoming.scope
+        || existing.profile_id != incoming.profile_id
+        || existing.workspace_id != incoming.workspace_id
+        || existing.repo_id != incoming.repo_id
+        || existing.record_type != incoming.record_type
+    {
+        return existing.metadata.clone();
+    }
+    let Some(incoming_provenance) = original.as_object() else {
+        return existing.metadata.clone();
+    };
+    let mut result = existing_object.clone();
+    let mut provenance = result
+        .get("provenance")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for key in [
+        "source_kind",
+        "actor",
+        "write_origin",
+        "execution_context",
+        "session_id",
+    ] {
+        if let Some(value) = incoming_provenance.get(key).and_then(Value::as_str) {
+            if let Some(old) = provenance.get(key).and_then(Value::as_str) {
+                if old != value {
+                    return existing.metadata.clone();
+                }
+            } else if !value.trim().is_empty() && !value.contains(['\r', '\n']) {
+                provenance.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    if let (Some(old), Some(new)) = (
+        existing_object.get("actor").and_then(Value::as_str),
+        incoming_provenance.get("actor").and_then(Value::as_str),
+    ) {
+        if old != new {
+            return existing.metadata.clone();
+        }
+    }
+    if !provenance.is_empty() {
+        result.insert("provenance".to_string(), Value::Object(provenance));
+    }
+    Value::Object(result)
+}
+
 /// The durable store handle. Cloneable (shares the pool).
 #[derive(Clone)]
 pub struct Store {
@@ -1934,8 +1999,28 @@ impl Store {
     /// content hash exists, returns `Skipped` and merges any new source ids.
     pub fn upsert_record(&self, new: &NewRecord) -> Result<UpsertOutcome> {
         if let Some(existing) = self.find_by_content_hash(&new.content_hash)? {
-            // Merge new source ids and refresh updated_at; do not duplicate.
-            if !new.source_ids.is_empty() {
+            // Merge source ids and only fill missing allowlisted provenance.
+            // Never replace metadata owned by the existing writer.
+            let original_metadata: Option<String> = if let Some(id) = existing
+                .metadata
+                .get("conclusion_id")
+                .and_then(Value::as_str)
+            {
+                let conn = self.conn()?;
+                conn.query_row(
+                    "SELECT metadata FROM conclusions WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3 AND repo_id IS ?4 AND target = ?5 AND content = ?6",
+                    params![id, existing.profile_id, existing.workspace_id, existing.repo_id, existing.metadata.get("target").and_then(Value::as_str), existing.content],
+                    |row| row.get(0),
+                ).optional()?
+            } else {
+                None
+            };
+            let merged_metadata = original_metadata
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|value| crate::portable_bundle::safe_provenance(&value))
+                .map(|original| merge_allowlisted_metadata(&existing, new, &original))
+                .unwrap_or_else(|| existing.metadata.clone());
+            if !new.source_ids.is_empty() || merged_metadata != existing.metadata {
                 let mut merged = existing.source_ids.clone();
                 for sid in &new.source_ids {
                     if !merged.contains(sid) {
@@ -1945,8 +2030,8 @@ impl Store {
                 let now = ids::now_rfc3339();
                 let conn = self.conn()?;
                 conn.execute(
-                    "UPDATE memory_records SET source_ids = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![serde_json::to_string(&merged)?, now, existing.id],
+                    "UPDATE memory_records SET source_ids = ?1, metadata = ?2, updated_at = ?3 WHERE id = ?4",
+                    params![serde_json::to_string(&merged)?, merged_metadata.to_string(), if new.source_ids.is_empty() { existing.updated_at.clone() } else { now }, existing.id],
                 )?;
             }
             return Ok(UpsertOutcome::Skipped(existing.id));

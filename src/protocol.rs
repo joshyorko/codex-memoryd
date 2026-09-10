@@ -381,6 +381,19 @@ pub struct RecallProvenance {
     pub trust_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_score: Option<f64>,
+    /// Origin metadata for records whose provenance is not an external source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

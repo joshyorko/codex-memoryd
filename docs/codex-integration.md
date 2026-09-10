@@ -167,7 +167,13 @@ Response `data`:
           "subject_id": null,
           "episode_id": null,
           "source_risk": "medium",
-          "trust_level": "high"
+          "trust_level": "high",
+          "origin": "conclusion",
+          "target": "assistant",
+          "source_kind": "hermes_native_memory",
+          "actor": "agent:friday",
+          "write_origin": "assistant_tool",
+          "session_id": "…"
         },
         "admission": {
           "decision": "admitted",
@@ -196,6 +202,11 @@ Response `data`:
 
 For compatibility, existing fields (`summary`, `facts`, `checkpoints`, `citations`, `truncated`, and legacy `authority`) remain valid and unchanged in meaning. New top-level `policy`, `pack`, and per-fact `policy` objects are additive metadata used for diagnostics, pack selection, and ranking auditability.
 `facts[].policy.provenance.source_risk` and `facts[].policy.provenance.trust_level` are additive diagnostics derived from existing record sensitivity and source metadata; they do not affect ranking, storage, or admission.
+`facts[].policy.provenance.origin`, `target`, `source_kind`, `actor`,
+`write_origin`, and `session_id` are additive origin metadata for durable records
+when the writer supplies it. Agent-authored conclusions may have no
+`evidence_refs` when no independent source exists; the provider must not invent
+an external source reference to make the field non-empty.
 `facts[].policy.admission` explains why an emitted item was admitted. `withheld`
 is optional and reports deterministic counts by gate only; it never includes raw
 withheld content.

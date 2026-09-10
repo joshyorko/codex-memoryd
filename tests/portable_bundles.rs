@@ -46,7 +46,7 @@ fn seed_store(path: &Path) -> Store {
             source_ids: Vec::new(),
             content_hash,
             supersedes: Vec::new(),
-            metadata: serde_json::json!({"origin": "fixture"}),
+            metadata: serde_json::json!({"origin": "fixture", "provenance": {"source_kind": "test", "actor": "agent:test", "write_origin": "bundle", "execution_context": "unit"}}),
         })
         .expect("record");
     assert!(matches!(outcome, UpsertOutcome::Created(_)));
@@ -218,6 +218,21 @@ fn bundle_round_trip_is_previewed_atomic_and_idempotent() {
             .expect("query imported")
             .len()
             == 1
+    );
+    let imported = destination
+        .query_records(&codex_memoryd::store::RecordQuery {
+            profile_id: Some("personal".to_string()),
+            workspace_id: Some("bundle-fixture".to_string()),
+            ..Default::default()
+        })
+        .expect("query imported");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].metadata["provenance"]["source_kind"], "test");
+    assert_eq!(imported[0].metadata["provenance"]["actor"], "agent:test");
+    assert_eq!(imported[0].metadata["provenance"]["write_origin"], "bundle");
+    assert_eq!(
+        imported[0].metadata["provenance"]["execution_context"],
+        "unit"
     );
 
     let replay = import_apply(&destination, &bundle_path, &import_options(), &plan_id)
