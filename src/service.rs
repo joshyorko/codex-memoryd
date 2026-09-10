@@ -1916,14 +1916,41 @@ impl Service {
                 (!configured.endpoint.trim().is_empty()).then_some(configured.endpoint.as_str())
             })
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                Error::invalid_request(
-                    "model-backed Dream jobs require an explicit provider endpoint",
-                )
-            })?;
-        if endpoint.contains('@')
-            || !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            .filter(|value| !value.is_empty());
+        let command = if adapter == DreamProviderAdapter::Command {
+            if provider.endpoint.is_some()
+                || provider
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model != configured.model)
+            {
+                return Err(Error::invalid_request(
+                    "command jobs cannot override the configured model or endpoint",
+                ));
+            }
+            if provider.command.is_some() {
+                return Err(Error::invalid_request(
+                    "job-supplied provider commands are denied",
+                ));
+            }
+            if configured.command.is_empty() {
+                return Err(Error::invalid_request(
+                    "command adapter requires configured provider_command",
+                ));
+            }
+            configured.command.clone()
+        } else {
+            Vec::new()
+        };
+        if adapter != DreamProviderAdapter::Command && endpoint.is_none() {
+            return Err(Error::invalid_request(
+                "model-backed Dream jobs require an explicit provider endpoint",
+            ));
+        }
+        let endpoint = endpoint.unwrap_or_default();
+        if adapter != DreamProviderAdapter::Command
+            && (endpoint.contains('@')
+                || !(endpoint.starts_with("http://") || endpoint.starts_with("https://")))
         {
             return Err(Error::invalid_request(
                 "dream provider endpoint must be an http(s) URL without credentials",
@@ -1937,12 +1964,17 @@ impl Service {
             ));
         }
         let uses_configured_endpoint = configured.endpoint.trim() == endpoint;
-        if adapter == DreamProviderAdapter::Provider && !endpoint.starts_with("https://") {
+        if adapter == DreamProviderAdapter::Command {
+            // Native command adapters own their subscription/auth lifecycle.
+        } else if adapter == DreamProviderAdapter::Provider && !endpoint.starts_with("https://") {
             return Err(Error::invalid_request(
                 "provider adapter requires an https endpoint",
             ));
         }
-        if !uses_configured_endpoint && !configured.api_key.trim().is_empty() {
+        if adapter != DreamProviderAdapter::Command
+            && !uses_configured_endpoint
+            && !configured.api_key.trim().is_empty()
+        {
             return Err(Error::secret(
                 "job-supplied provider endpoints cannot use configured credentials",
             ));
@@ -1980,6 +2012,7 @@ impl Service {
         Ok(Some(ResolvedDreamProvider {
             adapter,
             endpoint: endpoint.to_string(),
+            command,
             api_key: uses_configured_endpoint
                 .then(|| configured.api_key.clone())
                 .unwrap_or_default(),
@@ -2071,6 +2104,7 @@ impl Service {
             &crate::provider::DreamProviderRequest {
                 adapter,
                 endpoint: &provider.endpoint,
+                command: &provider.command,
                 api_key: &provider.api_key,
                 model: &provider.model,
                 provider_name: &provider.provider_name,
@@ -2400,22 +2434,69 @@ impl Service {
         }
 
         let started = Instant::now();
-        let result = dream::run(
-            &self.store,
-            &dream::DreamParams {
-                profile,
-                workspace: &workspace,
-                repo_id: None,
-                mode,
-                now: &now,
-                recency_cutoff: watermark_before.as_deref(),
-                include_archived_sources: false,
-                max_records: cfg.max_batch_size,
-                max_candidates: Some(cfg.max_candidates),
-                patch_run_id: None,
-                deadline: None,
-            },
-        );
+        let command_mode = cfg.scheduled_provider_enabled
+            && self.config.dream_provider.enabled
+            && DreamProviderAdapter::parse(&self.config.dream_provider.adapter)
+                == Some(DreamProviderAdapter::Command);
+        let result = if command_mode {
+            if cfg.automatic_apply {
+                Err(Error::invalid_request(
+                    "scheduled command providers are preview-only",
+                ))
+            } else {
+                self.run_dream_job(DreamJobRunRequest {
+                    job_id: None,
+                    profile: Some(profile.as_str().to_string()),
+                    workspace: Some(workspace.clone()),
+                    repo: None,
+                    now: Some(now.clone()),
+                    since: watermark_before.clone(),
+                    kind: "dream_preview".to_string(),
+                    mode: Some("command".to_string()),
+                    provider: None,
+                    budget: DreamJobBudget {
+                        max_runtime_seconds: cfg.max_runtime_seconds,
+                        max_input_records: cfg.max_batch_size,
+                        max_candidates: cfg.max_candidates,
+                        max_input_tokens: 8000,
+                        max_output_tokens: 2048,
+                        max_input_bytes: 32000,
+                        max_output_bytes: 262144,
+                        max_provider_calls: 1,
+                        max_retries: 0,
+                        max_cost_micros: 0,
+                        daily_cost_ceiling_micros: self
+                            .config
+                            .dream_provider
+                            .daily_cost_ceiling_micros,
+                    },
+                })
+                .and_then(|job| {
+                    if job.status == "error" {
+                        Err(Error::internal("scheduled native provider preview failed"))
+                    } else {
+                        Ok((job.preview, !job.limits_hit.is_empty()))
+                    }
+                })
+            }
+        } else {
+            dream::run(
+                &self.store,
+                &dream::DreamParams {
+                    profile,
+                    workspace: &workspace,
+                    repo_id: None,
+                    mode,
+                    now: &now,
+                    recency_cutoff: watermark_before.as_deref(),
+                    include_archived_sources: false,
+                    max_records: cfg.max_batch_size,
+                    max_candidates: Some(cfg.max_candidates),
+                    patch_run_id: None,
+                    deadline: None,
+                },
+            )
+        };
         let elapsed = started.elapsed();
         let mut limits_hit = Vec::new();
         if elapsed.as_secs() >= cfg.max_runtime_seconds {
@@ -2424,7 +2505,8 @@ impl Service {
         match result {
             Ok((mut run, mut max_candidates_hit)) => {
                 let provider_config = &self.config.dream_provider;
-                if self.config.dream_scheduler.scheduled_provider_enabled
+                if !command_mode
+                    && self.config.dream_scheduler.scheduled_provider_enabled
                     && provider_config.enabled
                     && !provider_config.endpoint.trim().is_empty()
                 {
@@ -3123,8 +3205,9 @@ fn extract_evidence_refs(metadata: &Value) -> Vec<DreamEvidenceSource> {
 
 struct ResolvedDreamProvider {
     adapter: DreamProviderAdapter,
-    endpoint: String,
-    api_key: String,
+    pub endpoint: String,
+    command: Vec<String>,
+    pub api_key: String,
     model: String,
     provider_name: String,
     timeout: StdDuration,
@@ -3223,7 +3306,7 @@ fn dream_provider_context(response: &DreamResponse) -> Result<String> {
         "profile": response.profile,
         "workspace": response.workspace,
         "repo_id": response.repo_id,
-        "evidence_window": response.evidence_window,
+        "evidence_window": {"start": response.evidence_window.start, "end": response.evidence_window.end},
         "evidence_content": evidence_content,
     }))
     .map_err(Error::from)
@@ -4869,5 +4952,31 @@ mod scheduled_dream_mode_tests {
             .expect("promoted");
         assert!(promoted.supersedes.is_empty());
         assert!(archived.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod provider_projection_review_tests {
+    use super::*;
+    #[test]
+    fn provider_projection_omits_unneeded_raw_evidence_metadata() {
+        let svc = Service::new(Store::open(":memory:").unwrap(), Config::default());
+        svc.conclusions(serde_json::from_value(json!({"profile":"personal","workspace":"ws","conclusions":["Preference: concise updates"]})).unwrap()).unwrap();
+        let mut response = svc
+            .dream(
+                serde_json::from_value(
+                    json!({"profile":"personal","workspace":"ws","mode":"preview"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        response.evidence_window.conclusions.sources[0].conversation_title =
+            Some("private-title-sentinel".into());
+        response.evidence_window.conclusions.sources[0].source_path =
+            Some("private-path-sentinel".into());
+        let context = dream_provider_context(&response).unwrap();
+        assert!(!context.contains("private-title-sentinel"));
+        assert!(!context.contains("private-path-sentinel"));
+        assert!(context.contains("concise updates"));
     }
 }

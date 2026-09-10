@@ -1,0 +1,56 @@
+use codex_memoryd::protocol::ConclusionsRequest;
+use codex_memoryd::{config::Config, service::Service, store::Store};
+use serde_json::json;
+
+fn service(script: &str) -> (Service, Store) {
+    let store = Store::open(":memory:").unwrap();
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec!["/bin/sh".into(), "-c".into(), script.into()];
+    let svc = Service::new(store.clone(), config);
+    let req: ConclusionsRequest = serde_json::from_value(json!({
+        "profile":"personal", "workspace":"ws", "target":"user",
+        "conclusions":["Preference: concise summaries"]
+    }))
+    .unwrap();
+    svc.conclusions(req).unwrap();
+    (svc, store)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scheduled_command_uses_typed_preview_without_promoting_memory() {
+    let (svc, _) = service(
+        r#"cat >/dev/null; printf '{"schema_version":"dream-preview-v1","profile":"personal","workspace":"ws","candidates":[]}'"#,
+    );
+    let result = svc.scheduled_dream(None).unwrap();
+    assert_eq!(result.status, "ok");
+    let preview = result.run.unwrap();
+    assert!(preview.created.is_empty());
+    assert!(preview.archived.is_empty());
+    assert_eq!(
+        serde_json::to_value(preview).unwrap()["provenance"]["adapter"],
+        "command"
+    );
+    assert!(result.watermark_after.is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_scheduled_command_does_not_advance_success_watermark() {
+    let (svc, store) = service("cat >/dev/null; exit 7");
+    let error = svc.scheduled_dream(None).unwrap_err();
+    assert!(error.message.contains("provider command"));
+    assert!(store
+        .scheduled_dream_watermark("personal", "ws", None)
+        .unwrap()
+        .is_none());
+}

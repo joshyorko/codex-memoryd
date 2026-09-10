@@ -102,6 +102,7 @@ pub struct DreamSection {
     pub provider_endpoint: Option<String>,
     pub provider_model: Option<String>,
     pub provider_name: Option<String>,
+    pub provider_command: Option<Vec<String>>,
     pub provider_timeout_seconds: Option<u64>,
     pub provider_max_response_bytes: Option<usize>,
     pub provider_cost_per_1k_input_micros: Option<u64>,
@@ -132,6 +133,7 @@ pub struct DreamProviderConfig {
     pub api_key: String,
     pub model: String,
     pub provider_name: String,
+    pub command: Vec<String>,
     pub timeout_seconds: u64,
     pub max_response_bytes: usize,
     pub cost_per_1k_input_micros: u64,
@@ -148,6 +150,7 @@ impl fmt::Debug for DreamProviderConfig {
             .field("api_key", &"[redacted]")
             .field("model", &self.model)
             .field("provider_name", &self.provider_name)
+            .field("command", &self.command)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("cost_per_1k_input_micros", &self.cost_per_1k_input_micros)
@@ -166,6 +169,7 @@ impl Default for DreamProviderConfig {
             api_key: String::new(),
             model: String::new(),
             provider_name: "openai-compatible".to_string(),
+            command: Vec::new(),
             timeout_seconds: 10,
             max_response_bytes: 256 * 1024,
             cost_per_1k_input_micros: 0,
@@ -547,6 +551,9 @@ impl Config {
         if let Some(name) = file.dream.provider_name {
             self.dream_provider.provider_name = name;
         }
+        if let Some(command) = file.dream.provider_command {
+            self.dream_provider.command = command;
+        }
         if let Some(seconds) = file.dream.provider_timeout_seconds {
             self.dream_provider.timeout_seconds = seconds;
         }
@@ -608,7 +615,7 @@ impl Config {
         }
         if DreamProviderAdapter::parse(&self.dream_provider.adapter).is_none() {
             return Err(Error::invalid_request(format!(
-                "dream.provider_adapter must be deterministic, local-model, or provider (got '{}')",
+                "dream.provider_adapter must be deterministic, local-model, provider, or command (got '{}')",
                 self.dream_provider.adapter
             )));
         }
@@ -620,6 +627,14 @@ impl Config {
         if self.dream_provider.max_response_bytes == 0 {
             return Err(Error::invalid_request(
                 "dream.provider_max_response_bytes must be > 0",
+            ));
+        }
+        if DreamProviderAdapter::parse(&self.dream_provider.adapter)
+            == Some(DreamProviderAdapter::Command)
+            && self.dream_provider.command.is_empty()
+        {
+            return Err(Error::invalid_request(
+                "dream.provider_command must contain an executable",
             ));
         }
         if self.dream_provider.endpoint.contains('@') {
