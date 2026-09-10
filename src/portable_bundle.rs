@@ -225,6 +225,8 @@ pub struct SafeMetadata {
     pub redaction_state: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_artifact_stored: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2782,7 +2784,27 @@ fn safe_metadata(value: &Value) -> SafeMetadata {
         raw_artifact_stored: object
             .get("raw_artifact_stored")
             .and_then(sanitize_metadata_value),
+        provenance: object.get("provenance").and_then(safe_provenance),
     }
+}
+
+pub(crate) fn safe_provenance(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut sanitized = Map::new();
+    for key in [
+        "source_kind",
+        "actor",
+        "write_origin",
+        "execution_context",
+        "session_id",
+    ] {
+        if let Some(value) = object.get(key).and_then(Value::as_str).map(str::trim) {
+            if !value.is_empty() && !value.contains(['\r', '\n']) {
+                sanitized.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    sanitize_metadata_value(&Value::Object(sanitized))
 }
 
 fn sanitize_metadata_value(value: &Value) -> Option<Value> {
@@ -4385,6 +4407,9 @@ fn metadata_value(metadata: &SafeMetadata) -> Value {
     }
     if let Some(value) = &metadata.raw_artifact_stored {
         object.insert("raw_artifact_stored".to_string(), value.clone());
+    }
+    if let Some(value) = &metadata.provenance {
+        object.insert("provenance".to_string(), value.clone());
     }
     Value::Object(object)
 }

@@ -880,6 +880,9 @@ impl Service {
         self.store.ensure_workspace(profile.as_str(), &workspace)?;
 
         let target = req.target.clone().unwrap_or_else(|| "user".to_string());
+        if !matches!(target.as_str(), "user" | "assistant") {
+            return Err(Error::invalid_request("target must be user or assistant"));
+        }
         let metadata = screen_optional_json_metadata("conclusions.metadata", &req.metadata)?;
         let conclusions = req
             .conclusions

@@ -683,7 +683,9 @@ fn recall_provenance(record: &MemoryRecord) -> RecallProvenance {
         source_kind: record_provenance
             .and_then(|metadata| metadata_string(metadata, "source_kind"))
             .or_else(|| metadata_string(&record.metadata, "source_kind")),
-        actor: record_provenance.and_then(|metadata| metadata_string(metadata, "actor")),
+        actor: record_provenance
+            .and_then(|metadata| metadata_string(metadata, "actor"))
+            .or_else(|| metadata_string(&record.metadata, "actor")),
         write_origin: record_provenance
             .and_then(|metadata| metadata_string(metadata, "write_origin")),
         session_id: record_provenance.and_then(|metadata| metadata_string(metadata, "session_id")),

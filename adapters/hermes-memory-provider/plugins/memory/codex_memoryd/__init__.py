@@ -167,12 +167,17 @@ class CodexMemoryDProvider(MemoryProvider):
                 content = fact.get("content")
                 if not content:
                     continue
-                provenance = ((fact.get("policy") or {}).get("provenance") or {})
+                provenance = dict(((fact.get("policy") or {}).get("provenance") or {}))
+                if not provenance.get("actor") and fact.get("actor"):
+                    provenance["actor"] = fact["actor"]
                 labels = [f"record: {fact['id']}"] if fact.get("id") else []
                 for key in ("profile_id", "workspace_id", "trust_level", "origin", "target",
                             "source_kind", "actor", "write_origin", "session_id"):
                     if provenance.get(key):
-                        labels.append(f"{key}: {provenance[key]}")
+                        value = "".join(ch if ch.isprintable() and ch not in "[]" else " " for ch in str(provenance[key]))
+                        if key == "target" and value not in {"user", "assistant"}:
+                            value = "unrecognized"
+                        labels.append(f"{key}: {value}")
                 refs = list(provenance.get("evidence_refs") or [])
                 refs.extend(c["source_id"] for c in (data.get("data") or {}).get("citations", [])
                             if c.get("memory_id") == fact.get("id") and c.get("source_id"))
