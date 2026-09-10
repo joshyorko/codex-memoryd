@@ -344,6 +344,9 @@ Rules:
 - `content` MUST be concise enough for retrieval and display.
 - Providers SHOULD reject oversized memory records.
 - Providers MUST retain provenance.
+- Agent-authored conclusions MAY have an empty `source_ids` list when no
+  independent source exists; their origin metadata MUST remain distinguishable
+  and MUST NOT be converted into an external evidence reference.
 - Providers SHOULD prefer updating or superseding old memories over duplicating similar facts.
 - Archived records MUST NOT be returned by default recall.
 
@@ -671,6 +674,9 @@ Rules:
 - Conclusions MUST pass policy checks.
 - Conclusions SHOULD become memory records.
 - Conclusions SHOULD preserve metadata and provenance.
+- When a conclusion becomes a memory record, safe origin metadata may be copied
+  into the record's provenance metadata without turning the conclusion into an
+  independent source.
 
 ### 6.5a `POST /v1/checkpoints`
 

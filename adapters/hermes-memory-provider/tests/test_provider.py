@@ -86,6 +86,57 @@ def test_builtin_memory_write_is_mirrored_with_explicit_provenance():
     assert request["metadata"]["actor"] == "agent:friday"
     assert request["metadata"]["source_kind"] == "friday_self_memory"
     httpd.shutdown()
+    httpd.server_close()
+
+
+def test_native_user_memory_write_is_not_labeled_as_import():
+    httpd = server()
+    try:
+        provider = CodexMemoryDProvider({'endpoint': f'http://127.0.0.1:{httpd.server_port}',
+                                         'bootstrap_origin': False})
+        provider.initialize('session-1', agent_identity='friday', platform='cli')
+        provider.on_memory_write('add', 'user', 'Synthetic user profile correction.',
+                                 {'write_origin': 'assistant_tool', 'session_id': 'session-1'})
+        path, request = MemoryDHandler.requests[0]
+        assert path == '/v1/conclusions'
+        assert request['metadata']['write_origin'] == 'assistant_tool'
+        assert request['metadata']['source_kind'] == 'hermes_native_memory'
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_recall_renders_native_conclusion_provenance_without_evidence_ref():
+    httpd = server()
+    try:
+        MemoryDHandler.recall_facts = [{
+            'id': 'record-native',
+            'content': 'Synthetic corrected fact',
+            'policy': {'provenance': {
+                'profile_id': 'personal',
+                'workspace_id': 'friday-self',
+                'origin': 'conclusion',
+                'target': 'assistant',
+                'source_kind': 'friday_self_memory',
+                'actor': 'agent:friday',
+                'write_origin': 'assistant_tool',
+                'session_id': 'synthetic-writer',
+            }},
+        }]
+        provider = CodexMemoryDProvider({'endpoint': f'http://127.0.0.1:{httpd.server_port}',
+                                         'bootstrap_origin': False})
+        rendered = provider.prefetch('synthetic corrected')
+        assert 'origin: conclusion' in rendered
+        assert 'target: assistant' in rendered
+        assert 'source_kind: friday_self_memory' in rendered
+        assert 'actor: agent:friday' in rendered
+        assert 'write_origin: assistant_tool' in rendered
+        assert 'session_id: synthetic-writer' in rendered
+        assert 'evidence:' not in rendered
+    finally:
+        MemoryDHandler.recall_facts = []
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_origin_bootstrap_sends_builtin_record_without_rewriting_it(tmp_path):

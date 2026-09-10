@@ -880,6 +880,9 @@ impl Service {
         self.store.ensure_workspace(profile.as_str(), &workspace)?;
 
         let target = req.target.clone().unwrap_or_else(|| "user".to_string());
+        if !matches!(target.as_str(), "user" | "assistant") {
+            return Err(Error::invalid_request("target must be user or assistant"));
+        }
         let metadata = screen_optional_json_metadata("conclusions.metadata", &req.metadata)?;
         let conclusions = req
             .conclusions
@@ -990,7 +993,7 @@ impl Service {
                 source_ids: vec![],
                 content_hash: content_hash.clone(),
                 supersedes: vec![],
-                metadata: json!({ "origin": "conclusion", "conclusion_id": conclusion.id, "target": target.clone() }),
+                metadata: conclusion_record_metadata(&conclusion.id, &target, metadata.as_ref()),
             };
             if let crate::store::UpsertOutcome::Created(id) = self.store.upsert_record(&new)? {
                 record_ids.push(id);
@@ -4242,6 +4245,43 @@ fn screen_optional_json_metadata(field: &str, value: &Option<Value>) -> Result<O
         }
         None => Ok(None),
     }
+}
+
+const CONCLUSION_RECORD_PROVENANCE_KEYS: &[&str] = &[
+    "source_kind",
+    "actor",
+    "write_origin",
+    "execution_context",
+    "session_id",
+];
+
+fn conclusion_record_metadata(
+    conclusion_id: &str,
+    target: &str,
+    request_metadata: Option<&Value>,
+) -> Value {
+    let mut record = json!({
+        "origin": "conclusion",
+        "conclusion_id": conclusion_id,
+        "target": target,
+    });
+    let mut provenance = serde_json::Map::new();
+    if let Some(metadata) = request_metadata.and_then(Value::as_object) {
+        for key in CONCLUSION_RECORD_PROVENANCE_KEYS {
+            if let Some(value) = metadata
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                provenance.insert((*key).to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    if !provenance.is_empty() {
+        record["provenance"] = Value::Object(provenance);
+    }
+    record
 }
 
 fn screen_json_metadata(field: &str, value: &Value) -> Result<()> {
