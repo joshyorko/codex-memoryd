@@ -307,6 +307,7 @@ dependencies = [
  "axum",
  "clap",
  "dirs 5.0.1",
+ "libc",
  "once_cell",
  "predicates",
  "r2d2",
