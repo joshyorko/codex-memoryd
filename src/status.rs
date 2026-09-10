@@ -186,15 +186,24 @@ fn dream_worker_status(
     } else {
         "deterministic"
     };
-    let local_provider_configured =
-        model_enabled && configured_adapter == crate::protocol::DreamProviderAdapter::LocalModel;
+    let command_configured = model_enabled
+        && configured_adapter == crate::protocol::DreamProviderAdapter::Command
+        && !config.dream_provider.command.is_empty();
+    let command_ready = cfg!(target_os = "linux")
+        && command_configured
+        && std::path::Path::new(&config.dream_provider.command[0]).is_file()
+        && !config.dream_provider.model.trim().is_empty();
+    let local_provider_configured = model_enabled
+        && (configured_adapter == crate::protocol::DreamProviderAdapter::LocalModel
+            || command_configured);
     let provider_configured =
         model_enabled && configured_adapter == crate::protocol::DreamProviderAdapter::Provider;
     let endpoint_configured = !config.dream_provider.endpoint.trim().is_empty();
-    let local_provider_ready = local_provider_configured
-        && endpoint_configured
-        && !config.dream_provider.model.trim().is_empty()
-        && parse_local_http_endpoint(&config.dream_provider.endpoint).is_some();
+    let local_provider_ready = command_ready
+        || (local_provider_configured
+            && endpoint_configured
+            && !config.dream_provider.model.trim().is_empty()
+            && parse_local_http_endpoint(&config.dream_provider.endpoint).is_some());
     let provider_ready = provider_configured
         && endpoint_configured
         && !config.dream_provider.model.trim().is_empty()
@@ -204,7 +213,7 @@ fn dream_worker_status(
     DreamWorkerStatus {
         enabled: dream_scheduler.enabled,
         mode: mode.to_string(),
-        configured: !model_enabled || endpoint_configured,
+        configured: !model_enabled || endpoint_configured || command_configured,
         active: false,
         preview_only: true,
         automatic_apply: config.dream_scheduler.automatic_apply,
@@ -228,9 +237,9 @@ fn dream_worker_status(
             max_batch_size: config.dream_scheduler.max_batch_size,
             max_candidates: config.dream_scheduler.max_candidates,
             max_runtime_seconds: config.dream_scheduler.max_runtime_seconds,
-            max_input_tokens: 0,
-            max_output_tokens: 0,
-            max_input_bytes: 0,
+            max_input_tokens: if command_configured { 8000 } else { 0 },
+            max_output_tokens: if command_configured { 2048 } else { 0 },
+            max_input_bytes: if command_configured { 32000 } else { 0 },
             max_output_bytes: config.dream_provider.max_response_bytes,
             max_provider_calls: 1,
             max_retries: 0,

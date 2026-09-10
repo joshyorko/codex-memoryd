@@ -162,16 +162,16 @@ pub fn run(service: &Service) -> Result<DoctorReport> {
     })
 }
 
-/// Whether the committed policy corpus fixtures are present in the source tree.
-/// Best-effort: looks relative to the manifest dir, which exists in dev/CI.
+/// Verify that the packaged policy fixtures remain valid JSON.
 fn policy_corpus_present() -> bool {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("policy");
-    ["allow.json", "deny.json", "redact.json"]
-        .iter()
-        .all(|f| dir.join(f).exists())
+    // Installed binaries must not depend on the build machine's source path.
+    [
+        include_str!("../tests/fixtures/policy/allow.json"),
+        include_str!("../tests/fixtures/policy/deny.json"),
+        include_str!("../tests/fixtures/policy/redact.json"),
+    ]
+    .iter()
+    .all(|fixture| serde_json::from_str::<serde_json::Value>(fixture).is_ok())
 }
 
 /// Render a short human summary of the report.

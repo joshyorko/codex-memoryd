@@ -249,6 +249,7 @@ pub enum DreamProviderAdapter {
     Deterministic,
     LocalModel,
     Provider,
+    Command,
 }
 
 impl Default for DreamProviderAdapter {
@@ -263,6 +264,7 @@ impl DreamProviderAdapter {
             Self::Deterministic => "deterministic",
             Self::LocalModel => "local-model",
             Self::Provider => "provider",
+            Self::Command => "command",
         }
     }
 
@@ -271,6 +273,7 @@ impl DreamProviderAdapter {
             "deterministic" => Some(Self::Deterministic),
             "local-model" | "local" => Some(Self::LocalModel),
             "provider" | "remote-provider" => Some(Self::Provider),
+            "command" | "native-command" => Some(Self::Command),
             _ => None,
         }
     }
