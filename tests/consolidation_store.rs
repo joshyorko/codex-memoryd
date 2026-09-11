@@ -221,6 +221,49 @@ fn guarded_undo_preserves_a_later_edit() {
 }
 
 #[test]
+fn deferred_candidate_does_not_freeze_independent_adoption() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("output-a");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates.push(ConsolidationCandidate {
+        candidate_id: "candidate-2".into(),
+        output_digest: "output-b".into(),
+        claim: "prefers stable interfaces".into(),
+        claim_class: "preference".into(),
+        subject: "synthetic-user".into(),
+        inferred: false,
+        source_ids: vec!["source-2".into()],
+        supporting_spans: vec!["I prefer stable interfaces".into()],
+    });
+    let decisions = vec![
+        ConsolidationDecision {
+            candidate_id: "candidate-1".into(),
+            output_digest: "output-a".into(),
+            operation: ConsolidationOperation::Defer,
+            reason: "validator unavailable".into(),
+            distinct_evidence_roots: vec![],
+            validator: None,
+        },
+        ConsolidationDecision {
+            candidate_id: "candidate-2".into(),
+            output_digest: "output-b".into(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: vec!["root-2".into()],
+            validator: None,
+        },
+    ];
+    store
+        .persist_consolidation_batch(&proposal, Some(&decisions), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &decisions)
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(store.count_records().unwrap(), 1);
+}
+
+#[test]
 fn changed_policy_cannot_apply_a_persisted_batch() {
     let store = Store::open(":memory:").unwrap();
     let proposal = batch("output-a");
