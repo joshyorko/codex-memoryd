@@ -1909,7 +1909,7 @@ impl Service {
         }
 
         let configured = &self.config.dream_provider;
-        if !configured.enabled {
+        if adapter == DreamProviderAdapter::Command && !configured.enabled {
             return Err(Error::invalid_request(
                 "model-backed Dream jobs require enabled runtime provider configuration",
             ));
@@ -2098,6 +2098,25 @@ impl Service {
             ));
         }
         let model_input = dream_provider_context(&response)?;
+        let remaining_candidates = budget
+            .max_candidates
+            .saturating_sub(response.candidates.len() + response.rejected.len());
+        if remaining_candidates == 0 {
+            return Ok((
+                response,
+                true,
+                None,
+                Some(DreamBudgetUsage {
+                    input_records,
+                    output_candidates: budget.max_candidates,
+                    ..DreamBudgetUsage::default()
+                }),
+            ));
+        }
+        let provider_budget = DreamJobBudget {
+            max_candidates: remaining_candidates,
+            ..budget.clone()
+        };
         if adapter == DreamProviderAdapter::Provider {
             if let Some(limit) = provider.daily_cost_ceiling_micros {
                 let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
@@ -2128,7 +2147,7 @@ impl Service {
             &response.workspace,
             response.repo_id.as_deref(),
             &model_input,
-            budget,
+            &provider_budget,
         )?;
         validate_provider_scope(
             &response,
@@ -3315,10 +3334,49 @@ fn dream_provider_context(response: &DreamResponse) -> Result<String> {
         "profile": response.profile,
         "workspace": response.workspace,
         "repo_id": response.repo_id,
-        "evidence_window": {"start": response.evidence_window.start, "end": response.evidence_window.end},
+        "evidence_window": {
+            "start": response.evidence_window.start,
+            "end": response.evidence_window.end,
+            "visible_turns": provider_evidence_stream(&response.evidence_window.visible_turns),
+            "conclusions": provider_evidence_stream(&response.evidence_window.conclusions),
+            "checkpoints": provider_evidence_stream(&response.evidence_window.checkpoints),
+            "imported_memories": provider_evidence_stream(&response.evidence_window.imported_memories),
+            "active_memory_records": provider_evidence_stream(&response.evidence_window.active_memory_records),
+        },
         "evidence_content": evidence_content,
     }))
     .map_err(Error::from)
+}
+
+fn provider_evidence_stream(stream: &DreamEvidenceStream) -> Value {
+    let sources = stream
+        .sources
+        .iter()
+        .map(|source| {
+            let content = source.content.as_deref().map(|content| {
+                match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                    PolicyDecision::Accept(value) => value,
+                    PolicyDecision::Reject { .. } => "[screened]".to_string(),
+                }
+            });
+            json!({
+                "id": source.id,
+                "kind": source.kind,
+                "created_at": source.created_at,
+                "updated_at": source.updated_at,
+                "actor": source.actor,
+                "record_type": source.record_type,
+                "state": source.state,
+                "summary": source.summary,
+                "content": content,
+                "source_path": source.source_path,
+                "conversation_id": source.conversation_id,
+                "message_id": source.message_id,
+                "turn_index": source.turn_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"count": stream.count, "sources": sources})
 }
 
 fn validate_provider_scope(
