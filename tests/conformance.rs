@@ -712,7 +712,10 @@ fn recall_exposes_policy_metadata_and_deprioritizes_stale_records() {
         .ranking_signals
         .contains(&"recency".to_string()));
     assert!(recall.facts.len() >= 2);
-    assert_eq!(recall.facts[0].id, fresh_id);
+    assert_eq!(
+        recall.facts[0].id,
+        ids::public_handle(ids::PublicHandleKind::MemoryRef, &fresh_id)
+    );
     assert_eq!(recall.facts[0].policy.rank, 1);
     assert!(!recall.facts[0].policy.freshness.stale);
     assert_eq!(recall.facts[0].policy.admission.decision, "admitted");
@@ -780,7 +783,10 @@ fn recall_applies_operational_valence_as_ranking_signal_only() {
         .unwrap();
 
     assert_eq!(recall.authority, "recall_not_authority");
-    assert_eq!(recall.facts[0].id, marker_id);
+    assert_eq!(
+        recall.facts[0].id,
+        ids::public_handle(ids::PublicHandleKind::MemoryRef, &marker_id)
+    );
     assert_eq!(recall.facts[0].policy.admission.decision, "admitted");
     assert!(recall.facts[0]
         .policy
@@ -821,11 +827,14 @@ fn recall_prevents_stale_battle_scar_from_dominating_new_evidence() {
         .recall(recall_req("personal", "ws", "cache warmup"))
         .unwrap();
 
-    assert_eq!(recall.facts[0].id, fresh_id);
+    assert_eq!(
+        recall.facts[0].id,
+        ids::public_handle(ids::PublicHandleKind::MemoryRef, &fresh_id)
+    );
     let scar = recall
         .facts
         .iter()
-        .find(|fact| fact.id == scar_id)
+        .find(|fact| fact.id == ids::public_handle(ids::PublicHandleKind::MemoryRef, &scar_id))
         .expect("scar remains recallable");
     assert!(scar
         .policy

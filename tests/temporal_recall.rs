@@ -224,7 +224,11 @@ fn assert_fixture(path: &str) {
 
     for query in &fixture.queries {
         let actual = recall_ids(&store, &fixture, query);
-        let expected: BTreeSet<String> = query.expect_visible.iter().cloned().collect();
+        let expected: BTreeSet<String> = query
+            .expect_visible
+            .iter()
+            .map(|id| ids::public_handle(ids::PublicHandleKind::MemoryRef, id))
+            .collect();
         assert_eq!(
             actual, expected,
             "{} / {} visible ids",
@@ -348,7 +352,10 @@ fn invalidate_record_hides_claim_from_default_recall_but_preserves_history() {
     )
     .unwrap();
     assert_eq!(history.facts.len(), 1);
-    assert_eq!(history.facts[0].id, id);
+    assert_eq!(
+        history.facts[0].id,
+        ids::public_handle(ids::PublicHandleKind::MemoryRef, &id)
+    );
 }
 
 #[test]
@@ -397,6 +404,12 @@ fn include_history_mode_keeps_old_evidence_inspectable() {
         .map(|fact| fact.id)
         .collect();
 
-    assert!(ids.contains("pref_spaces"));
-    assert!(ids.contains("pref_tabs"));
+    assert!(ids.contains(&ids::public_handle(
+        ids::PublicHandleKind::MemoryRef,
+        "pref_spaces"
+    )));
+    assert!(ids.contains(&ids::public_handle(
+        ids::PublicHandleKind::MemoryRef,
+        "pref_tabs"
+    )));
 }
