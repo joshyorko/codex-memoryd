@@ -136,3 +136,33 @@ fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
         .apply_consolidation_proposal("batch-recovery-1", &preview, &[])
         .is_err());
 }
+
+#[test]
+fn guarded_undo_archives_only_untouched_batch_records() {
+    let store = Store::open(":memory:").unwrap();
+    let proposal = batch("output-a");
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-a".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let ids = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision])
+        .unwrap();
+    assert_eq!(
+        store
+            .undo_consolidation_proposal("batch-recovery-1")
+            .unwrap(),
+        ids
+    );
+    assert!(store.get_record(&ids[0]).unwrap().unwrap().archived);
+    assert!(store
+        .undo_consolidation_proposal("batch-recovery-1")
+        .is_err());
+}

@@ -629,6 +629,11 @@ impl Store {
             if status == "applied" {
                 return record_ids_for_batch(tx, batch_id);
             }
+            if status == "reverted" {
+                return Err(Error::invalid_request(
+                    "consolidation proposal has already been reverted",
+                ));
+            }
             if stored_decisions.as_deref() != Some(decisions_json.as_str()) {
                 return Err(Error::new(
                     ErrorCode::BundlePlanStale,
@@ -698,6 +703,51 @@ impl Store {
             Ok(applied)
         })?;
         Ok(ids)
+    }
+
+    /// Guarded inverse for an applied batch. Records changed after adoption
+    /// are left untouched; this is never a whole-database rollback.
+    pub fn undo_consolidation_proposal(&self, batch_id: &str) -> Result<Vec<String>> {
+        self.transaction_immediate(|tx| {
+            let status: String = tx
+                .query_row(
+                    "SELECT status FROM consolidation_proposals WHERE batch_id = ?1",
+                    rusqlite::params![batch_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+            if status != "applied" {
+                return Err(Error::invalid_request(
+                    "only an applied consolidation proposal can be undone",
+                ));
+            }
+            let mut stmt = tx.prepare(
+                "SELECT id FROM memory_records
+                 WHERE json_extract(metadata, '$.batch_id') = ?1
+                   AND archived = 0 AND updated_at = created_at
+                 ORDER BY id",
+            )?;
+            let ids = stmt
+                .query_map(rusqlite::params![batch_id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            drop(stmt);
+            tx.execute(
+                "UPDATE memory_records
+                 SET archived = 1, temporal_state = 'historical',
+                     historical_reason = 'governed_consolidation_undo',
+                     updated_at = ?1,
+                     metadata = json_set(metadata, '$.undo_batch_id', ?2)
+                 WHERE json_extract(metadata, '$.batch_id') = ?2
+                   AND archived = 0 AND updated_at = created_at",
+                rusqlite::params![ids::now_rfc3339(), batch_id],
+            )?;
+            tx.execute(
+                "UPDATE consolidation_proposals SET status = 'reverted', updated_at = ?1 WHERE batch_id = ?2",
+                rusqlite::params![ids::now_rfc3339(), batch_id],
+            )?;
+            Ok(ids)
+        })
     }
 
     pub fn ensure_workspace_in_transaction(
