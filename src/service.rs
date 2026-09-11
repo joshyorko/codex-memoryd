@@ -2750,6 +2750,7 @@ impl Service {
                     inferred: false,
                     source_ids: candidate.evidence_ids.clone(),
                     supporting_spans: vec![candidate.content.clone()],
+                    supersedes: candidate.supersedes.clone(),
                 };
                 let evidence = candidate
                     .evidence_refs
@@ -2807,6 +2808,7 @@ impl Service {
                 operation: ConsolidationOperation::AdoptStatement,
                 reason: "deterministic source-backed candidate".to_string(),
                 distinct_evidence_roots: candidate.source_ids.clone(),
+                supersedes: candidate.supersedes.clone(),
                 validator: None,
             })
             .collect::<Vec<_>>();
@@ -2815,6 +2817,13 @@ impl Service {
         run.created =
             self.store
                 .apply_consolidation_proposal(&batch.batch_id, &policy, &decisions)?;
+        run.archived = batch
+            .candidates
+            .iter()
+            .flat_map(|candidate| candidate.supersedes.iter().cloned())
+            .collect();
+        run.archived.sort();
+        run.archived.dedup();
         run.mode = "apply".to_string();
         Ok(())
     }

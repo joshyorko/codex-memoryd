@@ -68,6 +68,112 @@ fn governed_adoption_survives_restart_and_fresh_recall() {
 }
 
 #[test]
+fn scheduled_adoption_fresh_consumer_correction_wins_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("correction.sqlite");
+    let old = "Decision: project cobalt uses violet lanterns for release ceremonies.";
+    let new =
+        "Correction: project cobalt uses amber lanterns for release ceremonies instead of violet lanterns.";
+
+    let first = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    first
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            target: Some("user".into()),
+            conclusions: Some(vec![old.into()]),
+            metadata: None,
+            record_type: Some("decision".into()),
+        })
+        .unwrap();
+    let first_run = first
+        .scheduled_dream(Some("2000-01-01T00:00:00Z".into()))
+        .unwrap()
+        .run
+        .unwrap();
+    let old_id = first_run.created[0].clone();
+    drop(first);
+
+    let second = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    let before = second
+        .recall(RecallRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            session: None,
+            query: Some("cobalt release ceremonies".into()),
+            files: vec![],
+            max_tokens: Some(500),
+            pack_mode: Some("default".into()),
+            include_types: vec![],
+            exclude_types: vec![],
+            recency_days: None,
+            as_of: None,
+            include_history: false,
+            metadata: None,
+        })
+        .unwrap();
+    assert!(before.facts.iter().any(|fact| fact.content == old));
+
+    let correction = second
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            target: Some("user".into()),
+            conclusions: Some(vec![new.into()]),
+            metadata: None,
+            record_type: Some("decision".into()),
+        })
+        .unwrap();
+    let new_id = correction.record_ids[0].clone();
+    let second_run = second
+        .scheduled_dream(Some("2100-01-01T00:00:00Z".into()))
+        .unwrap()
+        .run
+        .unwrap();
+    assert!(second_run.archived.contains(&old_id));
+    assert!(
+        second.store.get_record(&old_id).unwrap().unwrap().archived,
+        "scheduled correction must archive the superseded record"
+    );
+    assert_eq!(
+        second
+            .store
+            .get_record(&new_id)
+            .unwrap()
+            .unwrap()
+            .supersedes,
+        vec![old_id.clone()]
+    );
+    drop(second);
+
+    let fresh = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    let after = fresh
+        .recall(RecallRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            session: None,
+            query: Some("cobalt release ceremonies".into()),
+            files: vec![],
+            max_tokens: Some(500),
+            pack_mode: Some("default".into()),
+            include_types: vec![],
+            exclude_types: vec![],
+            recency_days: None,
+            as_of: None,
+            include_history: false,
+            metadata: None,
+        })
+        .unwrap();
+    assert!(after.facts.iter().any(|fact| fact.content == new));
+    assert!(!after.facts.iter().any(|fact| fact.content == old));
+    assert_eq!(after.authority, "recall_not_authority");
+}
+
+#[test]
 fn consolidation_controls_cannot_activate_disabled_policy() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("disabled.sqlite");

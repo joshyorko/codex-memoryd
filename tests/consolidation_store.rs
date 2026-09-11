@@ -27,6 +27,7 @@ fn batch(output: &str) -> ConsolidationBatch {
             inferred: false,
             source_ids: vec!["source-1".into()],
             supporting_spans: vec!["I prefer concise updates".into()],
+            supersedes: vec![],
         }],
     }
 }
@@ -75,6 +76,7 @@ fn decision_snapshot_is_read_back_with_exact_batch() {
         operation: ConsolidationOperation::AdoptStatement,
         reason: "supported".into(),
         distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
         validator: None,
     };
     store
@@ -121,6 +123,7 @@ fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
         operation: ConsolidationOperation::AdoptStatement,
         reason: "supported".into(),
         distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
         validator: None,
     };
     store
@@ -152,6 +155,7 @@ fn guarded_undo_archives_only_untouched_batch_records() {
         operation: ConsolidationOperation::AdoptStatement,
         reason: "supported".into(),
         distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
         validator: None,
     };
     store
@@ -183,6 +187,7 @@ fn guarded_undo_preserves_a_later_edit() {
         operation: ConsolidationOperation::AdoptStatement,
         reason: "supported".into(),
         distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
         validator: None,
     };
     store
@@ -234,6 +239,7 @@ fn deferred_candidate_does_not_freeze_independent_adoption() {
         inferred: false,
         source_ids: vec!["source-2".into()],
         supporting_spans: vec!["I prefer stable interfaces".into()],
+        supersedes: vec![],
     });
     let decisions = vec![
         ConsolidationDecision {
@@ -242,6 +248,7 @@ fn deferred_candidate_does_not_freeze_independent_adoption() {
             operation: ConsolidationOperation::Defer,
             reason: "validator unavailable".into(),
             distinct_evidence_roots: vec![],
+            supersedes: vec![],
             validator: None,
         },
         ConsolidationDecision {
@@ -250,6 +257,7 @@ fn deferred_candidate_does_not_freeze_independent_adoption() {
             operation: ConsolidationOperation::AdoptStatement,
             reason: "supported".into(),
             distinct_evidence_roots: vec!["root-2".into()],
+            supersedes: vec![],
             validator: None,
         },
     ];
@@ -273,6 +281,7 @@ fn changed_policy_cannot_apply_a_persisted_batch() {
         operation: ConsolidationOperation::AdoptStatement,
         reason: "supported".into(),
         distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
         validator: None,
     };
     store

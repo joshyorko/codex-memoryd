@@ -671,10 +671,13 @@ impl Store {
                 if !policy.operations.contains(&decision.operation) {
                     return Err(Error::policy("consolidation operation is not permitted by policy"));
                 }
-                let classification = crate::policy::classify(
+                let record_type = RecordType::parse(&candidate.claim_class)
+                    .ok_or_else(|| Error::invalid_request("consolidation claim class is invalid"))?;
+                let classification = crate::policy::classify_as(
                     &candidate.claim,
                     profile,
                     false,
+                    record_type,
                 );
                 let content_hash = ids::content_hash(profile.as_str(), &batch.workspace, None, classification.record_type.as_str(), classification.scope.as_str(), &candidate.claim);
                 let existing: Option<String> = tx.query_row(
@@ -704,6 +707,14 @@ impl Store {
                     Store::insert_record_in_transaction(tx, &record)?;
                     id
                 };
+                Self::apply_consolidation_supersession(
+                    tx,
+                    &batch.profile,
+                    &batch.workspace,
+                    &record_id,
+                    &decision.supersedes,
+                    &ids::now_rfc3339(),
+                )?;
                 applied.push(record_id);
             }
             tx.execute(
@@ -760,6 +771,115 @@ impl Store {
             )?;
             Ok(ids)
         })
+    }
+
+    fn apply_consolidation_supersession(
+        tx: &rusqlite::Transaction<'_>,
+        profile_id: &str,
+        workspace_id: &str,
+        replacement_id: &str,
+        superseded_ids: &[String],
+        now: &str,
+    ) -> Result<()> {
+        let ids = superseded_ids
+            .iter()
+            .filter(|id| id.as_str() != replacement_id)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for superseded_id in &ids {
+            let state: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT archived, COALESCE(temporal_state, 'current')
+                 FROM memory_records
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+                    params![superseded_id, profile_id, workspace_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if !matches!(state, Some((0, ref temporal_state)) if temporal_state == "current") {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target changed before apply",
+                ));
+            }
+        }
+
+        let raw: String = tx.query_row(
+            "SELECT supersedes FROM memory_records
+         WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+            params![replacement_id, profile_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        let mut replacement_supersedes = json_str_list(&raw);
+        for superseded_id in &ids {
+            if !replacement_supersedes.contains(superseded_id) {
+                replacement_supersedes.push(superseded_id.clone());
+            }
+        }
+        tx.execute(
+            "UPDATE memory_records
+         SET supersedes = ?1, updated_at = ?2
+         WHERE id = ?3 AND profile_id = ?4 AND workspace_id = ?5",
+            params![
+                serde_json::to_string(&replacement_supersedes)?,
+                now,
+                replacement_id,
+                profile_id,
+                workspace_id,
+            ],
+        )?;
+
+        for superseded_id in &ids {
+            let raw: String = tx.query_row(
+                "SELECT metadata FROM memory_records
+             WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+                params![superseded_id, profile_id, workspace_id],
+                |row| row.get(0),
+            )?;
+            let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("state".into(), Value::String("superseded".into()));
+                object.insert("policy_outcome".into(), Value::String("superseded".into()));
+                object.insert(
+                    "historical_reason".into(),
+                    Value::String("superseded by governed consolidation".into()),
+                );
+                object.insert("archived_at".into(), Value::String(now.into()));
+                object.insert("superseded_by".into(), Value::String(replacement_id.into()));
+            }
+            let changed = tx.execute(
+                "UPDATE memory_records
+             SET archived = 1, temporal_state = 'superseded', superseded_by = ?1,
+                 valid_until = COALESCE(valid_until, ?2),
+                 historical_reason = ?3, updated_at = ?2, metadata = ?4
+             WHERE id = ?5 AND profile_id = ?6 AND workspace_id = ?7
+               AND archived = 0
+               AND COALESCE(temporal_state, 'current') = 'current'",
+                params![
+                    replacement_id,
+                    now,
+                    "superseded by governed consolidation",
+                    metadata.to_string(),
+                    superseded_id,
+                    profile_id,
+                    workspace_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target changed before apply",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn ensure_workspace_in_transaction(

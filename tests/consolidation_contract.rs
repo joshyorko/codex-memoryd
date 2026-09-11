@@ -52,6 +52,7 @@ fn exact_output_identity_is_part_of_a_candidate() {
         inferred: false,
         source_ids: vec!["source-1".into()],
         supporting_spans: vec!["one".into()],
+        supersedes: vec![],
     };
     let b = ConsolidationCandidate {
         output_digest: "output-b".into(),

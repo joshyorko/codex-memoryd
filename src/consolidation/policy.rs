@@ -38,6 +38,7 @@ pub fn evaluate_candidate(
         operation: ConsolidationOperation::Defer,
         reason: reason.into(),
         distinct_evidence_roots: vec![],
+        supersedes: candidate.supersedes.clone(),
         validator: validation.map(|result| result.validator.clone()),
     };
     if policy.validate().is_err() {
@@ -108,6 +109,7 @@ pub fn evaluate_candidate(
             operation: ConsolidationOperation::NoChange,
             reason: "claim_and_evidence_already_represented".into(),
             distinct_evidence_roots: roots.iter().map(|root| (*root).into()).collect(),
+            supersedes: candidate.supersedes.clone(),
             validator: validation.map(|result| result.validator.clone()),
         };
     }
@@ -133,6 +135,7 @@ pub fn evaluate_candidate(
         operation,
         reason: "bounded_source_and_semantic_checks_passed".into(),
         distinct_evidence_roots: roots.iter().map(|root| (*root).into()).collect(),
+        supersedes: candidate.supersedes.clone(),
         validator: validation.map(|result| result.validator.clone()),
     }
 }

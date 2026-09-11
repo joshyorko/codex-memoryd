@@ -125,6 +125,8 @@ pub struct ConsolidationCandidate {
     pub inferred: bool,
     pub source_ids: Vec<String>,
     pub supporting_spans: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 impl ConsolidationCandidate {
@@ -135,6 +137,7 @@ impl ConsolidationCandidate {
         if self.source_ids.is_empty()
             || self.source_ids.len() > MAX_ITEMS
             || self.supporting_spans.len() > MAX_ITEMS
+            || self.supersedes.len() > MAX_ITEMS
         {
             return Err("candidate evidence is missing or unbounded".into());
         }
@@ -183,6 +186,8 @@ pub struct ConsolidationDecision {
     pub operation: ConsolidationOperation,
     pub reason: String,
     pub distinct_evidence_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
     pub validator: Option<String>,
 }
 
