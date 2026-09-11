@@ -191,7 +191,7 @@ fn dream_worker_status(
         && !config.dream_provider.command.is_empty();
     let command_ready = cfg!(target_os = "linux")
         && command_configured
-        && std::path::Path::new(&config.dream_provider.command[0]).is_file()
+        && executable_file(&config.dream_provider.command[0])
         && !config.dream_provider.model.trim().is_empty();
     let local_provider_configured = model_enabled
         && (configured_adapter == crate::protocol::DreamProviderAdapter::LocalModel
@@ -240,12 +240,34 @@ fn dream_worker_status(
             max_input_tokens: if command_configured { 8000 } else { 0 },
             max_output_tokens: if command_configured { 2048 } else { 0 },
             max_input_bytes: if command_configured { 32000 } else { 0 },
-            max_output_bytes: config.dream_provider.max_response_bytes,
+            max_output_bytes: if command_configured {
+                config.dream_provider.max_response_bytes.min(262_144)
+            } else {
+                config.dream_provider.max_response_bytes
+            },
             max_provider_calls: 1,
             max_retries: 0,
             max_cost_micros: 0,
             daily_cost_ceiling_micros: config.dream_provider.daily_cost_ceiling_micros,
         },
+    }
+}
+
+fn executable_file(path: &str) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -396,5 +418,29 @@ mod tests {
         assert!(status.local_provider_configured);
         assert!(status.local_provider_ready);
         assert!(!status.paid_provider_configured);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_status_reports_effective_output_limit_and_executable_readiness() {
+        let mut cfg = Config::default();
+        cfg.dream_provider.enabled = true;
+        cfg.dream_provider.adapter = "command".into();
+        cfg.dream_provider.model = "model".into();
+        cfg.dream_provider.command = vec!["/bin/sh".into()];
+        cfg.dream_provider.max_response_bytes = 1_000_000;
+        let scheduler = ScheduledDreamStatus {
+            enabled: true,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_run_id: None,
+            last_watermark: None,
+            next_eligible_run: None,
+            degraded: false,
+        };
+        let status = dream_worker_status(&cfg, &scheduler);
+        assert!(status.local_provider_ready);
+        assert_eq!(status.limits.max_output_bytes, 262_144);
     }
 }
