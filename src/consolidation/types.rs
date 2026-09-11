@@ -7,15 +7,34 @@ const MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ConsolidationMode { Off, Preview, Automatic }
+pub enum ConsolidationMode {
+    Off,
+    Preview,
+    Automatic,
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ConsolidationOperation { AdoptStatement, AdoptInference, Reinforce, Supersede, NoChange, Defer, Reject }
+pub enum ConsolidationOperation {
+    AdoptStatement,
+    AdoptInference,
+    Reinforce,
+    Supersede,
+    NoChange,
+    Defer,
+    Reject,
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ConsolidationStatus { Proposed, Validated, Applied, Deferred, Rejected, Conflict }
+pub enum ConsolidationStatus {
+    Proposed,
+    Validated,
+    Applied,
+    Deferred,
+    Rejected,
+    Conflict,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -29,9 +48,21 @@ pub struct ConsolidationBudget {
 
 impl ConsolidationBudget {
     pub fn validate(&self) -> Result<(), String> {
-        let values = [self.max_candidates, self.max_source_records, self.max_provider_calls];
-        if values.iter().any(|value| *value == 0 || *value > MAX_ITEMS) { return Err("budget item limits must be finite and within bounds".into()); }
-        if self.max_input_bytes == 0 || self.max_output_bytes == 0 || self.max_input_bytes > MAX_BYTES || self.max_output_bytes > MAX_BYTES { return Err("budget byte limits are invalid".into()); }
+        let values = [
+            self.max_candidates,
+            self.max_source_records,
+            self.max_provider_calls,
+        ];
+        if values.iter().any(|value| *value == 0 || *value > MAX_ITEMS) {
+            return Err("budget item limits must be finite and within bounds".into());
+        }
+        if self.max_input_bytes == 0
+            || self.max_output_bytes == 0
+            || self.max_input_bytes > MAX_BYTES
+            || self.max_output_bytes > MAX_BYTES
+        {
+            return Err("budget byte limits are invalid".into());
+        }
         Ok(())
     }
 }
@@ -54,9 +85,15 @@ pub struct ConsolidationPolicy {
 
 impl ConsolidationPolicy {
     pub fn validate(&self) -> Result<(), String> {
-        if self.contract_version != CONSOLIDATION_CONTRACT_VERSION { return Err("unsupported consolidation contract version".into()); }
-        if self.scopes.is_empty() || self.scopes.len() > MAX_ITEMS { return Err("policy scopes must be bounded and non-empty".into()); }
-        if self.retention_days == 0 { return Err("retention_days must be positive".into()); }
+        if self.contract_version != CONSOLIDATION_CONTRACT_VERSION {
+            return Err("unsupported consolidation contract version".into());
+        }
+        if self.scopes.is_empty() || self.scopes.len() > MAX_ITEMS {
+            return Err("policy scopes must be bounded and non-empty".into());
+        }
+        if self.retention_days == 0 {
+            return Err("retention_days must be positive".into());
+        }
         self.budget.validate()
     }
 }
@@ -64,8 +101,10 @@ impl ConsolidationPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsolidationSourceCursor {
-    #[serde(default)] pub since: Option<String>,
-    #[serde(default)] pub until: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
     pub explicit_since: bool,
 }
 
@@ -84,8 +123,15 @@ pub struct ConsolidationCandidate {
 
 impl ConsolidationCandidate {
     pub fn validate(&self) -> Result<(), String> {
-        if self.candidate_id.is_empty() || self.output_digest.is_empty() || self.claim.is_empty() { return Err("candidate identity and claim are required".into()); }
-        if self.source_ids.is_empty() || self.source_ids.len() > MAX_ITEMS || self.supporting_spans.len() > MAX_ITEMS { return Err("candidate evidence is missing or unbounded".into()); }
+        if self.candidate_id.is_empty() || self.output_digest.is_empty() || self.claim.is_empty() {
+            return Err("candidate identity and claim are required".into());
+        }
+        if self.source_ids.is_empty()
+            || self.source_ids.len() > MAX_ITEMS
+            || self.supporting_spans.len() > MAX_ITEMS
+        {
+            return Err("candidate evidence is missing or unbounded".into());
+        }
         Ok(())
     }
 }
@@ -104,9 +150,19 @@ pub struct ConsolidationBatch {
 
 impl ConsolidationBatch {
     pub fn validate(&self) -> Result<(), String> {
-        if self.contract_version != CONSOLIDATION_CONTRACT_VERSION || self.batch_id.is_empty() || self.policy_digest.is_empty() || self.snapshot_digest.is_empty() { return Err("batch identity or contract version is invalid".into()); }
-        if self.candidates.is_empty() || self.candidates.len() > MAX_ITEMS { return Err("batch candidates must be bounded and non-empty".into()); }
-        for candidate in &self.candidates { candidate.validate()?; }
+        if self.contract_version != CONSOLIDATION_CONTRACT_VERSION
+            || self.batch_id.is_empty()
+            || self.policy_digest.is_empty()
+            || self.snapshot_digest.is_empty()
+        {
+            return Err("batch identity or contract version is invalid".into());
+        }
+        if self.candidates.is_empty() || self.candidates.len() > MAX_ITEMS {
+            return Err("batch candidates must be bounded and non-empty".into());
+        }
+        for candidate in &self.candidates {
+            candidate.validate()?;
+        }
         Ok(())
     }
 }

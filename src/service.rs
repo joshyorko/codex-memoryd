@@ -1909,6 +1909,11 @@ impl Service {
         }
 
         let configured = &self.config.dream_provider;
+        if !configured.enabled {
+            return Err(Error::invalid_request(
+                "model-backed Dream jobs require enabled runtime provider configuration",
+            ));
+        }
         let endpoint = provider
             .endpoint
             .as_deref()

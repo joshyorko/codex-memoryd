@@ -17,6 +17,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::Row;
 use serde_json::Value;
 
+use crate::consolidation::{ConsolidationBatch, ConsolidationDecision};
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -41,7 +42,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 12;
+pub const STORAGE_SCHEMA_VERSION: i64 = 13;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -57,6 +58,8 @@ const MIGRATION_SEMANTIC_RELATIONS: &str =
 const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
 const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.sql");
 const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
+const MIGRATION_CONSOLIDATION_PROPOSALS: &str =
+    include_str!("../migrations/0013_consolidation_proposals.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -490,6 +493,73 @@ impl Store {
         Ok(value)
     }
 
+    /// Persist an immutable consolidation proposal before any application.
+    /// Replaying the same batch returns the existing proposal and never
+    /// replaces its payload.
+    pub fn persist_consolidation_batch(
+        &self,
+        batch: &ConsolidationBatch,
+        decisions: Option<&[ConsolidationDecision]>,
+        status: &str,
+    ) -> Result<bool> {
+        batch.validate().map_err(Error::invalid_request)?;
+        if status.trim().is_empty() {
+            return Err(Error::invalid_request(
+                "consolidation proposal status is required",
+            ));
+        }
+        let batch_json = serde_json::to_string(batch)?;
+        let decisions_json = decisions.map(serde_json::to_string).transpose()?;
+        let now = ids::now_rfc3339();
+        let inserted = self.transaction_immediate(|tx| {
+            let changed = tx.execute(
+                "INSERT INTO consolidation_proposals(
+                    batch_id, scope, proposal_digest, batch_json, decisions_json,
+                    status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT(batch_id) DO NOTHING",
+                rusqlite::params![
+                    batch.batch_id,
+                    batch.scope,
+                    batch.snapshot_digest,
+                    batch_json,
+                    decisions_json,
+                    status,
+                    now
+                ],
+            )?;
+            if changed == 0 {
+                let existing: String = tx.query_row(
+                    "SELECT batch_json FROM consolidation_proposals WHERE batch_id = ?1",
+                    rusqlite::params![batch.batch_id],
+                    |row| row.get(0),
+                )?;
+                let existing_batch: ConsolidationBatch = serde_json::from_str(&existing)?;
+                if existing_batch != *batch {
+                    return Err(Error::new(
+                        ErrorCode::BundlePlanStale,
+                        "consolidation batch id already has a different payload",
+                    ));
+                }
+            }
+            Ok(changed == 1)
+        })?;
+        Ok(inserted)
+    }
+
+    /// Read the exact proposal payload retained by the canonical store.
+    pub fn read_consolidation_batch(&self, batch_id: &str) -> Result<Option<ConsolidationBatch>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT batch_json FROM consolidation_proposals WHERE batch_id = ?1",
+            rusqlite::params![batch_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str(&raw).map_err(Error::from))
+        .transpose()
+    }
+
     pub fn ensure_workspace_in_transaction(
         tx: &rusqlite::Transaction<'_>,
         profile_id: &str,
@@ -664,6 +734,7 @@ impl Store {
         ensure_temporal_columns(&conn)?;
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
+        conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
         ensure_instance_metadata(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
