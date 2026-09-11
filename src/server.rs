@@ -476,8 +476,12 @@ fn spawn_dream_scheduler(service: Service) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
         loop {
             interval.tick().await;
-            if let Err(err) = service.scheduled_dream(None) {
-                tracing::warn!(error = %err, "scheduled Dreamer run failed");
+            let scheduled_service = service.clone();
+            match tokio::task::spawn_blocking(move || scheduled_service.scheduled_dream(None)).await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => tracing::warn!(error = %err, "scheduled Dreamer run failed"),
+                Err(err) => tracing::warn!(error = %err, "scheduled Dreamer task failed"),
             }
         }
     });
