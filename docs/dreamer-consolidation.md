@@ -19,6 +19,12 @@ batch-only `/v1/consolidation/apply` and `/v1/consolidation/undo` controls do
 not accept policy, mode, credential, or scope overrides. Undo only reverses
 untouched records from that batch; later edits are preserved.
 
+When a scheduled candidate supersedes a current record, the persisted decision
+retains the superseded record IDs. Automatic apply validates those targets in
+the same SQLite transaction, links the replacement, archives the old records as
+superseded, and returns unique applied record IDs. A changed or missing target
+rejects the transaction as stale.
+
 The existing `/v1/dream` preview path remains non-adopting. Model-backed
 semantic validation and FRIDAY consumer acceptance are separate gates; this
 documentation does not claim live activation or production-corpus migration.
