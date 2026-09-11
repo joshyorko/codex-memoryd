@@ -142,6 +142,8 @@ pub struct ConsolidationBatch {
     pub contract_version: String,
     pub batch_id: String,
     pub policy_digest: String,
+    pub profile: String,
+    pub workspace: String,
     pub scope: String,
     pub source_cursor: ConsolidationSourceCursor,
     pub snapshot_digest: String,
