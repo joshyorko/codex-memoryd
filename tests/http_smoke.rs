@@ -379,6 +379,12 @@ fn auth_missing_blocks_v1_routes_except_status() {
             .send()
             .unwrap(),
     );
+    assert_v1_blocked(
+        http.post(format!("{base}/v1/consolidation/undo"))
+            .json(&json!({"batch_id": "synthetic-batch"}))
+            .send()
+            .unwrap(),
+    );
 
     assert_v1_blocked(
         http.post(format!("{base}/v1/recall"))

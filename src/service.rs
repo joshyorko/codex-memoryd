@@ -2707,6 +2707,24 @@ impl Service {
         })
     }
 
+    pub fn undo_stored_consolidation(
+        &self,
+        req: ConsolidationUndoRequest,
+    ) -> Result<ConsolidationUndoResponse> {
+        if !self.config.dream_scheduler.automatic_apply {
+            return Err(Error::policy(
+                "consolidation undo requires the operator automatic policy",
+            ));
+        }
+        let record_ids = self.store.undo_consolidation_proposal(&req.batch_id)?;
+        Ok(ConsolidationUndoResponse {
+            batch_id: req.batch_id,
+            status: "reverted".to_string(),
+            record_ids,
+            authority: "recall_not_authority".to_string(),
+        })
+    }
+
     fn apply_governed_deterministic_batch(
         &self,
         run: &mut DreamResponse,

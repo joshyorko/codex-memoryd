@@ -1409,6 +1409,19 @@ pub struct ConsolidationApplyResponse {
     pub authority: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConsolidationUndoRequest {
+    pub batch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsolidationUndoResponse {
+    pub batch_id: String,
+    pub status: String,
+    pub record_ids: Vec<String>,
+    pub authority: String,
+}
+
 // ---------------------------------------------------------------------------
 // Local Codex memory sync (SPEC §6.6)
 // ---------------------------------------------------------------------------
