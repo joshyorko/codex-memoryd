@@ -145,6 +145,52 @@ fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
 }
 
 #[test]
+fn automatic_apply_receipt_deduplicates_shared_record_ids() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("output-a");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates.push(ConsolidationCandidate {
+        candidate_id: "candidate-2".into(),
+        output_digest: "output-b".into(),
+        claim: "prefers concise updates".into(),
+        claim_class: "preference".into(),
+        subject: "synthetic-user".into(),
+        inferred: false,
+        source_ids: vec!["source-2".into()],
+        supporting_spans: vec!["I prefer concise updates".into()],
+        supersedes: vec![],
+    });
+    let decisions = vec![
+        ConsolidationDecision {
+            candidate_id: "candidate-1".into(),
+            output_digest: "output-a".into(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: vec!["root-1".into()],
+            supersedes: vec![],
+            validator: None,
+        },
+        ConsolidationDecision {
+            candidate_id: "candidate-2".into(),
+            output_digest: "output-b".into(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: vec!["root-2".into()],
+            supersedes: vec![],
+            validator: None,
+        },
+    ];
+    store
+        .persist_consolidation_batch(&proposal, Some(&decisions), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &decisions)
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(store.count_records().unwrap(), 1);
+}
+
+#[test]
 fn guarded_undo_archives_only_untouched_batch_records() {
     let store = Store::open(":memory:").unwrap();
     let mut proposal = batch("output-a");

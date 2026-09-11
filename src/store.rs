@@ -715,7 +715,9 @@ impl Store {
                     &decision.supersedes,
                     &ids::now_rfc3339(),
                 )?;
-                applied.push(record_id);
+                if !applied.contains(&record_id) {
+                    applied.push(record_id);
+                }
             }
             tx.execute(
                 "UPDATE consolidation_proposals
