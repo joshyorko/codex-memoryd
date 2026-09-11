@@ -11,3 +11,14 @@ reinforce, supersede, no change, defer, or reject. Application, correction, and
 undo are server-owned transactional operations; recall remains
 `recall_not_authority`. Synthetic acceptance fixtures are listed in
 `tests/fixtures/consolidation/manifest.json`.
+
+The existing `CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY` setting is off by default.
+When an operator enables it, deterministic scheduled candidates pass the
+governed policy boundary and persist an immutable batch before applying. The
+batch-only `/v1/consolidation/apply` and `/v1/consolidation/undo` controls do
+not accept policy, mode, credential, or scope overrides. Undo only reverses
+untouched records from that batch; later edits are preserved.
+
+The existing `/v1/dream` preview path remains non-adopting. Model-backed
+semantic validation and FRIDAY consumer acceptance are separate gates; this
+documentation does not claim live activation or production-corpus migration.
