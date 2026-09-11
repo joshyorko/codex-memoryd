@@ -152,3 +152,40 @@ fn represented_claim_with_no_new_root_is_no_change() {
     );
     assert_eq!(decision.operation, ConsolidationOperation::NoChange);
 }
+
+#[test]
+fn quoted_hypothetical_and_task_scoped_statements_do_not_become_preferences() {
+    for claim in [
+        "Hypothetically, I prefer blue.",
+        "As an example, I prefer blue.",
+        "I prefer blue only for this task.",
+        "I do not remember preferring blue.",
+    ] {
+        let decision = evaluate_candidate(
+            &policy(),
+            "personal",
+            &candidate(false, claim),
+            &evidence(),
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(decision.operation, ConsolidationOperation::Defer, "{claim}");
+        assert_eq!(decision.reason, "statement_scope_or_negation_uncertain");
+    }
+}
+
+#[test]
+fn secret_shaped_candidate_content_is_not_adopted() {
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &candidate(false, "OPENAI_API_KEY=sk-abcdefghijklmnop1234"),
+        &evidence(),
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "candidate_content_rejected");
+}

@@ -59,6 +59,24 @@ pub fn evaluate_candidate(
     if candidate.validate().is_err() {
         return defer("malformed_candidate");
     }
+    match crate::policy::screen_content(&candidate.claim, crate::policy::MAX_RECORD_CHARS) {
+        crate::policy::PolicyDecision::Accept(_) => {}
+        crate::policy::PolicyDecision::Reject { .. } => return defer("candidate_content_rejected"),
+    }
+    if !candidate.inferred {
+        let claim = candidate.claim.to_ascii_lowercase();
+        if claim.contains("just for this task")
+            || claim.contains("only for this task")
+            || claim.contains("hypothetically")
+            || claim.contains("as an example")
+            || claim.contains("quoted")
+            || claim.contains("do not remember")
+            || claim.contains("don't remember")
+            || claim.starts_with("not ")
+        {
+            return defer("statement_scope_or_negation_uncertain");
+        }
+    }
     let referenced: BTreeSet<&str> = candidate.source_ids.iter().map(String::as_str).collect();
     let matched: Vec<&EvidenceDescriptor> = evidence
         .iter()
