@@ -66,3 +66,28 @@ fn governed_adoption_survives_restart_and_fresh_recall() {
         .any(|fact| fact.content.contains("concise summaries")));
     assert_eq!(recall.authority, "recall_not_authority");
 }
+
+#[test]
+fn consolidation_controls_cannot_activate_disabled_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("disabled.sqlite");
+    let mut disabled = config(&path);
+    disabled.dream_scheduler.automatic_apply = false;
+    let service = Service::new(Store::open(path.to_str().unwrap()).unwrap(), disabled);
+    let apply =
+        service.apply_stored_consolidation(codex_memoryd::protocol::ConsolidationApplyRequest {
+            batch_id: "synthetic".into(),
+        });
+    assert!(apply
+        .unwrap_err()
+        .message
+        .contains("operator automatic policy"));
+    let undo =
+        service.undo_stored_consolidation(codex_memoryd::protocol::ConsolidationUndoRequest {
+            batch_id: "synthetic".into(),
+        });
+    assert!(undo
+        .unwrap_err()
+        .message
+        .contains("operator automatic policy"));
+}
