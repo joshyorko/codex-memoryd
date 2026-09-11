@@ -1167,7 +1167,7 @@ fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
 }
 
 #[test]
-fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
+fn scheduled_dreamer_keeps_provider_observations_non_adopting_in_governed_mode() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
     let address = listener.local_addr().expect("provider address");
     let server = std::thread::spawn(move || {
@@ -1208,6 +1208,7 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
     let db_path = temp.path().join("memory.db");
     let store = Store::open(&db_path).expect("open store");
     let mut scheduler = scheduler_config();
+    scheduler.scheduled_provider_enabled = true;
     scheduler.automatic_apply = true;
     let svc = Service::new(
         store,
@@ -1248,16 +1249,14 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
         .iter()
         .find(|observation| observation.id == "obs_provider_220")
         .expect("provider observation");
-    assert_eq!(observation.policy, "accepted");
-    assert!(observation.apply_eligible);
-    let record = svc
+    assert_eq!(observation.policy, "provider_generated");
+    assert!(!observation.apply_eligible);
+    assert!(!svc
         .store
         .query_records(&Default::default())
         .unwrap()
         .into_iter()
-        .find(|record| record.content == observation.content)
-        .expect("promoted provider memory");
-    assert!(run.created.contains(&record.id));
+        .any(|record| record.content == observation.content));
 
     let conn = Connection::open(db_path).expect("open ledger db");
     let ledger_count: i64 = conn
@@ -1267,7 +1266,7 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
             |row| row.get(0),
         )
         .expect("provider ledger entry");
-    assert_eq!(ledger_count, 1);
+    assert_eq!(ledger_count, 0);
 }
 
 #[test]
