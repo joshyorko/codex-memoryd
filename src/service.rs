@@ -2592,7 +2592,7 @@ impl Service {
                                     .into_iter()
                                     .filter_map(|value| serde_json::from_value(value).ok()),
                             );
-                            if mode == "apply" {
+                            if mode == "apply" && !cfg.automatic_apply {
                                 let deterministic_attempts =
                                     run.candidates.len().saturating_add(run.rejected.len());
                                 let remaining_candidates = if max_candidates_hit {
