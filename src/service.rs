@@ -17,6 +17,7 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use crate::config::Config;
+use crate::consolidation::*;
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -2513,7 +2514,7 @@ impl Service {
                     profile,
                     workspace: &workspace,
                     repo_id: None,
-                    mode,
+                    mode: "preview",
                     now: &now,
                     recency_cutoff: watermark_before.as_deref(),
                     include_archived_sources: false,
@@ -2584,6 +2585,9 @@ impl Service {
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
+                if cfg.automatic_apply && !command_mode {
+                    self.apply_governed_deterministic_batch(&mut run, &profile, &workspace, &now)?;
+                }
                 let status = if limits_hit.is_empty() {
                     "ok"
                 } else {
@@ -2636,6 +2640,101 @@ impl Service {
                 Err(err)
             }
         }
+    }
+
+    fn apply_governed_deterministic_batch(
+        &self,
+        run: &mut DreamResponse,
+        profile: &Profile,
+        workspace: &str,
+        now: &str,
+    ) -> Result<()> {
+        let policy = ConsolidationPolicy {
+            contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
+            mode: ConsolidationMode::Automatic,
+            scopes: vec![profile.as_str().to_string()],
+            claim_classes: [
+                RecordType::Preference,
+                RecordType::RepoConvention,
+                RecordType::Command,
+                RecordType::Decision,
+                RecordType::Gotcha,
+                RecordType::Landmark,
+                RecordType::TaskCheckpoint,
+                RecordType::Identity,
+                RecordType::WorkflowPattern,
+                RecordType::Other,
+            ]
+            .iter()
+            .map(|record_type| record_type.as_str().to_string())
+            .collect(),
+            source_classes: vec!["deterministic_dream".to_string()],
+            operations: vec![ConsolidationOperation::AdoptStatement],
+            budget: ConsolidationBudget {
+                max_candidates: run.candidates.len().max(1),
+                max_source_records: evidence_window_count(&run.evidence_window).max(1),
+                max_provider_calls: 1,
+                max_input_bytes: 256 * 1024,
+                max_output_bytes: 256 * 1024,
+            },
+            retention_days: 30,
+            semantic_validation: false,
+            legacy_metadata: None,
+        };
+        let candidates = run
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.apply_eligible && !candidate.evidence_ids.is_empty())
+            .map(|candidate| ConsolidationCandidate {
+                candidate_id: ids::sha256_hex(
+                    format!("{}\u{1f}{}", candidate.action, candidate.content).as_bytes(),
+                ),
+                output_digest: ids::sha256_hex(candidate.content.as_bytes()),
+                claim: candidate.content.clone(),
+                claim_class: candidate.proposed_type.clone(),
+                subject: candidate.subject_key.clone(),
+                inferred: false,
+                source_ids: candidate.evidence_ids.clone(),
+                supporting_spans: vec![candidate.content.clone()],
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let batch = ConsolidationBatch {
+            contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
+            batch_id: format!("consolidation_{}", run.run_id),
+            policy_digest: policy.digest(),
+            profile: profile.as_str().to_string(),
+            workspace: workspace.to_string(),
+            scope: profile.as_str().to_string(),
+            source_cursor: ConsolidationSourceCursor {
+                since: None,
+                until: Some(now.to_string()),
+                explicit_since: false,
+            },
+            snapshot_digest: ids::sha256_hex(run.run_id.as_bytes()),
+            candidates,
+        };
+        let decisions = batch
+            .candidates
+            .iter()
+            .map(|candidate| ConsolidationDecision {
+                candidate_id: candidate.candidate_id.clone(),
+                output_digest: candidate.output_digest.clone(),
+                operation: ConsolidationOperation::AdoptStatement,
+                reason: "deterministic source-backed candidate".to_string(),
+                distinct_evidence_roots: candidate.source_ids.clone(),
+                validator: None,
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .persist_consolidation_batch(&batch, Some(&decisions), "validated")?;
+        run.created =
+            self.store
+                .apply_consolidation_proposal(&batch.batch_id, &policy, &decisions)?;
+        run.mode = "apply".to_string();
+        Ok(())
     }
 
     // ------------------------------------------------------------------

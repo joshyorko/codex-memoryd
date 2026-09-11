@@ -54,3 +54,36 @@ fn failed_scheduled_command_does_not_advance_success_watermark() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn deterministic_automatic_schedule_uses_governed_apply_boundary() {
+    let store = Store::open(":memory:").unwrap();
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.automatic_apply = true;
+    config.dream_scheduler.scheduled_provider_enabled = false;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    let svc = codex_memoryd::service::Service::new(store.clone(), config);
+    svc.conclusions(codex_memoryd::protocol::ConclusionsRequest {
+        profile: Some("personal".into()),
+        workspace: Some("ws".into()),
+        repo: None,
+        target: Some("user".into()),
+        conclusions: Some(vec!["Decision: use concise summaries".into()]),
+        metadata: None,
+        record_type: Some("decision".into()),
+    })
+    .unwrap();
+    let result = svc
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap();
+    assert_eq!(result.status, "ok");
+    let run = result.run.unwrap();
+    assert_eq!(run.mode, "apply");
+    assert_eq!(run.created.len(), 1);
+    assert!(store.get_record(&run.created[0]).unwrap().is_some());
+}
