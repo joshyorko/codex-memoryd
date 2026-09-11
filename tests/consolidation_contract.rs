@@ -1,4 +1,5 @@
 use codex_memoryd::consolidation::*;
+use codex_memoryd::protocol::{ConsolidationApplyRequest, ConsolidationUndoRequest};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -74,4 +75,16 @@ fn fixture_manifest_freezes_all_required_cases() {
     assert_eq!(manifest["contract_version"], CONSOLIDATION_CONTRACT_VERSION);
     assert_eq!(manifest["fixture_count"], 26);
     assert_eq!(manifest["fixtures"].as_array().unwrap().len(), 26);
+}
+
+#[test]
+fn control_requests_cannot_enable_or_widen_policy() {
+    assert!(serde_json::from_value::<ConsolidationApplyRequest>(json!({
+        "batch_id": "batch", "mode": "automatic", "policy": {"scopes": ["all"]}
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<ConsolidationUndoRequest>(json!({
+        "batch_id": "batch", "credentials": "none"
+    }))
+    .is_err());
 }

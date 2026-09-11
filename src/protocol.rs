@@ -1397,6 +1397,7 @@ pub struct ScheduledDreamResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsolidationApplyRequest {
     pub batch_id: String,
 }
@@ -1410,6 +1411,7 @@ pub struct ConsolidationApplyResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsolidationUndoRequest {
     pub batch_id: String,
 }
