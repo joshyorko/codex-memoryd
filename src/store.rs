@@ -872,8 +872,29 @@ impl Store {
                     rusqlite::params![content_hash],
                     |row| row.get(0),
                 ).optional()?;
-                let record_id = if let Some(id) = existing {
-                    id
+                let existing = match existing {
+                    Some(id) => Some(id),
+                    None => tx
+                        .query_row(
+                            "SELECT id FROM memory_records
+                             WHERE profile_id = ?1 AND workspace_id = ?2
+                               AND repo_id IS NULL AND type = ?3 AND scope = ?4
+                               AND content = ?5 AND archived = 0
+                               AND COALESCE(temporal_state, 'current') = 'current'
+                             ORDER BY updated_at DESC, id DESC LIMIT 1",
+                            rusqlite::params![
+                                profile.as_str(),
+                                &batch.workspace,
+                                classification.record_type.as_str(),
+                                classification.scope.as_str(),
+                                &candidate.claim,
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?,
+                };
+                let (record_id, reused_existing) = if let Some(id) = existing {
+                    (id, true)
                 } else {
                     let id = ids::new_id("mem");
                     let now = ids::now_rfc3339();
@@ -892,8 +913,25 @@ impl Store {
                         metadata: json!({"origin":"governed_consolidation","batch_id":batch.batch_id,"candidate_id":candidate.candidate_id,"inferred":candidate.inferred,"decision_digest":decision.output_digest}),
                     };
                     Store::insert_record_in_transaction(tx, &record)?;
-                    id
+                    (id, false)
                 };
+                if reused_existing {
+                    let raw_metadata: String = tx.query_row(
+                        "SELECT metadata FROM memory_records WHERE id = ?1",
+                        rusqlite::params![&record_id],
+                        |row| row.get(0),
+                    )?;
+                    let mut metadata = serde_json::from_str::<Value>(&raw_metadata)
+                        .unwrap_or_else(|_| json!({}));
+                    if !metadata.is_object() {
+                        metadata = json!({});
+                    }
+                    metadata["governed_consolidation_applied"] = Value::Bool(true);
+                    tx.execute(
+                        "UPDATE memory_records SET metadata = ?1 WHERE id = ?2",
+                        rusqlite::params![metadata.to_string(), &record_id],
+                    )?;
+                }
                 Self::apply_consolidation_supersession(
                     tx,
                     &batch.profile,
@@ -3030,6 +3068,39 @@ impl Store {
             )
             .optional()?;
         Ok(result)
+    }
+
+    pub fn find_current_by_exact_content(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+        record_type: &str,
+        scope: &str,
+        content: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            &format!(
+                "SELECT {RECORD_COLS} FROM memory_records
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND repo_id IS ?3
+                   AND type = ?4 AND scope = ?5 AND content = ?6
+                   AND archived = 0
+                   AND COALESCE(temporal_state, 'current') = 'current'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
+            params![
+                profile_id,
+                workspace_id,
+                repo_id,
+                record_type,
+                scope,
+                content
+            ],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Error::from)
     }
 
     pub fn get_record(&self, id: &str) -> Result<Option<MemoryRecord>> {

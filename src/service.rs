@@ -2801,9 +2801,21 @@ impl Service {
         if candidates.is_empty() {
             return Ok(());
         }
+        let candidate_set_digest = ids::sha256_hex(&serde_json::to_vec(&candidates)?);
+        let base_batch_id = format!("consolidation_{}", run.run_id);
+        let batch_id = match self.store.read_consolidation_batch(&base_batch_id)? {
+            None => base_batch_id.clone(),
+            Some(existing)
+                if existing.snapshot_digest == candidate_set_digest
+                    && existing.candidates == candidates =>
+            {
+                base_batch_id.clone()
+            }
+            Some(_) => format!("{base_batch_id}_{candidate_set_digest}"),
+        };
         let batch = ConsolidationBatch {
             contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
-            batch_id: format!("consolidation_{}", run.run_id),
+            batch_id,
             policy_digest: policy.digest(),
             profile: profile.as_str().to_string(),
             workspace: workspace.to_string(),
@@ -2813,7 +2825,7 @@ impl Service {
                 until: Some(now.to_string()),
                 explicit_since: false,
             },
-            snapshot_digest: ids::sha256_hex(run.run_id.as_bytes()),
+            snapshot_digest: candidate_set_digest,
             candidates,
         };
         let decisions = batch
@@ -2867,7 +2879,25 @@ impl Service {
                 classification.scope.as_str(),
                 &candidate.content,
             );
-            if self.store.find_by_content_hash(&content_hash)?.is_none() {
+            let already_current = self.store.find_by_content_hash(&content_hash)?.is_some()
+                || self
+                    .store
+                    .find_current_by_exact_content(
+                        profile.as_str(),
+                        workspace,
+                        None,
+                        classification.record_type.as_str(),
+                        classification.scope.as_str(),
+                        &candidate.content,
+                    )?
+                    .is_some_and(|record| {
+                        record
+                            .metadata
+                            .get("governed_consolidation_applied")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    });
+            if !already_current || !candidate.supersedes.is_empty() {
                 pending.push(candidate);
             }
         }
