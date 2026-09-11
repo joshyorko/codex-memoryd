@@ -2685,17 +2685,47 @@ impl Service {
             .candidates
             .iter()
             .filter(|candidate| candidate.apply_eligible && !candidate.evidence_ids.is_empty())
-            .map(|candidate| ConsolidationCandidate {
-                candidate_id: ids::sha256_hex(
+            .filter_map(|candidate| {
+                let candidate_id = ids::sha256_hex(
                     format!("{}\u{1f}{}", candidate.action, candidate.content).as_bytes(),
-                ),
-                output_digest: ids::sha256_hex(candidate.content.as_bytes()),
-                claim: candidate.content.clone(),
-                claim_class: candidate.proposed_type.clone(),
-                subject: candidate.subject_key.clone(),
-                inferred: false,
-                source_ids: candidate.evidence_ids.clone(),
-                supporting_spans: vec![candidate.content.clone()],
+                );
+                let proposal = ConsolidationCandidate {
+                    candidate_id,
+                    output_digest: ids::sha256_hex(candidate.content.as_bytes()),
+                    claim: candidate.content.clone(),
+                    claim_class: candidate.proposed_type.clone(),
+                    subject: candidate.subject_key.clone(),
+                    inferred: false,
+                    source_ids: candidate.evidence_ids.clone(),
+                    supporting_spans: vec![candidate.content.clone()],
+                };
+                let evidence = candidate
+                    .evidence_refs
+                    .iter()
+                    .map(|source| crate::consolidation::policy::EvidenceDescriptor {
+                        id: source.id.clone(),
+                        root_id: source.id.clone(),
+                        source_class: "deterministic_dream".to_string(),
+                        actor: source.actor.clone().unwrap_or_default(),
+                        subject: proposal.subject.clone(),
+                        content: source
+                            .content
+                            .clone()
+                            .unwrap_or_else(|| candidate.content.clone()),
+                        supporting_span: Some(candidate.content.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                let decision = crate::consolidation::policy::evaluate_candidate(
+                    &policy,
+                    profile.as_str(),
+                    &proposal,
+                    &evidence,
+                    &[],
+                    &[],
+                    None,
+                );
+                matches!(decision.operation, ConsolidationOperation::AdoptStatement)
+                    .then_some(proposal)
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
