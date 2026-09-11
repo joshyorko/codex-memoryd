@@ -645,6 +645,137 @@ impl Store {
         Ok(false)
     }
 
+    /// Withdraw one source within a profile/workspace. Derived records are
+    /// invalidated atomically and proposals citing the source become
+    /// non-applicable while their audit payload remains inspectable.
+    pub fn withdraw_consolidation_source(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        source_id: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        if source_id.trim().is_empty() {
+            return Err(Error::invalid_request("source id is required"));
+        }
+        let source_id = source_id.to_string();
+        let reason = ledger_safe_summary(reason);
+        self.transaction_immediate(|tx| {
+            let source_metadata: String = tx
+                .query_row(
+                    "SELECT metadata FROM memory_sources
+                     WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+                    params![source_id, profile_id, workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation source not found"))?;
+            let now = ids::now_rfc3339();
+            let mut source_metadata =
+                serde_json::from_str::<Value>(&source_metadata).unwrap_or_else(|_| json!({}));
+            if !source_metadata.is_object() {
+                source_metadata = json!({});
+            }
+            if let Some(object) = source_metadata.as_object_mut() {
+                object.insert("withdrawn".into(), Value::Bool(true));
+                object.insert("withdrawn_at".into(), Value::String(now.clone()));
+                object.insert("withdrawal_reason".into(), Value::String(reason.clone()));
+            }
+            tx.execute(
+                "UPDATE memory_sources SET metadata = ?1 WHERE id = ?2",
+                params![source_metadata.to_string(), source_id],
+            )?;
+
+            let mut records = tx
+                .prepare(
+                    "SELECT id, metadata FROM memory_records
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND archived = 0
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(memory_records.source_ids)
+                           WHERE json_each.value = ?3
+                       )",
+                )?
+                .query_map(params![profile_id, workspace_id, source_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut withdrawn_records = Vec::with_capacity(records.len());
+            for (id, raw_metadata) in records.drain(..) {
+                let mut metadata =
+                    serde_json::from_str::<Value>(&raw_metadata).unwrap_or_else(|_| json!({}));
+                if !metadata.is_object() {
+                    metadata = json!({});
+                }
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert("state".into(), Value::String("invalidated".into()));
+                    object.insert("policy_outcome".into(), Value::String("withdrawn".into()));
+                    object.insert(
+                        "withdrawn_source_id".into(),
+                        Value::String(source_id.clone()),
+                    );
+                    object.insert("withdrawn_at".into(), Value::String(now.clone()));
+                    object.insert("historical_reason".into(), Value::String(reason.clone()));
+                }
+                if tx.execute(
+                    "UPDATE memory_records
+                     SET archived = 1, temporal_state = 'invalidated',
+                         invalidated_at = ?1, valid_until = COALESCE(valid_until, ?1),
+                         historical_reason = ?2, updated_at = ?1, metadata = ?3
+                     WHERE id = ?4 AND profile_id = ?5 AND workspace_id = ?6 AND archived = 0",
+                    params![
+                        now,
+                        reason,
+                        metadata.to_string(),
+                        id,
+                        profile_id,
+                        workspace_id
+                    ],
+                )? > 0
+                {
+                    withdrawn_records.push(id);
+                }
+            }
+
+            let mut proposals = tx
+                .prepare(
+                    "SELECT batch_id, batch_json, status
+                     FROM consolidation_proposals",
+                )?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (batch_id, batch_json, status) in proposals.drain(..) {
+                let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+                if batch.profile == profile_id
+                    && batch.workspace == workspace_id
+                    && status != "reverted"
+                    && batch
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.source_ids.iter().any(|id| id == &source_id))
+                {
+                    tx.execute(
+                        "UPDATE consolidation_proposals
+                         SET status = 'rejected', updated_at = ?1 WHERE batch_id = ?2",
+                        params![now, batch_id],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE evidence_ledger SET policy_state = 'withdrawn'
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND source_id = ?3",
+                params![profile_id, workspace_id, source_id],
+            )?;
+            withdrawn_records.sort();
+            Ok(withdrawn_records)
+        })
+    }
+
     /// Apply an already persisted, validated proposal atomically. The caller
     /// must supply the exact decision snapshot that was persisted with it.
     pub fn apply_consolidation_proposal(
@@ -680,6 +811,11 @@ impl Store {
             if status == "reverted" {
                 return Err(Error::invalid_request(
                     "consolidation proposal has already been reverted",
+                ));
+            }
+            if status == "rejected" {
+                return Err(Error::policy(
+                    "consolidation proposal source was withdrawn or rejected",
                 ));
             }
             if stored_decisions.as_deref() != Some(decisions_json.as_str()) {

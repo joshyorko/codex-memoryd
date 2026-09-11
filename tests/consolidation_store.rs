@@ -105,6 +105,88 @@ fn rejected_inference_with_no_new_evidence_is_suppressed() {
 }
 
 #[test]
+fn source_withdrawal_suppresses_queued_proposals_and_archives_derivatives() {
+    let store = Store::open(":memory:").unwrap();
+    let (withdrawn_source, _) = store
+        .upsert_source(
+            "personal",
+            "fixture-workspace",
+            "fixture",
+            Some("fixture:withdrawn"),
+            "withdrawn-source-hash",
+            &json!({"fixture": true}),
+        )
+        .unwrap();
+    let withdrawn_source_id = withdrawn_source.id;
+
+    let mut applied_batch = batch("withdrawal-output");
+    applied_batch.batch_id = "withdrawal-applied".into();
+    applied_batch.policy_digest = automatic_policy().digest();
+    applied_batch.candidates[0].source_ids = vec![withdrawn_source_id.clone()];
+    let applied_decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "withdrawal-output".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec![withdrawn_source_id.clone()],
+        supersedes: vec![],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(
+            &applied_batch,
+            Some(std::slice::from_ref(&applied_decision)),
+            "validated",
+        )
+        .unwrap();
+    let applied_ids = store
+        .apply_consolidation_proposal(
+            "withdrawal-applied",
+            &automatic_policy(),
+            std::slice::from_ref(&applied_decision),
+        )
+        .unwrap();
+
+    let mut queued_batch = batch("withdrawal-queued-output");
+    queued_batch.batch_id = "withdrawal-queued".into();
+    queued_batch.candidates[0].source_ids = vec![withdrawn_source_id.clone()];
+    store
+        .persist_consolidation_batch(&queued_batch, None, "proposed")
+        .unwrap();
+
+    let withdrawn = store
+        .withdraw_consolidation_source(
+            "personal",
+            "fixture-workspace",
+            &withdrawn_source_id,
+            "fixture user withdrawal",
+        )
+        .unwrap();
+
+    assert_eq!(withdrawn, applied_ids);
+    assert!(store.get_record(&applied_ids[0]).unwrap().unwrap().archived);
+    assert!(store
+        .get_source(&withdrawn_source_id)
+        .unwrap()
+        .unwrap()
+        .metadata["withdrawn"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(
+        store
+            .read_consolidation_proposal("withdrawal-queued")
+            .unwrap()
+            .unwrap()
+            .status,
+        "rejected"
+    );
+    let error = store
+        .apply_consolidation_proposal("withdrawal-queued", &automatic_policy(), &[])
+        .unwrap_err();
+    assert!(error.message.contains("withdrawn"));
+}
+
+#[test]
 fn decision_snapshot_is_read_back_with_exact_batch() {
     let store = Store::open(":memory:").unwrap();
     let proposal = batch("output-a");
