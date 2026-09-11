@@ -1,5 +1,8 @@
 use codex_memoryd::consolidation::*;
+use codex_memoryd::domain::{Portability, RecordType, Scope, Sensitivity};
+use codex_memoryd::store::NewRecord;
 use codex_memoryd::store::Store;
+use serde_json::json;
 
 fn batch(output: &str) -> ConsolidationBatch {
     ConsolidationBatch {
@@ -167,6 +170,54 @@ fn guarded_undo_archives_only_untouched_batch_records() {
     assert!(store
         .undo_consolidation_proposal("batch-recovery-1")
         .is_err());
+}
+
+#[test]
+fn guarded_undo_preserves_a_later_edit() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("output-a");
+    proposal.policy_digest = automatic_policy().digest();
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-a".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let ids = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision])
+        .unwrap();
+    let record = store.get_record(&ids[0]).unwrap().unwrap();
+    store
+        .upsert_record(&NewRecord {
+            profile_id: record.profile_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: Scope::Workspace,
+            record_type: RecordType::Preference,
+            content: record.content.clone(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: record.confidence,
+            source_ids: vec!["later-edit".into()],
+            content_hash: record.content_hash.clone(),
+            supersedes: vec![],
+            metadata: json!({"operator_correction":true}),
+        })
+        .unwrap();
+    assert!(store
+        .undo_consolidation_proposal("batch-recovery-1")
+        .unwrap()
+        .is_empty());
+    assert!(!store.get_record(&ids[0]).unwrap().unwrap().archived);
 }
 
 #[test]
