@@ -15,9 +15,10 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use rusqlite::Row;
+use serde_json::json;
 use serde_json::Value;
 
-use crate::consolidation::{ConsolidationBatch, ConsolidationDecision};
+use crate::consolidation::{ConsolidationBatch, ConsolidationDecision, ConsolidationOperation};
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -25,6 +26,7 @@ use crate::domain::MemoryRecord;
 use crate::domain::MemorySource;
 use crate::domain::Portability;
 use crate::domain::Procedure;
+use crate::domain::Profile;
 use crate::domain::RecordType;
 use crate::domain::Relation;
 use crate::domain::RelationExpansion;
@@ -597,6 +599,105 @@ impl Store {
             })
         })
         .transpose()
+    }
+
+    /// Apply an already persisted, validated proposal atomically. The caller
+    /// must supply the exact decision snapshot that was persisted with it.
+    pub fn apply_consolidation_proposal(
+        &self,
+        batch_id: &str,
+        policy: &crate::consolidation::ConsolidationPolicy,
+        decisions: &[ConsolidationDecision],
+    ) -> Result<Vec<String>> {
+        if policy.mode != crate::consolidation::ConsolidationMode::Automatic {
+            return Err(Error::invalid_request(
+                "consolidation application requires automatic policy mode",
+            ));
+        }
+        policy.validate().map_err(Error::invalid_request)?;
+        let decisions_json = serde_json::to_string(decisions)?;
+        let ids = self.transaction_immediate(|tx| {
+            let (batch_json, stored_decisions, status): (String, Option<String>, String) = tx
+                .query_row(
+                    "SELECT batch_json, decisions_json, status
+                     FROM consolidation_proposals WHERE batch_id = ?1",
+                    rusqlite::params![batch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+            if status == "applied" {
+                return record_ids_for_batch(tx, batch_id);
+            }
+            if stored_decisions.as_deref() != Some(decisions_json.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation decision snapshot changed before apply",
+                ));
+            }
+            let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+            batch.validate().map_err(Error::invalid_request)?;
+            if !policy.scopes.iter().any(|scope| scope == &batch.scope) {
+                return Err(Error::policy("consolidation batch scope is outside the active policy"));
+            }
+            let profile = Profile::parse(&batch.profile)
+                .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
+            let mut applied = Vec::new();
+            for decision in decisions {
+                let Some(candidate) = batch.candidates.iter().find(|item| item.candidate_id == decision.candidate_id) else {
+                    return Err(Error::invalid_request("consolidation decision references unknown candidate"));
+                };
+                if candidate.output_digest != decision.output_digest {
+                    return Err(Error::new(ErrorCode::BundlePlanStale, "consolidation output identity changed"));
+                }
+                if !matches!(decision.operation, ConsolidationOperation::AdoptStatement | ConsolidationOperation::AdoptInference) {
+                    continue;
+                }
+                if !policy.operations.contains(&decision.operation) {
+                    return Err(Error::policy("consolidation operation is not permitted by policy"));
+                }
+                let classification = crate::policy::classify(
+                    &candidate.claim,
+                    profile,
+                    false,
+                );
+                let content_hash = ids::content_hash(profile.as_str(), &batch.workspace, None, classification.record_type.as_str(), classification.scope.as_str(), &candidate.claim);
+                let existing: Option<String> = tx.query_row(
+                    "SELECT id FROM memory_records WHERE content_hash = ?1",
+                    rusqlite::params![content_hash],
+                    |row| row.get(0),
+                ).optional()?;
+                let record_id = if let Some(id) = existing {
+                    id
+                } else {
+                    let id = ids::new_id("mem");
+                    let now = ids::now_rfc3339();
+                    let record = MemoryRecord {
+                        id: id.clone(), profile_id: profile.as_str().into(), workspace_id: batch.workspace.clone(),
+                        repo_id: None, subject_id: None, episode_id: None, scope: classification.scope,
+                        record_type: classification.record_type, content: candidate.claim.clone(),
+                        related_files: classification.related_files, tags: classification.tags,
+                        sensitivity: classification.sensitivity, portability: classification.portability,
+                        confidence: classification.confidence, source_ids: candidate.source_ids.clone(),
+                        content_hash, supersedes: vec![], created_at: now.clone(), updated_at: now.clone(),
+                        last_used_at: None, archived: false, trust_state: "trusted".into(), trust_score: classification.confidence,
+                        quarantine_reason: None, quarantined_at: None, promoted_at: Some(now.clone()),
+                        valid_from: None, valid_until: None, observed_at: Some(now), invalidated_at: None,
+                        superseded_by: None, historical_reason: None, temporal_state: TemporalState::Current,
+                        metadata: json!({"origin":"governed_consolidation","batch_id":batch.batch_id,"candidate_id":candidate.candidate_id,"inferred":candidate.inferred,"decision_digest":decision.output_digest}),
+                    };
+                    Store::insert_record_in_transaction(tx, &record)?;
+                    id
+                };
+                applied.push(record_id);
+            }
+            tx.execute(
+                "UPDATE consolidation_proposals SET status = 'applied', updated_at = ?1 WHERE batch_id = ?2",
+                rusqlite::params![ids::now_rfc3339(), batch_id],
+            )?;
+            Ok(applied)
+        })?;
+        Ok(ids)
     }
 
     pub fn ensure_workspace_in_transaction(
@@ -3925,6 +4026,18 @@ pub struct SchemaReport {
 /// table name into SQL (no bound-parameter form exists for identifiers).
 fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn record_ids_for_batch(tx: &rusqlite::Transaction<'_>, batch_id: &str) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT id FROM memory_records
+         WHERE json_extract(metadata, '$.batch_id') = ?1
+         ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![batch_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(rows)
 }
 
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {

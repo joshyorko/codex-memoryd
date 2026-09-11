@@ -7,6 +7,8 @@ fn batch(output: &str) -> ConsolidationBatch {
         policy_digest: "policy-1".into(),
         batch_id: "batch-recovery-1".into(),
         scope: "fixture/personal".into(),
+        profile: "personal".into(),
+        workspace: "fixture-workspace".into(),
         source_cursor: ConsolidationSourceCursor {
             since: None,
             until: Some("2026-09-11T00:00:00Z".into()),
@@ -82,4 +84,55 @@ fn decision_snapshot_is_read_back_with_exact_batch() {
     assert_eq!(read.batch, proposal);
     assert_eq!(read.decisions, Some(vec![decision]));
     assert_eq!(read.status, "validated");
+}
+
+fn automatic_policy() -> ConsolidationPolicy {
+    ConsolidationPolicy {
+        contract_version: CONSOLIDATION_CONTRACT_VERSION.into(),
+        mode: ConsolidationMode::Automatic,
+        scopes: vec!["fixture/personal".into()],
+        claim_classes: vec!["preference".into()],
+        source_classes: vec!["user_statement".into()],
+        operations: vec![ConsolidationOperation::AdoptStatement],
+        budget: ConsolidationBudget {
+            max_candidates: 5,
+            max_source_records: 5,
+            max_provider_calls: 1,
+            max_input_bytes: 1000,
+            max_output_bytes: 1000,
+        },
+        retention_days: 30,
+        semantic_validation: true,
+        legacy_metadata: None,
+    }
+}
+
+#[test]
+fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
+    let store = Store::open(":memory:").unwrap();
+    let proposal = batch("output-a");
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-a".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let first = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision.clone()])
+        .unwrap();
+    let second = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision])
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(store.count_records().unwrap(), 1);
+    let mut preview = automatic_policy();
+    preview.mode = ConsolidationMode::Preview;
+    assert!(store
+        .apply_consolidation_proposal("batch-recovery-1", &preview, &[])
+        .is_err());
 }
