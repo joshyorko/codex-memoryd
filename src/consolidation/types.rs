@@ -84,6 +84,11 @@ pub struct ConsolidationPolicy {
 }
 
 impl ConsolidationPolicy {
+    pub fn digest(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("consolidation policy is serializable");
+        crate::ids::sha256_hex(&encoded)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.contract_version != CONSOLIDATION_CONTRACT_VERSION {
             return Err("unsupported consolidation contract version".into());

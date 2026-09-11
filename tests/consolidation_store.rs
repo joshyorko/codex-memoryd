@@ -110,7 +110,8 @@ fn automatic_policy() -> ConsolidationPolicy {
 #[test]
 fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
     let store = Store::open(":memory:").unwrap();
-    let proposal = batch("output-a");
+    let mut proposal = batch("output-a");
+    proposal.policy_digest = automatic_policy().digest();
     let decision = ConsolidationDecision {
         candidate_id: "candidate-1".into(),
         output_digest: "output-a".into(),
@@ -140,7 +141,8 @@ fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
 #[test]
 fn guarded_undo_archives_only_untouched_batch_records() {
     let store = Store::open(":memory:").unwrap();
-    let proposal = batch("output-a");
+    let mut proposal = batch("output-a");
+    proposal.policy_digest = automatic_policy().digest();
     let decision = ConsolidationDecision {
         candidate_id: "candidate-1".into(),
         output_digest: "output-a".into(),
@@ -165,4 +167,25 @@ fn guarded_undo_archives_only_untouched_batch_records() {
     assert!(store
         .undo_consolidation_proposal("batch-recovery-1")
         .is_err());
+}
+
+#[test]
+fn changed_policy_cannot_apply_a_persisted_batch() {
+    let store = Store::open(":memory:").unwrap();
+    let proposal = batch("output-a");
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-a".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let error = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision])
+        .unwrap_err();
+    assert!(error.message.contains("policy changed"));
 }

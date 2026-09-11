@@ -642,6 +642,12 @@ impl Store {
             }
             let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
             batch.validate().map_err(Error::invalid_request)?;
+            if batch.policy_digest != policy.digest() {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation policy changed before apply",
+                ));
+            }
             if !policy.scopes.iter().any(|scope| scope == &batch.scope) {
                 return Err(Error::policy("consolidation batch scope is outside the active policy"));
             }
