@@ -3553,7 +3553,6 @@ fn provider_evidence_stream(stream: &DreamEvidenceStream) -> Value {
                 "state": source.state,
                 "summary": source.summary,
                 "content": content,
-                "source_path": source.source_path,
                 "conversation_id": source.conversation_id,
                 "message_id": source.message_id,
                 "turn_index": source.turn_index,
