@@ -69,6 +69,7 @@ fn command_provider_uses_the_rolling_daily_cost_ceiling() {
         repo: None,
         now: Some("2030-01-01T00:00:00Z".into()),
         since: None,
+        since_explicit: false,
         kind: "dream_preview".into(),
         mode: Some("command".into()),
         budget: codex_memoryd::protocol::DreamJobBudget {

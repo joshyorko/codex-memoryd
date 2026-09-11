@@ -1688,12 +1688,14 @@ impl Service {
         let provider = req.provider.unwrap_or_default();
         let resolved_provider = self.resolve_dream_provider(adapter, &provider, &req.budget)?;
         let persisted_provider = persisted_dream_provider(&provider, resolved_provider.as_ref());
-        let explicit_since = req.since.is_some();
+        let explicit_since = req.since.is_some() || req.since_explicit;
         let source_window_start = match req.since.as_ref() {
             Some(since) => Some(since.clone()),
-            None => self
-                .store
-                .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
+            None if !req.since_explicit => {
+                self.store
+                    .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?
+            }
+            None => None,
         };
 
         self.store.upsert_dream_job(&DreamJobRecord {
@@ -2475,6 +2477,7 @@ impl Service {
                     repo: None,
                     now: Some(now.clone()),
                     since: watermark_before.clone(),
+                    since_explicit: true,
                     kind: "dream_preview".to_string(),
                     mode: Some("command".to_string()),
                     provider: None,

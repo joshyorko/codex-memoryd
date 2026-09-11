@@ -66,6 +66,7 @@ fn base_request() -> DreamJobRunRequest {
         repo: None::<RepoIdentity>,
         now: Some("2030-01-01T00:00:00Z".to_string()),
         since: None,
+        since_explicit: false,
         kind: "dream_preview".to_string(),
         mode: Some("deterministic".to_string()),
         budget: DreamJobBudget {
@@ -198,6 +199,7 @@ fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
             repo: None::<RepoIdentity>,
             now: Some("2030-01-01T00:00:00Z".to_string()),
             since: None,
+            since_explicit: false,
             kind: "dream_preview".to_string(),
             mode: Some("deterministic".to_string()),
             budget: DreamJobBudget {
@@ -273,6 +275,7 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
             repo: None::<RepoIdentity>,
             now: Some("2030-01-01T00:00:00Z".to_string()),
             since: None,
+            since_explicit: false,
             kind: "dream_preview".to_string(),
             mode: Some("deterministic".to_string()),
             budget: DreamJobBudget {

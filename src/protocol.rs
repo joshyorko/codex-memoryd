@@ -1038,6 +1038,9 @@ pub struct DreamJobRunRequest {
     pub now: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
+    /// Distinguishes an explicitly empty scheduled cutoff from an omitted one.
+    #[serde(default)]
+    pub since_explicit: bool,
     pub kind: String,
     #[serde(default)]
     pub mode: Option<String>,
