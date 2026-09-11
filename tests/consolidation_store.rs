@@ -272,6 +272,71 @@ fn guarded_undo_preserves_a_later_edit() {
 }
 
 #[test]
+fn guarded_undo_restores_a_superseded_record_and_archives_replacement() {
+    let store = Store::open(":memory:").unwrap();
+    store
+        .ensure_workspace("personal", "fixture-workspace")
+        .unwrap();
+    let old = NewRecord {
+        profile_id: "personal".into(),
+        workspace_id: "fixture-workspace".into(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type: RecordType::Preference,
+        content: "prefers concise updates".into(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.8,
+        source_ids: vec!["old-source".into()],
+        content_hash: codex_memoryd::ids::content_hash(
+            "personal",
+            "fixture-workspace",
+            None,
+            "preference",
+            "workspace",
+            "prefers concise updates",
+        ),
+        supersedes: vec![],
+        metadata: json!({"origin":"fixture"}),
+    };
+    let old_id = store.upsert_record(&old).unwrap().id().to_string();
+    let mut proposal = batch("output-new");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates[0].claim = "prefers stable interfaces".into();
+    proposal.candidates[0].output_digest = "output-new".into();
+    proposal.candidates[0].supersedes = vec![old_id.clone()];
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-new".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported correction".into(),
+        distinct_evidence_roots: vec!["new-source".into()],
+        supersedes: vec![old_id.clone()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &[decision])
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+
+    assert_eq!(
+        store
+            .undo_consolidation_proposal("batch-recovery-1")
+            .unwrap(),
+        applied
+    );
+    assert!(!store.get_record(&old_id).unwrap().unwrap().archived);
+    assert!(store.get_record(&applied[0]).unwrap().unwrap().archived);
+}
+
+#[test]
 fn deferred_candidate_does_not_freeze_independent_adoption() {
     let store = Store::open(":memory:").unwrap();
     let mut proposal = batch("output-a");

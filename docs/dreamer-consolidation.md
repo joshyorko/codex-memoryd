@@ -18,6 +18,10 @@ governed policy boundary and persist an immutable batch before applying. The
 batch-only `/v1/consolidation/apply` and `/v1/consolidation/undo` controls do
 not accept policy, mode, credential, or scope overrides. Undo only reverses
 untouched records from that batch; later edits are preserved.
+For a batch-created replacement that supersedes a current record, undo restores
+the recorded prior state only when the replacement and supersession link remain
+untouched. If a replacement existed before the batch or a later edit changed
+the link, the old record stays historical.
 
 When a scheduled candidate supersedes a current record, the persisted decision
 retains the superseded record IDs. Automatic apply validates those targets in

@@ -713,6 +713,7 @@ impl Store {
                     &batch.workspace,
                     &record_id,
                     &decision.supersedes,
+                    batch_id,
                     &ids::now_rfc3339(),
                 )?;
                 if !applied.contains(&record_id) {
@@ -757,6 +758,64 @@ impl Store {
                 .query_map(rusqlite::params![batch_id], |row| row.get(0))?
                 .collect::<std::result::Result<Vec<String>, _>>()?;
             drop(stmt);
+            for replacement_id in &ids {
+                let old_records = tx
+                    .prepare(
+                        "SELECT id, metadata FROM memory_records
+                         WHERE archived = 1 AND temporal_state = 'superseded'
+                           AND superseded_by = ?1
+                           AND json_extract(metadata, '$.consolidation_batch_id') = ?2",
+                    )?
+                    .query_map(rusqlite::params![replacement_id, batch_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (old_id, raw_metadata) in old_records {
+                    let metadata = serde_json::from_str::<Value>(&raw_metadata)
+                        .unwrap_or_else(|_| json!({}));
+                    let Some(previous) = metadata.get("consolidation_previous") else {
+                        continue;
+                    };
+                    let previous_metadata = metadata
+                        .get("consolidation_previous_metadata")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let previous_temporal_state = previous
+                        .get("temporal_state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("current");
+                    let previous_archived = previous
+                        .get("archived")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let previous_superseded_by = previous
+                        .get("superseded_by")
+                        .and_then(Value::as_str);
+                    let previous_valid_until = previous
+                        .get("valid_until")
+                        .and_then(Value::as_str);
+                    let previous_historical_reason = previous
+                        .get("historical_reason")
+                        .and_then(Value::as_str);
+                    tx.execute(
+                        "UPDATE memory_records
+                         SET archived = ?1, temporal_state = ?2, superseded_by = ?3,
+                             valid_until = ?4, historical_reason = ?5,
+                             updated_at = ?6, metadata = ?7
+                         WHERE id = ?8",
+                        rusqlite::params![
+                            previous_archived,
+                            previous_temporal_state,
+                            previous_superseded_by,
+                            previous_valid_until,
+                            previous_historical_reason,
+                            ids::now_rfc3339(),
+                            previous_metadata.to_string(),
+                            old_id,
+                        ],
+                    )?;
+                }
+            }
             tx.execute(
                 "UPDATE memory_records
                  SET archived = 1, temporal_state = 'historical',
@@ -781,6 +840,7 @@ impl Store {
         workspace_id: &str,
         replacement_id: &str,
         superseded_ids: &[String],
+        batch_id: &str,
         now: &str,
     ) -> Result<()> {
         let ids = superseded_ids
@@ -824,11 +884,10 @@ impl Store {
         }
         tx.execute(
             "UPDATE memory_records
-         SET supersedes = ?1, updated_at = ?2
-         WHERE id = ?3 AND profile_id = ?4 AND workspace_id = ?5",
+         SET supersedes = ?1
+         WHERE id = ?2 AND profile_id = ?3 AND workspace_id = ?4",
             params![
                 serde_json::to_string(&replacement_supersedes)?,
-                now,
                 replacement_id,
                 profile_id,
                 workspace_id,
@@ -836,17 +895,58 @@ impl Store {
         )?;
 
         for superseded_id in &ids {
-            let raw: String = tx.query_row(
-                "SELECT metadata FROM memory_records
-             WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+            let (
+                raw,
+                valid_until,
+                previous_superseded_by,
+                previous_historical_reason,
+                previous_temporal_state,
+                previous_archived,
+            ): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+                i64,
+            ) = tx.query_row(
+                "SELECT metadata, valid_until, superseded_by, historical_reason,
+                        COALESCE(temporal_state, 'current'), archived
+                 FROM memory_records
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
                 params![superseded_id, profile_id, workspace_id],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )?;
             let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
             if !metadata.is_object() {
                 metadata = json!({});
             }
+            let previous_metadata = metadata.clone();
             if let Some(object) = metadata.as_object_mut() {
+                object.insert("consolidation_previous_metadata".into(), previous_metadata);
+                object.insert(
+                    "consolidation_previous".into(),
+                    json!({
+                        "valid_until": valid_until,
+                        "superseded_by": previous_superseded_by,
+                        "historical_reason": previous_historical_reason,
+                        "temporal_state": previous_temporal_state,
+                        "archived": previous_archived,
+                    }),
+                );
+                object.insert(
+                    "consolidation_batch_id".into(),
+                    Value::String(batch_id.into()),
+                );
                 object.insert("state".into(), Value::String("superseded".into()));
                 object.insert("policy_outcome".into(), Value::String("superseded".into()));
                 object.insert(
