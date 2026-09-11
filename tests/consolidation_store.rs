@@ -59,3 +59,27 @@ fn changed_payload_cannot_reuse_batch_identity() {
         .unwrap_err();
     assert!(error.message.contains("different payload"));
 }
+
+#[test]
+fn decision_snapshot_is_read_back_with_exact_batch() {
+    let store = Store::open(":memory:").unwrap();
+    let proposal = batch("output-a");
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-a".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        validator: None,
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let read = store
+        .read_consolidation_proposal("batch-recovery-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.batch, proposal);
+    assert_eq!(read.decisions, Some(vec![decision]));
+    assert_eq!(read.status, "validated");
+}

@@ -182,6 +182,13 @@ pub struct DreamJobRecord {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConsolidationProposalRecord {
+    pub batch: ConsolidationBatch,
+    pub decisions: Option<Vec<ConsolidationDecision>>,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScheduledDreamRunSummary {
     pub run_id: String,
@@ -557,6 +564,38 @@ impl Store {
         )
         .optional()?
         .map(|raw| serde_json::from_str(&raw).map_err(Error::from))
+        .transpose()
+    }
+
+    /// Read the immutable batch together with its persisted decision snapshot.
+    pub fn read_consolidation_proposal(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<ConsolidationProposalRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT batch_json, decisions_json, status
+             FROM consolidation_proposals WHERE batch_id = ?1",
+            rusqlite::params![batch_id],
+            |row| {
+                let batch_json: String = row.get(0)?;
+                let decisions_json: Option<String> = row.get(1)?;
+                let status: String = row.get(2)?;
+                Ok((batch_json, decisions_json, status))
+            },
+        )
+        .optional()?
+        .map(|(batch_json, decisions_json, status)| {
+            let batch = serde_json::from_str(&batch_json)?;
+            let decisions = decisions_json
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?;
+            Ok(ConsolidationProposalRecord {
+                batch,
+                decisions,
+                status,
+            })
+        })
         .transpose()
     }
 
