@@ -2558,7 +2558,7 @@ impl Service {
                     recency_cutoff: watermark_before.as_deref(),
                     include_archived_sources: false,
                     max_records: cfg.max_batch_size,
-                    max_candidates: Some(cfg.max_candidates),
+                    max_candidates: (!cfg.automatic_apply).then_some(cfg.max_candidates),
                     patch_run_id: None,
                     deadline: None,
                 },
@@ -2571,11 +2571,20 @@ impl Service {
         }
         match result {
             Ok((mut run, mut max_candidates_hit)) => {
+                if cfg.automatic_apply && !command_mode {
+                    max_candidates_hit |= self.filter_applied_scheduled_candidates(
+                        &mut run,
+                        &profile,
+                        &workspace,
+                        cfg.max_candidates,
+                    )?;
+                }
                 let provider_config = &self.config.dream_provider;
                 if !command_mode
                     && self.config.dream_scheduler.scheduled_provider_enabled
                     && provider_config.enabled
                     && !provider_config.endpoint.trim().is_empty()
+                    && scheduled_provider_has_evidence(&run)
                 {
                     if let Ok(context) = scheduled_dream_provider_context(
                         &self.store,
@@ -2834,6 +2843,43 @@ impl Service {
         run.archived.dedup();
         run.mode = "apply".to_string();
         Ok(())
+    }
+
+    fn filter_applied_scheduled_candidates(
+        &self,
+        run: &mut DreamResponse,
+        profile: &Profile,
+        workspace: &str,
+        max_candidates: usize,
+    ) -> Result<bool> {
+        let mut pending = Vec::with_capacity(run.candidates.len());
+        for candidate in std::mem::take(&mut run.candidates) {
+            let record_type = RecordType::parse(&candidate.proposed_type).unwrap_or_else(|| {
+                policy::classify(&candidate.content, *profile, false).record_type
+            });
+            let classification =
+                policy::classify_as(&candidate.content, *profile, false, record_type);
+            let content_hash = ids::exact_content_hash(
+                profile.as_str(),
+                workspace,
+                None,
+                classification.record_type.as_str(),
+                classification.scope.as_str(),
+                &candidate.content,
+            );
+            if self.store.find_by_content_hash(&content_hash)?.is_none() {
+                pending.push(candidate);
+            }
+        }
+        let mut max_candidates_hit = pending.len() > max_candidates;
+        pending.truncate(max_candidates);
+        run.candidates = pending;
+        let remaining = max_candidates.saturating_sub(run.candidates.len());
+        if run.rejected.len() > remaining {
+            max_candidates_hit = true;
+            run.rejected.truncate(remaining);
+        }
+        Ok(max_candidates_hit)
     }
 
     // ------------------------------------------------------------------
@@ -3502,6 +3548,11 @@ fn evidence_window_count(window: &DreamEvidenceWindow) -> usize {
         + window.checkpoints.count
         + window.imported_memories.count
         + window.active_memory_records.count
+}
+
+fn scheduled_provider_has_evidence(response: &DreamResponse) -> bool {
+    response.evidence_window.visible_turns.count > 0
+        || response.evidence_window.imported_memories.count > 0
 }
 
 fn dream_provider_context(response: &DreamResponse) -> Result<String> {

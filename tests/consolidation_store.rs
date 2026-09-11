@@ -361,6 +361,74 @@ fn automatic_apply_preserves_case_sensitive_claims() {
 }
 
 #[test]
+fn automatic_apply_keeps_meaning_preservation_perturbations_distinct() {
+    let store = Store::open(":memory:").unwrap();
+    let claims = [
+        "Use git branch -d feature",
+        "Use git branch -D feature",
+        "Deploy from /srv/Alpha",
+        "Deploy from /srv/alpha",
+        "Reserve 1 GiB for the cache",
+        "Reserve 2 GiB for the cache",
+        "Do not deploy on Friday",
+        "Deploy on Friday",
+        "Use concise updates",
+        "Usa actualizaciones concisas",
+        "  Preserve exact indentation",
+        "Preserve exact indentation",
+    ];
+    let mut proposal = batch("meaning-preservation");
+    proposal.batch_id = "meaning-preservation-batch".into();
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates = claims
+        .iter()
+        .enumerate()
+        .map(|(index, claim)| ConsolidationCandidate {
+            candidate_id: format!("meaning-candidate-{index}"),
+            output_digest: format!("meaning-output-{index}"),
+            claim: (*claim).into(),
+            claim_class: "preference".into(),
+            subject: "synthetic-user".into(),
+            inferred: false,
+            source_ids: vec![format!("meaning-source-{index}")],
+            supporting_spans: vec![(*claim).into()],
+            supersedes: vec![],
+        })
+        .collect();
+    let decisions = proposal
+        .candidates
+        .iter()
+        .map(|candidate| ConsolidationDecision {
+            candidate_id: candidate.candidate_id.clone(),
+            output_digest: candidate.output_digest.clone(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: candidate.source_ids.clone(),
+            supersedes: vec![],
+            validator: None,
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .persist_consolidation_batch(&proposal, Some(&decisions), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal(
+            "meaning-preservation-batch",
+            &automatic_policy(),
+            &decisions,
+        )
+        .unwrap();
+    assert_eq!(applied.len(), claims.len());
+
+    let records = store.query_records(&Default::default()).unwrap();
+    assert_eq!(records.len(), claims.len());
+    for claim in claims {
+        assert!(records.iter().any(|record| record.content == claim));
+    }
+}
+
+#[test]
 fn guarded_undo_archives_only_untouched_batch_records() {
     let store = Store::open(":memory:").unwrap();
     let mut proposal = batch("output-a");
