@@ -67,6 +67,44 @@ fn changed_payload_cannot_reuse_batch_identity() {
 }
 
 #[test]
+fn rejected_inference_with_no_new_evidence_is_suppressed() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("rejected-inference");
+    proposal.batch_id = "rejected-inference-batch".into();
+    proposal.candidates[0].candidate_id = "rejected-candidate".into();
+    proposal.candidates[0].output_digest = "rejected-inference".into();
+    proposal.candidates[0].claim = "values concise communication".into();
+    proposal.candidates[0].claim_class = "pattern".into();
+    proposal.candidates[0].inferred = true;
+    proposal.candidates[0].source_ids = vec!["source-a".into(), "source-b".into()];
+    let rejection = ConsolidationDecision {
+        candidate_id: "rejected-candidate".into(),
+        output_digest: "rejected-inference".into(),
+        operation: ConsolidationOperation::Reject,
+        reason: "user rejected inferred insight".into(),
+        distinct_evidence_roots: vec!["root-a".into(), "root-b".into()],
+        supersedes: vec![],
+        validator: Some("fixture-validator".into()),
+    };
+    store
+        .persist_consolidation_batch(&proposal, Some(&[rejection]), "validated")
+        .unwrap();
+
+    let mut paraphrase = proposal.candidates[0].clone();
+    paraphrase.candidate_id = "new-candidate-id".into();
+    paraphrase.output_digest = "new-output".into();
+    paraphrase.claim = "prefers concise communication".into();
+    assert!(store
+        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase)
+        .unwrap());
+
+    paraphrase.source_ids.push("source-new".into());
+    assert!(!store
+        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase)
+        .unwrap());
+}
+
+#[test]
 fn decision_snapshot_is_read_back_with_exact_batch() {
     let store = Store::open(":memory:").unwrap();
     let proposal = batch("output-a");
@@ -188,6 +226,56 @@ fn automatic_apply_receipt_deduplicates_shared_record_ids() {
         .unwrap();
     assert_eq!(applied.len(), 1);
     assert_eq!(store.count_records().unwrap(), 1);
+}
+
+#[test]
+fn automatic_apply_preserves_case_sensitive_claims() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("output-case-a");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates[0].claim = "Use git branch -d feature".into();
+    proposal.candidates[0].output_digest = "output-case-a".into();
+    proposal.candidates.push(ConsolidationCandidate {
+        candidate_id: "candidate-case-b".into(),
+        output_digest: "output-case-b".into(),
+        claim: "Use git branch -D feature".into(),
+        claim_class: "preference".into(),
+        subject: "synthetic-user".into(),
+        inferred: false,
+        source_ids: vec!["source-2".into()],
+        supporting_spans: vec!["Use git branch -D feature".into()],
+        supersedes: vec![],
+    });
+    let decisions = vec![
+        ConsolidationDecision {
+            candidate_id: "candidate-1".into(),
+            output_digest: "output-case-a".into(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: vec!["root-1".into()],
+            supersedes: vec![],
+            validator: None,
+        },
+        ConsolidationDecision {
+            candidate_id: "candidate-case-b".into(),
+            output_digest: "output-case-b".into(),
+            operation: ConsolidationOperation::AdoptStatement,
+            reason: "supported".into(),
+            distinct_evidence_roots: vec!["root-2".into()],
+            supersedes: vec![],
+            validator: None,
+        },
+    ];
+    store
+        .persist_consolidation_batch(&proposal, Some(&decisions), "validated")
+        .unwrap();
+
+    let applied = store
+        .apply_consolidation_proposal("batch-recovery-1", &automatic_policy(), &decisions)
+        .unwrap();
+
+    assert_eq!(applied.len(), 2);
+    assert_eq!(store.count_records().unwrap(), 2);
 }
 
 #[test]

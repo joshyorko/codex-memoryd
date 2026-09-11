@@ -12,6 +12,11 @@ undo are server-owned transactional operations; recall remains
 `recall_not_authority`. Synthetic acceptance fixtures are listed in
 `tests/fixtures/consolidation/manifest.json`.
 
+Consolidation candidate identity preserves the exact claim text, including
+case, punctuation, units, and negation. The provider input budget covers the
+complete serialized request envelope and schema, and all Dream evidence streams
+share one bounded record budget.
+
 The existing `CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY` setting is off by default.
 When an operator enables it, deterministic scheduled candidates pass the
 governed policy boundary and persist an immutable batch before applying. The
@@ -28,6 +33,10 @@ retains the superseded record IDs. Automatic apply validates those targets in
 the same SQLite transaction, links the replacement, archives the old records as
 superseded, and returns unique applied record IDs. A changed or missing target
 rejects the transaction as stale.
+
+A scheduled run that hits a runtime or candidate limit does not advance its
+watermark past the unprocessed source tail; a later run must rediscover that
+work.
 
 The existing `/v1/dream` preview path remains non-adopting. Model-backed
 semantic validation and FRIDAY consumer acceptance are separate gates; this

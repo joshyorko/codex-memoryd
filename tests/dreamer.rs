@@ -1365,7 +1365,7 @@ fn scheduled_dreamer_enforces_candidate_limit() {
             .scheduled_dream_watermark("personal", "ws", None)
             .unwrap()
             .as_deref(),
-        Some("2030-01-01T00:00:00Z")
+        None
     );
     let status = svc.status().unwrap();
     let scheduler = status.features.get("dream_scheduler").unwrap();
@@ -2450,6 +2450,7 @@ fn imported_chatgpt_turns_do_not_exceed_native_max_records_cap() {
             repo_id: None,
             mode: "preview",
             now: "2026-06-09T00:00:00Z",
+            source_window_end: None,
             recency_cutoff: None,
             include_archived_sources: false,
             max_records: 1,

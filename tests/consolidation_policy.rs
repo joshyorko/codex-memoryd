@@ -115,6 +115,68 @@ fn valid_ids_without_semantic_support_do_not_adopt() {
 }
 
 #[test]
+fn inferred_claims_require_two_distinct_evidence_roots() {
+    let mut copied = evidence();
+    copied[1].root_id = copied[0].root_id.clone();
+    let validation = SemanticValidation {
+        supported: true,
+        validator: "fixture-validator".into(),
+        reason: "supported".into(),
+    };
+
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &candidate(true, "values concise communication"),
+        &copied,
+        &[],
+        &[],
+        Some(&validation),
+    );
+
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "insufficient_distinct_evidence");
+}
+
+#[test]
+fn user_statements_require_user_authored_evidence() {
+    let mut assistant_evidence = evidence();
+    assistant_evidence[0].actor = "assistant".into();
+
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &candidate(false, "prefers concise updates"),
+        &assistant_evidence,
+        &[],
+        &[],
+        None,
+    );
+
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "source_actor_not_allowed");
+}
+
+#[test]
+fn disallowed_adoption_operation_is_deferred_by_policy() {
+    let mut restricted = policy();
+    restricted.operations = vec![ConsolidationOperation::Defer];
+
+    let decision = evaluate_candidate(
+        &restricted,
+        "personal",
+        &candidate(false, "prefers concise updates"),
+        &evidence(),
+        &[],
+        &[],
+        None,
+    );
+
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "operation_not_allowed");
+}
+
+#[test]
 fn duplicate_roots_and_scope_mismatch_are_not_independent_support() {
     let mut copied = evidence();
     copied[1].root_id = "root-a".into();
@@ -152,6 +214,23 @@ fn represented_claim_with_no_new_root_is_no_change() {
         None,
     );
     assert_eq!(decision.operation, ConsolidationOperation::NoChange);
+}
+
+#[test]
+fn repeated_derivation_with_unchanged_roots_stays_no_change() {
+    for _ in 0..20 {
+        let decision = evaluate_candidate(
+            &policy(),
+            "personal",
+            &candidate(false, "existing"),
+            &evidence(),
+            &["existing".into()],
+            &["root-a".into(), "root-b".into()],
+            None,
+        );
+        assert_eq!(decision.operation, ConsolidationOperation::NoChange);
+        assert_eq!(decision.distinct_evidence_roots.len(), 2);
+    }
 }
 
 #[test]

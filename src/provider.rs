@@ -141,8 +141,6 @@ pub fn execute_preview(
         ));
     }
 
-    let input_bytes = model_input.as_bytes().len();
-    let input_tokens = estimate_tokens(model_input);
     let request_body = json!({
         "schema_version": DREAM_PROVIDER_SCHEMA_VERSION,
         "profile": profile,
@@ -174,6 +172,10 @@ pub fn execute_preview(
     });
     let request_bytes = serde_json::to_vec(&request_body)
         .map_err(|_| Error::internal("provider request could not be encoded"))?;
+    // Charge the complete wire request, including the schema and provider
+    // envelope, rather than only the evidence string.
+    let input_bytes = request_bytes.len();
+    let input_tokens = estimate_tokens_from_bytes(input_bytes);
     if budget.max_input_bytes > 0 && input_bytes > budget.max_input_bytes {
         return Err(Error::internal(
             "dream provider input byte budget exhausted",
@@ -574,21 +576,19 @@ fn parsed_usage(value: &Value) -> ParsedUsage {
     }
 }
 
-fn estimate_tokens(value: &str) -> usize {
-    estimate_tokens_from_bytes(value.len())
-}
-
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
     bytes.saturating_add(3) / 4
 }
 
 #[cfg(test)]
 mod tests {
-    use super::generate_observations;
+    use super::{execute_preview, generate_observations, DreamProviderRequest};
+    use crate::protocol::DreamProviderAdapter;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn generates_observations_from_openai_compatible_response() {
@@ -636,6 +636,32 @@ mod tests {
             generate_observations("http://127.0.0.1:1/v1", "", "test-model", "Evidence text")
                 .expect("fail open");
         assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn provider_input_budget_includes_request_schema_overhead() {
+        let request = DreamProviderRequest {
+            adapter: DreamProviderAdapter::LocalModel,
+            endpoint: "http://127.0.0.1:1/v1",
+            command: &[],
+            api_key: "",
+            model: "model",
+            provider_name: "provider",
+            timeout: Duration::from_millis(25),
+            max_response_bytes: 1024,
+            max_provider_calls: 1,
+            max_retries: 0,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let budget = crate::protocol::DreamJobBudget {
+            max_candidates: 1,
+            max_input_bytes: 100,
+            ..Default::default()
+        };
+
+        let error = execute_preview(&request, "personal", "workspace", None, "tiny", &budget)
+            .expect_err("wire payload should exceed the input-byte budget");
+        assert_eq!(error.message, "dream provider input byte budget exhausted");
     }
 
     fn command_run(script: &str, limit: usize) -> Result<serde_json::Value, &'static str> {

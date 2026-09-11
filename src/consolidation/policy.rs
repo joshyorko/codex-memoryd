@@ -23,6 +23,27 @@ pub struct SemanticValidation {
     pub reason: String,
 }
 
+/// Stable suppression identity for an inferred proposal rejected without new
+/// evidence. It intentionally excludes model output text so a paraphrase
+/// backed by the same subject, class, and source lineage remains suppressed.
+pub fn rejection_fingerprint(candidate: &ConsolidationCandidate) -> String {
+    let source_ids = candidate
+        .source_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    crate::ids::sha256_hex(
+        format!(
+            "consolidation-rejection.v1\u{1f}{}\u{1f}{}\u{1f}{}",
+            candidate.claim_class, candidate.subject, source_ids
+        )
+        .as_bytes(),
+    )
+}
+
 pub fn evaluate_candidate(
     policy: &ConsolidationPolicy,
     scope: &str,
@@ -98,11 +119,27 @@ pub fn evaluate_candidate(
     if matched.iter().any(|item| item.subject != candidate.subject) {
         return defer("subject_scope_mismatch");
     }
+    if !candidate.inferred
+        && matched.iter().any(|item| {
+            matches!(item.source_class.as_str(), "user_statement" | "turn") && item.actor != "user"
+        })
+    {
+        return defer("source_actor_not_allowed");
+    }
+    if candidate.inferred && roots.len() < 2 {
+        return defer("insufficient_distinct_evidence");
+    }
     if current_claims.iter().any(|claim| claim == &candidate.claim)
         && roots
             .iter()
             .all(|root| current_roots.iter().any(|known| known == root))
     {
+        if !policy
+            .operations
+            .contains(&ConsolidationOperation::NoChange)
+        {
+            return defer("operation_not_allowed");
+        }
         return ConsolidationDecision {
             candidate_id: candidate.candidate_id.clone(),
             output_digest: candidate.output_digest.clone(),
@@ -129,6 +166,9 @@ pub fn evaluate_candidate(
     } else {
         ConsolidationOperation::AdoptStatement
     };
+    if !policy.operations.contains(&operation) {
+        return defer("operation_not_allowed");
+    }
     ConsolidationDecision {
         candidate_id: candidate.candidate_id.clone(),
         output_digest: candidate.output_digest.clone(),

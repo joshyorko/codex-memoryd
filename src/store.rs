@@ -18,7 +18,9 @@ use rusqlite::Row;
 use serde_json::json;
 use serde_json::Value;
 
-use crate::consolidation::{ConsolidationBatch, ConsolidationDecision, ConsolidationOperation};
+use crate::consolidation::{
+    ConsolidationBatch, ConsolidationCandidate, ConsolidationDecision, ConsolidationOperation,
+};
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -601,6 +603,48 @@ impl Store {
         .transpose()
     }
 
+    /// Check whether an inferred candidate repeats a previously rejected
+    /// insight without adding a new source lineage root.
+    pub fn is_consolidation_candidate_suppressed(
+        &self,
+        scope: &str,
+        candidate: &ConsolidationCandidate,
+    ) -> Result<bool> {
+        if !candidate.inferred {
+            return Ok(false);
+        }
+        let fingerprint = crate::consolidation::policy::rejection_fingerprint(candidate);
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT batch_json, decisions_json
+             FROM consolidation_proposals
+             WHERE scope = ?1 AND decisions_json IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![scope], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (batch_json, decisions_json) = row?;
+            let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+            let decisions: Vec<ConsolidationDecision> = serde_json::from_str(&decisions_json)?;
+            if decisions.iter().any(|decision| {
+                decision.operation == ConsolidationOperation::Reject
+                    && batch
+                        .candidates
+                        .iter()
+                        .find(|item| item.candidate_id == decision.candidate_id)
+                        .is_some_and(|rejected| {
+                            rejected.inferred
+                                && crate::consolidation::policy::rejection_fingerprint(rejected)
+                                    == fingerprint
+                        })
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply an already persisted, validated proposal atomically. The caller
     /// must supply the exact decision snapshot that was persisted with it.
     pub fn apply_consolidation_proposal(
@@ -679,7 +723,14 @@ impl Store {
                     false,
                     record_type,
                 );
-                let content_hash = ids::content_hash(profile.as_str(), &batch.workspace, None, classification.record_type.as_str(), classification.scope.as_str(), &candidate.claim);
+                let content_hash = ids::exact_content_hash(
+                    profile.as_str(),
+                    &batch.workspace,
+                    None,
+                    classification.record_type.as_str(),
+                    classification.scope.as_str(),
+                    &candidate.claim,
+                );
                 let existing: Option<String> = tx.query_row(
                     "SELECT id FROM memory_records WHERE content_hash = ?1",
                     rusqlite::params![content_hash],
@@ -3179,6 +3230,24 @@ impl Store {
     /// Filtered listing without text search (used by export and recall
     /// candidate gathering).
     pub fn query_records(&self, query: &RecordQuery) -> Result<Vec<MemoryRecord>> {
+        self.query_records_with_end(query, None)
+    }
+
+    /// Filtered listing with an inclusive upper timestamp for bounded Dream
+    /// frontiers. General recall keeps the legacy open-ended query above.
+    pub fn query_records_until(
+        &self,
+        query: &RecordQuery,
+        until: &str,
+    ) -> Result<Vec<MemoryRecord>> {
+        self.query_records_with_end(query, Some(until))
+    }
+
+    fn query_records_with_end(
+        &self,
+        query: &RecordQuery,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>> {
         let conn = self.conn()?;
         let mut sql = format!("SELECT {RECORD_COLS} FROM memory_records WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -3212,6 +3281,10 @@ impl Store {
         if let Some(cutoff) = &query.recency_cutoff {
             sql.push_str(" AND updated_at >= ?");
             args.push(Box::new(cutoff.clone()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND updated_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY updated_at DESC");
         if query.limit > 0 {
@@ -3434,6 +3507,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Checkpoint>> {
         let conn = self.conn()?;
@@ -3454,6 +3528,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND created_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND created_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
         if limit > 0 {
@@ -3499,6 +3577,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Conclusion>> {
         let conn = self.conn()?;
@@ -3518,6 +3597,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND created_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND created_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
         if limit > 0 {
@@ -3560,6 +3643,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<VisibleTurn>> {
         let conn = self.conn()?;
@@ -3580,6 +3664,10 @@ impl Store {
             sql.push_str(" AND t.created_at >= ?");
             args.push(Box::new(since.to_string()));
         }
+        if let Some(until) = until {
+            sql.push_str(" AND t.created_at <= ?");
+            args.push(Box::new(until.to_string()));
+        }
         sql.push_str(" ORDER BY t.created_at DESC, t.id ASC");
         if limit > 0 {
             sql.push_str(&format!(" LIMIT {limit}"));
@@ -3599,6 +3687,7 @@ impl Store {
         profile_id: &str,
         workspace_id: &str,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemorySource>> {
         let conn = self.conn()?;
@@ -3614,6 +3703,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND ingested_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND ingested_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY ingested_at DESC, id ASC");
         if limit > 0 {

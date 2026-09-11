@@ -242,6 +242,8 @@ pub struct DreamParams<'a> {
     pub repo_id: Option<&'a str>,
     pub mode: &'a str,
     pub now: &'a str,
+    /// Inclusive source frontier, which may differ from the logical clock.
+    pub source_window_end: Option<&'a str>,
     pub recency_cutoff: Option<&'a str>,
     pub include_archived_sources: bool,
     pub max_records: usize,
@@ -252,17 +254,21 @@ pub struct DreamParams<'a> {
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     check_deadline(params)?;
-    let mut records = store.query_records(&RecordQuery {
-        profile_id: Some(params.profile.as_str().to_string()),
-        workspace_id: Some(params.workspace.to_string()),
-        repo_id: params.repo_id.map(str::to_string),
-        record_type: None,
-        scope: None,
-        include_archived: params.include_archived_sources,
-        recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
-        limit: params.max_records,
-        offset: 0,
-    })?;
+    let source_window_end = params.source_window_end.unwrap_or(params.now);
+    let mut records = store.query_records_until(
+        &RecordQuery {
+            profile_id: Some(params.profile.as_str().to_string()),
+            workspace_id: Some(params.workspace.to_string()),
+            repo_id: params.repo_id.map(str::to_string),
+            record_type: None,
+            scope: None,
+            include_archived: params.include_archived_sources,
+            recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
+            limit: params.max_records,
+            offset: 0,
+        },
+        source_window_end,
+    )?;
     check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
@@ -278,8 +284,13 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             .cmp(&a.updated_at)
             .then_with(|| a.id.cmp(&b.id))
     });
-    let evidence_window =
-        build_evidence_window(store, params, params.recency_cutoff, params.now, &records)?;
+    let evidence_window = build_evidence_window(
+        store,
+        params,
+        params.recency_cutoff,
+        source_window_end,
+        &records,
+    )?;
     let mut candidates = Vec::new();
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
@@ -610,11 +621,13 @@ fn imported_chatgpt_candidate_records(
     params: &DreamParams,
     limit: usize,
 ) -> Result<Vec<MemoryRecord>> {
+    let source_window_end = params.source_window_end.unwrap_or(params.now);
     let turns = store.dream_visible_turns(
         params.profile.as_str(),
         params.workspace,
         params.repo_id,
         params.recency_cutoff,
+        Some(source_window_end),
         params.max_records,
     )?;
     let mut records = Vec::new();
@@ -758,33 +771,58 @@ fn build_evidence_window(
     end: &str,
     active_records: &[MemoryRecord],
 ) -> Result<DreamEvidenceWindow> {
-    let visible_turns = store.dream_visible_turns(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let conclusions = store.dream_conclusions(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let checkpoints = store.dream_checkpoints(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let imported_memories = store.dream_memory_sources(
-        params.profile.as_str(),
-        params.workspace,
-        start,
-        params.max_records,
-    )?;
+    let stream_budget = params.max_records.saturating_sub(active_records.len());
+    let visible_limit = split_evidence_budget(stream_budget, 4, 0);
+    let visible_turns = if visible_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_visible_turns(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            Some(end),
+            visible_limit,
+        )?
+    };
+    let conclusions_limit = split_evidence_budget(stream_budget, 4, 1);
+    let conclusions = if conclusions_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_conclusions(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            Some(end),
+            conclusions_limit,
+        )?
+    };
+    let checkpoints_limit = split_evidence_budget(stream_budget, 4, 2);
+    let checkpoints = if checkpoints_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_checkpoints(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            Some(end),
+            checkpoints_limit,
+        )?
+    };
+    let imported_limit = split_evidence_budget(stream_budget, 4, 3);
+    let imported_memories = if imported_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_memory_sources(
+            params.profile.as_str(),
+            params.workspace,
+            start,
+            Some(end),
+            imported_limit,
+        )?
+    };
 
     Ok(DreamEvidenceWindow {
         start: start.map(str::to_string),
@@ -795,6 +833,14 @@ fn build_evidence_window(
         imported_memories: stream_from_sources(&imported_memories),
         active_memory_records: stream_from_memory_records(active_records),
     })
+}
+
+fn split_evidence_budget(total: usize, stream_count: usize, stream_index: usize) -> usize {
+    if stream_count == 0 || stream_index >= stream_count {
+        return 0;
+    }
+    let base = total / stream_count;
+    base + usize::from(stream_index < total % stream_count)
 }
 
 fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
@@ -1950,7 +1996,13 @@ fn promotion_reason(
 fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
     let mut seen = BTreeSet::new();
     candidates.retain(|c| {
-        let key = format!("{}:{}:{:?}", c.action, normalize(&c.content), c.supersedes);
+        // Candidate equality must not erase case, punctuation, units, or
+        // negation. Similarity is useful for grouping evidence, but it is not
+        // an identity proof for a durable memory effect.
+        let key = format!(
+            "{}:{}:{}:{}:{:?}",
+            c.action, c.proposed_type, c.subject_key, c.content, c.supersedes
+        );
         seen.insert(key)
     });
 }
@@ -2296,6 +2348,52 @@ fn date_part(value: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn candidate_for_dedup(content: &str) -> DreamCandidate {
+        DreamCandidate {
+            action: "promote".to_string(),
+            proposed_type: "command".to_string(),
+            content: content.to_string(),
+            confidence: 0.8,
+            state: "active".to_string(),
+            drift_prone: false,
+            expires_at: None,
+            valid_until: None,
+            historical_reason: None,
+            supersedes: vec![],
+            policy: "accept".to_string(),
+            candidate_state: "accepted".to_string(),
+            subject_key: "repo".to_string(),
+            threshold_reason: "fixture".to_string(),
+            evidence_weight: 1.0,
+            evidence_classes: vec!["user_visible_turn".to_string()],
+            evidence_ids: vec!["source".to_string()],
+            evidence_refs: vec![],
+            retires: vec![],
+            evidence_count: 1,
+            user_evidence_count: 1,
+            assistant_evidence_count: 0,
+            first_seen_at: "2026-09-11T00:00:00Z".to_string(),
+            last_seen_at: "2026-09-11T00:00:00Z".to_string(),
+            promotion_reason: "fixture".to_string(),
+            apply_eligible: true,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn candidate_dedup_preserves_case_and_punctuation_meaning() {
+        let mut candidates = vec![
+            candidate_for_dedup("git branch -d feature"),
+            candidate_for_dedup("git branch -D feature"),
+            candidate_for_dedup("/srv/Alpha uses 1 GiB"),
+            candidate_for_dedup("/srv/alpha uses 1024 MiB"),
+        ];
+
+        dedupe_candidates(&mut candidates);
+
+        assert_eq!(candidates.len(), 4);
+    }
+
     #[test]
     fn attach_counter_evidence_retires_returns_timeout_for_expired_deadline() {
         let params = DreamParams {
@@ -2304,6 +2402,7 @@ mod tests {
             repo_id: None,
             mode: "preview",
             now: "2030-01-01T00:00:00Z",
+            source_window_end: None,
             recency_cutoff: None,
             include_archived_sources: false,
             max_records: 0,

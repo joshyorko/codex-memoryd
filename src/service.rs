@@ -1759,6 +1759,7 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: "preview",
                 now: &now,
+                source_window_end: Some(&now),
                 recency_cutoff: source_window_start.as_deref(),
                 include_archived_sources: explicit_since,
                 max_records: req.budget.max_input_records,
@@ -2308,11 +2309,15 @@ impl Service {
                 "dream mode must be preview or apply",
             ));
         }
+        let explicit_now = req.now.is_some();
         let now = req.now.unwrap_or_else(|| {
             let current = ids::now_rfc3339();
             let day = current.split('T').next().unwrap_or("1970-01-01");
             format!("{day}T00:00:00Z")
         });
+        let source_window_end = explicit_now
+            .then(|| now.clone())
+            .unwrap_or_else(ids::now_rfc3339);
         if OffsetDateTime::parse(&now, &Rfc3339).is_err() {
             let _ = self.store.insert_dream_run(&dream_error_audit(
                 profile.as_str(),
@@ -2360,6 +2365,7 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: &mode,
                 now: &now,
+                source_window_end: Some(&source_window_end),
                 recency_cutoff: source_window_start.as_deref(),
                 include_archived_sources: explicit_since,
                 max_records: 500,
@@ -2551,6 +2557,7 @@ impl Service {
                     repo_id: None,
                     mode: "preview",
                     now: &now,
+                    source_window_end: Some(&now),
                     recency_cutoff: watermark_before.as_deref(),
                     include_archived_sources: false,
                     max_records: cfg.max_batch_size,
@@ -2578,6 +2585,7 @@ impl Service {
                         profile.as_str(),
                         &workspace,
                         watermark_before.as_deref(),
+                        Some(&now),
                         cfg.max_batch_size,
                     ) {
                         if let Ok(observations) = crate::provider::generate_observations(
@@ -2628,7 +2636,10 @@ impl Service {
                 } else {
                     "ok_with_limits"
                 };
-                let watermark_after = Some(now.clone());
+                // A limited run has not durably covered the source frontier.
+                // Leave the previous cursor in place so a later run can find
+                // the unprocessed tail instead of skipping it.
+                let watermark_after = limits_hit.is_empty().then(|| now.clone());
                 self.store.record_dream_run(&DreamRunRecord {
                     run_id: run.run_id.clone(),
                     profile_id: run.profile.clone(),
@@ -4810,14 +4821,33 @@ fn scheduled_dream_provider_context(
     profile: &str,
     workspace: &str,
     since: Option<&str>,
+    until: Option<&str>,
     limit: usize,
 ) -> Result<String> {
-    let visible_turns = store.dream_visible_turns(profile, workspace, None, since, limit)?;
-    let imported_memories = store.dream_memory_sources(profile, workspace, since, limit)?;
+    let visible_limit = split_source_budget(limit, 2, 0);
+    let imported_limit = split_source_budget(limit, 2, 1);
+    let visible_turns = if visible_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_visible_turns(profile, workspace, None, since, until, visible_limit)?
+    };
+    let imported_memories = if imported_limit == 0 {
+        Vec::new()
+    } else {
+        store.dream_memory_sources(profile, workspace, since, until, imported_limit)?
+    };
     Ok(serde_json::to_string(&json!({
         "visible_turns": visible_turns,
         "imported_memories": imported_memories,
     }))?)
+}
+
+fn split_source_budget(total: usize, stream_count: usize, stream_index: usize) -> usize {
+    if stream_count == 0 || stream_index >= stream_count {
+        return 0;
+    }
+    let base = total / stream_count;
+    base + usize::from(stream_index < total % stream_count)
 }
 
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {
@@ -5237,5 +5267,60 @@ mod provider_projection_review_tests {
         assert!(!context.contains("private-title-sentinel"));
         assert!(!context.contains("private-path-sentinel"));
         assert!(context.contains("concise updates"));
+    }
+}
+
+#[cfg(test)]
+mod scheduled_provider_context_budget_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_provider_context_has_one_combined_source_budget() {
+        let store = Store::open(":memory:").expect("store");
+        store
+            .ensure_workspace("personal", "budget")
+            .expect("workspace");
+        store
+            .ensure_session(
+                "budget-session",
+                "personal",
+                "budget",
+                None,
+                None,
+                "fixture",
+            )
+            .expect("session");
+        for index in 0..2 {
+            store
+                .insert_visible_turn(&VisibleTurn {
+                    id: format!("budget-turn-{index}"),
+                    session_id: "budget-session".into(),
+                    actor: "user".into(),
+                    content: format!("budget turn {index}"),
+                    created_at: format!("2026-09-11T00:0{index}:00Z"),
+                    metadata: json!({}),
+                })
+                .expect("visible turn");
+            store
+                .upsert_source(
+                    "personal",
+                    "budget",
+                    "fixture",
+                    Some(&format!("budget:{index}")),
+                    &format!("budget-hash-{index}"),
+                    &json!({}),
+                )
+                .expect("imported source");
+        }
+
+        let raw = scheduled_dream_provider_context(&store, "personal", "budget", None, None, 2)
+            .expect("provider context");
+        let context: Value = serde_json::from_str(&raw).expect("context json");
+        let total = context["visible_turns"].as_array().unwrap().len()
+            + context["imported_memories"].as_array().unwrap().len();
+        assert!(
+            total <= 2,
+            "scheduled provider context used {total} records"
+        );
     }
 }
