@@ -254,21 +254,22 @@ pub struct DreamParams<'a> {
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     check_deadline(params)?;
+    let query = RecordQuery {
+        profile_id: Some(params.profile.as_str().to_string()),
+        workspace_id: Some(params.workspace.to_string()),
+        repo_id: params.repo_id.map(str::to_string),
+        record_type: None,
+        scope: None,
+        include_archived: params.include_archived_sources,
+        recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
+        limit: params.max_records,
+        offset: 0,
+    };
+    let mut records = match params.source_window_end {
+        Some(end) => store.query_records_until(&query, end)?,
+        None => store.query_records(&query)?,
+    };
     let source_window_end = params.source_window_end.unwrap_or(params.now);
-    let mut records = store.query_records_until(
-        &RecordQuery {
-            profile_id: Some(params.profile.as_str().to_string()),
-            workspace_id: Some(params.workspace.to_string()),
-            repo_id: params.repo_id.map(str::to_string),
-            record_type: None,
-            scope: None,
-            include_archived: params.include_archived_sources,
-            recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
-            limit: params.max_records,
-            offset: 0,
-        },
-        source_window_end,
-    )?;
     check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
@@ -621,13 +622,12 @@ fn imported_chatgpt_candidate_records(
     params: &DreamParams,
     limit: usize,
 ) -> Result<Vec<MemoryRecord>> {
-    let source_window_end = params.source_window_end.unwrap_or(params.now);
     let turns = store.dream_visible_turns(
         params.profile.as_str(),
         params.workspace,
         params.repo_id,
         params.recency_cutoff,
-        Some(source_window_end),
+        params.source_window_end,
         params.max_records,
     )?;
     let mut records = Vec::new();
@@ -781,7 +781,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            Some(end),
+            params.source_window_end,
             visible_limit,
         )?
     };
@@ -794,7 +794,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            Some(end),
+            params.source_window_end,
             conclusions_limit,
         )?
     };
@@ -807,7 +807,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            Some(end),
+            params.source_window_end,
             checkpoints_limit,
         )?
     };
@@ -819,7 +819,7 @@ fn build_evidence_window(
             params.profile.as_str(),
             params.workspace,
             start,
-            Some(end),
+            params.source_window_end,
             imported_limit,
         )?
     };

@@ -1134,7 +1134,9 @@ fn scheduled_dreamer_skips_short_lived_sessions() {
 
 #[test]
 fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
-    let svc = scheduled_service(scheduler_config());
+    let mut config = scheduler_config();
+    config.automatic_apply = true;
+    let svc = scheduled_service(config);
     let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
     conclude(

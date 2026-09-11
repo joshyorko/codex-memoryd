@@ -2309,15 +2309,11 @@ impl Service {
                 "dream mode must be preview or apply",
             ));
         }
-        let explicit_now = req.now.is_some();
         let now = req.now.unwrap_or_else(|| {
             let current = ids::now_rfc3339();
             let day = current.split('T').next().unwrap_or("1970-01-01");
             format!("{day}T00:00:00Z")
         });
-        let source_window_end = explicit_now
-            .then(|| now.clone())
-            .unwrap_or_else(ids::now_rfc3339);
         if OffsetDateTime::parse(&now, &Rfc3339).is_err() {
             let _ = self.store.insert_dream_run(&dream_error_audit(
                 profile.as_str(),
@@ -2365,7 +2361,7 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: &mode,
                 now: &now,
-                source_window_end: Some(&source_window_end),
+                source_window_end: None,
                 recency_cutoff: source_window_start.as_deref(),
                 include_archived_sources: explicit_since,
                 max_records: 500,
@@ -2421,6 +2417,7 @@ impl Service {
 
     pub fn scheduled_dream(&self, now: Option<String>) -> Result<ScheduledDreamResponse> {
         let cfg = self.config.dream_scheduler;
+        let simulated_now = now.is_some();
         let mode = scheduled_dream_mode(cfg.automatic_apply);
         let profile = self.resolve_profile(&Some(self.config.default_profile.clone()))?;
         let workspace = self.config.default_workspace.clone();
@@ -2557,7 +2554,7 @@ impl Service {
                     repo_id: None,
                     mode: "preview",
                     now: &now,
-                    source_window_end: Some(&now),
+                    source_window_end: (!simulated_now).then_some(now.as_str()),
                     recency_cutoff: watermark_before.as_deref(),
                     include_archived_sources: false,
                     max_records: cfg.max_batch_size,
@@ -2585,7 +2582,7 @@ impl Service {
                         profile.as_str(),
                         &workspace,
                         watermark_before.as_deref(),
-                        Some(&now),
+                        (!simulated_now).then_some(now.as_str()),
                         cfg.max_batch_size,
                     ) {
                         if let Ok(observations) = crate::provider::generate_observations(
