@@ -19,6 +19,7 @@ pub mod backup;
 pub mod benchmark_eval;
 pub mod chatgpt_export_import;
 pub mod config;
+pub mod consolidation;
 pub mod conformance;
 pub mod doctor;
 pub mod domain;
