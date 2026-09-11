@@ -74,6 +74,7 @@ pub fn router(service: Service) -> Router {
         .route("/v1/procedures/recall", post(procedures_recall_handler))
         .route("/v1/checkpoints", post(checkpoints_handler))
         .route("/v1/dream", post(dream_handler))
+        .route("/v1/consolidation/apply", post(consolidation_apply_handler))
         .route("/v1/sync/local-codex-memory", post(sync_handler))
         .route("/v1/adapter/export", post(adapter_export_handler))
         .route("/v1/forget", post(forget_handler))
@@ -335,6 +336,20 @@ async fn dream_handler(State(state): State<Arc<AppState>>, body: axum::body::Byt
         Err(e) => return err_envelope(e),
     };
     match state.service.dream(req) {
+        Ok(data) => ok_envelope(data, vec![]),
+        Err(e) => err_envelope(e),
+    }
+}
+
+async fn consolidation_apply_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req = match parse_body(body).await {
+        Ok(r) => r,
+        Err(e) => return err_envelope(e),
+    };
+    match state.service.apply_stored_consolidation(req) {
         Ok(data) => ok_envelope(data, vec![]),
         Err(e) => err_envelope(e),
     }

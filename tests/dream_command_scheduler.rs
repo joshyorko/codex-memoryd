@@ -86,4 +86,11 @@ fn deterministic_automatic_schedule_uses_governed_apply_boundary() {
     assert_eq!(run.mode, "apply");
     assert_eq!(run.created.len(), 1);
     assert!(store.get_record(&run.created[0]).unwrap().is_some());
+    let control = svc
+        .apply_stored_consolidation(codex_memoryd::protocol::ConsolidationApplyRequest {
+            batch_id: format!("consolidation_{}", run.run_id),
+        })
+        .unwrap();
+    assert_eq!(control.status, "applied");
+    assert_eq!(control.record_ids, run.created);
 }

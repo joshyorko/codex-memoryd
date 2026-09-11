@@ -617,17 +617,21 @@ impl Store {
         policy.validate().map_err(Error::invalid_request)?;
         let decisions_json = serde_json::to_string(decisions)?;
         let ids = self.transaction_immediate(|tx| {
-            let (batch_json, stored_decisions, status): (String, Option<String>, String) = tx
+            let (batch_json, stored_decisions, status, stored_record_ids):
+                (String, Option<String>, String, Option<String>) = tx
                 .query_row(
-                    "SELECT batch_json, decisions_json, status
+                    "SELECT batch_json, decisions_json, status, applied_record_ids_json
                      FROM consolidation_proposals WHERE batch_id = ?1",
                     rusqlite::params![batch_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?
                 .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
             if status == "applied" {
-                return record_ids_for_batch(tx, batch_id);
+                return stored_record_ids
+                    .map(|raw| serde_json::from_str(&raw).map_err(Error::from))
+                    .transpose()
+                    .map(|ids| ids.unwrap_or_default());
             }
             if status == "reverted" {
                 return Err(Error::invalid_request(
@@ -703,8 +707,10 @@ impl Store {
                 applied.push(record_id);
             }
             tx.execute(
-                "UPDATE consolidation_proposals SET status = 'applied', updated_at = ?1 WHERE batch_id = ?2",
-                rusqlite::params![ids::now_rfc3339(), batch_id],
+                "UPDATE consolidation_proposals
+                 SET status = 'applied', applied_record_ids_json = ?1, updated_at = ?2
+                 WHERE batch_id = ?3",
+                rusqlite::params![serde_json::to_string(&applied)?, ids::now_rfc3339(), batch_id],
             )?;
             Ok(applied)
         })?;
@@ -931,6 +937,12 @@ impl Store {
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
         conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
+        ensure_column(
+            &conn,
+            "consolidation_proposals",
+            "applied_record_ids_json",
+            "TEXT",
+        )?;
         ensure_instance_metadata(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
@@ -4082,18 +4094,6 @@ pub struct SchemaReport {
 /// table name into SQL (no bound-parameter form exists for identifiers).
 fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn record_ids_for_batch(tx: &rusqlite::Transaction<'_>, batch_id: &str) -> Result<Vec<String>> {
-    let mut stmt = tx.prepare(
-        "SELECT id FROM memory_records
-         WHERE json_extract(metadata, '$.batch_id') = ?1
-         ORDER BY id",
-    )?;
-    let rows = stmt
-        .query_map(rusqlite::params![batch_id], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<String>, _>>()?;
-    Ok(rows)
 }
 
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {

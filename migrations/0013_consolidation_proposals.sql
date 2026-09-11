@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS consolidation_proposals (
     proposal_digest TEXT NOT NULL,
     batch_json      TEXT NOT NULL,
     decisions_json  TEXT,
+    applied_record_ids_json TEXT,
     status          TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,

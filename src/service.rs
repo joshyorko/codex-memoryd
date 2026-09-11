@@ -82,6 +82,41 @@ const ADAPTER_TARGETS: &[&str] = &[
 ];
 const RECENT_SCAR_PREFIXES: &[&str] = &["battle scar:", "scar:"];
 
+fn governed_deterministic_policy(profile: &Profile) -> ConsolidationPolicy {
+    ConsolidationPolicy {
+        contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
+        mode: ConsolidationMode::Automatic,
+        scopes: vec![profile.as_str().to_string()],
+        claim_classes: [
+            RecordType::Preference,
+            RecordType::RepoConvention,
+            RecordType::Command,
+            RecordType::Decision,
+            RecordType::Gotcha,
+            RecordType::Landmark,
+            RecordType::TaskCheckpoint,
+            RecordType::Identity,
+            RecordType::WorkflowPattern,
+            RecordType::Other,
+        ]
+        .iter()
+        .map(|record_type| record_type.as_str().to_string())
+        .collect(),
+        source_classes: vec!["deterministic_dream".to_string()],
+        operations: vec![ConsolidationOperation::AdoptStatement],
+        budget: ConsolidationBudget {
+            max_candidates: 10_000,
+            max_source_records: 10_000,
+            max_provider_calls: 1,
+            max_input_bytes: 256 * 1024,
+            max_output_bytes: 256 * 1024,
+        },
+        retention_days: 30,
+        semantic_validation: false,
+        legacy_metadata: None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
     AgentsMd,
@@ -2642,6 +2677,36 @@ impl Service {
         }
     }
 
+    pub fn apply_stored_consolidation(
+        &self,
+        req: ConsolidationApplyRequest,
+    ) -> Result<ConsolidationApplyResponse> {
+        if !self.config.dream_scheduler.automatic_apply {
+            return Err(Error::policy(
+                "consolidation apply requires the operator automatic policy",
+            ));
+        }
+        let proposal = self
+            .store
+            .read_consolidation_proposal(&req.batch_id)?
+            .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+        let decisions = proposal
+            .decisions
+            .ok_or_else(|| Error::invalid_request("consolidation proposal has no decisions"))?;
+        let profile = Profile::parse(&proposal.batch.profile)
+            .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
+        let policy = governed_deterministic_policy(&profile);
+        let record_ids =
+            self.store
+                .apply_consolidation_proposal(&req.batch_id, &policy, &decisions)?;
+        Ok(ConsolidationApplyResponse {
+            batch_id: req.batch_id,
+            status: "applied".to_string(),
+            record_ids,
+            authority: "recall_not_authority".to_string(),
+        })
+    }
+
     fn apply_governed_deterministic_batch(
         &self,
         run: &mut DreamResponse,
@@ -2649,38 +2714,7 @@ impl Service {
         workspace: &str,
         now: &str,
     ) -> Result<()> {
-        let policy = ConsolidationPolicy {
-            contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
-            mode: ConsolidationMode::Automatic,
-            scopes: vec![profile.as_str().to_string()],
-            claim_classes: [
-                RecordType::Preference,
-                RecordType::RepoConvention,
-                RecordType::Command,
-                RecordType::Decision,
-                RecordType::Gotcha,
-                RecordType::Landmark,
-                RecordType::TaskCheckpoint,
-                RecordType::Identity,
-                RecordType::WorkflowPattern,
-                RecordType::Other,
-            ]
-            .iter()
-            .map(|record_type| record_type.as_str().to_string())
-            .collect(),
-            source_classes: vec!["deterministic_dream".to_string()],
-            operations: vec![ConsolidationOperation::AdoptStatement],
-            budget: ConsolidationBudget {
-                max_candidates: run.candidates.len().max(1),
-                max_source_records: evidence_window_count(&run.evidence_window).max(1),
-                max_provider_calls: 1,
-                max_input_bytes: 256 * 1024,
-                max_output_bytes: 256 * 1024,
-            },
-            retention_days: 30,
-            semantic_validation: false,
-            legacy_metadata: None,
-        };
+        let policy = governed_deterministic_policy(profile);
         let candidates = run
             .candidates
             .iter()
