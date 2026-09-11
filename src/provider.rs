@@ -77,6 +77,7 @@ pub fn generate_observations(
 
 pub const DREAM_PROVIDER_SCHEMA_VERSION: &str = "dream-preview-v1";
 pub const DREAM_PROVIDER_ADAPTER_VERSION: &str = "http-json-v1";
+pub const DREAM_COMMAND_ADAPTER_VERSION: &str = "native-command-v1";
 
 /// Runtime-only provider call configuration. It deliberately contains the
 /// credential only in memory; callers must never persist or serialize it.

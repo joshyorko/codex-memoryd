@@ -1938,6 +1938,11 @@ impl Service {
                     "job-supplied provider commands are denied",
                 ));
             }
+            if provider.provider.is_some() || provider.adapter_version.is_some() {
+                return Err(Error::invalid_request(
+                    "command provenance is owned by the configured runtime",
+                ));
+            }
             if configured.command.is_empty() {
                 return Err(Error::invalid_request(
                     "command adapter requires configured provider_command",
@@ -3260,8 +3265,12 @@ fn persisted_dream_provider(
     let mut persisted = provider.clone();
     if let Some(resolved) = resolved {
         persisted.adapter = Some(resolved.adapter);
-        persisted.adapter_version =
-            Some(crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string());
+        persisted.adapter_version = Some(match resolved.adapter {
+            DreamProviderAdapter::Command => {
+                crate::provider::DREAM_COMMAND_ADAPTER_VERSION.to_string()
+            }
+            _ => crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+        });
         if persisted.model.is_none() {
             persisted.model = Some(resolved.model.clone());
         }

@@ -13,6 +13,8 @@ fn command_jobs_cannot_choose_a_different_model_endpoint_or_executable() {
         json!({"model":"other-model"}),
         json!({"endpoint":"https://example.invalid"}),
         json!({"command":{"argv":["other"]}}),
+        json!({"provider":"spoofed-provider"}),
+        json!({"adapter_version":"spoofed-version"}),
     ] {
         let request: DreamJobRunRequest = serde_json::from_value(json!({
             "profile":"personal","workspace":"ws","kind":"dream_preview","mode":"command",
