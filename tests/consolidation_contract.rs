@@ -88,3 +88,12 @@ fn control_requests_cannot_enable_or_widen_policy() {
     }))
     .is_err());
 }
+
+#[test]
+fn terminal_undo_status_is_closed_and_versioned() {
+    assert_eq!(
+        serde_json::to_string(&ConsolidationStatus::Reverted).unwrap(),
+        "\"reverted\""
+    );
+    assert!(serde_json::from_str::<ConsolidationStatus>("\"rolled_back\"").is_err());
+}

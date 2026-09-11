@@ -34,6 +34,7 @@ pub enum ConsolidationStatus {
     Deferred,
     Rejected,
     Conflict,
+    Reverted,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
