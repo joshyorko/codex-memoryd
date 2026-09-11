@@ -2159,22 +2159,12 @@ impl Service {
             "dream_{}",
             ids::sha256_hex(format!("{}:{}", response.run_id, call.input_hash).as_bytes())
         );
-        if adapter == DreamProviderAdapter::Provider {
-            if let Some(limit) = provider.daily_cost_ceiling_micros {
-                let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
-                    .format(&Rfc3339)
-                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-                let prior_cost = self
-                    .store
-                    .dream_provider_cost_since(&daily_start, Some(&final_run_id))?;
-                if prior_cost.saturating_add(cost_micros) > limit {
-                    return Err(Error::internal(
-                        "dream provider daily cost ceiling exhausted",
-                    ));
-                }
-            }
-        } else if let Some(limit) = provider.daily_cost_ceiling_micros {
-            if cost_micros > limit {
+        if let Some(limit) = provider.daily_cost_ceiling_micros {
+            let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+            let prior_cost = self.store.dream_provider_cost_since(&daily_start, None)?;
+            if prior_cost.saturating_add(cost_micros) > limit {
                 return Err(Error::internal(
                     "dream provider daily cost ceiling exhausted",
                 ));
@@ -2197,7 +2187,12 @@ impl Service {
         let provenance = DreamProviderProvenance {
             schema_version: crate::provider::DREAM_PROVIDER_SCHEMA_VERSION.to_string(),
             adapter: adapter.as_str().to_string(),
-            adapter_version: crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+            adapter_version: match adapter {
+                DreamProviderAdapter::Command => {
+                    crate::provider::DREAM_COMMAND_ADAPTER_VERSION.to_string()
+                }
+                _ => crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+            },
             provider: provider.provider_name.clone(),
             model: provider.model.clone(),
             request_hash: call.request_hash,

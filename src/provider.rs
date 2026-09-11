@@ -440,7 +440,13 @@ fn call_command(
                     if eof && stdin.is_none() {
                         let value = serde_json::from_slice::<Value>(&bytes)
                             .map_err(|_| "provider response was not valid JSON")?;
-                        return Ok((value, bytes.len(), None));
+                        let reported_cost_micros = value
+                            .get("cost_micros")
+                            .and_then(Value::as_u64)
+                            .or_else(|| {
+                                value.pointer("/usage/cost_micros").and_then(Value::as_u64)
+                            });
+                        return Ok((value, bytes.len(), reported_cost_micros));
                     }
                 }
                 std::thread::sleep(
