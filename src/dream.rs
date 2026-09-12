@@ -771,48 +771,50 @@ fn build_evidence_window(
     end: &str,
     active_records: &[MemoryRecord],
 ) -> Result<DreamEvidenceWindow> {
-    let stream_budget = params.max_records.saturating_sub(active_records.len());
-    let visible_limit = split_evidence_budget(stream_budget, 4, 0);
-    let visible_turns = if visible_limit == 0 {
+    let mut remaining = params.max_records.saturating_sub(active_records.len());
+    let visible_turns = if remaining == 0 {
         Vec::new()
     } else {
-        store.dream_visible_turns(
+        let records = store.dream_visible_turns(
             params.profile.as_str(),
             params.workspace,
             params.repo_id,
             start,
             params.source_window_end,
-            visible_limit,
-        )?
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
     };
-    let conclusions_limit = split_evidence_budget(stream_budget, 4, 1);
-    let conclusions = if conclusions_limit == 0 {
+    let conclusions = if remaining == 0 {
         Vec::new()
     } else {
-        store.dream_conclusions(
+        let records = store.dream_conclusions(
             params.profile.as_str(),
             params.workspace,
             params.repo_id,
             start,
             params.source_window_end,
-            conclusions_limit,
-        )?
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
     };
-    let checkpoints_limit = split_evidence_budget(stream_budget, 4, 2);
-    let checkpoints = if checkpoints_limit == 0 {
+    let checkpoints = if remaining == 0 {
         Vec::new()
     } else {
-        store.dream_checkpoints(
+        let records = store.dream_checkpoints(
             params.profile.as_str(),
             params.workspace,
             params.repo_id,
             start,
             params.source_window_end,
-            checkpoints_limit,
-        )?
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
     };
-    let imported_limit = split_evidence_budget(stream_budget, 4, 3);
-    let imported_memories = if imported_limit == 0 {
+    let imported_memories = if remaining == 0 {
         Vec::new()
     } else {
         store.dream_memory_sources(
@@ -820,7 +822,7 @@ fn build_evidence_window(
             params.workspace,
             start,
             params.source_window_end,
-            imported_limit,
+            remaining,
         )?
     };
 
@@ -833,14 +835,6 @@ fn build_evidence_window(
         imported_memories: stream_from_sources(&imported_memories),
         active_memory_records: stream_from_memory_records(active_records),
     })
-}
-
-fn split_evidence_budget(total: usize, stream_count: usize, stream_index: usize) -> usize {
-    if stream_count == 0 || stream_index >= stream_count {
-        return 0;
-    }
-    let base = total / stream_count;
-    base + usize::from(stream_index < total % stream_count)
 }
 
 fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {

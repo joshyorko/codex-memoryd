@@ -28,6 +28,9 @@ fn batch(output: &str) -> ConsolidationBatch {
             source_ids: vec!["source-1".into()],
             supporting_spans: vec!["I prefer concise updates".into()],
             supersedes: vec![],
+            temporal_state: None,
+            valid_until: None,
+            historical_reason: None,
         }],
     }
 }
@@ -94,13 +97,22 @@ fn rejected_inference_with_no_new_evidence_is_suppressed() {
     paraphrase.candidate_id = "new-candidate-id".into();
     paraphrase.output_digest = "new-output".into();
     paraphrase.claim = "prefers concise communication".into();
+    let current_time = codex_memoryd::ids::now_rfc3339();
     assert!(store
-        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase)
+        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase, 30, &current_time)
+        .unwrap());
+    assert!(!store
+        .is_consolidation_candidate_suppressed(
+            &proposal.scope,
+            &paraphrase,
+            30,
+            "2099-01-01T00:00:00Z"
+        )
         .unwrap());
 
     paraphrase.source_ids.push("source-new".into());
     assert!(!store
-        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase)
+        .is_consolidation_candidate_suppressed(&proposal.scope, &paraphrase, 30, &current_time)
         .unwrap());
 }
 
@@ -265,6 +277,43 @@ fn automatic_apply_is_idempotent_and_preview_cannot_apply() {
 }
 
 #[test]
+fn automatic_apply_preserves_candidate_temporal_fields() {
+    let store = Store::open(":memory:").unwrap();
+    let mut proposal = batch("temporal-output");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates[0].temporal_state = Some("historical".into());
+    proposal.candidates[0].valid_until = Some("2026-09-01T00:00:00Z".into());
+    proposal.candidates[0].historical_reason = Some("expired source claim".into());
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "temporal-output".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "preserve temporal state".into(),
+        distinct_evidence_roots: vec!["root-1".into()],
+        supersedes: vec![],
+        validator: None,
+    };
+
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal(&proposal.batch_id, &automatic_policy(), &[decision])
+        .unwrap();
+    let record = store.get_record(&applied[0]).unwrap().unwrap();
+
+    assert_eq!(
+        record.temporal_state,
+        codex_memoryd::domain::TemporalState::Historical
+    );
+    assert_eq!(record.valid_until.as_deref(), Some("2026-09-01T00:00:00Z"));
+    assert_eq!(
+        record.historical_reason.as_deref(),
+        Some("expired source claim")
+    );
+}
+
+#[test]
 fn automatic_apply_receipt_deduplicates_shared_record_ids() {
     let store = Store::open(":memory:").unwrap();
     let mut proposal = batch("output-a");
@@ -279,6 +328,9 @@ fn automatic_apply_receipt_deduplicates_shared_record_ids() {
         source_ids: vec!["source-2".into()],
         supporting_spans: vec!["I prefer concise updates".into()],
         supersedes: vec![],
+        temporal_state: None,
+        valid_until: None,
+        historical_reason: None,
     });
     let decisions = vec![
         ConsolidationDecision {
@@ -327,6 +379,9 @@ fn automatic_apply_preserves_case_sensitive_claims() {
         source_ids: vec!["source-2".into()],
         supporting_spans: vec!["Use git branch -D feature".into()],
         supersedes: vec![],
+        temporal_state: None,
+        valid_until: None,
+        historical_reason: None,
     });
     let decisions = vec![
         ConsolidationDecision {
@@ -393,6 +448,9 @@ fn automatic_apply_keeps_meaning_preservation_perturbations_distinct() {
             source_ids: vec![format!("meaning-source-{index}")],
             supporting_spans: vec![(*claim).into()],
             supersedes: vec![],
+            temporal_state: None,
+            valid_until: None,
+            historical_reason: None,
         })
         .collect();
     let decisions = proposal
@@ -589,6 +647,9 @@ fn deferred_candidate_does_not_freeze_independent_adoption() {
         source_ids: vec!["source-2".into()],
         supporting_spans: vec!["I prefer stable interfaces".into()],
         supersedes: vec![],
+        temporal_state: None,
+        valid_until: None,
+        historical_reason: None,
     });
     let decisions = vec![
         ConsolidationDecision {

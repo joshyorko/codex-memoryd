@@ -799,4 +799,10 @@ fn rolling_daily_model_cost_ceiling_is_enforced() {
         .expect_err("rolling daily ceiling should fail");
     server.join().expect("second provider server");
     assert!(err.message.contains("daily cost ceiling"));
+    assert_eq!(
+        svc.store
+            .dream_provider_cost_since("2000-01-01T00:00:00Z", None)
+            .unwrap(),
+        120
+    );
 }

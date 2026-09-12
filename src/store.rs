@@ -17,6 +17,9 @@ use rusqlite::OptionalExtension;
 use rusqlite::Row;
 use serde_json::json;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::Duration;
+use time::OffsetDateTime;
 
 use crate::consolidation::{
     ConsolidationBatch, ConsolidationCandidate, ConsolidationDecision, ConsolidationOperation,
@@ -650,18 +653,31 @@ impl Store {
         &self,
         scope: &str,
         candidate: &ConsolidationCandidate,
+        retention_days: u32,
+        now: &str,
     ) -> Result<bool> {
         if !candidate.inferred {
             return Ok(false);
         }
+        if retention_days == 0 {
+            return Err(Error::invalid_request(
+                "consolidation retention_days must be positive",
+            ));
+        }
+        let cutoff = OffsetDateTime::parse(now, &Rfc3339)
+            .map_err(|_| Error::invalid_request("consolidation retention cutoff is invalid"))?
+            .checked_sub(Duration::days(i64::from(retention_days)))
+            .ok_or_else(|| Error::invalid_request("consolidation retention cutoff is invalid"))?
+            .format(&Rfc3339)
+            .map_err(|_| Error::invalid_request("consolidation retention cutoff is invalid"))?;
         let fingerprint = crate::consolidation::policy::rejection_fingerprint(candidate);
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT batch_json, decisions_json
              FROM consolidation_proposals
-             WHERE scope = ?1 AND decisions_json IS NOT NULL",
+             WHERE scope = ?1 AND created_at >= ?2 AND decisions_json IS NOT NULL",
         )?;
-        let rows = stmt.query_map(rusqlite::params![scope], |row| {
+        let rows = stmt.query_map(rusqlite::params![scope, cutoff], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -892,6 +908,16 @@ impl Store {
                 if !policy.operations.contains(&decision.operation) {
                     return Err(Error::policy("consolidation operation is not permitted by policy"));
                 }
+                let temporal_state = candidate
+                    .temporal_state
+                    .as_deref()
+                    .map(|value| {
+                        TemporalState::parse(value).ok_or_else(|| {
+                            Error::invalid_request("consolidation temporal state is invalid")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(TemporalState::Current);
                 let record_type = RecordType::parse(&candidate.claim_class)
                     .ok_or_else(|| Error::invalid_request("consolidation claim class is invalid"))?;
                 let classification = crate::policy::classify_as(
@@ -949,9 +975,9 @@ impl Store {
                         content_hash, supersedes: vec![], created_at: now.clone(), updated_at: now.clone(),
                         last_used_at: None, archived: false, trust_state: "trusted".into(), trust_score: classification.confidence,
                         quarantine_reason: None, quarantined_at: None, promoted_at: Some(now.clone()),
-                        valid_from: None, valid_until: None, observed_at: Some(now), invalidated_at: None,
-                        superseded_by: None, historical_reason: None, temporal_state: TemporalState::Current,
-                        metadata: json!({"origin":"governed_consolidation","batch_id":batch.batch_id,"candidate_id":candidate.candidate_id,"inferred":candidate.inferred,"decision_digest":decision.output_digest}),
+                        valid_from: None, valid_until: candidate.valid_until.clone(), observed_at: Some(now), invalidated_at: None,
+                        superseded_by: None, historical_reason: candidate.historical_reason.clone(), temporal_state,
+                        metadata: json!({"origin":"governed_consolidation","batch_id":batch.batch_id,"candidate_id":candidate.candidate_id,"inferred":candidate.inferred,"decision_digest":decision.output_digest,"temporal_state":candidate.temporal_state,"valid_until":candidate.valid_until,"historical_reason":candidate.historical_reason}),
                     };
                     Store::insert_record_in_transaction(tx, &record)?;
                     (id, false)

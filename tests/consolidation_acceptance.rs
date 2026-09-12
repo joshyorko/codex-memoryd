@@ -7,7 +7,7 @@ use codex_memoryd::protocol::{
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
@@ -124,6 +124,183 @@ fn dream_job_combines_all_evidence_streams_within_input_record_budget() {
         + window.imported_memories.count
         + window.active_memory_records.count;
     assert!(total <= 2, "evidence window used {total} records");
+}
+
+#[test]
+fn evidence_window_reuses_budget_when_one_stream_is_empty() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace("personal", "checkpoint-heavy")
+        .expect("workspace");
+    store
+        .ensure_session(
+            "checkpoint-heavy-session",
+            "personal",
+            "checkpoint-heavy",
+            None,
+            None,
+            "fixture",
+        )
+        .expect("session");
+    for index in 0..10 {
+        store
+            .insert_checkpoint(&Checkpoint {
+                id: format!("checkpoint-heavy-{index}"),
+                session_id: Some("checkpoint-heavy-session".into()),
+                profile_id: "personal".into(),
+                workspace_id: "checkpoint-heavy".into(),
+                repo_id: None,
+                summary: format!("checkpoint evidence {index}"),
+                changed_files: vec![],
+                decisions: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                tests_run: vec![],
+                tests_not_run: vec![],
+                branch: None,
+                commit: None,
+                created_at: format!("2026-09-11T00:{index:02}:00Z"),
+            })
+            .expect("checkpoint");
+    }
+
+    let service = Service::new(
+        store,
+        Config {
+            default_profile: "personal".into(),
+            default_workspace: "checkpoint-heavy".into(),
+            ..Default::default()
+        },
+    );
+    let response = service
+        .run_dream_job(DreamJobRunRequest {
+            job_id: Some("checkpoint-heavy-job".into()),
+            profile: Some("personal".into()),
+            workspace: Some("checkpoint-heavy".into()),
+            repo: None,
+            now: Some("2030-01-01T00:00:00Z".into()),
+            since: None,
+            since_explicit: false,
+            kind: "dream_preview".into(),
+            mode: Some("deterministic".into()),
+            budget: DreamJobBudget {
+                max_runtime_seconds: 10,
+                max_input_records: 10,
+                max_candidates: 10,
+                ..Default::default()
+            },
+            provider: None,
+        })
+        .expect("dream job");
+
+    let window = response.preview.evidence_window;
+    assert_eq!(window.checkpoints.count, 10);
+    assert_eq!(
+        window.visible_turns.count
+            + window.conclusions.count
+            + window.checkpoints.count
+            + window.imported_memories.count
+            + window.active_memory_records.count,
+        10
+    );
+}
+
+#[test]
+fn scheduled_provider_receives_conclusion_only_evidence() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let address = listener.local_addr().expect("provider address");
+    let (body_tx, body_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 8192];
+                    loop {
+                        let read = stream.read(&mut chunk).expect("read provider request");
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(str::to_string)
+                                })
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + content_length {
+                                let body = String::from_utf8_lossy(
+                                    &request[header_end + 4..header_end + 4 + content_length],
+                                )
+                                .into_owned();
+                                body_tx.send(body).expect("send provider body");
+                                let response =
+                                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                                stream
+                                    .write_all(response.as_bytes())
+                                    .expect("write provider response");
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                _ => return,
+            }
+        }
+    });
+
+    let store = Store::open(":memory:").expect("store");
+    store
+        .insert_conclusion(&Conclusion {
+            id: "conclusion-provider-only".into(),
+            profile_id: "personal".into(),
+            workspace_id: "provider-only".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Conclusion-only provider evidence must be sent.".into(),
+            source_id: None,
+            created_at: "2026-09-11T00:00:00Z".into(),
+            metadata: json!({}),
+        })
+        .expect("conclusion");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "provider-only".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_provider = DreamProviderConfig {
+        enabled: true,
+        endpoint: format!("http://{address}/v1"),
+        model: "fixture-model".into(),
+        ..DreamProviderConfig::default()
+    };
+    let service = Service::new(store, config);
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("scheduled dream");
+
+    let body = body_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("provider should receive conclusion evidence");
+    assert!(body.contains("Conclusion-only provider evidence must be sent."));
+    server.join().expect("provider server");
 }
 
 #[test]

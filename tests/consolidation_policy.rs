@@ -38,6 +38,9 @@ fn candidate(inferred: bool, claim: &str) -> ConsolidationCandidate {
         source_ids: vec!["source-a".into(), "source-b".into()],
         supporting_spans: vec!["support".into()],
         supersedes: vec![],
+        temporal_state: None,
+        valid_until: None,
+        historical_reason: None,
     }
 }
 

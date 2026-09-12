@@ -13,9 +13,10 @@ undo are server-owned transactional operations; recall remains
 `tests/fixtures/consolidation/manifest.json`.
 
 Consolidation candidate identity preserves the exact claim text, including
-case, punctuation, units, and negation. The provider input budget covers the
-complete serialized request envelope and schema, and all Dream evidence streams
-share one bounded record budget.
+case, punctuation, units, and negation; its deterministic ID also binds the
+action, type, subject, and supersession set. The provider input budget covers
+the complete serialized request envelope and schema, and all Dream evidence
+streams share one bounded record budget without fixed per-stream quotas.
 
 Automatic adoption is off by default. Set `[dream] automatic_apply = true`
 in TOML or `CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY=true`; the environment override
@@ -25,6 +26,11 @@ later edits to either side of a supersession. Proposals lacking required revisio
 snapshots fail closed rather than deriving fresh authority during recovery.
 Identical scope/digest proposals on a later scheduler tick reuse the original
 immutable batch and its decisions; a changed payload or policy is not a replay.
+Scheduled model observations use that same bounded, screened window across
+visible turns, conclusions, checkpoints, imported memories, and active records.
+If a billed provider response exceeds the daily ceiling, its measured usage is
+still recorded before the request is rejected. Rejected-inference suppression
+only scans proposal history inside the active retention window.
 When an operator enables it, deterministic scheduled candidates pass the
 governed policy boundary and persist an immutable batch before applying. The
 batch-only `/v1/consolidation/apply` and `/v1/consolidation/undo` controls do
