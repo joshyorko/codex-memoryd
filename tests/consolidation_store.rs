@@ -12,6 +12,7 @@ fn batch(output: &str) -> ConsolidationBatch {
         scope: "fixture/personal".into(),
         profile: "personal".into(),
         workspace: "fixture-workspace".into(),
+        repo_id: None,
         source_cursor: ConsolidationSourceCursor {
             since: None,
             until: Some("2026-09-11T00:00:00Z".into()),

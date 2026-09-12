@@ -297,7 +297,12 @@ fn review_full_input_window_does_not_skip_unselected_records() {
         .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
         .unwrap();
     assert!(result.limits_hit.contains(&"max_input_records".into()));
-    assert!(result.watermark_after.is_none());
+    // A full page must retain a bounded continuation cursor, not advance to
+    // the run's end timestamp and skip unselected records.
+    assert!(result
+        .watermark_after
+        .as_deref()
+        .is_some_and(codex_memoryd::dream::is_scheduler_cursor));
 }
 
 #[test]
