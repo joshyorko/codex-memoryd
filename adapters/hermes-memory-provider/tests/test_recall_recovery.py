@@ -61,3 +61,60 @@ def test_slow_lane_cannot_spend_later_lanes_time_budget():
         assert 'recall_not_authority' in rendered
         assert provider.recall_status().count == 3
         assert elapsed < .55
+
+
+def test_partial_recall_reports_degradation_not_daemon_outage(caplog):
+    with lane_server('evidence') as (endpoint, _):
+        provider = CodexMemoryDProvider({'endpoint': endpoint, 'timeout_seconds': .2})
+        assert provider.prefetch('private query sentinel')
+        assert 'recall partial' in caplog.text
+        assert 'completed=3 failed=1 recalled=3' in caplog.text
+        assert 'unavailable' not in caplog.text
+        assert 'private query sentinel' not in caplog.text
+        assert 'Synthetic fact' not in caplog.text
+
+
+def test_protocol_failure_diagnostics_do_not_log_server_text(caplog):
+    import logging
+    from test_transport import raw_server
+
+    with caplog.at_level(logging.DEBUG), raw_server(b'private-response-sentinel\r\n\r\n') as endpoint:
+        provider = CodexMemoryDProvider({'endpoint': endpoint})
+        assert provider.prefetch('private-query-sentinel') == ''
+        provider.sync_turn('private-user-sentinel', 'private-assistant-sentinel')
+    assert 'recall failed: completed=0 failed=4 recalled=0' in caplog.text
+    assert '/v1/recall BadStatusLine' in caplog.text
+    assert '/v1/turns BadStatusLine' in caplog.text
+    assert 'sentinel' not in caplog.text
+
+
+def test_successful_empty_recall_is_not_reported_as_failure(caplog):
+    from test_transport import raw_server
+
+    raw = b'{"ok":true,"data":{"facts":[]}}'
+    response = b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(raw)).encode() + b'\r\n\r\n' + raw
+    with raw_server(response) as endpoint:
+        provider = CodexMemoryDProvider({'endpoint': endpoint})
+        assert provider.prefetch('synthetic') == ''
+        assert provider.recall_status() is None
+    assert not caplog.records
+
+
+def test_fast_lanes_donate_time_to_last_lane():
+    from test_provider import provider_module
+    from unittest.mock import patch
+
+    clock = [0.0]
+    budgets = []
+    provider = CodexMemoryDProvider({'timeout_seconds': .5})
+
+    def request(method, path, payload, timeout):
+        budgets.append(timeout)
+        clock[0] += .01
+        return 200, b'{"ok":true,"data":{"facts":[]}}'
+
+    with patch.object(provider_module.time, 'monotonic', lambda: clock[0]), patch.object(provider, '_request', request):
+        assert provider.prefetch('synthetic') == ''
+    assert len(budgets) == 4
+    assert budgets[0] == .125
+    assert budgets[-1] > .46

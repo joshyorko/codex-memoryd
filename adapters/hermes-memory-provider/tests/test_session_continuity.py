@@ -24,4 +24,4 @@ def test_outage_is_reported_as_warning(caplog):
     with caplog.at_level(logging.WARNING):
         provider = CodexMemoryDProvider({"endpoint": "http://127.0.0.1:1", "bootstrap_origin": False, "timeout_seconds": 0.05})
         assert provider.prefetch("synthetic fixture") == ""
-    assert "codex-memoryd unavailable" in caplog.text
+    assert "codex-memoryd recall failed: completed=0 failed=4 recalled=0" in caplog.text

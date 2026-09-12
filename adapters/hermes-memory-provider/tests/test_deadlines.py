@@ -30,8 +30,10 @@ def test_prefetch_uses_one_deadline_for_all_lanes():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         p = CodexMemoryDProvider({'endpoint':f'http://127.0.0.1:{server.server_port}', 'timeout_seconds':.08})
+        start = time.monotonic()
         assert p.prefetch('synthetic') == ''
-        assert SlowHandler.calls == 1
+        assert time.monotonic() - start < .2
+        assert SlowHandler.calls == 4
     finally:
         server.shutdown(); server.server_close()
 
