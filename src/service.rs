@@ -2634,6 +2634,13 @@ impl Service {
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
+                // A full bounded input window is not proof the entire frontier
+                // was covered, even when all selected candidates were consumed.
+                if !command_mode
+                    && evidence_window_count(&run.evidence_window) >= cfg.max_batch_size
+                {
+                    limits_hit.push("max_input_records".to_string());
+                }
                 if cfg.automatic_apply && !command_mode {
                     self.apply_governed_deterministic_batch(&mut run, &profile, &workspace, &now)?;
                 }
@@ -2772,17 +2779,27 @@ impl Service {
                 let evidence = candidate
                     .evidence_refs
                     .iter()
-                    .map(|source| crate::consolidation::policy::EvidenceDescriptor {
-                        id: source.id.clone(),
-                        root_id: source.id.clone(),
-                        source_class: "deterministic_dream".to_string(),
-                        actor: source.actor.clone().unwrap_or_default(),
-                        subject: proposal.subject.clone(),
-                        content: source
-                            .content
-                            .clone()
-                            .unwrap_or_else(|| candidate.content.clone()),
-                        supporting_span: Some(candidate.content.clone()),
+                    .flat_map(|source| {
+                        let roots = if source.root_ids.is_empty() {
+                            vec![source.id.clone()]
+                        } else {
+                            source.root_ids.clone()
+                        };
+                        let subject = proposal.subject.clone();
+                        roots.into_iter().map(move |id| {
+                            crate::consolidation::policy::EvidenceDescriptor {
+                                root_id: id.clone(),
+                                id,
+                                source_class: "deterministic_dream".to_string(),
+                                actor: source.actor.clone().unwrap_or_default(),
+                                subject: subject.clone(),
+                                content: source
+                                    .content
+                                    .clone()
+                                    .unwrap_or_else(|| candidate.content.clone()),
+                                supporting_span: Some(candidate.content.clone()),
+                            }
+                        })
                     })
                     .collect::<Vec<_>>();
                 let decision = crate::consolidation::policy::evaluate_candidate(
@@ -2843,9 +2860,13 @@ impl Service {
             .collect::<Vec<_>>();
         self.store
             .persist_consolidation_batch(&batch, Some(&decisions), "validated")?;
+        let canonical_id = self
+            .store
+            .consolidation_batch_id_by_digest(&batch.scope, &batch.snapshot_digest)?
+            .ok_or_else(|| Error::not_found("persisted consolidation proposal missing"))?;
         run.created =
             self.store
-                .apply_consolidation_proposal(&batch.batch_id, &policy, &decisions)?;
+                .apply_consolidation_proposal(&canonical_id, &policy, &decisions)?;
         run.archived = batch
             .candidates
             .iter()
@@ -4980,6 +5001,7 @@ mod imported_provenance_tests {
     #[test]
     fn imported_patch_source_normalizes_and_escapes_adversarial_provenance() {
         let source = DreamEvidenceSource {
+            root_ids: Vec::new(),
             id: "src|\n# heading".to_string(),
             kind: "imported_chat_turn".to_string(),
             created_at: "2026-07-01T00:00:00Z".to_string(),
@@ -5234,6 +5256,7 @@ mod scheduled_dream_mode_tests {
         let mut observation = provider_observation("obs-evidence", "provider fact with evidence");
         observation.evidence_refs = vec![
             DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: existing_id.clone(),
                 kind: "memory_record".to_string(),
                 created_at: "2026-07-18T00:00:00Z".to_string(),
@@ -5250,6 +5273,7 @@ mod scheduled_dream_mode_tests {
                 turn_index: None,
             },
             DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: "hallucinated-evidence".to_string(),
                 kind: "memory_record".to_string(),
                 created_at: "2026-07-18T00:00:00Z".to_string(),

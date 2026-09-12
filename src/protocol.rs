@@ -1173,6 +1173,8 @@ pub struct MemoryPatchRollbackResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamEvidenceSource {
     pub id: String,
+    #[serde(skip)]
+    pub root_ids: Vec<String>,
     pub kind: String,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]

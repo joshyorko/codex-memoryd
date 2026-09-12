@@ -233,6 +233,74 @@ fn scheduled_adoption_fresh_consumer_correction_wins_after_restart() {
 }
 
 #[test]
+fn review_underlying_source_ids_remain_resolvable_during_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source-ids.sqlite");
+    let service = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    let captured = service
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            target: Some("user".into()),
+            conclusions: Some(vec!["I prefer concise status updates.".into()]),
+            metadata: None,
+            record_type: Some("preference".into()),
+        })
+        .unwrap();
+    service
+        .store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_records SET source_ids = ?1 WHERE id = ?2",
+                rusqlite::params!["[\"source-user-event\"]", &captured.record_ids[0]],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let run = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap()
+        .run
+        .unwrap();
+    assert_eq!(run.created, captured.record_ids);
+    let adopted = service.store.get_record(&run.created[0]).unwrap().unwrap();
+    assert!(adopted.source_ids.contains(&"source-user-event".into()));
+    assert_eq!(adopted.metadata["governed_consolidation_applied"], true);
+}
+
+#[test]
+fn review_full_input_window_does_not_skip_unselected_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input-cap.sqlite");
+    let mut cfg = config(&path);
+    cfg.dream_scheduler.max_batch_size = 1;
+    let service = Service::new(Store::open(path.to_str().unwrap()).unwrap(), cfg);
+    for content in [
+        "I prefer concise status updates.",
+        "I prefer stable interfaces.",
+        "I prefer explicit test results.",
+    ] {
+        service
+            .conclusions(ConclusionsRequest {
+                profile: Some("personal".into()),
+                workspace: Some("journey".into()),
+                repo: None,
+                target: Some("user".into()),
+                conclusions: Some(vec![content.into()]),
+                metadata: None,
+                record_type: Some("preference".into()),
+            })
+            .unwrap();
+    }
+    let result = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap();
+    assert!(result.limits_hit.contains(&"max_input_records".into()));
+    assert!(result.watermark_after.is_none());
+}
+
+#[test]
 fn consolidation_controls_cannot_activate_disabled_policy() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("disabled.sqlite");

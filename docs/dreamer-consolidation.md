@@ -17,7 +17,14 @@ case, punctuation, units, and negation. The provider input budget covers the
 complete serialized request envelope and schema, and all Dream evidence streams
 share one bounded record budget.
 
-The existing `CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY` setting is off by default.
+Automatic adoption is off by default. Set `[dream] automatic_apply = true`
+in TOML or `CODEX_MEMORYD_DREAM_AUTOMATIC_APPLY=true`; the environment override
+takes precedence. Proposal persistence freezes supersession target revisions,
+including source IDs and metadata. Apply rejects changed targets; undo preserves
+later edits to either side of a supersession. Proposals lacking required revision
+snapshots fail closed rather than deriving fresh authority during recovery.
+Identical scope/digest proposals on a later scheduler tick reuse the original
+immutable batch and its decisions; a changed payload or policy is not a replay.
 When an operator enables it, deterministic scheduled candidates pass the
 governed policy boundary and persist an immutable batch before applying. The
 batch-only `/v1/consolidation/apply` and `/v1/consolidation/undo` controls do
@@ -34,7 +41,8 @@ the same SQLite transaction, links the replacement, archives the old records as
 superseded, and returns unique applied record IDs. A changed or missing target
 rejects the transaction as stale.
 
-A scheduled run that hits a runtime or candidate limit does not advance its
+A scheduled run that fills its bounded input window or hits a runtime or
+candidate limit does not advance its
 watermark past the unprocessed source tail; a later run must rediscover that
 work.
 

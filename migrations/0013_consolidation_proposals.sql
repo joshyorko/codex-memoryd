@@ -12,3 +12,13 @@ CREATE TABLE IF NOT EXISTS consolidation_proposals (
 );
 CREATE INDEX IF NOT EXISTS idx_consolidation_proposals_scope_status
     ON consolidation_proposals(scope, status, updated_at);
+
+
+-- Freeze both sides of supersession; missing snapshots fail closed on replay.
+CREATE TABLE IF NOT EXISTS consolidation_target_revisions (
+    batch_id TEXT NOT NULL REFERENCES consolidation_proposals(batch_id),
+    record_id TEXT NOT NULL,
+    proposed_revision TEXT NOT NULL,
+    applied_revision TEXT,
+    PRIMARY KEY (batch_id, record_id)
+);

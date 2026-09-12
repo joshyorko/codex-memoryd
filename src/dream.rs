@@ -851,6 +851,7 @@ fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
             .map(|record| {
                 let provenance = imported_chatgpt_provenance(&record.metadata);
                 DreamEvidenceSource {
+                    root_ids: Vec::new(),
                     id: record.id.clone(),
                     kind: provenance
                         .as_ref()
@@ -889,6 +890,7 @@ fn stream_from_conclusions(records: &[Conclusion]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: "conclusion".to_string(),
                 created_at: record.created_at.clone(),
@@ -914,6 +916,7 @@ fn stream_from_checkpoints(records: &[Checkpoint]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: "checkpoint".to_string(),
                 created_at: record.created_at.clone(),
@@ -942,6 +945,7 @@ fn stream_from_sources(records: &[MemorySource]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: record.kind.clone(),
                 created_at: record.created_at.clone(),
@@ -967,6 +971,7 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: "memory_record".to_string(),
                 created_at: record.created_at.clone(),
@@ -1505,6 +1510,7 @@ fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
         .unwrap_or("memory_record")
         .to_string();
     DreamEvidenceSource {
+        root_ids: evidence_ids(record),
         id: record.id.clone(),
         kind: if provenance.is_some() {
             "imported_chat_turn".to_string()

@@ -87,8 +87,21 @@ pub struct HybridRecallSection {
     pub fusion_k: Option<usize>,
 }
 
+#[cfg(test)]
+mod review_file_policy {
+    use super::*;
+    #[test]
+    fn automatic_apply_toml_is_honored() {
+        let file: FileConfig = toml::from_str("[dream]\nautomatic_apply = true\n").unwrap();
+        let mut config = Config::default();
+        config.merge_file(file);
+        assert!(config.dream_scheduler.automatic_apply);
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DreamSection {
+    pub automatic_apply: Option<bool>,
     pub scheduler_enabled: Option<bool>,
     pub scheduler_interval_seconds: Option<u64>,
     pub idle_window_seconds: Option<i64>,
@@ -508,6 +521,9 @@ impl Config {
         }
         if let Some(fusion_k) = file.recall.hybrid.fusion_k {
             self.hybrid_recall.fusion_k = fusion_k;
+        }
+        if let Some(enabled) = file.dream.automatic_apply {
+            self.dream_scheduler.automatic_apply = enabled;
         }
         if let Some(enabled) = file.dream.scheduler_enabled {
             self.dream_scheduler.enabled = enabled;

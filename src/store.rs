@@ -528,7 +528,7 @@ impl Store {
                     batch_id, scope, proposal_digest, batch_json, decisions_json,
                     status, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-                 ON CONFLICT(batch_id) DO NOTHING",
+                 ON CONFLICT DO NOTHING",
                 rusqlite::params![
                     batch.batch_id,
                     batch.scope,
@@ -540,22 +540,63 @@ impl Store {
                 ],
             )?;
             if changed == 0 {
-                let existing: String = tx.query_row(
-                    "SELECT batch_json FROM consolidation_proposals WHERE batch_id = ?1",
-                    rusqlite::params![batch.batch_id],
-                    |row| row.get(0),
+                let (existing, existing_decisions): (String, Option<String>) = tx.query_row(
+                    "SELECT batch_json, decisions_json FROM consolidation_proposals
+                     WHERE batch_id = ?1 OR (scope = ?2 AND proposal_digest = ?3)
+                     ORDER BY CASE WHEN batch_id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                    rusqlite::params![batch.batch_id, batch.scope, batch.snapshot_digest],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                let existing_batch: ConsolidationBatch = serde_json::from_str(&existing)?;
-                if existing_batch != *batch {
+                let mut existing_batch: ConsolidationBatch = serde_json::from_str(&existing)?;
+                // A later scheduler tick may change only the run identity/cursor.
+                // Reuse the immutable proposal, never overwrite its decisions.
+                if existing_batch.batch_id != batch.batch_id {
+                    existing_batch.batch_id = batch.batch_id.clone();
+                    existing_batch.source_cursor = batch.source_cursor.clone();
+                }
+                if existing_batch != *batch || existing_decisions != decisions_json {
                     return Err(Error::new(
                         ErrorCode::BundlePlanStale,
                         "consolidation batch id already has a different payload",
                     ));
                 }
             }
+            if changed == 1 {
+                for id in batch.candidates.iter().flat_map(|c| c.supersedes.iter()).collect::<BTreeSet<_>>() {
+                    let revision = Self::consolidation_record_revision(tx, id)?;
+                    tx.execute(
+                        "INSERT INTO consolidation_target_revisions(batch_id, record_id, proposed_revision) VALUES (?1, ?2, ?3)",
+                        params![batch.batch_id, id, revision],
+                    )?;
+                }
+            }
             Ok(changed == 1)
         })?;
         Ok(inserted)
+    }
+
+    /// Resolve the canonical immutable proposal after a different-tick replay.
+    pub fn consolidation_batch_id_by_digest(
+        &self,
+        scope: &str,
+        digest: &str,
+    ) -> Result<Option<String>> {
+        self.conn()?.query_row(
+            "SELECT batch_id FROM consolidation_proposals WHERE scope = ?1 AND proposal_digest = ?2",
+            params![scope, digest], |row| row.get(0),
+        ).optional().map_err(Error::from)
+    }
+
+    fn consolidation_record_revision(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<String> {
+        let raw: String = tx.query_row(
+            "SELECT json_object('hash', content_hash, 'updated', updated_at,
+                'sources', source_ids, 'metadata', metadata, 'archived', archived,
+                'temporal', temporal_state, 'by', superseded_by, 'supersedes', supersedes,
+                'valid_until', valid_until) FROM memory_records WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(ids::sha256_hex(raw.as_bytes()))
     }
 
     /// Read the exact proposal payload retained by the canonical store.
@@ -983,6 +1024,7 @@ impl Store {
                 .query_map(rusqlite::params![batch_id], |row| row.get(0))?
                 .collect::<std::result::Result<Vec<String>, _>>()?;
             drop(stmt);
+            let mut reverted = Vec::new();
             for replacement_id in &ids {
                 let old_records = tx
                     .prepare(
@@ -995,6 +1037,17 @@ impl Store {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut unchanged = true;
+                for (old_id, _) in &old_records {
+                    let expected: Option<String> = tx.query_row(
+                        "SELECT applied_revision FROM consolidation_target_revisions WHERE batch_id = ?1 AND record_id = ?2",
+                        params![batch_id, old_id], |row| row.get(0),
+                    ).optional()?.flatten();
+                    let actual = Self::consolidation_record_revision(tx, old_id)?;
+                    if expected.as_deref() != Some(actual.as_str()) { unchanged = false; break; }
+                }
+                if !unchanged { continue; }
+                reverted.push(replacement_id.clone());
                 for (old_id, raw_metadata) in old_records {
                     let metadata = serde_json::from_str::<Value>(&raw_metadata)
                         .unwrap_or_else(|_| json!({}));
@@ -1041,21 +1094,23 @@ impl Store {
                     )?;
                 }
             }
+            for record_id in &reverted {
             tx.execute(
                 "UPDATE memory_records
                  SET archived = 1, temporal_state = 'historical',
                      historical_reason = 'governed_consolidation_undo',
                      updated_at = ?1,
                      metadata = json_set(metadata, '$.undo_batch_id', ?2)
-                 WHERE json_extract(metadata, '$.batch_id') = ?2
+                 WHERE json_extract(metadata, '$.batch_id') = ?2 AND id = ?3
                    AND archived = 0 AND updated_at = created_at",
-                rusqlite::params![ids::now_rfc3339(), batch_id],
+                rusqlite::params![ids::now_rfc3339(), batch_id, record_id],
             )?;
+            }
             tx.execute(
                 "UPDATE consolidation_proposals SET status = 'reverted', updated_at = ?1 WHERE batch_id = ?2",
                 rusqlite::params![ids::now_rfc3339(), batch_id],
             )?;
-            Ok(ids)
+            Ok(reverted)
         })
     }
 
@@ -1078,6 +1133,17 @@ impl Store {
         }
 
         for superseded_id in &ids {
+            let expected: Option<String> = tx.query_row(
+                "SELECT proposed_revision FROM consolidation_target_revisions WHERE batch_id = ?1 AND record_id = ?2",
+                params![batch_id, superseded_id], |row| row.get(0),
+            ).optional()?;
+            let actual = Self::consolidation_record_revision(tx, superseded_id)?;
+            if expected.as_deref() != Some(actual.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target revision changed before apply",
+                ));
+            }
             let state: Option<(i64, String)> = tx
                 .query_row(
                     "SELECT archived, COALESCE(temporal_state, 'current')
@@ -1205,6 +1271,9 @@ impl Store {
                     "consolidation supersession target changed before apply",
                 ));
             }
+            let revision = Self::consolidation_record_revision(tx, superseded_id)?;
+            tx.execute("UPDATE consolidation_target_revisions SET applied_revision = ?1 WHERE batch_id = ?2 AND record_id = ?3",
+                params![revision, batch_id, superseded_id])?;
         }
         Ok(())
     }

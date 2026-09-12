@@ -641,3 +641,117 @@ fn changed_policy_cannot_apply_a_persisted_batch() {
         .unwrap_err();
     assert!(error.message.contains("policy changed"));
 }
+
+fn review_supersession_fixture() -> (
+    Store,
+    NewRecord,
+    String,
+    ConsolidationBatch,
+    ConsolidationDecision,
+) {
+    let store = Store::open(":memory:").unwrap();
+    store
+        .ensure_workspace("personal", "fixture-workspace")
+        .unwrap();
+    let old = NewRecord {
+        profile_id: "personal".into(),
+        workspace_id: "fixture-workspace".into(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: Scope::Workspace,
+        record_type: RecordType::Preference,
+        content: "prefers concise updates".into(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: 0.8,
+        source_ids: vec!["old-source".into()],
+        content_hash: codex_memoryd::ids::content_hash(
+            "personal",
+            "fixture-workspace",
+            None,
+            "preference",
+            "workspace",
+            "prefers concise updates",
+        ),
+        supersedes: vec![],
+        metadata: json!({"origin":"fixture"}),
+    };
+    let old_id = store.upsert_record(&old).unwrap().id().to_string();
+    let mut proposal = batch("output-new");
+    proposal.policy_digest = automatic_policy().digest();
+    proposal.candidates[0].claim = "prefers stable interfaces".into();
+    proposal.candidates[0].output_digest = "output-new".into();
+    proposal.candidates[0].supersedes = vec![old_id.clone()];
+    let decision = ConsolidationDecision {
+        candidate_id: "candidate-1".into(),
+        output_digest: "output-new".into(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "supported correction".into(),
+        distinct_evidence_roots: vec!["new-source".into()],
+        supersedes: vec![old_id.clone()],
+        validator: None,
+    };
+    (store, old, old_id, proposal, decision)
+}
+
+#[test]
+fn review_apply_rejects_updated_supersession_target() {
+    let (store, mut old, old_id, proposal, decision) = review_supersession_fixture();
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    old.source_ids.push("later-source".into());
+    store.upsert_record(&old).unwrap();
+    assert!(store
+        .apply_consolidation_proposal(&proposal.batch_id, &automatic_policy(), &[decision])
+        .is_err());
+    assert!(!store.get_record(&old_id).unwrap().unwrap().archived);
+}
+
+#[test]
+fn review_undo_preserves_later_superseded_target_edit() {
+    let (store, mut old, old_id, proposal, decision) = review_supersession_fixture();
+    store
+        .persist_consolidation_batch(&proposal, Some(&[decision.clone()]), "validated")
+        .unwrap();
+    let applied = store
+        .apply_consolidation_proposal(&proposal.batch_id, &automatic_policy(), &[decision])
+        .unwrap();
+    old.source_ids.push("later-source".into());
+    store.upsert_record(&old).unwrap();
+    let before = store.get_record(&old_id).unwrap().unwrap();
+    assert!(store
+        .undo_consolidation_proposal(&proposal.batch_id)
+        .unwrap()
+        .is_empty());
+    let after = store.get_record(&old_id).unwrap().unwrap();
+    assert_eq!(before.metadata, after.metadata);
+    assert_eq!(before.source_ids, after.source_ids);
+    assert!(after.archived);
+    assert!(!store.get_record(&applied[0]).unwrap().unwrap().archived);
+}
+
+#[test]
+fn review_digest_replay_after_crash_preserves_original_proposal() {
+    let store = Store::open(":memory:").unwrap();
+    let first = batch("same-digest");
+    store
+        .persist_consolidation_batch(&first, None, "proposed")
+        .unwrap();
+    let mut retry = first.clone();
+    retry.batch_id = "later-tick".into();
+    retry.source_cursor.until = Some("2026-09-12T00:00:00Z".into());
+    assert!(!store
+        .persist_consolidation_batch(&retry, None, "proposed")
+        .unwrap());
+    assert_eq!(
+        store
+            .read_consolidation_batch(&first.batch_id)
+            .unwrap()
+            .unwrap(),
+        first
+    );
+}
