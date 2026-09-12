@@ -923,13 +923,13 @@ impl Store {
                 let classification = crate::policy::classify_as(
                     &candidate.claim,
                     profile,
-                    false,
+                    batch.repo_id.is_some(),
                     record_type,
                 );
                 let content_hash = ids::exact_content_hash(
                     profile.as_str(),
                     &batch.workspace,
-                    None,
+                    batch.repo_id.as_deref(),
                     classification.record_type.as_str(),
                     classification.scope.as_str(),
                     &candidate.claim,
@@ -945,13 +945,14 @@ impl Store {
                         .query_row(
                             "SELECT id FROM memory_records
                              WHERE profile_id = ?1 AND workspace_id = ?2
-                               AND repo_id IS NULL AND type = ?3 AND scope = ?4
-                               AND content = ?5 AND archived = 0
+                               AND repo_id IS ?3 AND type = ?4 AND scope = ?5
+                               AND content = ?6 AND archived = 0
                                AND COALESCE(temporal_state, 'current') = 'current'
                              ORDER BY updated_at DESC, id DESC LIMIT 1",
                             rusqlite::params![
                                 profile.as_str(),
                                 &batch.workspace,
+                                batch.repo_id.as_deref(),
                                 classification.record_type.as_str(),
                                 classification.scope.as_str(),
                                 &candidate.claim,
@@ -967,7 +968,7 @@ impl Store {
                     let now = ids::now_rfc3339();
                     let record = MemoryRecord {
                         id: id.clone(), profile_id: profile.as_str().into(), workspace_id: batch.workspace.clone(),
-                        repo_id: None, subject_id: None, episode_id: None, scope: classification.scope,
+                        repo_id: batch.repo_id.clone(), subject_id: None, episode_id: None, scope: classification.scope,
                         record_type: classification.record_type, content: candidate.claim.clone(),
                         related_files: classification.related_files, tags: classification.tags,
                         sensitivity: classification.sensitivity, portability: classification.portability,
@@ -1003,6 +1004,7 @@ impl Store {
                     tx,
                     &batch.profile,
                     &batch.workspace,
+                    batch.repo_id.as_deref(),
                     &record_id,
                     &decision.supersedes,
                     batch_id,
@@ -1144,6 +1146,7 @@ impl Store {
         tx: &rusqlite::Transaction<'_>,
         profile_id: &str,
         workspace_id: &str,
+        repo_id: Option<&str>,
         replacement_id: &str,
         superseded_ids: &[String],
         batch_id: &str,
@@ -1174,8 +1177,9 @@ impl Store {
                 .query_row(
                     "SELECT archived, COALESCE(temporal_state, 'current')
                  FROM memory_records
-                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
-                    params![superseded_id, profile_id, workspace_id],
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                   AND repo_id IS ?4",
+                    params![superseded_id, profile_id, workspace_id, repo_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
@@ -1189,8 +1193,9 @@ impl Store {
 
         let raw: String = tx.query_row(
             "SELECT supersedes FROM memory_records
-         WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
-            params![replacement_id, profile_id, workspace_id],
+         WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+           AND repo_id IS ?4",
+            params![replacement_id, profile_id, workspace_id, repo_id],
             |row| row.get(0),
         )?;
         let mut replacement_supersedes = json_str_list(&raw);
@@ -1202,12 +1207,14 @@ impl Store {
         tx.execute(
             "UPDATE memory_records
          SET supersedes = ?1
-         WHERE id = ?2 AND profile_id = ?3 AND workspace_id = ?4",
+         WHERE id = ?2 AND profile_id = ?3 AND workspace_id = ?4
+           AND repo_id IS ?5",
             params![
                 serde_json::to_string(&replacement_supersedes)?,
                 replacement_id,
                 profile_id,
                 workspace_id,
+                repo_id,
             ],
         )?;
 
@@ -1230,8 +1237,9 @@ impl Store {
                 "SELECT metadata, valid_until, superseded_by, historical_reason,
                         COALESCE(temporal_state, 'current'), archived
                  FROM memory_records
-                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
-                params![superseded_id, profile_id, workspace_id],
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                   AND repo_id IS ?4",
+                params![superseded_id, profile_id, workspace_id, repo_id],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -1279,6 +1287,7 @@ impl Store {
                  valid_until = COALESCE(valid_until, ?2),
                  historical_reason = ?3, updated_at = ?2, metadata = ?4
              WHERE id = ?5 AND profile_id = ?6 AND workspace_id = ?7
+               AND repo_id IS ?8
                AND archived = 0
                AND COALESCE(temporal_state, 'current') = 'current'",
                 params![
@@ -1289,6 +1298,7 @@ impl Store {
                     superseded_id,
                     profile_id,
                     workspace_id,
+                    repo_id,
                 ],
             )?;
             if changed != 1 {

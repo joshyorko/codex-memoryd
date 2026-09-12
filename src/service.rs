@@ -2773,11 +2773,44 @@ impl Service {
         now: &str,
     ) -> Result<()> {
         let policy = governed_deterministic_policy(profile);
-        let candidates = run
+        let candidate_repo_scope = |candidate: &DreamCandidate| -> Result<Option<String>> {
+            let mut boundary = run.repo_id.clone().map(Some);
+            let mut found = 0usize;
+            let mut missing = 0usize;
+            for source in &candidate.evidence_refs {
+                let Some(record) = self.store.get_record(&source.id)? else {
+                    missing += 1;
+                    continue;
+                };
+                if record.profile_id != profile.as_str() || record.workspace_id != workspace {
+                    return Err(Error::policy(
+                        "consolidation evidence record is outside the run boundary",
+                    ));
+                }
+                found += 1;
+                let source_boundary = record.repo_id.filter(|repo_id| !repo_id.trim().is_empty());
+                match boundary.as_ref() {
+                    Some(existing) if existing.as_ref() != source_boundary.as_ref() => {
+                        return Err(Error::policy(
+                            "consolidation candidate mixes repository boundaries",
+                        ));
+                    }
+                    None => boundary = Some(source_boundary),
+                    _ => {}
+                }
+            }
+            if missing > 0 && found > 0 {
+                return Err(Error::policy(
+                    "consolidation candidate has an unresolved repository boundary",
+                ));
+            }
+            Ok(boundary.flatten())
+        };
+        let scoped_candidates = run
             .candidates
             .iter()
             .filter(|candidate| candidate.apply_eligible && !candidate.evidence_ids.is_empty())
-            .filter_map(|candidate| {
+            .map(|candidate| {
                 let identity = (
                     &candidate.action,
                     &candidate.proposed_type,
@@ -2838,19 +2871,44 @@ impl Service {
                     &[],
                     None,
                 );
-                matches!(decision.operation, ConsolidationOperation::AdoptStatement)
-                    .then_some(proposal)
+                if matches!(decision.operation, ConsolidationOperation::AdoptStatement) {
+                    Ok(Some((proposal, candidate_repo_scope(candidate)?)))
+                } else {
+                    Ok(None)
+                }
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
-        if candidates.is_empty() {
+        if scoped_candidates.is_empty() {
             return Ok(());
         }
-        let candidate_set_digest = ids::sha256_hex(&serde_json::to_vec(&candidates)?);
+        let mut repository_scope: Option<Option<String>> = None;
+        for (_, candidate_repo_id) in &scoped_candidates {
+            match repository_scope.as_ref() {
+                Some(existing) if existing.as_ref() != candidate_repo_id.as_ref() => {
+                    return Err(Error::policy(
+                        "consolidation batch mixes repository boundaries",
+                    ));
+                }
+                None => repository_scope = Some(candidate_repo_id.clone()),
+                _ => {}
+            }
+        }
+        let repo_id = repository_scope.flatten();
+        let candidates = scoped_candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect::<Vec<_>>();
+        let candidate_set_digest =
+            ids::sha256_hex(&serde_json::to_vec(&(repo_id.clone(), &candidates))?);
         let base_batch_id = format!("consolidation_{}", run.run_id);
         let batch_id = match self.store.read_consolidation_batch(&base_batch_id)? {
             None => base_batch_id.clone(),
             Some(existing)
                 if existing.snapshot_digest == candidate_set_digest
+                    && existing.repo_id == repo_id
                     && existing.candidates == candidates =>
             {
                 base_batch_id.clone()
@@ -2863,6 +2921,7 @@ impl Service {
             policy_digest: policy.digest(),
             profile: profile.as_str().to_string(),
             workspace: workspace.to_string(),
+            repo_id,
             scope: profile.as_str().to_string(),
             source_cursor: ConsolidationSourceCursor {
                 since: None,
