@@ -159,6 +159,8 @@ pub struct ConsolidationBatch {
     pub policy_digest: String,
     pub profile: String,
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
     pub scope: String,
     pub source_cursor: ConsolidationSourceCursor,
     pub snapshot_digest: String,
@@ -173,6 +175,13 @@ impl ConsolidationBatch {
             || self.snapshot_digest.is_empty()
         {
             return Err("batch identity or contract version is invalid".into());
+        }
+        if self
+            .repo_id
+            .as_deref()
+            .is_some_and(|repo_id| repo_id.trim().is_empty())
+        {
+            return Err("batch repository scope must be non-empty when present".into());
         }
         if self.candidates.is_empty() || self.candidates.len() > MAX_ITEMS {
             return Err("batch candidates must be bounded and non-empty".into());

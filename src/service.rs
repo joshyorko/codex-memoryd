@@ -1704,7 +1704,8 @@ impl Service {
             ));
         }
         if let Some(since) = req.since.as_deref() {
-            if OffsetDateTime::parse(since, &Rfc3339).is_err() {
+            if OffsetDateTime::parse(since, &Rfc3339).is_err() && !dream::is_scheduler_cursor(since)
+            {
                 return Err(Error::invalid_request(
                     "dream job since must be an RFC3339 timestamp",
                 ));
@@ -1724,7 +1725,10 @@ impl Service {
         let provider = req.provider.unwrap_or_default();
         let resolved_provider = self.resolve_dream_provider(adapter, &provider, &req.budget)?;
         let persisted_provider = persisted_dream_provider(&provider, resolved_provider.as_ref());
-        let explicit_since = req.since.is_some() || req.since_explicit;
+        // A scheduled command preview may carry its watermark without granting
+        // the command adapter historical/archive replay access.
+        let include_archived_sources =
+            req.since_explicit || (req.since.is_some() && adapter != DreamProviderAdapter::Command);
         let source_window_start = match req.since.as_ref() {
             Some(since) => Some(since.clone()),
             None if !req.since_explicit => {
@@ -1761,7 +1765,7 @@ impl Service {
                 now: &now,
                 source_window_end: Some(&now),
                 recency_cutoff: source_window_start.as_deref(),
-                include_archived_sources: explicit_since,
+                include_archived_sources,
                 max_records: req.budget.max_input_records,
                 max_candidates: Some(req.budget.max_candidates),
                 patch_run_id: None,
@@ -2543,7 +2547,7 @@ impl Service {
                     repo: None,
                     now: Some(now.clone()),
                     since: watermark_before.clone(),
-                    since_explicit: true,
+                    since_explicit: false,
                     kind: "dream_preview".to_string(),
                     mode: Some("command".to_string()),
                     provider: None,
@@ -2656,9 +2660,9 @@ impl Service {
                 }
                 // A full bounded input window is not proof the entire frontier
                 // was covered, even when all selected candidates were consumed.
-                if !command_mode
-                    && evidence_window_count(&run.evidence_window) >= cfg.max_batch_size
-                {
+                let input_window_full = cfg.max_batch_size > 0
+                    && evidence_window_count(&run.evidence_window) >= cfg.max_batch_size;
+                if input_window_full {
                     limits_hit.push("max_input_records".to_string());
                 }
                 if cfg.automatic_apply && !command_mode {
@@ -2670,9 +2674,20 @@ impl Service {
                     "ok_with_limits"
                 };
                 // A limited run has not durably covered the source frontier.
-                // Leave the previous cursor in place so a later run can find
-                // the unprocessed tail instead of skipping it.
-                let watermark_after = limits_hit.is_empty().then(|| now.clone());
+                // Preserve a bounded source cursor for input-only limits; keep
+                // the previous cursor for runtime, provider, or candidate limits.
+                let watermark_after = if limits_hit.is_empty() {
+                    Some(now.clone())
+                } else if input_window_full
+                    && limits_hit.iter().all(|limit| limit == "max_input_records")
+                {
+                    dream::scheduler_watermark_after(
+                        watermark_before.as_deref(),
+                        &run.evidence_window,
+                    )?
+                } else {
+                    None
+                };
                 self.store.record_dream_run(&DreamRunRecord {
                     run_id: run.run_id.clone(),
                     profile_id: run.profile.clone(),
@@ -2777,11 +2792,44 @@ impl Service {
         now: &str,
     ) -> Result<()> {
         let policy = governed_deterministic_policy(profile);
-        let candidates = run
+        let candidate_repo_scope = |candidate: &DreamCandidate| -> Result<Option<String>> {
+            let mut boundary = run.repo_id.clone().map(Some);
+            let mut found = 0usize;
+            let mut missing = 0usize;
+            for source in &candidate.evidence_refs {
+                let Some(record) = self.store.get_record(&source.id)? else {
+                    missing += 1;
+                    continue;
+                };
+                if record.profile_id != profile.as_str() || record.workspace_id != workspace {
+                    return Err(Error::policy(
+                        "consolidation evidence record is outside the run boundary",
+                    ));
+                }
+                found += 1;
+                let source_boundary = record.repo_id.filter(|repo_id| !repo_id.trim().is_empty());
+                match boundary.as_ref() {
+                    Some(existing) if existing.as_ref() != source_boundary.as_ref() => {
+                        return Err(Error::policy(
+                            "consolidation candidate mixes repository boundaries",
+                        ));
+                    }
+                    None => boundary = Some(source_boundary),
+                    _ => {}
+                }
+            }
+            if missing > 0 && found > 0 {
+                return Err(Error::policy(
+                    "consolidation candidate has an unresolved repository boundary",
+                ));
+            }
+            Ok(boundary.flatten())
+        };
+        let scoped_candidates = run
             .candidates
             .iter()
             .filter(|candidate| candidate.apply_eligible && !candidate.evidence_ids.is_empty())
-            .filter_map(|candidate| {
+            .map(|candidate| {
                 let identity = (
                     &candidate.action,
                     &candidate.proposed_type,
@@ -2842,19 +2890,44 @@ impl Service {
                     &[],
                     None,
                 );
-                matches!(decision.operation, ConsolidationOperation::AdoptStatement)
-                    .then_some(proposal)
+                if matches!(decision.operation, ConsolidationOperation::AdoptStatement) {
+                    Ok(Some((proposal, candidate_repo_scope(candidate)?)))
+                } else {
+                    Ok(None)
+                }
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
-        if candidates.is_empty() {
+        if scoped_candidates.is_empty() {
             return Ok(());
         }
-        let candidate_set_digest = ids::sha256_hex(&serde_json::to_vec(&candidates)?);
+        let mut repository_scope: Option<Option<String>> = None;
+        for (_, candidate_repo_id) in &scoped_candidates {
+            match repository_scope.as_ref() {
+                Some(existing) if existing.as_ref() != candidate_repo_id.as_ref() => {
+                    return Err(Error::policy(
+                        "consolidation batch mixes repository boundaries",
+                    ));
+                }
+                None => repository_scope = Some(candidate_repo_id.clone()),
+                _ => {}
+            }
+        }
+        let repo_id = repository_scope.flatten();
+        let candidates = scoped_candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect::<Vec<_>>();
+        let candidate_set_digest =
+            ids::sha256_hex(&serde_json::to_vec(&(repo_id.clone(), &candidates))?);
         let base_batch_id = format!("consolidation_{}", run.run_id);
         let batch_id = match self.store.read_consolidation_batch(&base_batch_id)? {
             None => base_batch_id.clone(),
             Some(existing)
                 if existing.snapshot_digest == candidate_set_digest
+                    && existing.repo_id == repo_id
                     && existing.candidates == candidates =>
             {
                 base_batch_id.clone()
@@ -2867,6 +2940,7 @@ impl Service {
             policy_digest: policy.digest(),
             profile: profile.as_str().to_string(),
             workspace: workspace.to_string(),
+            repo_id,
             scope: profile.as_str().to_string(),
             source_cursor: ConsolidationSourceCursor {
                 since: None,
