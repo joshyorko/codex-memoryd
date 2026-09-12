@@ -659,6 +659,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             rejected,
             archived,
             created,
+            consolidation_batch_id: None,
             authority: "recall_not_authority".to_string(),
             provenance: None,
         },

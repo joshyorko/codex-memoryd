@@ -1368,6 +1368,8 @@ pub struct DreamResponse {
     pub rejected: Vec<DreamRejection>,
     pub archived: Vec<String>,
     pub created: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation_batch_id: Option<String>,
     pub authority: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<DreamProviderProvenance>,

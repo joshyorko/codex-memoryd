@@ -2227,47 +2227,40 @@ impl Service {
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
             let prior_cost = self.store.dream_provider_cost_since(&daily_start, None)?;
             if prior_cost.saturating_add(cost_micros) > limit {
-                let attempted_at = ids::now_rfc3339();
-                self.store.insert_dream_run(&DreamRunAudit {
-                    // A rejected provider call may still be billable. Keep
-                    // each recovery audit distinct because final_run_id is
-                    // deterministic for identical input and INSERT OR
-                    // REPLACE would otherwise erase prior usage.
-                    id: ids::new_id("dream"),
-                    profile_id: response.profile.clone(),
-                    workspace_id: response.workspace.clone(),
-                    repo_id: response.repo_id.clone(),
-                    mode: "preview".to_string(),
-                    status: "error".to_string(),
-                    started_at: attempted_at.clone(),
-                    completed_at: Some(attempted_at),
-                    implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
-                    config_hash: dream::config_hash(),
-                    ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
-                    fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
-                    source_window_start: response.evidence_window.start.clone(),
-                    source_window_end: Some(response.evidence_window.end.clone()),
-                    source_counts: dream_audit_source_counts(&response, None, Some(&usage)),
-                    candidate_counts: dream_audit_candidate_counts(&response, None, Some(&usage)),
-                    created_count: 0,
-                    archived_count: 0,
-                    rejected_count: 0,
-                    error_summary: Some("dream provider daily cost ceiling exhausted".to_string()),
-                })?;
+                self.persist_provider_budget_error_audit(
+                    &response,
+                    &usage,
+                    "dream provider daily cost ceiling exhausted",
+                )?;
                 return Err(Error::internal(
                     "dream provider daily cost ceiling exhausted",
                 ));
             }
         }
         if budget.max_cost_micros > 0 && cost_micros > budget.max_cost_micros {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider cost budget exhausted",
+            )?;
             return Err(Error::internal("dream provider cost budget exhausted"));
         }
         if budget.max_output_bytes > 0 && usage.output_bytes > budget.max_output_bytes {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider output byte budget exhausted",
+            )?;
             return Err(Error::internal(
                 "dream provider output byte budget exhausted",
             ));
         }
         if budget.max_output_tokens > 0 && usage.output_tokens > budget.max_output_tokens {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider output token budget exhausted",
+            )?;
             return Err(Error::internal(
                 "dream provider output token budget exhausted",
             ));
@@ -2313,6 +2306,42 @@ impl Service {
                 ..usage
             }),
         ))
+    }
+
+    fn persist_provider_budget_error_audit(
+        &self,
+        response: &DreamResponse,
+        usage: &DreamBudgetUsage,
+        error_summary: &str,
+    ) -> Result<()> {
+        let attempted_at = ids::now_rfc3339();
+        self.store.insert_dream_run(&DreamRunAudit {
+            // A rejected provider call may still be billable. Keep each
+            // recovery audit distinct because successful run IDs are
+            // deterministic for identical input and INSERT OR REPLACE would
+            // otherwise erase prior usage.
+            id: ids::new_id("dream"),
+            profile_id: response.profile.clone(),
+            workspace_id: response.workspace.clone(),
+            repo_id: response.repo_id.clone(),
+            mode: "preview".to_string(),
+            status: "error".to_string(),
+            started_at: attempted_at.clone(),
+            completed_at: Some(attempted_at),
+            implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+            config_hash: dream::config_hash(),
+            ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+            fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
+            source_window_start: response.evidence_window.start.clone(),
+            source_window_end: Some(response.evidence_window.end.clone()),
+            source_counts: dream_audit_source_counts(response, None, Some(usage)),
+            candidate_counts: dream_audit_candidate_counts(response, None, Some(usage)),
+            created_count: 0,
+            archived_count: 0,
+            rejected_count: 0,
+            error_summary: Some(sanitize_error_summary(error_summary)),
+        })?;
+        Ok(())
     }
 
     fn dream_with_patch_binding(
@@ -2979,6 +3008,7 @@ impl Service {
             .collect();
         run.archived.sort();
         run.archived.dedup();
+        run.consolidation_batch_id = Some(canonical_id);
         run.mode = "apply".to_string();
         Ok(())
     }
@@ -5647,6 +5677,7 @@ mod governed_candidate_identity_tests {
             rejected: vec![],
             archived: vec![],
             created: vec![],
+            consolidation_batch_id: None,
             authority: "recall_not_authority".into(),
             provenance: None,
         };
