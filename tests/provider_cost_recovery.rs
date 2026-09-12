@@ -30,6 +30,15 @@ fn request(job_id: &str) -> DreamJobRunRequest {
     }
 }
 
+fn rolling_cost(svc: &Service) -> u64 {
+    let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
+        .format(&Rfc3339)
+        .unwrap();
+    svc.store
+        .dream_provider_cost_since(&daily_start, None)
+        .unwrap()
+}
+
 #[test]
 fn repeated_ceiling_rejections_retain_each_billed_call_once() {
     let mut config = Config::default();
@@ -53,13 +62,30 @@ fn repeated_ceiling_rejections_retain_each_billed_call_once() {
         assert!(error.message.contains("daily cost ceiling"), "{error}");
     }
 
-    let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
-        .format(&Rfc3339)
-        .unwrap();
-    assert_eq!(
-        svc.store
-            .dream_provider_cost_since(&daily_start, None)
-            .unwrap(),
-        180
-    );
+    assert_eq!(rolling_cost(&svc), 180);
+}
+
+#[test]
+fn per_job_cost_rejections_retain_each_billed_call_once() {
+    let mut config = Config::default();
+    config.default_workspace = "ws".into();
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "configured-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r#"cat >/dev/null; printf '{"schema_version":"dream-preview-v1","profile":"personal","workspace":"ws","candidates":[],"cost_micros":60}'"#.into(),
+    ];
+    let svc = Service::new(Store::open(":memory:").unwrap(), config);
+
+    for job_id in ["provider-budget-one", "provider-budget-two"] {
+        let mut job = request(job_id);
+        job.budget.max_cost_micros = 50;
+        job.budget.daily_cost_ceiling_micros = None;
+        let error = svc.run_dream_job(job).unwrap_err();
+        assert!(error.message.contains("cost budget"), "{error}");
+    }
+
+    assert_eq!(rolling_cost(&svc), 120);
 }
