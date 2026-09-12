@@ -5706,6 +5706,24 @@ mod governed_candidate_identity_tests {
                 ..Default::default()
             },
         );
+        // Candidate references must resolve to real, scoped evidence records.
+        let source = |record_type: &str| {
+            service
+                .conclusions(ConclusionsRequest {
+                    profile: Some("personal".into()),
+                    workspace: Some("ws".into()),
+                    repo: None,
+                    target: Some("user".into()),
+                    conclusions: Some(vec!["same durable claim".into()]),
+                    metadata: None,
+                    record_type: Some(record_type.into()),
+                })
+                .expect("scoped evidence")
+                .record_ids[0]
+                .clone()
+        };
+        let source_a = source("preference");
+        let source_b = source("decision");
         let mut run = DreamResponse {
             run_id: "identity-run".into(),
             mode: "preview".into(),
@@ -5738,8 +5756,8 @@ mod governed_candidate_identity_tests {
                 },
             },
             candidates: vec![
-                candidate("preference", "subject-a", "source-a"),
-                candidate("decision", "subject-b", "source-b"),
+                candidate("preference", "subject-a", &source_a),
+                candidate("decision", "subject-b", &source_b),
             ],
             observations: vec![],
             markers: vec![],

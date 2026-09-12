@@ -1043,6 +1043,20 @@ impl Store {
                         )
                         .optional()?,
                 };
+                // Fresh evidence may re-adopt a plainly archived claim, but an
+                // inactive replacement must never archive other current targets.
+                let existing = if existing.is_none() && decision.supersedes.is_empty() {
+                    tx.query_row(
+                        "SELECT id FROM memory_records WHERE content_hash = ?1
+                         AND profile_id = ?2 AND workspace_id = ?3 AND repo_id IS ?4
+                         AND type = ?5 AND scope = ?6 AND archived = 1
+                         AND COALESCE(temporal_state, 'current') = 'current'",
+                        params![exact_content_hash, profile.as_str(), batch.workspace,
+                            batch.repo_id.as_deref(), classification.record_type.as_str(),
+                            classification.scope.as_str()],
+                        |row| row.get(0),
+                    ).optional()?
+                } else { existing };
                 let (record_id, reused_existing) = if let Some(id) = existing {
                     (id, true)
                 } else {
@@ -1114,8 +1128,8 @@ impl Store {
                              temporal_state = COALESCE(?2, temporal_state),
                              valid_until = COALESCE(?3, valid_until),
                              historical_reason = COALESCE(?4, historical_reason),
-                             metadata = ?5, updated_at = ?6
-                         WHERE id = ?7 AND archived = 0
+                             metadata = ?5, updated_at = ?6, archived = 0
+                         WHERE id = ?7 AND (archived = 0 OR ?8 = 1)
                            AND COALESCE(temporal_state, 'current') = 'current'",
                         rusqlite::params![
                             serde_json::to_string(&source_ids)?,
@@ -1125,6 +1139,7 @@ impl Store {
                             metadata.to_string(),
                             ids::now_rfc3339(),
                             &record_id,
+                            decision.supersedes.is_empty(),
                         ],
                     )?;
                     if updated != 1 {

@@ -389,4 +389,13 @@ fn archived_exact_hash_does_not_suppress_new_synthetic_evidence() {
         .expect("read consolidation batch")
         .expect("new evidence batch");
     assert_eq!(batch.candidates.len(), 1);
+    let readopted = store.get_record(&archived_id).unwrap().unwrap();
+    assert!(
+        !readopted.archived,
+        "fresh evidence must restore default-recall eligibility"
+    );
+    assert!(
+        !readopted.source_ids.is_empty(),
+        "re-adoption must retain fresh provenance"
+    );
 }
