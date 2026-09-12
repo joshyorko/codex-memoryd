@@ -373,6 +373,71 @@ fn merge_allowlisted_metadata(
     Value::Object(result)
 }
 
+/// Enforce the active consolidation budget before an apply transaction can
+/// mutate any memory records.
+fn enforce_consolidation_budget(
+    batch: &ConsolidationBatch,
+    policy: &crate::consolidation::ConsolidationPolicy,
+) -> Result<()> {
+    let over_budget = |name: &str, actual: usize, limit: usize| {
+        Error::new(
+            ErrorCode::BundleLimitExceeded,
+            format!("consolidation {name} budget exceeded: {actual} > {limit}"),
+        )
+    };
+    let candidate_count = batch.candidates.len();
+    if candidate_count > policy.budget.max_candidates {
+        return Err(over_budget(
+            "max_candidates",
+            candidate_count,
+            policy.budget.max_candidates,
+        ));
+    }
+
+    let source_records = batch
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.source_ids.iter())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if source_records > policy.budget.max_source_records {
+        return Err(over_budget(
+            "max_source_records",
+            source_records,
+            policy.budget.max_source_records,
+        ));
+    }
+
+    let input_payload = batch
+        .candidates
+        .iter()
+        .map(|candidate| (&candidate.source_ids, &candidate.supporting_spans))
+        .collect::<Vec<_>>();
+    let input_bytes = serde_json::to_vec(&input_payload)?.len();
+    if input_bytes > policy.budget.max_input_bytes {
+        return Err(over_budget(
+            "max_input_bytes",
+            input_bytes,
+            policy.budget.max_input_bytes,
+        ));
+    }
+
+    let output_claims = batch
+        .candidates
+        .iter()
+        .map(|candidate| &candidate.claim)
+        .collect::<Vec<_>>();
+    let output_bytes = serde_json::to_vec(&output_claims)?.len();
+    if output_bytes > policy.budget.max_output_bytes {
+        return Err(over_budget(
+            "max_output_bytes",
+            output_bytes,
+            policy.budget.max_output_bytes,
+        ));
+    }
+    Ok(())
+}
+
 /// The durable store handle. Cloneable (shares the pool).
 #[derive(Clone)]
 pub struct Store {
@@ -894,6 +959,7 @@ impl Store {
             }
             let profile = Profile::parse(&batch.profile)
                 .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
+            enforce_consolidation_budget(&batch, policy)?;
             let mut applied = Vec::new();
             for decision in decisions {
                 let Some(candidate) = batch.candidates.iter().find(|item| item.candidate_id == decision.candidate_id) else {
@@ -918,6 +984,10 @@ impl Store {
                     })
                     .transpose()?
                     .unwrap_or(TemporalState::Current);
+                let reused_temporal_state = candidate
+                    .temporal_state
+                    .as_ref()
+                    .map(|_| temporal_state.as_str());
                 let record_type = RecordType::parse(&candidate.claim_class)
                     .ok_or_else(|| Error::invalid_request("consolidation claim class is invalid"))?;
                 let classification = crate::policy::classify_as(
@@ -926,7 +996,7 @@ impl Store {
                     batch.repo_id.is_some(),
                     record_type,
                 );
-                let content_hash = ids::exact_content_hash(
+                let exact_content_hash = ids::exact_content_hash(
                     profile.as_str(),
                     &batch.workspace,
                     batch.repo_id.as_deref(),
@@ -935,8 +1005,20 @@ impl Store {
                     &candidate.claim,
                 );
                 let existing: Option<String> = tx.query_row(
-                    "SELECT id FROM memory_records WHERE content_hash = ?1",
-                    rusqlite::params![content_hash],
+                    "SELECT id FROM memory_records
+                     WHERE content_hash = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                       AND repo_id IS ?4 AND type = ?5 AND scope = ?6
+                       AND archived = 0
+                       AND COALESCE(temporal_state, 'current') = 'current'
+                     ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    rusqlite::params![
+                        exact_content_hash,
+                        profile.as_str(),
+                        &batch.workspace,
+                        batch.repo_id.as_deref(),
+                        classification.record_type.as_str(),
+                        classification.scope.as_str(),
+                    ],
                     |row| row.get(0),
                 ).optional()?;
                 let existing = match existing {
@@ -964,6 +1046,31 @@ impl Store {
                 let (record_id, reused_existing) = if let Some(id) = existing {
                     (id, true)
                 } else {
+                    let inactive_exact: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM memory_records
+                             WHERE content_hash = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                               AND repo_id IS ?4 AND type = ?5 AND scope = ?6
+                               AND (archived != 0
+                                    OR COALESCE(temporal_state, 'current') != 'current')
+                             ORDER BY updated_at DESC, id DESC LIMIT 1",
+                            rusqlite::params![
+                                &exact_content_hash,
+                                profile.as_str(),
+                                &batch.workspace,
+                                batch.repo_id.as_deref(),
+                                classification.record_type.as_str(),
+                                classification.scope.as_str(),
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if inactive_exact.is_some() {
+                        return Err(Error::new(
+                            ErrorCode::BundlePlanStale,
+                            "consolidation exact-hash replacement is inactive",
+                        ));
+                    }
                     let id = ids::new_id("mem");
                     let now = ids::now_rfc3339();
                     let record = MemoryRecord {
@@ -973,7 +1080,7 @@ impl Store {
                         related_files: classification.related_files, tags: classification.tags,
                         sensitivity: classification.sensitivity, portability: classification.portability,
                         confidence: classification.confidence, source_ids: candidate.source_ids.clone(),
-                        content_hash, supersedes: vec![], created_at: now.clone(), updated_at: now.clone(),
+                        content_hash: exact_content_hash, supersedes: vec![], created_at: now.clone(), updated_at: now.clone(),
                         last_used_at: None, archived: false, trust_state: "trusted".into(), trust_score: classification.confidence,
                         quarantine_reason: None, quarantined_at: None, promoted_at: Some(now.clone()),
                         valid_from: None, valid_until: candidate.valid_until.clone(), observed_at: Some(now), invalidated_at: None,
@@ -984,21 +1091,48 @@ impl Store {
                     (id, false)
                 };
                 if reused_existing {
-                    let raw_metadata: String = tx.query_row(
-                        "SELECT metadata FROM memory_records WHERE id = ?1",
+                    let (raw_source_ids, raw_metadata): (String, String) = tx.query_row(
+                        "SELECT source_ids, metadata FROM memory_records WHERE id = ?1",
                         rusqlite::params![&record_id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )?;
+                    let mut source_ids = json_str_list(&raw_source_ids);
+                    for source_id in &candidate.source_ids {
+                        if !source_ids.contains(source_id) {
+                            source_ids.push(source_id.clone());
+                        }
+                    }
                     let mut metadata = serde_json::from_str::<Value>(&raw_metadata)
                         .unwrap_or_else(|_| json!({}));
                     if !metadata.is_object() {
                         metadata = json!({});
                     }
                     metadata["governed_consolidation_applied"] = Value::Bool(true);
-                    tx.execute(
-                        "UPDATE memory_records SET metadata = ?1 WHERE id = ?2",
-                        rusqlite::params![metadata.to_string(), &record_id],
+                    let updated = tx.execute(
+                        "UPDATE memory_records
+                         SET source_ids = ?1,
+                             temporal_state = COALESCE(?2, temporal_state),
+                             valid_until = COALESCE(?3, valid_until),
+                             historical_reason = COALESCE(?4, historical_reason),
+                             metadata = ?5, updated_at = ?6
+                         WHERE id = ?7 AND archived = 0
+                           AND COALESCE(temporal_state, 'current') = 'current'",
+                        rusqlite::params![
+                            serde_json::to_string(&source_ids)?,
+                            reused_temporal_state,
+                            candidate.valid_until.as_deref(),
+                            candidate.historical_reason.as_deref(),
+                            metadata.to_string(),
+                            ids::now_rfc3339(),
+                            &record_id,
+                        ],
                     )?;
+                    if updated != 1 {
+                        return Err(Error::new(
+                            ErrorCode::BundlePlanStale,
+                            "consolidation reused record changed before update",
+                        ));
+                    }
                 }
                 Self::apply_consolidation_supersession(
                     tx,
@@ -2829,7 +2963,18 @@ impl Store {
     /// Idempotent insert keyed on `content_hash`. If a record with the same
     /// content hash exists, returns `Skipped` and merges any new source ids.
     pub fn upsert_record(&self, new: &NewRecord) -> Result<UpsertOutcome> {
-        if let Some(existing) = self.find_by_content_hash(&new.content_hash)? {
+        let existing = match self.find_by_content_hash(&new.content_hash)? {
+            Some(existing) => Some(existing),
+            None => self.find_current_by_exact_content(
+                &new.profile_id,
+                &new.workspace_id,
+                new.repo_id.as_deref(),
+                new.record_type.as_str(),
+                new.scope.as_str(),
+                &new.content,
+            )?,
+        };
+        if let Some(existing) = existing {
             // Merge source ids and only fill missing allowlisted provenance.
             // Never replace metadata owned by the existing writer.
             let original_metadata: Option<String> = if let Some(id) = existing

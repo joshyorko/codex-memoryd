@@ -233,8 +233,8 @@ fn automatic_policy() -> ConsolidationPolicy {
         source_classes: vec!["user_statement".into()],
         operations: vec![ConsolidationOperation::AdoptStatement],
         budget: ConsolidationBudget {
-            max_candidates: 5,
-            max_source_records: 5,
+            max_candidates: 20,
+            max_source_records: 20,
             max_provider_calls: 1,
             max_input_bytes: 1000,
             max_output_bytes: 1000,
