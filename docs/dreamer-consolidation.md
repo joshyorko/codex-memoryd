@@ -47,10 +47,11 @@ the same SQLite transaction, links the replacement, archives the old records as
 superseded, and returns unique applied record IDs. A changed or missing target
 rejects the transaction as stale.
 
-A scheduled run that fills its bounded input window or hits a runtime or
-candidate limit does not advance its
-watermark past the unprocessed source tail; a later run must rediscover that
-work.
+A scheduled run that fills its bounded input window persists a per-stream
+continuation cursor, including timestamp ties, rather than skipping to the run's
+end. Later ticks consume the remaining pages before advancing the time watermark.
+Runtime or candidate limits retain the previous cursor. A scheduled command's
+watermark does not authorize replay of archived or withdrawn evidence.
 
 The existing `/v1/dream` preview path remains non-adopting. Model-backed
 semantic validation and FRIDAY consumer acceptance are separate gates; this
