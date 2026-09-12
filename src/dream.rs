@@ -936,6 +936,10 @@ where
     if limit == 0 {
         return Ok(Vec::new());
     }
+    if let Some(start) = start {
+        sql.push_str(&format!(" AND {timestamp_column} >= ?"));
+        args.push(Box::new(start.to_string()));
+    }
     if let Some(position) = position {
         sql.push_str(&format!(
             " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {id_column} > ?))"
@@ -943,9 +947,6 @@ where
         args.push(Box::new(position.timestamp.clone()));
         args.push(Box::new(position.timestamp.clone()));
         args.push(Box::new(position.id.clone()));
-    } else if let Some(start) = start {
-        sql.push_str(&format!(" AND {timestamp_column} >= ?"));
-        args.push(Box::new(start.to_string()));
     }
     if let Some(end) = end {
         sql.push_str(&format!(" AND {timestamp_column} <= ?"));

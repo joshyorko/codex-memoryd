@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -31,6 +32,7 @@ use crate::domain::Scope;
 use crate::domain::Sensitivity;
 use crate::domain::Subject;
 use crate::domain::SubjectKind;
+use crate::domain::TemporalState;
 use crate::domain::VisibleTurn;
 use crate::dream;
 use crate::error::Error;
@@ -2794,20 +2796,27 @@ impl Service {
         let policy = governed_deterministic_policy(profile);
         let candidate_repo_scope = |candidate: &DreamCandidate| -> Result<Option<String>> {
             let mut boundary = run.repo_id.clone().map(Some);
-            let mut found = 0usize;
-            let mut missing = 0usize;
+            let mut unresolved = false;
             for source in &candidate.evidence_refs {
-                let Some(record) = self.store.get_record(&source.id)? else {
-                    missing += 1;
+                let source_boundary = if let Some(record) = self.store.get_record(&source.id)? {
+                    if record.profile_id != profile.as_str() || record.workspace_id != workspace {
+                        return Err(Error::policy(
+                            "consolidation evidence record is outside the run boundary",
+                        ));
+                    }
+                    Some(record.repo_id.filter(|repo_id| !repo_id.trim().is_empty()))
+                } else {
+                    resolve_synthetic_repo_boundary(
+                        &self.store,
+                        source,
+                        profile.as_str(),
+                        workspace,
+                    )?
+                };
+                let Some(source_boundary) = source_boundary else {
+                    unresolved = true;
                     continue;
                 };
-                if record.profile_id != profile.as_str() || record.workspace_id != workspace {
-                    return Err(Error::policy(
-                        "consolidation evidence record is outside the run boundary",
-                    ));
-                }
-                found += 1;
-                let source_boundary = record.repo_id.filter(|repo_id| !repo_id.trim().is_empty());
                 match boundary.as_ref() {
                     Some(existing) if existing.as_ref() != source_boundary.as_ref() => {
                         return Err(Error::policy(
@@ -2818,7 +2827,7 @@ impl Service {
                     _ => {}
                 }
             }
-            if missing > 0 && found > 0 {
+            if unresolved && run.repo_id.is_none() {
                 return Err(Error::policy(
                     "consolidation candidate has an unresolved repository boundary",
                 ));
@@ -3005,24 +3014,29 @@ impl Service {
                 classification.scope.as_str(),
                 &candidate.content,
             );
-            let already_current = self.store.find_by_content_hash(&content_hash)?.is_some()
-                || self
-                    .store
-                    .find_current_by_exact_content(
-                        profile.as_str(),
-                        workspace,
-                        None,
-                        classification.record_type.as_str(),
-                        classification.scope.as_str(),
-                        &candidate.content,
-                    )?
+            let already_current =
+                self.store
+                    .find_by_content_hash(&content_hash)?
                     .is_some_and(|record| {
-                        record
-                            .metadata
-                            .get("governed_consolidation_applied")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false)
-                    });
+                        !record.archived && record.temporal_state == TemporalState::Current
+                    })
+                    || self
+                        .store
+                        .find_current_by_exact_content(
+                            profile.as_str(),
+                            workspace,
+                            None,
+                            classification.record_type.as_str(),
+                            classification.scope.as_str(),
+                            &candidate.content,
+                        )?
+                        .is_some_and(|record| {
+                            record
+                                .metadata
+                                .get("governed_consolidation_applied")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        });
             if !already_current || !candidate.supersedes.is_empty() {
                 pending.push(candidate);
             }
@@ -3362,6 +3376,62 @@ impl Service {
         };
         export::export(&self.store, &params)
     }
+}
+
+fn resolve_synthetic_repo_boundary(
+    store: &Store,
+    source: &DreamEvidenceSource,
+    profile_id: &str,
+    workspace_id: &str,
+) -> Result<Option<Option<String>>> {
+    let mut boundary: Option<Option<String>> = None;
+    for root_id in &source.root_ids {
+        let root_boundary = match store.get_record(root_id)? {
+            Some(record) => {
+                if record.profile_id != profile_id || record.workspace_id != workspace_id {
+                    return Err(Error::policy(
+                        "consolidation evidence root is outside the run boundary",
+                    ));
+                }
+                Some(record.repo_id.filter(|value| !value.trim().is_empty()))
+            }
+            None => store.transaction(|tx| {
+                tx.query_row(
+                    "SELECT s.repo_id
+                     FROM visible_turns t
+                     JOIN sessions s ON s.id = t.session_id
+                     WHERE t.id = ?1 AND s.profile_id = ?2 AND s.workspace_id = ?3",
+                    rusqlite::params![root_id, profile_id, workspace_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|repo_id| {
+                    repo_id.map(|repo_id| repo_id.filter(|value| !value.trim().is_empty()))
+                })
+                .map_err(Into::into)
+            })?,
+        };
+        let Some(root_boundary) = root_boundary else {
+            continue;
+        };
+        match boundary.as_ref() {
+            Some(existing) if existing.as_ref() != root_boundary.as_ref() => {
+                return Err(Error::policy(
+                    "consolidation evidence roots mix repository boundaries",
+                ));
+            }
+            None => boundary = Some(root_boundary),
+            _ => {}
+        }
+    }
+
+    if boundary.is_some() {
+        return Ok(boundary);
+    }
+    if source.kind == "imported_memory" && source.root_ids.is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(None)
 }
 
 fn build_patch_preview_response(
