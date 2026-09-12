@@ -35,8 +35,13 @@ The provider uses four MemoryD workspaces by default:
 - `josh-friday`: explicit shared decisions and relationship history
 - `friday-evidence`: scoped world/work evidence and visible-turn writeback
 
-Recall shares one `timeout_seconds` deadline across all four lanes, including
-HTTP headers and body reads, and labels
+Recall shares one `timeout_seconds` deadline (default 0.5 seconds) across all
+four sequential lanes, including HTTP headers and body reads. Each request gets
+the remaining time divided by the number of unattempted lanes. Fast lanes donate
+unused time forward; a stalled lane cannot consume the later lanes' entire
+budget. This deliberately favors lane coverage over letting an early slow lane
+use the whole deadline; it does not promise every lane succeeds under load.
+Recall labels
 injected blocks `recall_not_authority`. Provenance uses the protocol's record ID,
 profile/workspace, trust level, evidence references and response citations; it
 also renders conclusion origin, target, source kind, actor, write origin and
@@ -84,9 +89,27 @@ An unacknowledged request is retryable; a connection lost after server commit
 can still duplicate a conclusion because the daemon has no idempotency key.
 No Codex, ChatGPT, or prior-assistant archive is imported.
 
-All network failures fail open: normal Hermes operation continues with empty
-external recall. The provider exposes no model tools; writes happen through
+Network failures fail open: successful lanes survive partial failure; entirely
+failed recall returns empty context. One warning reports `recall partial` or
+`recall failed` with completed/failed lane and rendered fact counts. Successful
+empty lanes are not failures. This is a recall outcome, not a daemon health
+verdict. Transport details are debug-level for recall and warning-level for
+writes, with operation path and exception class/HTTP status, never query,
+response body or exception text. The provider exposes no model tools; writes happen through
 native lifecycle hooks.
+
+Installing updated files does not hot-reload a provider already imported by
+Hermes. A fresh CLI process loads the new code; a long-running gateway needs an
+operator-coordinated restart after active work finishes. A new conversation in
+the same process is not sufficient. Do not mutate live provider objects or
+invalidate active prompt caches to activate an update.
+
+For strictly read-only live diagnostics, note that normal `/v1/recall` updates
+returned records' `last_used_at` (`src/recall.rs`, `Store::touch_records`). A
+no-write probe must exclude **all** record types (verified against the running
+release) so no facts can be touched, or use an isolated fixture daemon. Such a
+probe measures candidate lookup, not full fact packing/touch latency. Never
+print memory contents, checkpoints, queries, or raw error bodies in diagnostics.
 
 Test the adapter from this directory:
 

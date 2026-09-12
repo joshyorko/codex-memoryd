@@ -141,12 +141,15 @@ class CodexMemoryDProvider(MemoryProvider):
                  ("SHARED HISTORY", "relationship"), ("CURRENT WORK", "evidence"))
         rendered: list[str] = []
         budget = max(0, int(self._config.get("max_tokens", 1200)))
+        completed = failed = 0
         deadline = time.monotonic() + self._timeout
-        for label, lane in lanes:
+        for index, (label, lane) in enumerate(lanes):
             remaining = deadline - time.monotonic()
             tokens_left = budget - estimate_tokens_rough("\n".join(rendered))
             if remaining <= 0 or tokens_left <= 0:
                 break
+            # Reserve time for each unattempted lane; fast lanes donate
+            # unused time forward without increasing the overall deadline.
             data = self._post("/v1/recall", {
                 "profile": self._profile,
                 "workspace": self._workspaces[lane],
@@ -155,9 +158,11 @@ class CodexMemoryDProvider(MemoryProvider):
                 "max_tokens": tokens_left,
                 "pack_mode": "active_task",
                 "metadata": {"agent": self._agent, "source_kind": "hermes_prefetch", "lane": lane},
-            }, timeout=remaining)
-            if not data:
+            }, timeout=remaining / (len(lanes) - index))
+            if data is None:
+                failed += 1
                 continue
+            completed += 1
             facts = ((data.get("data") or {}).get("facts") or [])
             if not facts:
                 continue
@@ -190,6 +195,11 @@ class CodexMemoryDProvider(MemoryProvider):
                 rendered.extend(addition)
                 lane_started = True
                 self._last_count += 1
+        if failed:
+            logger.warning(
+                "codex-memoryd recall %s: completed=%d failed=%d recalled=%d",
+                "partial" if completed else "failed", completed, failed, self._last_count,
+            )
         if not rendered:
             return ""
         self._last_status = RecallStatus("codex-memoryd", self._last_count, "🧠")
@@ -360,11 +370,16 @@ class CodexMemoryDProvider(MemoryProvider):
         try:
             status, raw = self._request("POST", path, payload, self._timeout if timeout is None else timeout)
             if status != 200:
+                logger.log(logging.DEBUG if path == "/v1/recall" else logging.WARNING,
+                           "codex-memoryd request failed: %s HTTP %d", path, status)
                 return None
             body = json.loads(raw.decode())
             return body if isinstance(body, dict) and body.get("ok") else None
         except (OSError, URLError, ValueError, TimeoutError, HTTPException) as exc:
-            logger.warning("codex-memoryd unavailable: %s", exc)
+            # Exception text can contain server data (e.g. a bad status line).
+            # Recall reports aggregate partial/failure state after all lanes.
+            logger.log(logging.DEBUG if path == "/v1/recall" else logging.WARNING,
+                       "codex-memoryd request failed: %s %s", path, type(exc).__name__)
             return None
 
     @staticmethod
