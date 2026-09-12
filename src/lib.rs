@@ -20,6 +20,7 @@ pub mod benchmark_eval;
 pub mod chatgpt_export_import;
 pub mod config;
 pub mod conformance;
+pub mod consolidation;
 pub mod doctor;
 pub mod domain;
 pub mod dream;

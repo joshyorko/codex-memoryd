@@ -98,6 +98,9 @@ provider_adapter = "provider" # deterministic | local-model | provider
 # Set HERMES_HOME/PYTHONPATH in the service environment; credentials stay with Hermes.
 # Command configuration is operator-only. Do not put secrets in argv.
 # Scheduled command providers produce reviewed previews, never automatic memory writes.
+# Automatic deterministic consolidation is a separate explicit operator choice:
+# automatic_apply = true
+# It remains off by default; inspect and rollback through the governed controls.
 provider_timeout_seconds = 10
 provider_max_response_bytes = 262144
 # Costs are integer micros per 1,000 tokens.

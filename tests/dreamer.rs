@@ -1134,7 +1134,9 @@ fn scheduled_dreamer_skips_short_lived_sessions() {
 
 #[test]
 fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
-    let svc = scheduled_service(scheduler_config());
+    let mut config = scheduler_config();
+    config.automatic_apply = true;
+    let svc = scheduled_service(config);
     let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
     conclude(
@@ -1165,7 +1167,7 @@ fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
 }
 
 #[test]
-fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
+fn scheduled_dreamer_keeps_provider_observations_non_adopting_in_governed_mode() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
     let address = listener.local_addr().expect("provider address");
     let server = std::thread::spawn(move || {
@@ -1206,6 +1208,7 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
     let db_path = temp.path().join("memory.db");
     let store = Store::open(&db_path).expect("open store");
     let mut scheduler = scheduler_config();
+    scheduler.scheduled_provider_enabled = true;
     scheduler.automatic_apply = true;
     let svc = Service::new(
         store,
@@ -1246,16 +1249,14 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
         .iter()
         .find(|observation| observation.id == "obs_provider_220")
         .expect("provider observation");
-    assert_eq!(observation.policy, "accepted");
-    assert!(observation.apply_eligible);
-    let record = svc
+    assert_eq!(observation.policy, "provider_generated");
+    assert!(!observation.apply_eligible);
+    assert!(!svc
         .store
         .query_records(&Default::default())
         .unwrap()
         .into_iter()
-        .find(|record| record.content == observation.content)
-        .expect("promoted provider memory");
-    assert!(run.created.contains(&record.id));
+        .any(|record| record.content == observation.content));
 
     let conn = Connection::open(db_path).expect("open ledger db");
     let ledger_count: i64 = conn
@@ -1265,7 +1266,7 @@ fn scheduled_dreamer_promotes_provider_observations_with_provenance() {
             |row| row.get(0),
         )
         .expect("provider ledger entry");
-    assert_eq!(ledger_count, 1);
+    assert_eq!(ledger_count, 0);
 }
 
 #[test]
@@ -1365,7 +1366,7 @@ fn scheduled_dreamer_enforces_candidate_limit() {
             .scheduled_dream_watermark("personal", "ws", None)
             .unwrap()
             .as_deref(),
-        Some("2030-01-01T00:00:00Z")
+        None
     );
     let status = svc.status().unwrap();
     let scheduler = status.features.get("dream_scheduler").unwrap();
@@ -2450,6 +2451,7 @@ fn imported_chatgpt_turns_do_not_exceed_native_max_records_cap() {
             repo_id: None,
             mode: "preview",
             now: "2026-06-09T00:00:00Z",
+            source_window_end: None,
             recency_cutoff: None,
             include_archived_sources: false,
             max_records: 1,

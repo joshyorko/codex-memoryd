@@ -1,0 +1,7 @@
+{
+  "contract_version": "consolidation.v1",
+  "fixture_count": 26,
+  "fixtures": [
+    {"id":"P01","required_result":"adopt_statement"},{"id":"P02","required_result":"qualified_or_reject"},{"id":"P03","required_result":"adopt_inference"},{"id":"P04","required_result":"no_new_roots"},{"id":"P05","required_result":"reject_or_defer_unsupported_clause"},{"id":"P06","required_result":"correction_wins"},{"id":"P07","required_result":"bounded_no_change"},{"id":"P08","required_result":"preserve_distinct_meanings"},{"id":"P09","required_result":"scope_isolated"},{"id":"P10","required_result":"not_user_assertion"},{"id":"P11","required_result":"idempotent_exact_replay"},{"id":"P12","required_result":"recoverable_atomic_progress"},{"id":"P13","required_result":"revision_fenced"},{"id":"P14","required_result":"tail_discoverable"},{"id":"P15","required_result":"honest_time_basis"},{"id":"P16","required_result":"freshness_progress"},{"id":"P17","required_result":"foreground_responsive"},{"id":"P18","required_result":"off_budget_provenance_enforced"},{"id":"P19","required_result":"screened_no_secret_echo"},{"id":"P20","required_result":"retention_suppression_applied"},{"id":"P21","required_result":"guarded_undo"},{"id":"P22","required_result":"legacy_meaning_preserved"},{"id":"P23","required_result":"independent_candidates_progress"},{"id":"P24","required_result":"fresh_consumer_recall"},{"id":"P25","required_result":"saved_vs_usable_consistency"},{"id":"P26","required_result":"rejection_respected"}
+  ]
+}

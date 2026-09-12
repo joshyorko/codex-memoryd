@@ -66,6 +66,7 @@ fn base_request() -> DreamJobRunRequest {
         repo: None::<RepoIdentity>,
         now: Some("2030-01-01T00:00:00Z".to_string()),
         since: None,
+        since_explicit: false,
         kind: "dream_preview".to_string(),
         mode: Some("deterministic".to_string()),
         budget: DreamJobBudget {
@@ -198,6 +199,7 @@ fn deterministic_job_run_is_preview_only_and_persists_budgeted_job_record() {
             repo: None::<RepoIdentity>,
             now: Some("2030-01-01T00:00:00Z".to_string()),
             since: None,
+            since_explicit: false,
             kind: "dream_preview".to_string(),
             mode: Some("deterministic".to_string()),
             budget: DreamJobBudget {
@@ -273,6 +275,7 @@ fn deterministic_job_run_reuses_dream_run_audit_and_enforces_candidate_budget() 
             repo: None::<RepoIdentity>,
             now: Some("2030-01-01T00:00:00Z".to_string()),
             since: None,
+            since_explicit: false,
             kind: "dream_preview".to_string(),
             mode: Some("deterministic".to_string()),
             budget: DreamJobBudget {
@@ -508,17 +511,16 @@ fn local_model_job_is_typed_preview_only_and_audits_provenance() {
 }
 
 #[test]
-fn remote_provider_job_is_explicit_and_remains_preview_only() {
+fn remote_provider_job_requires_an_https_endpoint() {
     let svc = service();
     conclude(&svc, "I prefer concise commit messages.");
     let before = svc.store.count_records().unwrap();
-    let (endpoint, server) = fake_provider();
     let mut req = base_request();
     req.job_id = Some("job_remote_provider".to_string());
     req.mode = Some("provider".to_string());
     req.provider = Some(DreamJobProvider {
         adapter: Some(DreamProviderAdapter::Provider),
-        endpoint: Some(endpoint),
+        endpoint: Some("http://127.0.0.1:1/v1".to_string()),
         model: Some("fake-remote".to_string()),
         provider: Some("fake-provider".to_string()),
         ..Default::default()
@@ -526,19 +528,10 @@ fn remote_provider_job_is_explicit_and_remains_preview_only() {
     req.budget.max_provider_calls = 1;
     req.budget.max_cost_micros = 1;
 
-    let run = svc.run_dream_job(req).expect("remote provider preview");
-    server.join().expect("provider server");
-
-    assert_eq!(run.status, "ok");
-    assert_eq!(
-        run.provenance.as_ref().map(|value| value.adapter.as_str()),
-        Some("provider")
-    );
-    assert!(run
-        .preview
-        .candidates
-        .iter()
-        .all(|candidate| { candidate.provenance.is_some() && !candidate.apply_eligible }));
+    let error = svc
+        .run_dream_job(req)
+        .expect_err("remote provider must reject a plain HTTP endpoint");
+    assert!(error.message.contains("https endpoint"));
     assert_eq!(svc.store.count_records().unwrap(), before);
 }
 
@@ -644,13 +637,6 @@ fn malformed_provider_schema_is_audited_as_a_sanitized_failure() {
 #[test]
 fn provider_secrets_are_not_returned_or_persisted() {
     let sentinel = "sk-sentinel-secret-123456789";
-    let mut config = Config {
-        default_workspace: "ws".to_string(),
-        ..Default::default()
-    };
-    config.dream_provider.api_key = sentinel.to_string();
-    let svc = service_with_config(config);
-    conclude(&svc, "I prefer concise commit messages.");
     let (endpoint, server) = fake_provider_with_response(
         json!({
             "schema_version": "dream-preview-v1",
@@ -664,6 +650,15 @@ fn provider_secrets_are_not_returned_or_persisted() {
         200,
         Duration::ZERO,
     );
+    let mut config = Config {
+        default_workspace: "ws".to_string(),
+        ..Default::default()
+    };
+    config.dream_provider.enabled = true;
+    config.dream_provider.endpoint = endpoint.clone();
+    config.dream_provider.api_key = "sk-configured-fixture-key".to_string();
+    let svc = service_with_config(config);
+    conclude(&svc, "I prefer concise commit messages.");
     let mut req = base_request();
     req.job_id = Some("job_secret_isolation".to_string());
     req.mode = Some("local-model".to_string());
@@ -744,7 +739,7 @@ fn provider_output_byte_budget_terminates_without_memory_mutation() {
 }
 
 #[test]
-fn rolling_daily_provider_cost_ceiling_is_enforced() {
+fn rolling_daily_model_cost_ceiling_is_enforced() {
     let mut config = Config {
         default_workspace: "ws".to_string(),
         ..Default::default()
@@ -756,9 +751,9 @@ fn rolling_daily_provider_cost_ceiling_is_enforced() {
     let run_with_cost = |svc: &Service, job_id: &str, endpoint: String| {
         let mut req = base_request();
         req.job_id = Some(job_id.to_string());
-        req.mode = Some("provider".to_string());
+        req.mode = Some("local-model".to_string());
         req.provider = Some(DreamJobProvider {
-            adapter: Some(DreamProviderAdapter::Provider),
+            adapter: Some(DreamProviderAdapter::LocalModel),
             endpoint: Some(endpoint),
             model: Some("fake-remote".to_string()),
             ..Default::default()
@@ -804,4 +799,10 @@ fn rolling_daily_provider_cost_ceiling_is_enforced() {
         .expect_err("rolling daily ceiling should fail");
     server.join().expect("second provider server");
     assert!(err.message.contains("daily cost ceiling"));
+    assert_eq!(
+        svc.store
+            .dream_provider_cost_since("2000-01-01T00:00:00Z", None)
+            .unwrap(),
+        120
+    );
 }

@@ -460,15 +460,9 @@ fn recall_allows_legacy_metadata_without_admission_markers() {
     assert_public_handle(&resp.facts[0].id, "mr_");
     assert_eq!(resp.citations.len(), 1);
     assert_eq!(resp.citations[0].source_path, None);
-    assert_public_handle(
-        resp.citations[0].source_id.as_deref().expect("source id"),
-        "msrc_",
-    );
+    assert_eq!(resp.citations[0].source_id, None);
     let provenance = &resp.facts[0].policy.provenance;
-    assert_public_handle(
-        provenance.evidence_refs.first().expect("evidence ref"),
-        "msrc_",
-    );
+    assert!(provenance.evidence_refs.is_empty());
 }
 
 #[test]

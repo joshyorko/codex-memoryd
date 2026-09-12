@@ -15,8 +15,15 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use rusqlite::Row;
+use serde_json::json;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::Duration;
+use time::OffsetDateTime;
 
+use crate::consolidation::{
+    ConsolidationBatch, ConsolidationCandidate, ConsolidationDecision, ConsolidationOperation,
+};
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -24,6 +31,7 @@ use crate::domain::MemoryRecord;
 use crate::domain::MemorySource;
 use crate::domain::Portability;
 use crate::domain::Procedure;
+use crate::domain::Profile;
 use crate::domain::RecordType;
 use crate::domain::Relation;
 use crate::domain::RelationExpansion;
@@ -41,7 +49,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 12;
+pub const STORAGE_SCHEMA_VERSION: i64 = 13;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -57,6 +65,8 @@ const MIGRATION_SEMANTIC_RELATIONS: &str =
 const MIGRATION_TEMPORAL_RECORDS: &str = include_str!("../migrations/0010_temporal_records.sql");
 const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.sql");
 const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
+const MIGRATION_CONSOLIDATION_PROPOSALS: &str =
+    include_str!("../migrations/0013_consolidation_proposals.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -177,6 +187,13 @@ pub struct DreamJobRecord {
     pub last_run_id: Option<String>,
     pub last_run_at: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsolidationProposalRecord {
+    pub batch: ConsolidationBatch,
+    pub decisions: Option<Vec<ConsolidationDecision>>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -356,6 +373,71 @@ fn merge_allowlisted_metadata(
     Value::Object(result)
 }
 
+/// Enforce the active consolidation budget before an apply transaction can
+/// mutate any memory records.
+fn enforce_consolidation_budget(
+    batch: &ConsolidationBatch,
+    policy: &crate::consolidation::ConsolidationPolicy,
+) -> Result<()> {
+    let over_budget = |name: &str, actual: usize, limit: usize| {
+        Error::new(
+            ErrorCode::BundleLimitExceeded,
+            format!("consolidation {name} budget exceeded: {actual} > {limit}"),
+        )
+    };
+    let candidate_count = batch.candidates.len();
+    if candidate_count > policy.budget.max_candidates {
+        return Err(over_budget(
+            "max_candidates",
+            candidate_count,
+            policy.budget.max_candidates,
+        ));
+    }
+
+    let source_records = batch
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.source_ids.iter())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if source_records > policy.budget.max_source_records {
+        return Err(over_budget(
+            "max_source_records",
+            source_records,
+            policy.budget.max_source_records,
+        ));
+    }
+
+    let input_payload = batch
+        .candidates
+        .iter()
+        .map(|candidate| (&candidate.source_ids, &candidate.supporting_spans))
+        .collect::<Vec<_>>();
+    let input_bytes = serde_json::to_vec(&input_payload)?.len();
+    if input_bytes > policy.budget.max_input_bytes {
+        return Err(over_budget(
+            "max_input_bytes",
+            input_bytes,
+            policy.budget.max_input_bytes,
+        ));
+    }
+
+    let output_claims = batch
+        .candidates
+        .iter()
+        .map(|candidate| &candidate.claim)
+        .collect::<Vec<_>>();
+    let output_bytes = serde_json::to_vec(&output_claims)?.len();
+    if output_bytes > policy.budget.max_output_bytes {
+        return Err(over_budget(
+            "max_output_bytes",
+            output_bytes,
+            policy.budget.max_output_bytes,
+        ));
+    }
+    Ok(())
+}
+
 /// The durable store handle. Cloneable (shares the pool).
 #[derive(Clone)]
 pub struct Store {
@@ -488,6 +570,897 @@ impl Store {
         let value = operation(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Persist an immutable consolidation proposal before any application.
+    /// Replaying the same batch returns the existing proposal and never
+    /// replaces its payload.
+    pub fn persist_consolidation_batch(
+        &self,
+        batch: &ConsolidationBatch,
+        decisions: Option<&[ConsolidationDecision]>,
+        status: &str,
+    ) -> Result<bool> {
+        batch.validate().map_err(Error::invalid_request)?;
+        if status.trim().is_empty() {
+            return Err(Error::invalid_request(
+                "consolidation proposal status is required",
+            ));
+        }
+        let batch_json = serde_json::to_string(batch)?;
+        let decisions_json = decisions.map(serde_json::to_string).transpose()?;
+        let now = ids::now_rfc3339();
+        let inserted = self.transaction_immediate(|tx| {
+            let changed = tx.execute(
+                "INSERT INTO consolidation_proposals(
+                    batch_id, scope, proposal_digest, batch_json, decisions_json,
+                    status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT DO NOTHING",
+                rusqlite::params![
+                    batch.batch_id,
+                    batch.scope,
+                    batch.snapshot_digest,
+                    batch_json,
+                    decisions_json,
+                    status,
+                    now
+                ],
+            )?;
+            if changed == 0 {
+                let (existing, existing_decisions): (String, Option<String>) = tx.query_row(
+                    "SELECT batch_json, decisions_json FROM consolidation_proposals
+                     WHERE batch_id = ?1 OR (scope = ?2 AND proposal_digest = ?3)
+                     ORDER BY CASE WHEN batch_id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                    rusqlite::params![batch.batch_id, batch.scope, batch.snapshot_digest],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let mut existing_batch: ConsolidationBatch = serde_json::from_str(&existing)?;
+                // A later scheduler tick may change only the run identity/cursor.
+                // Reuse the immutable proposal, never overwrite its decisions.
+                if existing_batch.batch_id != batch.batch_id {
+                    existing_batch.batch_id = batch.batch_id.clone();
+                    existing_batch.source_cursor = batch.source_cursor.clone();
+                }
+                if existing_batch != *batch || existing_decisions != decisions_json {
+                    return Err(Error::new(
+                        ErrorCode::BundlePlanStale,
+                        "consolidation batch id already has a different payload",
+                    ));
+                }
+            }
+            if changed == 1 {
+                for id in batch.candidates.iter().flat_map(|c| c.supersedes.iter()).collect::<BTreeSet<_>>() {
+                    let revision = Self::consolidation_record_revision(tx, id)?;
+                    tx.execute(
+                        "INSERT INTO consolidation_target_revisions(batch_id, record_id, proposed_revision) VALUES (?1, ?2, ?3)",
+                        params![batch.batch_id, id, revision],
+                    )?;
+                }
+            }
+            Ok(changed == 1)
+        })?;
+        Ok(inserted)
+    }
+
+    /// Resolve the canonical immutable proposal after a different-tick replay.
+    pub fn consolidation_batch_id_by_digest(
+        &self,
+        scope: &str,
+        digest: &str,
+    ) -> Result<Option<String>> {
+        self.conn()?.query_row(
+            "SELECT batch_id FROM consolidation_proposals WHERE scope = ?1 AND proposal_digest = ?2",
+            params![scope, digest], |row| row.get(0),
+        ).optional().map_err(Error::from)
+    }
+
+    fn consolidation_record_revision(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<String> {
+        let raw: String = tx.query_row(
+            "SELECT json_object('hash', content_hash, 'updated', updated_at,
+                'sources', source_ids, 'metadata', metadata, 'archived', archived,
+                'temporal', temporal_state, 'by', superseded_by, 'supersedes', supersedes,
+                'valid_until', valid_until) FROM memory_records WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(ids::sha256_hex(raw.as_bytes()))
+    }
+
+    /// Read the exact proposal payload retained by the canonical store.
+    pub fn read_consolidation_batch(&self, batch_id: &str) -> Result<Option<ConsolidationBatch>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT batch_json FROM consolidation_proposals WHERE batch_id = ?1",
+            rusqlite::params![batch_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str(&raw).map_err(Error::from))
+        .transpose()
+    }
+
+    /// Read the immutable batch together with its persisted decision snapshot.
+    pub fn read_consolidation_proposal(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<ConsolidationProposalRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT batch_json, decisions_json, status
+             FROM consolidation_proposals WHERE batch_id = ?1",
+            rusqlite::params![batch_id],
+            |row| {
+                let batch_json: String = row.get(0)?;
+                let decisions_json: Option<String> = row.get(1)?;
+                let status: String = row.get(2)?;
+                Ok((batch_json, decisions_json, status))
+            },
+        )
+        .optional()?
+        .map(|(batch_json, decisions_json, status)| {
+            let batch = serde_json::from_str(&batch_json)?;
+            let decisions = decisions_json
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?;
+            Ok(ConsolidationProposalRecord {
+                batch,
+                decisions,
+                status,
+            })
+        })
+        .transpose()
+    }
+
+    /// Check whether an inferred candidate repeats a previously rejected
+    /// insight without adding a new source lineage root.
+    pub fn is_consolidation_candidate_suppressed(
+        &self,
+        scope: &str,
+        candidate: &ConsolidationCandidate,
+        retention_days: u32,
+        now: &str,
+    ) -> Result<bool> {
+        if !candidate.inferred {
+            return Ok(false);
+        }
+        if retention_days == 0 {
+            return Err(Error::invalid_request(
+                "consolidation retention_days must be positive",
+            ));
+        }
+        let cutoff = OffsetDateTime::parse(now, &Rfc3339)
+            .map_err(|_| Error::invalid_request("consolidation retention cutoff is invalid"))?
+            .checked_sub(Duration::days(i64::from(retention_days)))
+            .ok_or_else(|| Error::invalid_request("consolidation retention cutoff is invalid"))?
+            .format(&Rfc3339)
+            .map_err(|_| Error::invalid_request("consolidation retention cutoff is invalid"))?;
+        let fingerprint = crate::consolidation::policy::rejection_fingerprint(candidate);
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT batch_json, decisions_json
+             FROM consolidation_proposals
+             WHERE scope = ?1 AND created_at >= ?2 AND decisions_json IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![scope, cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (batch_json, decisions_json) = row?;
+            let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+            let decisions: Vec<ConsolidationDecision> = serde_json::from_str(&decisions_json)?;
+            if decisions.iter().any(|decision| {
+                decision.operation == ConsolidationOperation::Reject
+                    && batch
+                        .candidates
+                        .iter()
+                        .find(|item| item.candidate_id == decision.candidate_id)
+                        .is_some_and(|rejected| {
+                            rejected.inferred
+                                && crate::consolidation::policy::rejection_fingerprint(rejected)
+                                    == fingerprint
+                        })
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Withdraw one source within a profile/workspace. Derived records are
+    /// invalidated atomically and proposals citing the source become
+    /// non-applicable while their audit payload remains inspectable.
+    pub fn withdraw_consolidation_source(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        source_id: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        if source_id.trim().is_empty() {
+            return Err(Error::invalid_request("source id is required"));
+        }
+        let source_id = source_id.to_string();
+        let reason = ledger_safe_summary(reason);
+        self.transaction_immediate(|tx| {
+            let source_metadata: String = tx
+                .query_row(
+                    "SELECT metadata FROM memory_sources
+                     WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3",
+                    params![source_id, profile_id, workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation source not found"))?;
+            let now = ids::now_rfc3339();
+            let mut source_metadata =
+                serde_json::from_str::<Value>(&source_metadata).unwrap_or_else(|_| json!({}));
+            if !source_metadata.is_object() {
+                source_metadata = json!({});
+            }
+            if let Some(object) = source_metadata.as_object_mut() {
+                object.insert("withdrawn".into(), Value::Bool(true));
+                object.insert("withdrawn_at".into(), Value::String(now.clone()));
+                object.insert("withdrawal_reason".into(), Value::String(reason.clone()));
+            }
+            tx.execute(
+                "UPDATE memory_sources SET metadata = ?1 WHERE id = ?2",
+                params![source_metadata.to_string(), source_id],
+            )?;
+
+            let mut records = tx
+                .prepare(
+                    "SELECT id, metadata FROM memory_records
+                     WHERE profile_id = ?1 AND workspace_id = ?2 AND archived = 0
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(memory_records.source_ids)
+                           WHERE json_each.value = ?3
+                       )",
+                )?
+                .query_map(params![profile_id, workspace_id, source_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut withdrawn_records = Vec::with_capacity(records.len());
+            for (id, raw_metadata) in records.drain(..) {
+                let mut metadata =
+                    serde_json::from_str::<Value>(&raw_metadata).unwrap_or_else(|_| json!({}));
+                if !metadata.is_object() {
+                    metadata = json!({});
+                }
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert("state".into(), Value::String("invalidated".into()));
+                    object.insert("policy_outcome".into(), Value::String("withdrawn".into()));
+                    object.insert(
+                        "withdrawn_source_id".into(),
+                        Value::String(source_id.clone()),
+                    );
+                    object.insert("withdrawn_at".into(), Value::String(now.clone()));
+                    object.insert("historical_reason".into(), Value::String(reason.clone()));
+                }
+                if tx.execute(
+                    "UPDATE memory_records
+                     SET archived = 1, temporal_state = 'invalidated',
+                         invalidated_at = ?1, valid_until = COALESCE(valid_until, ?1),
+                         historical_reason = ?2, updated_at = ?1, metadata = ?3
+                     WHERE id = ?4 AND profile_id = ?5 AND workspace_id = ?6 AND archived = 0",
+                    params![
+                        now,
+                        reason,
+                        metadata.to_string(),
+                        id,
+                        profile_id,
+                        workspace_id
+                    ],
+                )? > 0
+                {
+                    withdrawn_records.push(id);
+                }
+            }
+
+            let mut proposals = tx
+                .prepare(
+                    "SELECT batch_id, batch_json, status
+                     FROM consolidation_proposals",
+                )?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (batch_id, batch_json, status) in proposals.drain(..) {
+                let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+                if batch.profile == profile_id
+                    && batch.workspace == workspace_id
+                    && status != "reverted"
+                    && batch
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.source_ids.iter().any(|id| id == &source_id))
+                {
+                    tx.execute(
+                        "UPDATE consolidation_proposals
+                         SET status = 'rejected', updated_at = ?1 WHERE batch_id = ?2",
+                        params![now, batch_id],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE evidence_ledger SET policy_state = 'withdrawn'
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND source_id = ?3",
+                params![profile_id, workspace_id, source_id],
+            )?;
+            withdrawn_records.sort();
+            Ok(withdrawn_records)
+        })
+    }
+
+    /// Apply an already persisted, validated proposal atomically. The caller
+    /// must supply the exact decision snapshot that was persisted with it.
+    pub fn apply_consolidation_proposal(
+        &self,
+        batch_id: &str,
+        policy: &crate::consolidation::ConsolidationPolicy,
+        decisions: &[ConsolidationDecision],
+    ) -> Result<Vec<String>> {
+        if policy.mode != crate::consolidation::ConsolidationMode::Automatic {
+            return Err(Error::invalid_request(
+                "consolidation application requires automatic policy mode",
+            ));
+        }
+        policy.validate().map_err(Error::invalid_request)?;
+        let decisions_json = serde_json::to_string(decisions)?;
+        let ids = self.transaction_immediate(|tx| {
+            let (batch_json, stored_decisions, status, stored_record_ids):
+                (String, Option<String>, String, Option<String>) = tx
+                .query_row(
+                    "SELECT batch_json, decisions_json, status, applied_record_ids_json
+                     FROM consolidation_proposals WHERE batch_id = ?1",
+                    rusqlite::params![batch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+            if status == "applied" {
+                return stored_record_ids
+                    .map(|raw| serde_json::from_str(&raw).map_err(Error::from))
+                    .transpose()
+                    .map(|ids| ids.unwrap_or_default());
+            }
+            if status == "reverted" {
+                return Err(Error::invalid_request(
+                    "consolidation proposal has already been reverted",
+                ));
+            }
+            if status == "rejected" {
+                return Err(Error::policy(
+                    "consolidation proposal source was withdrawn or rejected",
+                ));
+            }
+            if stored_decisions.as_deref() != Some(decisions_json.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation decision snapshot changed before apply",
+                ));
+            }
+            let batch: ConsolidationBatch = serde_json::from_str(&batch_json)?;
+            batch.validate().map_err(Error::invalid_request)?;
+            if batch.policy_digest != policy.digest() {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation policy changed before apply",
+                ));
+            }
+            if !policy.scopes.iter().any(|scope| scope == &batch.scope) {
+                return Err(Error::policy("consolidation batch scope is outside the active policy"));
+            }
+            let profile = Profile::parse(&batch.profile)
+                .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
+            enforce_consolidation_budget(&batch, policy)?;
+            let mut applied = Vec::new();
+            for decision in decisions {
+                let Some(candidate) = batch.candidates.iter().find(|item| item.candidate_id == decision.candidate_id) else {
+                    return Err(Error::invalid_request("consolidation decision references unknown candidate"));
+                };
+                if candidate.output_digest != decision.output_digest {
+                    return Err(Error::new(ErrorCode::BundlePlanStale, "consolidation output identity changed"));
+                }
+                if !matches!(decision.operation, ConsolidationOperation::AdoptStatement | ConsolidationOperation::AdoptInference) {
+                    continue;
+                }
+                if !policy.operations.contains(&decision.operation) {
+                    return Err(Error::policy("consolidation operation is not permitted by policy"));
+                }
+                let temporal_state = candidate
+                    .temporal_state
+                    .as_deref()
+                    .map(|value| {
+                        TemporalState::parse(value).ok_or_else(|| {
+                            Error::invalid_request("consolidation temporal state is invalid")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(TemporalState::Current);
+                let reused_temporal_state = candidate
+                    .temporal_state
+                    .as_ref()
+                    .map(|_| temporal_state.as_str());
+                let record_type = RecordType::parse(&candidate.claim_class)
+                    .ok_or_else(|| Error::invalid_request("consolidation claim class is invalid"))?;
+                let classification = crate::policy::classify_as(
+                    &candidate.claim,
+                    profile,
+                    batch.repo_id.is_some(),
+                    record_type,
+                );
+                let exact_content_hash = ids::exact_content_hash(
+                    profile.as_str(),
+                    &batch.workspace,
+                    batch.repo_id.as_deref(),
+                    classification.record_type.as_str(),
+                    classification.scope.as_str(),
+                    &candidate.claim,
+                );
+                let existing: Option<String> = tx.query_row(
+                    "SELECT id FROM memory_records
+                     WHERE content_hash = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                       AND repo_id IS ?4 AND type = ?5 AND scope = ?6
+                       AND archived = 0
+                       AND COALESCE(temporal_state, 'current') = 'current'
+                     ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    rusqlite::params![
+                        exact_content_hash,
+                        profile.as_str(),
+                        &batch.workspace,
+                        batch.repo_id.as_deref(),
+                        classification.record_type.as_str(),
+                        classification.scope.as_str(),
+                    ],
+                    |row| row.get(0),
+                ).optional()?;
+                let existing = match existing {
+                    Some(id) => Some(id),
+                    None => tx
+                        .query_row(
+                            "SELECT id FROM memory_records
+                             WHERE profile_id = ?1 AND workspace_id = ?2
+                               AND repo_id IS ?3 AND type = ?4 AND scope = ?5
+                               AND content = ?6 AND archived = 0
+                               AND COALESCE(temporal_state, 'current') = 'current'
+                             ORDER BY updated_at DESC, id DESC LIMIT 1",
+                            rusqlite::params![
+                                profile.as_str(),
+                                &batch.workspace,
+                                batch.repo_id.as_deref(),
+                                classification.record_type.as_str(),
+                                classification.scope.as_str(),
+                                &candidate.claim,
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?,
+                };
+                // Fresh evidence may re-adopt a plainly archived claim, but an
+                // inactive replacement must never archive other current targets.
+                let existing = if existing.is_none() && decision.supersedes.is_empty() {
+                    tx.query_row(
+                        "SELECT id FROM memory_records WHERE content_hash = ?1
+                         AND profile_id = ?2 AND workspace_id = ?3 AND repo_id IS ?4
+                         AND type = ?5 AND scope = ?6 AND archived = 1
+                         AND COALESCE(temporal_state, 'current') = 'current'",
+                        params![exact_content_hash, profile.as_str(), batch.workspace,
+                            batch.repo_id.as_deref(), classification.record_type.as_str(),
+                            classification.scope.as_str()],
+                        |row| row.get(0),
+                    ).optional()?
+                } else { existing };
+                let (record_id, reused_existing) = if let Some(id) = existing {
+                    (id, true)
+                } else {
+                    let inactive_exact: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM memory_records
+                             WHERE content_hash = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                               AND repo_id IS ?4 AND type = ?5 AND scope = ?6
+                               AND (archived != 0
+                                    OR COALESCE(temporal_state, 'current') != 'current')
+                             ORDER BY updated_at DESC, id DESC LIMIT 1",
+                            rusqlite::params![
+                                &exact_content_hash,
+                                profile.as_str(),
+                                &batch.workspace,
+                                batch.repo_id.as_deref(),
+                                classification.record_type.as_str(),
+                                classification.scope.as_str(),
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if inactive_exact.is_some() {
+                        return Err(Error::new(
+                            ErrorCode::BundlePlanStale,
+                            "consolidation exact-hash replacement is inactive",
+                        ));
+                    }
+                    let id = ids::new_id("mem");
+                    let now = ids::now_rfc3339();
+                    let record = MemoryRecord {
+                        id: id.clone(), profile_id: profile.as_str().into(), workspace_id: batch.workspace.clone(),
+                        repo_id: batch.repo_id.clone(), subject_id: None, episode_id: None, scope: classification.scope,
+                        record_type: classification.record_type, content: candidate.claim.clone(),
+                        related_files: classification.related_files, tags: classification.tags,
+                        sensitivity: classification.sensitivity, portability: classification.portability,
+                        confidence: classification.confidence, source_ids: candidate.source_ids.clone(),
+                        content_hash: exact_content_hash, supersedes: vec![], created_at: now.clone(), updated_at: now.clone(),
+                        last_used_at: None, archived: false, trust_state: "trusted".into(), trust_score: classification.confidence,
+                        quarantine_reason: None, quarantined_at: None, promoted_at: Some(now.clone()),
+                        valid_from: None, valid_until: candidate.valid_until.clone(), observed_at: Some(now), invalidated_at: None,
+                        superseded_by: None, historical_reason: candidate.historical_reason.clone(), temporal_state,
+                        metadata: json!({"origin":"governed_consolidation","batch_id":batch.batch_id,"candidate_id":candidate.candidate_id,"inferred":candidate.inferred,"decision_digest":decision.output_digest,"temporal_state":candidate.temporal_state,"valid_until":candidate.valid_until,"historical_reason":candidate.historical_reason}),
+                    };
+                    Store::insert_record_in_transaction(tx, &record)?;
+                    (id, false)
+                };
+                if reused_existing {
+                    let (raw_source_ids, raw_metadata): (String, String) = tx.query_row(
+                        "SELECT source_ids, metadata FROM memory_records WHERE id = ?1",
+                        rusqlite::params![&record_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let mut source_ids = json_str_list(&raw_source_ids);
+                    for source_id in &candidate.source_ids {
+                        if !source_ids.contains(source_id) {
+                            source_ids.push(source_id.clone());
+                        }
+                    }
+                    let mut metadata = serde_json::from_str::<Value>(&raw_metadata)
+                        .unwrap_or_else(|_| json!({}));
+                    if !metadata.is_object() {
+                        metadata = json!({});
+                    }
+                    metadata["governed_consolidation_applied"] = Value::Bool(true);
+                    let updated = tx.execute(
+                        "UPDATE memory_records
+                         SET source_ids = ?1,
+                             temporal_state = COALESCE(?2, temporal_state),
+                             valid_until = COALESCE(?3, valid_until),
+                             historical_reason = COALESCE(?4, historical_reason),
+                             metadata = ?5, updated_at = ?6, archived = 0
+                         WHERE id = ?7 AND (archived = 0 OR ?8 = 1)
+                           AND COALESCE(temporal_state, 'current') = 'current'",
+                        rusqlite::params![
+                            serde_json::to_string(&source_ids)?,
+                            reused_temporal_state,
+                            candidate.valid_until.as_deref(),
+                            candidate.historical_reason.as_deref(),
+                            metadata.to_string(),
+                            ids::now_rfc3339(),
+                            &record_id,
+                            decision.supersedes.is_empty(),
+                        ],
+                    )?;
+                    if updated != 1 {
+                        return Err(Error::new(
+                            ErrorCode::BundlePlanStale,
+                            "consolidation reused record changed before update",
+                        ));
+                    }
+                }
+                Self::apply_consolidation_supersession(
+                    tx,
+                    &batch.profile,
+                    &batch.workspace,
+                    batch.repo_id.as_deref(),
+                    &record_id,
+                    &decision.supersedes,
+                    batch_id,
+                    &ids::now_rfc3339(),
+                )?;
+                if !applied.contains(&record_id) {
+                    applied.push(record_id);
+                }
+            }
+            tx.execute(
+                "UPDATE consolidation_proposals
+                 SET status = 'applied', applied_record_ids_json = ?1, updated_at = ?2
+                 WHERE batch_id = ?3",
+                rusqlite::params![serde_json::to_string(&applied)?, ids::now_rfc3339(), batch_id],
+            )?;
+            Ok(applied)
+        })?;
+        Ok(ids)
+    }
+
+    /// Guarded inverse for an applied batch. Records changed after adoption
+    /// are left untouched; this is never a whole-database rollback.
+    pub fn undo_consolidation_proposal(&self, batch_id: &str) -> Result<Vec<String>> {
+        self.transaction_immediate(|tx| {
+            let status: String = tx
+                .query_row(
+                    "SELECT status FROM consolidation_proposals WHERE batch_id = ?1",
+                    rusqlite::params![batch_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+            if status != "applied" {
+                return Err(Error::invalid_request(
+                    "only an applied consolidation proposal can be undone",
+                ));
+            }
+            let mut stmt = tx.prepare(
+                "SELECT id FROM memory_records
+                 WHERE json_extract(metadata, '$.batch_id') = ?1
+                   AND archived = 0 AND updated_at = created_at
+                 ORDER BY id",
+            )?;
+            let ids = stmt
+                .query_map(rusqlite::params![batch_id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            drop(stmt);
+            let mut reverted = Vec::new();
+            for replacement_id in &ids {
+                let old_records = tx
+                    .prepare(
+                        "SELECT id, metadata FROM memory_records
+                         WHERE archived = 1 AND temporal_state = 'superseded'
+                           AND superseded_by = ?1
+                           AND json_extract(metadata, '$.consolidation_batch_id') = ?2",
+                    )?
+                    .query_map(rusqlite::params![replacement_id, batch_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut unchanged = true;
+                for (old_id, _) in &old_records {
+                    let expected: Option<String> = tx.query_row(
+                        "SELECT applied_revision FROM consolidation_target_revisions WHERE batch_id = ?1 AND record_id = ?2",
+                        params![batch_id, old_id], |row| row.get(0),
+                    ).optional()?.flatten();
+                    let actual = Self::consolidation_record_revision(tx, old_id)?;
+                    if expected.as_deref() != Some(actual.as_str()) { unchanged = false; break; }
+                }
+                if !unchanged { continue; }
+                reverted.push(replacement_id.clone());
+                for (old_id, raw_metadata) in old_records {
+                    let metadata = serde_json::from_str::<Value>(&raw_metadata)
+                        .unwrap_or_else(|_| json!({}));
+                    let Some(previous) = metadata.get("consolidation_previous") else {
+                        continue;
+                    };
+                    let previous_metadata = metadata
+                        .get("consolidation_previous_metadata")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let previous_temporal_state = previous
+                        .get("temporal_state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("current");
+                    let previous_archived = previous
+                        .get("archived")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let previous_superseded_by = previous
+                        .get("superseded_by")
+                        .and_then(Value::as_str);
+                    let previous_valid_until = previous
+                        .get("valid_until")
+                        .and_then(Value::as_str);
+                    let previous_historical_reason = previous
+                        .get("historical_reason")
+                        .and_then(Value::as_str);
+                    tx.execute(
+                        "UPDATE memory_records
+                         SET archived = ?1, temporal_state = ?2, superseded_by = ?3,
+                             valid_until = ?4, historical_reason = ?5,
+                             updated_at = ?6, metadata = ?7
+                         WHERE id = ?8",
+                        rusqlite::params![
+                            previous_archived,
+                            previous_temporal_state,
+                            previous_superseded_by,
+                            previous_valid_until,
+                            previous_historical_reason,
+                            ids::now_rfc3339(),
+                            previous_metadata.to_string(),
+                            old_id,
+                        ],
+                    )?;
+                }
+            }
+            for record_id in &reverted {
+            tx.execute(
+                "UPDATE memory_records
+                 SET archived = 1, temporal_state = 'historical',
+                     historical_reason = 'governed_consolidation_undo',
+                     updated_at = ?1,
+                     metadata = json_set(metadata, '$.undo_batch_id', ?2)
+                 WHERE json_extract(metadata, '$.batch_id') = ?2 AND id = ?3
+                   AND archived = 0 AND updated_at = created_at",
+                rusqlite::params![ids::now_rfc3339(), batch_id, record_id],
+            )?;
+            }
+            tx.execute(
+                "UPDATE consolidation_proposals SET status = 'reverted', updated_at = ?1 WHERE batch_id = ?2",
+                rusqlite::params![ids::now_rfc3339(), batch_id],
+            )?;
+            Ok(reverted)
+        })
+    }
+
+    fn apply_consolidation_supersession(
+        tx: &rusqlite::Transaction<'_>,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+        replacement_id: &str,
+        superseded_ids: &[String],
+        batch_id: &str,
+        now: &str,
+    ) -> Result<()> {
+        let ids = superseded_ids
+            .iter()
+            .filter(|id| id.as_str() != replacement_id)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for superseded_id in &ids {
+            let expected: Option<String> = tx.query_row(
+                "SELECT proposed_revision FROM consolidation_target_revisions WHERE batch_id = ?1 AND record_id = ?2",
+                params![batch_id, superseded_id], |row| row.get(0),
+            ).optional()?;
+            let actual = Self::consolidation_record_revision(tx, superseded_id)?;
+            if expected.as_deref() != Some(actual.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target revision changed before apply",
+                ));
+            }
+            let state: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT archived, COALESCE(temporal_state, 'current')
+                 FROM memory_records
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                   AND repo_id IS ?4",
+                    params![superseded_id, profile_id, workspace_id, repo_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if !matches!(state, Some((0, ref temporal_state)) if temporal_state == "current") {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target changed before apply",
+                ));
+            }
+        }
+
+        let raw: String = tx.query_row(
+            "SELECT supersedes FROM memory_records
+         WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+           AND repo_id IS ?4",
+            params![replacement_id, profile_id, workspace_id, repo_id],
+            |row| row.get(0),
+        )?;
+        let mut replacement_supersedes = json_str_list(&raw);
+        for superseded_id in &ids {
+            if !replacement_supersedes.contains(superseded_id) {
+                replacement_supersedes.push(superseded_id.clone());
+            }
+        }
+        tx.execute(
+            "UPDATE memory_records
+         SET supersedes = ?1
+         WHERE id = ?2 AND profile_id = ?3 AND workspace_id = ?4
+           AND repo_id IS ?5",
+            params![
+                serde_json::to_string(&replacement_supersedes)?,
+                replacement_id,
+                profile_id,
+                workspace_id,
+                repo_id,
+            ],
+        )?;
+
+        for superseded_id in &ids {
+            let (
+                raw,
+                valid_until,
+                previous_superseded_by,
+                previous_historical_reason,
+                previous_temporal_state,
+                previous_archived,
+            ): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+                i64,
+            ) = tx.query_row(
+                "SELECT metadata, valid_until, superseded_by, historical_reason,
+                        COALESCE(temporal_state, 'current'), archived
+                 FROM memory_records
+                 WHERE id = ?1 AND profile_id = ?2 AND workspace_id = ?3
+                   AND repo_id IS ?4",
+                params![superseded_id, profile_id, workspace_id, repo_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
+            let mut metadata = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            let previous_metadata = metadata.clone();
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("consolidation_previous_metadata".into(), previous_metadata);
+                object.insert(
+                    "consolidation_previous".into(),
+                    json!({
+                        "valid_until": valid_until,
+                        "superseded_by": previous_superseded_by,
+                        "historical_reason": previous_historical_reason,
+                        "temporal_state": previous_temporal_state,
+                        "archived": previous_archived,
+                    }),
+                );
+                object.insert(
+                    "consolidation_batch_id".into(),
+                    Value::String(batch_id.into()),
+                );
+                object.insert("state".into(), Value::String("superseded".into()));
+                object.insert("policy_outcome".into(), Value::String("superseded".into()));
+                object.insert(
+                    "historical_reason".into(),
+                    Value::String("superseded by governed consolidation".into()),
+                );
+                object.insert("archived_at".into(), Value::String(now.into()));
+                object.insert("superseded_by".into(), Value::String(replacement_id.into()));
+            }
+            let changed = tx.execute(
+                "UPDATE memory_records
+             SET archived = 1, temporal_state = 'superseded', superseded_by = ?1,
+                 valid_until = COALESCE(valid_until, ?2),
+                 historical_reason = ?3, updated_at = ?2, metadata = ?4
+             WHERE id = ?5 AND profile_id = ?6 AND workspace_id = ?7
+               AND repo_id IS ?8
+               AND archived = 0
+               AND COALESCE(temporal_state, 'current') = 'current'",
+                params![
+                    replacement_id,
+                    now,
+                    "superseded by governed consolidation",
+                    metadata.to_string(),
+                    superseded_id,
+                    profile_id,
+                    workspace_id,
+                    repo_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::new(
+                    ErrorCode::BundlePlanStale,
+                    "consolidation supersession target changed before apply",
+                ));
+            }
+            let revision = Self::consolidation_record_revision(tx, superseded_id)?;
+            tx.execute("UPDATE consolidation_target_revisions SET applied_revision = ?1 WHERE batch_id = ?2 AND record_id = ?3",
+                params![revision, batch_id, superseded_id])?;
+        }
+        Ok(())
     }
 
     pub fn ensure_workspace_in_transaction(
@@ -664,6 +1637,13 @@ impl Store {
         ensure_temporal_columns(&conn)?;
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
+        conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
+        ensure_column(
+            &conn,
+            "consolidation_proposals",
+            "applied_record_ids_json",
+            "TEXT",
+        )?;
         ensure_instance_metadata(&conn)?;
 
         // Probe FTS5 by attempting the virtual-table migration. If the SQLite
@@ -1998,7 +2978,18 @@ impl Store {
     /// Idempotent insert keyed on `content_hash`. If a record with the same
     /// content hash exists, returns `Skipped` and merges any new source ids.
     pub fn upsert_record(&self, new: &NewRecord) -> Result<UpsertOutcome> {
-        if let Some(existing) = self.find_by_content_hash(&new.content_hash)? {
+        let existing = match self.find_by_content_hash(&new.content_hash)? {
+            Some(existing) => Some(existing),
+            None => self.find_current_by_exact_content(
+                &new.profile_id,
+                &new.workspace_id,
+                new.repo_id.as_deref(),
+                new.record_type.as_str(),
+                new.scope.as_str(),
+                &new.content,
+            )?,
+        };
+        if let Some(existing) = existing {
             // Merge source ids and only fill missing allowlisted provenance.
             // Never replace metadata owned by the existing writer.
             let original_metadata: Option<String> = if let Some(id) = existing
@@ -2344,6 +3335,39 @@ impl Store {
         Ok(result)
     }
 
+    pub fn find_current_by_exact_content(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+        record_type: &str,
+        scope: &str,
+        content: &str,
+    ) -> Result<Option<MemoryRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            &format!(
+                "SELECT {RECORD_COLS} FROM memory_records
+                 WHERE profile_id = ?1 AND workspace_id = ?2 AND repo_id IS ?3
+                   AND type = ?4 AND scope = ?5 AND content = ?6
+                   AND archived = 0
+                   AND COALESCE(temporal_state, 'current') = 'current'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
+            params![
+                profile_id,
+                workspace_id,
+                repo_id,
+                record_type,
+                scope,
+                content
+            ],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
     pub fn get_record(&self, id: &str) -> Result<Option<MemoryRecord>> {
         let conn = self.conn()?;
         let result = conn
@@ -2678,6 +3702,24 @@ impl Store {
     /// Filtered listing without text search (used by export and recall
     /// candidate gathering).
     pub fn query_records(&self, query: &RecordQuery) -> Result<Vec<MemoryRecord>> {
+        self.query_records_with_end(query, None)
+    }
+
+    /// Filtered listing with an inclusive upper timestamp for bounded Dream
+    /// frontiers. General recall keeps the legacy open-ended query above.
+    pub fn query_records_until(
+        &self,
+        query: &RecordQuery,
+        until: &str,
+    ) -> Result<Vec<MemoryRecord>> {
+        self.query_records_with_end(query, Some(until))
+    }
+
+    fn query_records_with_end(
+        &self,
+        query: &RecordQuery,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>> {
         let conn = self.conn()?;
         let mut sql = format!("SELECT {RECORD_COLS} FROM memory_records WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2711,6 +3753,10 @@ impl Store {
         if let Some(cutoff) = &query.recency_cutoff {
             sql.push_str(" AND updated_at >= ?");
             args.push(Box::new(cutoff.clone()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND updated_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY updated_at DESC");
         if query.limit > 0 {
@@ -2933,6 +3979,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Checkpoint>> {
         let conn = self.conn()?;
@@ -2953,6 +4000,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND created_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND created_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
         if limit > 0 {
@@ -2998,6 +4049,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Conclusion>> {
         let conn = self.conn()?;
@@ -3017,6 +4069,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND created_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND created_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
         if limit > 0 {
@@ -3059,6 +4115,7 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<VisibleTurn>> {
         let conn = self.conn()?;
@@ -3079,6 +4136,10 @@ impl Store {
             sql.push_str(" AND t.created_at >= ?");
             args.push(Box::new(since.to_string()));
         }
+        if let Some(until) = until {
+            sql.push_str(" AND t.created_at <= ?");
+            args.push(Box::new(until.to_string()));
+        }
         sql.push_str(" ORDER BY t.created_at DESC, t.id ASC");
         if limit > 0 {
             sql.push_str(&format!(" LIMIT {limit}"));
@@ -3098,6 +4159,7 @@ impl Store {
         profile_id: &str,
         workspace_id: &str,
         since: Option<&str>,
+        until: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemorySource>> {
         let conn = self.conn()?;
@@ -3113,6 +4175,10 @@ impl Store {
         if let Some(since) = since {
             sql.push_str(" AND ingested_at >= ?");
             args.push(Box::new(since.to_string()));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND ingested_at <= ?");
+            args.push(Box::new(until.to_string()));
         }
         sql.push_str(" ORDER BY ingested_at DESC, id ASC");
         if limit > 0 {

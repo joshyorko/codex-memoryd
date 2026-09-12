@@ -152,6 +152,37 @@ pub fn content_hash(
     out
 }
 
+/// Content hash for governed consolidation candidates. Unlike the legacy
+/// record hash, this identity preserves case, punctuation, units, and
+/// negation because consolidation must not merge materially different claims.
+pub fn exact_content_hash(
+    profile: &str,
+    workspace: &str,
+    repo_id: Option<&str>,
+    record_type: &str,
+    scope: &str,
+    content: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(profile.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(workspace.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(repo_id.unwrap_or("").as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(record_type.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(scope.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(content.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::from("sha256:");
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// Source hash binds raw imported content to its source path and
 /// profile/workspace, per SPEC §4.2. Used to short-circuit unchanged re-imports.
 pub fn source_hash(profile: &str, workspace: &str, source_path: &str, raw_content: &str) -> String {

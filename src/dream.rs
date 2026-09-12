@@ -8,6 +8,9 @@ use std::time::Instant;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rusqlite::types::ToSql;
+use rusqlite::Row;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -43,6 +46,30 @@ use crate::store::UpsertOutcome;
 pub const DREAM_IMPLEMENTATION_VERSION: &str = "heuristic-v1";
 pub const DREAM_RULESET_VERSION: &str = "dreamer-heuristics-v1";
 pub const DREAM_FIXTURE_SCHEMA_VERSION: Option<&str> = None;
+
+const SCHEDULER_CURSOR_PREFIX: &str = "dream-cursor-v1:";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DreamSourceCursor {
+    timestamp: String,
+    id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DreamSchedulerCursor {
+    #[serde(default)]
+    lower_bound: Option<String>,
+    #[serde(default)]
+    visible_turns: Option<DreamSourceCursor>,
+    #[serde(default)]
+    conclusions: Option<DreamSourceCursor>,
+    #[serde(default)]
+    checkpoints: Option<DreamSourceCursor>,
+    #[serde(default)]
+    imported_memories: Option<DreamSourceCursor>,
+    #[serde(default)]
+    active_memory_records: Option<DreamSourceCursor>,
+}
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -242,6 +269,9 @@ pub struct DreamParams<'a> {
     pub repo_id: Option<&'a str>,
     pub mode: &'a str,
     pub now: &'a str,
+    /// Inclusive source frontier, which may differ from the logical clock.
+    pub source_window_end: Option<&'a str>,
+    /// Inclusive RFC3339 cutoff or an internal scheduler keyset cursor.
     pub recency_cutoff: Option<&'a str>,
     pub include_archived_sources: bool,
     pub max_records: usize,
@@ -252,7 +282,12 @@ pub struct DreamParams<'a> {
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     check_deadline(params)?;
-    let mut records = store.query_records(&RecordQuery {
+    let scheduler_cursor = params.recency_cutoff.and_then(parse_scheduler_cursor);
+    let source_window_start = match scheduler_cursor.as_ref() {
+        Some(cursor) => cursor.lower_bound.as_deref(),
+        None => params.recency_cutoff,
+    };
+    let query = RecordQuery {
         profile_id: Some(params.profile.as_str().to_string()),
         workspace_id: Some(params.workspace.to_string()),
         repo_id: params.repo_id.map(str::to_string),
@@ -262,7 +297,25 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         recency_cutoff: params.recency_cutoff.map(|s| s.to_string()),
         limit: params.max_records,
         offset: 0,
-    })?;
+    };
+    let mut records = match scheduler_cursor.as_ref() {
+        Some(cursor) => query_memory_records_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            source_window_start,
+            params.source_window_end,
+            cursor.active_memory_records.as_ref(),
+            params.max_records,
+            params.include_archived_sources,
+        )?,
+        None => match params.source_window_end {
+            Some(end) => store.query_records_until(&query, end)?,
+            None => store.query_records(&query)?,
+        },
+    };
+    let source_window_end = params.source_window_end.unwrap_or(params.now);
     check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
@@ -270,6 +323,8 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             store,
             params,
             imported_limit,
+            source_window_start,
+            scheduler_cursor.as_ref(),
         )?);
     }
     check_deadline(params)?;
@@ -278,8 +333,14 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             .cmp(&a.updated_at)
             .then_with(|| a.id.cmp(&b.id))
     });
-    let evidence_window =
-        build_evidence_window(store, params, params.recency_cutoff, params.now, &records)?;
+    let evidence_window = build_evidence_window(
+        store,
+        params,
+        source_window_start,
+        source_window_end,
+        scheduler_cursor.as_ref(),
+        &records,
+    )?;
     let mut candidates = Vec::new();
     let mut stale = Vec::new();
     let mut rejected = Vec::new();
@@ -598,6 +659,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             rejected,
             archived,
             created,
+            consolidation_batch_id: None,
             authority: "recall_not_authority".to_string(),
             provenance: None,
         },
@@ -609,14 +671,29 @@ fn imported_chatgpt_candidate_records(
     store: &Store,
     params: &DreamParams,
     limit: usize,
+    source_window_start: Option<&str>,
+    scheduler_cursor: Option<&DreamSchedulerCursor>,
 ) -> Result<Vec<MemoryRecord>> {
-    let turns = store.dream_visible_turns(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        params.recency_cutoff,
-        params.max_records,
-    )?;
+    let turns = match scheduler_cursor {
+        Some(cursor) => query_visible_turns_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            source_window_start,
+            params.source_window_end,
+            cursor.visible_turns.as_ref(),
+            params.max_records,
+        )?,
+        None => store.dream_visible_turns(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            source_window_start,
+            params.source_window_end,
+            params.max_records,
+        )?,
+    };
     let mut records = Vec::new();
     for turn in turns {
         if records.len() >= limit {
@@ -751,40 +828,505 @@ fn imported_chatgpt_record_type(
     }
 }
 
+fn parse_scheduler_cursor(value: &str) -> Option<DreamSchedulerCursor> {
+    value
+        .strip_prefix(SCHEDULER_CURSOR_PREFIX)
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+pub fn is_scheduler_cursor(value: &str) -> bool {
+    parse_scheduler_cursor(value).is_some()
+}
+
+fn scheduler_cursor_from_watermark(previous: Option<&str>) -> DreamSchedulerCursor {
+    previous
+        .and_then(parse_scheduler_cursor)
+        .unwrap_or_else(|| DreamSchedulerCursor {
+            lower_bound: previous.map(str::to_string),
+            ..DreamSchedulerCursor::default()
+        })
+}
+
+/// Return a bounded scheduler cursor for a window that did not cover the
+/// entire input frontier. The cursor keeps one keyset position per source
+/// stream because the streams are budgeted in order and can advance unevenly.
+pub fn scheduler_watermark_after(
+    previous: Option<&str>,
+    window: &DreamEvidenceWindow,
+) -> Result<Option<String>> {
+    let mut cursor = scheduler_cursor_from_watermark(previous);
+    update_stream_cursor(&mut cursor.visible_turns, &window.visible_turns, false);
+    update_stream_cursor(&mut cursor.conclusions, &window.conclusions, false);
+    update_stream_cursor(&mut cursor.checkpoints, &window.checkpoints, false);
+    update_stream_cursor(
+        &mut cursor.imported_memories,
+        &window.imported_memories,
+        true,
+    );
+    for source in &window.active_memory_records.sources {
+        if source.kind == "imported_chat_turn" && !source.root_ids.is_empty() {
+            for root_id in &source.root_ids {
+                update_cursor_position(
+                    &mut cursor.visible_turns,
+                    source.created_at.clone(),
+                    root_id.clone(),
+                );
+            }
+        } else {
+            update_cursor_position(
+                &mut cursor.active_memory_records,
+                source
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| source.created_at.clone()),
+                source.id.clone(),
+            );
+        }
+    }
+
+    let encoded = serde_json::to_string(&cursor)?;
+    Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")))
+}
+
+fn update_stream_cursor(
+    slot: &mut Option<DreamSourceCursor>,
+    stream: &DreamEvidenceStream,
+    use_updated_at: bool,
+) {
+    for source in &stream.sources {
+        update_cursor_position(
+            slot,
+            if use_updated_at {
+                source
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| source.created_at.clone())
+            } else {
+                source.created_at.clone()
+            },
+            source.id.clone(),
+        );
+    }
+}
+
+fn update_cursor_position(slot: &mut Option<DreamSourceCursor>, timestamp: String, id: String) {
+    let candidate = DreamSourceCursor { timestamp, id };
+    if slot.as_ref().is_none_or(|current| {
+        candidate.timestamp < current.timestamp
+            || (candidate.timestamp == current.timestamp && candidate.id > current.id)
+    }) {
+        *slot = Some(candidate);
+    }
+}
+
+fn query_dream_rows<T, F>(
+    store: &Store,
+    mut sql: String,
+    mut args: Vec<Box<dyn ToSql>>,
+    timestamp_column: &str,
+    id_column: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+    mapper: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(start) = start {
+        sql.push_str(&format!(" AND {timestamp_column} >= ?"));
+        args.push(Box::new(start.to_string()));
+    }
+    if let Some(position) = position {
+        sql.push_str(&format!(
+            " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {id_column} > ?))"
+        ));
+        args.push(Box::new(position.timestamp.clone()));
+        args.push(Box::new(position.timestamp.clone()));
+        args.push(Box::new(position.id.clone()));
+    }
+    if let Some(end) = end {
+        sql.push_str(&format!(" AND {timestamp_column} <= ?"));
+        args.push(Box::new(end.to_string()));
+    }
+    let params_ref: Vec<&dyn ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
+    sql.push_str(&format!(
+        " ORDER BY {timestamp_column} DESC, {id_column} ASC LIMIT {limit}"
+    ));
+    store.transaction(|tx| {
+        let mut statement = tx.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_ref.as_slice(), mapper)?
+            .collect::<std::result::Result<Vec<_>, _>>();
+        rows.map_err(Into::into)
+    })
+}
+
+fn query_visible_turns_with_frontier(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+) -> Result<Vec<VisibleTurn>> {
+    let mut sql = "SELECT t.id, t.session_id, t.actor, t.content, t.created_at, t.metadata
+         FROM visible_turns t
+         JOIN sessions s ON s.id = t.session_id
+         WHERE s.profile_id = ? AND s.workspace_id = ?"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![
+        Box::new(profile_id.to_string()),
+        Box::new(workspace_id.to_string()),
+    ];
+    if let Some(repo_id) = repo_id {
+        sql.push_str(" AND s.repo_id = ?");
+        args.push(Box::new(repo_id.to_string()));
+    }
+    query_dream_rows(
+        store,
+        sql,
+        args,
+        "t.created_at",
+        "t.id",
+        start,
+        end,
+        position,
+        limit,
+        |row| {
+            Ok(VisibleTurn {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                actor: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                metadata: dream_json_value(&row.get::<_, String>(5)?),
+            })
+        },
+    )
+}
+
+fn query_conclusions_with_frontier(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+) -> Result<Vec<Conclusion>> {
+    let mut sql = "SELECT id, profile_id, workspace_id, repo_id, target, content, source_id,
+            created_at, metadata
+         FROM conclusions
+         WHERE profile_id = ? AND workspace_id = ?"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![
+        Box::new(profile_id.to_string()),
+        Box::new(workspace_id.to_string()),
+    ];
+    if let Some(repo_id) = repo_id {
+        sql.push_str(" AND repo_id = ?");
+        args.push(Box::new(repo_id.to_string()));
+    }
+    query_dream_rows(
+        store,
+        sql,
+        args,
+        "created_at",
+        "id",
+        start,
+        end,
+        position,
+        limit,
+        |row| {
+            Ok(Conclusion {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                workspace_id: row.get(2)?,
+                repo_id: row.get(3)?,
+                target: row.get(4)?,
+                content: row.get(5)?,
+                source_id: row.get(6)?,
+                created_at: row.get(7)?,
+                metadata: dream_json_value(&row.get::<_, String>(8)?),
+            })
+        },
+    )
+}
+
+fn query_checkpoints_with_frontier(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+) -> Result<Vec<Checkpoint>> {
+    let mut sql = "SELECT id, session_id, profile_id, workspace_id, repo_id, summary,
+            changed_files, decisions, blockers, next_steps, tests_run, tests_not_run,
+            branch, commit_sha, created_at
+         FROM checkpoints
+         WHERE profile_id = ? AND workspace_id = ?"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![
+        Box::new(profile_id.to_string()),
+        Box::new(workspace_id.to_string()),
+    ];
+    if let Some(repo_id) = repo_id {
+        sql.push_str(" AND repo_id = ?");
+        args.push(Box::new(repo_id.to_string()));
+    }
+    query_dream_rows(
+        store,
+        sql,
+        args,
+        "created_at",
+        "id",
+        start,
+        end,
+        position,
+        limit,
+        |row| {
+            Ok(Checkpoint {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                profile_id: row.get(2)?,
+                workspace_id: row.get(3)?,
+                repo_id: row.get(4)?,
+                summary: row.get(5)?,
+                changed_files: dream_json_list(&row.get::<_, String>(6)?),
+                decisions: dream_json_list(&row.get::<_, String>(7)?),
+                blockers: dream_json_list(&row.get::<_, String>(8)?),
+                next_steps: dream_json_list(&row.get::<_, String>(9)?),
+                tests_run: dream_json_list(&row.get::<_, String>(10)?),
+                tests_not_run: dream_json_list(&row.get::<_, String>(11)?),
+                branch: row.get(12)?,
+                commit: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        },
+    )
+}
+
+fn query_memory_sources_with_frontier(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+) -> Result<Vec<MemorySource>> {
+    let sql = "SELECT id, profile_id, workspace_id, kind, source_path, source_hash,
+            created_at, ingested_at, metadata
+         FROM memory_sources
+         WHERE profile_id = ? AND workspace_id = ?"
+        .to_string();
+    let args: Vec<Box<dyn ToSql>> = vec![
+        Box::new(profile_id.to_string()),
+        Box::new(workspace_id.to_string()),
+    ];
+    query_dream_rows(
+        store,
+        sql,
+        args,
+        "ingested_at",
+        "id",
+        start,
+        end,
+        position,
+        limit,
+        |row| {
+            Ok(MemorySource {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                workspace_id: row.get(2)?,
+                kind: row.get(3)?,
+                source_path: row.get(4)?,
+                source_hash: row.get(5)?,
+                created_at: row.get(6)?,
+                ingested_at: row.get(7)?,
+                metadata: dream_json_value(&row.get::<_, String>(8)?),
+            })
+        },
+    )
+}
+
+fn query_memory_records_with_frontier(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+    include_archived: bool,
+) -> Result<Vec<MemoryRecord>> {
+    let mut sql = "SELECT id FROM memory_records
+         WHERE profile_id = ? AND workspace_id = ?"
+        .to_string();
+    let mut args: Vec<Box<dyn ToSql>> = vec![
+        Box::new(profile_id.to_string()),
+        Box::new(workspace_id.to_string()),
+    ];
+    if let Some(repo_id) = repo_id {
+        sql.push_str(" AND repo_id = ?");
+        args.push(Box::new(repo_id.to_string()));
+    }
+    if !include_archived {
+        sql.push_str(" AND archived = 0");
+    }
+    sql.push_str(" AND sensitivity != 'secret_blocked' AND trust_state != 'quarantined'");
+    let ids = query_dream_rows(
+        store,
+        sql,
+        args,
+        "updated_at",
+        "id",
+        start,
+        end,
+        position,
+        limit,
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(record) = store.get_record(&id)? {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+fn dream_json_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+fn dream_json_list(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 fn build_evidence_window(
     store: &Store,
     params: &DreamParams,
     start: Option<&str>,
     end: &str,
+    scheduler_cursor: Option<&DreamSchedulerCursor>,
     active_records: &[MemoryRecord],
 ) -> Result<DreamEvidenceWindow> {
-    let visible_turns = store.dream_visible_turns(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let conclusions = store.dream_conclusions(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let checkpoints = store.dream_checkpoints(
-        params.profile.as_str(),
-        params.workspace,
-        params.repo_id,
-        start,
-        params.max_records,
-    )?;
-    let imported_memories = store.dream_memory_sources(
-        params.profile.as_str(),
-        params.workspace,
-        start,
-        params.max_records,
-    )?;
+    let mut remaining = params.max_records.saturating_sub(active_records.len());
+    let visible_turns = if remaining == 0 {
+        Vec::new()
+    } else if let Some(cursor) = scheduler_cursor {
+        let records = query_visible_turns_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            cursor.visible_turns.as_ref(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    } else {
+        let records = store.dream_visible_turns(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    };
+    let conclusions = if remaining == 0 {
+        Vec::new()
+    } else if let Some(cursor) = scheduler_cursor {
+        let records = query_conclusions_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            cursor.conclusions.as_ref(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    } else {
+        let records = store.dream_conclusions(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    };
+    let checkpoints = if remaining == 0 {
+        Vec::new()
+    } else if let Some(cursor) = scheduler_cursor {
+        let records = query_checkpoints_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            cursor.checkpoints.as_ref(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    } else {
+        let records = store.dream_checkpoints(
+            params.profile.as_str(),
+            params.workspace,
+            params.repo_id,
+            start,
+            params.source_window_end,
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(records.len());
+        records
+    };
+    let imported_memories = if remaining == 0 {
+        Vec::new()
+    } else if let Some(cursor) = scheduler_cursor {
+        query_memory_sources_with_frontier(
+            store,
+            params.profile.as_str(),
+            params.workspace,
+            start,
+            params.source_window_end,
+            cursor.imported_memories.as_ref(),
+            remaining,
+        )?
+    } else {
+        store.dream_memory_sources(
+            params.profile.as_str(),
+            params.workspace,
+            start,
+            params.source_window_end,
+            remaining,
+        )?
+    };
 
     Ok(DreamEvidenceWindow {
         start: start.map(str::to_string),
@@ -805,6 +1347,7 @@ fn stream_from_visible_turns(records: &[VisibleTurn]) -> DreamEvidenceStream {
             .map(|record| {
                 let provenance = imported_chatgpt_provenance(&record.metadata);
                 DreamEvidenceSource {
+                    root_ids: Vec::new(),
                     id: record.id.clone(),
                     kind: provenance
                         .as_ref()
@@ -843,6 +1386,7 @@ fn stream_from_conclusions(records: &[Conclusion]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: "conclusion".to_string(),
                 created_at: record.created_at.clone(),
@@ -868,6 +1412,7 @@ fn stream_from_checkpoints(records: &[Checkpoint]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: "checkpoint".to_string(),
                 created_at: record.created_at.clone(),
@@ -896,6 +1441,7 @@ fn stream_from_sources(records: &[MemorySource]) -> DreamEvidenceStream {
         sources: records
             .iter()
             .map(|record| DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: record.id.clone(),
                 kind: record.kind.clone(),
                 created_at: record.created_at.clone(),
@@ -920,25 +1466,35 @@ fn stream_from_memory_records(records: &[MemoryRecord]) -> DreamEvidenceStream {
         count: records.len(),
         sources: records
             .iter()
-            .map(|record| DreamEvidenceSource {
-                id: record.id.clone(),
-                kind: "memory_record".to_string(),
-                created_at: record.created_at.clone(),
-                updated_at: Some(record.updated_at.clone()),
-                actor: None,
-                record_type: Some(record.record_type.as_str().to_string()),
-                state: Some(state_for_record(record)),
-                source_path: None,
-                summary: Some(format!(
-                    "{}:{}",
-                    record.record_type.as_str(),
-                    state_for_record(record)
-                )),
-                content: Some(record.content.clone()),
-                conversation_id: None,
-                conversation_title: None,
-                message_id: None,
-                turn_index: None,
+            .map(|record| {
+                let imported_chat_turn =
+                    record.metadata.get("source").and_then(Value::as_str) == Some("chatgpt-export");
+                DreamEvidenceSource {
+                    root_ids: record.source_ids.clone(),
+                    id: record.id.clone(),
+                    kind: if imported_chat_turn {
+                        "imported_chat_turn"
+                    } else {
+                        "memory_record"
+                    }
+                    .to_string(),
+                    created_at: record.created_at.clone(),
+                    updated_at: Some(record.updated_at.clone()),
+                    actor: None,
+                    record_type: Some(record.record_type.as_str().to_string()),
+                    state: Some(state_for_record(record)),
+                    source_path: None,
+                    summary: Some(format!(
+                        "{}:{}",
+                        record.record_type.as_str(),
+                        state_for_record(record)
+                    )),
+                    content: Some(record.content.clone()),
+                    conversation_id: None,
+                    conversation_title: None,
+                    message_id: None,
+                    turn_index: None,
+                }
             })
             .collect(),
     }
@@ -1193,8 +1749,9 @@ fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
                 EvidenceClass::ImportedMemory | EvidenceClass::ActiveMemory
             )
         });
-    let single_unconfirmed_preference =
-        evidence.len() == 1 && evidence[0].record_type == crate::domain::RecordType::Preference;
+    let single_unconfirmed_preference = evidence.len() == 1
+        && evidence[0].record_type == crate::domain::RecordType::Preference
+        && conclusions == 0;
 
     let (candidate_state, reason, apply_eligible) = if assistant_only {
         ("quarantined", "assistant_only_proposal_quarantined", false)
@@ -1458,6 +2015,7 @@ fn evidence_ref(record: &MemoryRecord) -> DreamEvidenceSource {
         .unwrap_or("memory_record")
         .to_string();
     DreamEvidenceSource {
+        root_ids: evidence_ids(record),
         id: record.id.clone(),
         kind: if provenance.is_some() {
             "imported_chat_turn".to_string()
@@ -1950,7 +2508,13 @@ fn promotion_reason(
 fn dedupe_candidates(candidates: &mut Vec<DreamCandidate>) {
     let mut seen = BTreeSet::new();
     candidates.retain(|c| {
-        let key = format!("{}:{}:{:?}", c.action, normalize(&c.content), c.supersedes);
+        // Candidate equality must not erase case, punctuation, units, or
+        // negation. Similarity is useful for grouping evidence, but it is not
+        // an identity proof for a durable memory effect.
+        let key = format!(
+            "{}:{}:{}:{}:{:?}",
+            c.action, c.proposed_type, c.subject_key, c.content, c.supersedes
+        );
         seen.insert(key)
     });
 }
@@ -2296,6 +2860,52 @@ fn date_part(value: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn candidate_for_dedup(content: &str) -> DreamCandidate {
+        DreamCandidate {
+            action: "promote".to_string(),
+            proposed_type: "command".to_string(),
+            content: content.to_string(),
+            confidence: 0.8,
+            state: "active".to_string(),
+            drift_prone: false,
+            expires_at: None,
+            valid_until: None,
+            historical_reason: None,
+            supersedes: vec![],
+            policy: "accept".to_string(),
+            candidate_state: "accepted".to_string(),
+            subject_key: "repo".to_string(),
+            threshold_reason: "fixture".to_string(),
+            evidence_weight: 1.0,
+            evidence_classes: vec!["user_visible_turn".to_string()],
+            evidence_ids: vec!["source".to_string()],
+            evidence_refs: vec![],
+            retires: vec![],
+            evidence_count: 1,
+            user_evidence_count: 1,
+            assistant_evidence_count: 0,
+            first_seen_at: "2026-09-11T00:00:00Z".to_string(),
+            last_seen_at: "2026-09-11T00:00:00Z".to_string(),
+            promotion_reason: "fixture".to_string(),
+            apply_eligible: true,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn candidate_dedup_preserves_case_and_punctuation_meaning() {
+        let mut candidates = vec![
+            candidate_for_dedup("git branch -d feature"),
+            candidate_for_dedup("git branch -D feature"),
+            candidate_for_dedup("/srv/Alpha uses 1 GiB"),
+            candidate_for_dedup("/srv/alpha uses 1024 MiB"),
+        ];
+
+        dedupe_candidates(&mut candidates);
+
+        assert_eq!(candidates.len(), 4);
+    }
+
     #[test]
     fn attach_counter_evidence_retires_returns_timeout_for_expired_deadline() {
         let params = DreamParams {
@@ -2304,6 +2914,7 @@ mod tests {
             repo_id: None,
             mode: "preview",
             now: "2030-01-01T00:00:00Z",
+            source_window_end: None,
             recency_cutoff: None,
             include_archived_sources: false,
             max_records: 0,

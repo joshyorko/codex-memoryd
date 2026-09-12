@@ -1038,6 +1038,9 @@ pub struct DreamJobRunRequest {
     pub now: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
+    /// Distinguishes an explicitly empty scheduled cutoff from an omitted one.
+    #[serde(default)]
+    pub since_explicit: bool,
     pub kind: String,
     #[serde(default)]
     pub mode: Option<String>,
@@ -1170,6 +1173,8 @@ pub struct MemoryPatchRollbackResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamEvidenceSource {
     pub id: String,
+    #[serde(skip)]
+    pub root_ids: Vec<String>,
     pub kind: String,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1363,6 +1368,8 @@ pub struct DreamResponse {
     pub rejected: Vec<DreamRejection>,
     pub archived: Vec<String>,
     pub created: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation_batch_id: Option<String>,
     pub authority: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<DreamProviderProvenance>,
@@ -1391,6 +1398,34 @@ pub struct ScheduledDreamResponse {
     pub watermark_before: Option<String>,
     pub watermark_after: Option<String>,
     pub limits_hit: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationApplyRequest {
+    pub batch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsolidationApplyResponse {
+    pub batch_id: String,
+    pub status: String,
+    pub record_ids: Vec<String>,
+    pub authority: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationUndoRequest {
+    pub batch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsolidationUndoResponse {
+    pub batch_id: String,
+    pub status: String,
+    pub record_ids: Vec<String>,
+    pub authority: String,
 }
 
 // ---------------------------------------------------------------------------

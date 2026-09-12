@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -17,6 +18,7 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use crate::config::Config;
+use crate::consolidation::*;
 use crate::domain::Checkpoint;
 use crate::domain::Conclusion;
 use crate::domain::Episode;
@@ -30,6 +32,7 @@ use crate::domain::Scope;
 use crate::domain::Sensitivity;
 use crate::domain::Subject;
 use crate::domain::SubjectKind;
+use crate::domain::TemporalState;
 use crate::domain::VisibleTurn;
 use crate::dream;
 use crate::error::Error;
@@ -80,6 +83,41 @@ const ADAPTER_TARGETS: &[&str] = &[
     "markdown-wiki",
 ];
 const RECENT_SCAR_PREFIXES: &[&str] = &["battle scar:", "scar:"];
+
+fn governed_deterministic_policy(profile: &Profile) -> ConsolidationPolicy {
+    ConsolidationPolicy {
+        contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
+        mode: ConsolidationMode::Automatic,
+        scopes: vec![profile.as_str().to_string()],
+        claim_classes: [
+            RecordType::Preference,
+            RecordType::RepoConvention,
+            RecordType::Command,
+            RecordType::Decision,
+            RecordType::Gotcha,
+            RecordType::Landmark,
+            RecordType::TaskCheckpoint,
+            RecordType::Identity,
+            RecordType::WorkflowPattern,
+            RecordType::Other,
+        ]
+        .iter()
+        .map(|record_type| record_type.as_str().to_string())
+        .collect(),
+        source_classes: vec!["deterministic_dream".to_string()],
+        operations: vec![ConsolidationOperation::AdoptStatement],
+        budget: ConsolidationBudget {
+            max_candidates: 10_000,
+            max_source_records: 10_000,
+            max_provider_calls: 1,
+            max_input_bytes: 256 * 1024,
+            max_output_bytes: 256 * 1024,
+        },
+        retention_days: 30,
+        semantic_validation: false,
+        legacy_metadata: None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterTarget {
@@ -1668,7 +1706,8 @@ impl Service {
             ));
         }
         if let Some(since) = req.since.as_deref() {
-            if OffsetDateTime::parse(since, &Rfc3339).is_err() {
+            if OffsetDateTime::parse(since, &Rfc3339).is_err() && !dream::is_scheduler_cursor(since)
+            {
                 return Err(Error::invalid_request(
                     "dream job since must be an RFC3339 timestamp",
                 ));
@@ -1688,12 +1727,17 @@ impl Service {
         let provider = req.provider.unwrap_or_default();
         let resolved_provider = self.resolve_dream_provider(adapter, &provider, &req.budget)?;
         let persisted_provider = persisted_dream_provider(&provider, resolved_provider.as_ref());
-        let explicit_since = req.since.is_some();
+        // A scheduled command preview may carry its watermark without granting
+        // the command adapter historical/archive replay access.
+        let include_archived_sources =
+            req.since_explicit || (req.since.is_some() && adapter != DreamProviderAdapter::Command);
         let source_window_start = match req.since.as_ref() {
             Some(since) => Some(since.clone()),
-            None => self
-                .store
-                .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
+            None if !req.since_explicit => {
+                self.store
+                    .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?
+            }
+            None => None,
         };
 
         self.store.upsert_dream_job(&DreamJobRecord {
@@ -1721,8 +1765,9 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: "preview",
                 now: &now,
+                source_window_end: Some(&now),
                 recency_cutoff: source_window_start.as_deref(),
-                include_archived_sources: explicit_since,
+                include_archived_sources,
                 max_records: req.budget.max_input_records,
                 max_candidates: Some(req.budget.max_candidates),
                 patch_run_id: None,
@@ -1909,6 +1954,11 @@ impl Service {
         }
 
         let configured = &self.config.dream_provider;
+        if adapter == DreamProviderAdapter::Command && !configured.enabled {
+            return Err(Error::invalid_request(
+                "model-backed Dream jobs require enabled runtime provider configuration",
+            ));
+        }
         let endpoint = provider
             .endpoint
             .as_deref()
@@ -1931,6 +1981,11 @@ impl Service {
             if provider.command.is_some() {
                 return Err(Error::invalid_request(
                     "job-supplied provider commands are denied",
+                ));
+            }
+            if provider.provider.is_some() || provider.adapter_version.is_some() {
+                return Err(Error::invalid_request(
+                    "command provenance is owned by the configured runtime",
                 ));
             }
             if configured.command.is_empty() {
@@ -2088,6 +2143,25 @@ impl Service {
             ));
         }
         let model_input = dream_provider_context(&response)?;
+        let remaining_candidates = budget
+            .max_candidates
+            .saturating_sub(response.candidates.len() + response.rejected.len());
+        if remaining_candidates == 0 {
+            return Ok((
+                response,
+                true,
+                None,
+                Some(DreamBudgetUsage {
+                    input_records,
+                    output_candidates: budget.max_candidates,
+                    ..DreamBudgetUsage::default()
+                }),
+            ));
+        }
+        let provider_budget = DreamJobBudget {
+            max_candidates: remaining_candidates,
+            ..budget.clone()
+        };
         if adapter == DreamProviderAdapter::Provider {
             if let Some(limit) = provider.daily_cost_ceiling_micros {
                 let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
@@ -2118,7 +2192,7 @@ impl Service {
             &response.workspace,
             response.repo_id.as_deref(),
             &model_input,
-            budget,
+            &provider_budget,
         )?;
         validate_provider_scope(
             &response,
@@ -2149,36 +2223,46 @@ impl Service {
             "dream_{}",
             ids::sha256_hex(format!("{}:{}", response.run_id, call.input_hash).as_bytes())
         );
-        if adapter == DreamProviderAdapter::Provider {
-            if let Some(limit) = provider.daily_cost_ceiling_micros {
-                let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
-                    .format(&Rfc3339)
-                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-                let prior_cost = self
-                    .store
-                    .dream_provider_cost_since(&daily_start, Some(&final_run_id))?;
-                if prior_cost.saturating_add(cost_micros) > limit {
-                    return Err(Error::internal(
-                        "dream provider daily cost ceiling exhausted",
-                    ));
-                }
-            }
-        } else if let Some(limit) = provider.daily_cost_ceiling_micros {
-            if cost_micros > limit {
+        if let Some(limit) = provider.daily_cost_ceiling_micros {
+            let daily_start = (OffsetDateTime::now_utc() - Duration::days(1))
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+            let prior_cost = self.store.dream_provider_cost_since(&daily_start, None)?;
+            if prior_cost.saturating_add(cost_micros) > limit {
+                self.persist_provider_budget_error_audit(
+                    &response,
+                    &usage,
+                    "dream provider daily cost ceiling exhausted",
+                )?;
                 return Err(Error::internal(
                     "dream provider daily cost ceiling exhausted",
                 ));
             }
         }
         if budget.max_cost_micros > 0 && cost_micros > budget.max_cost_micros {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider cost budget exhausted",
+            )?;
             return Err(Error::internal("dream provider cost budget exhausted"));
         }
         if budget.max_output_bytes > 0 && usage.output_bytes > budget.max_output_bytes {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider output byte budget exhausted",
+            )?;
             return Err(Error::internal(
                 "dream provider output byte budget exhausted",
             ));
         }
         if budget.max_output_tokens > 0 && usage.output_tokens > budget.max_output_tokens {
+            self.persist_provider_budget_error_audit(
+                &response,
+                &usage,
+                "dream provider output token budget exhausted",
+            )?;
             return Err(Error::internal(
                 "dream provider output token budget exhausted",
             ));
@@ -2187,7 +2271,12 @@ impl Service {
         let provenance = DreamProviderProvenance {
             schema_version: crate::provider::DREAM_PROVIDER_SCHEMA_VERSION.to_string(),
             adapter: adapter.as_str().to_string(),
-            adapter_version: crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+            adapter_version: match adapter {
+                DreamProviderAdapter::Command => {
+                    crate::provider::DREAM_COMMAND_ADAPTER_VERSION.to_string()
+                }
+                _ => crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+            },
             provider: provider.provider_name.clone(),
             model: provider.model.clone(),
             request_hash: call.request_hash,
@@ -2219,6 +2308,42 @@ impl Service {
                 ..usage
             }),
         ))
+    }
+
+    fn persist_provider_budget_error_audit(
+        &self,
+        response: &DreamResponse,
+        usage: &DreamBudgetUsage,
+        error_summary: &str,
+    ) -> Result<()> {
+        let attempted_at = ids::now_rfc3339();
+        self.store.insert_dream_run(&DreamRunAudit {
+            // A rejected provider call may still be billable. Keep each
+            // recovery audit distinct because successful run IDs are
+            // deterministic for identical input and INSERT OR REPLACE would
+            // otherwise erase prior usage.
+            id: ids::new_id("dream"),
+            profile_id: response.profile.clone(),
+            workspace_id: response.workspace.clone(),
+            repo_id: response.repo_id.clone(),
+            mode: "preview".to_string(),
+            status: "error".to_string(),
+            started_at: attempted_at.clone(),
+            completed_at: Some(attempted_at),
+            implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+            config_hash: dream::config_hash(),
+            ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+            fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION.map(str::to_string),
+            source_window_start: response.evidence_window.start.clone(),
+            source_window_end: Some(response.evidence_window.end.clone()),
+            source_counts: dream_audit_source_counts(response, None, Some(usage)),
+            candidate_counts: dream_audit_candidate_counts(response, None, Some(usage)),
+            created_count: 0,
+            archived_count: 0,
+            rejected_count: 0,
+            error_summary: Some(sanitize_error_summary(error_summary)),
+        })?;
+        Ok(())
     }
 
     fn dream_with_patch_binding(
@@ -2298,6 +2423,7 @@ impl Service {
                 repo_id: repo_id.as_deref(),
                 mode: &mode,
                 now: &now,
+                source_window_end: None,
                 recency_cutoff: source_window_start.as_deref(),
                 include_archived_sources: explicit_since,
                 max_records: 500,
@@ -2353,6 +2479,7 @@ impl Service {
 
     pub fn scheduled_dream(&self, now: Option<String>) -> Result<ScheduledDreamResponse> {
         let cfg = self.config.dream_scheduler;
+        let simulated_now = now.is_some();
         let mode = scheduled_dream_mode(cfg.automatic_apply);
         let profile = self.resolve_profile(&Some(self.config.default_profile.clone()))?;
         let workspace = self.config.default_workspace.clone();
@@ -2451,6 +2578,7 @@ impl Service {
                     repo: None,
                     now: Some(now.clone()),
                     since: watermark_before.clone(),
+                    since_explicit: false,
                     kind: "dream_preview".to_string(),
                     mode: Some("command".to_string()),
                     provider: None,
@@ -2486,12 +2614,13 @@ impl Service {
                     profile,
                     workspace: &workspace,
                     repo_id: None,
-                    mode,
+                    mode: "preview",
                     now: &now,
+                    source_window_end: (!simulated_now).then_some(now.as_str()),
                     recency_cutoff: watermark_before.as_deref(),
                     include_archived_sources: false,
                     max_records: cfg.max_batch_size,
-                    max_candidates: Some(cfg.max_candidates),
+                    max_candidates: (!cfg.automatic_apply).then_some(cfg.max_candidates),
                     patch_run_id: None,
                     deadline: None,
                 },
@@ -2504,19 +2633,22 @@ impl Service {
         }
         match result {
             Ok((mut run, mut max_candidates_hit)) => {
+                if cfg.automatic_apply && !command_mode {
+                    max_candidates_hit |= self.filter_applied_scheduled_candidates(
+                        &mut run,
+                        &profile,
+                        &workspace,
+                        cfg.max_candidates,
+                    )?;
+                }
                 let provider_config = &self.config.dream_provider;
                 if !command_mode
                     && self.config.dream_scheduler.scheduled_provider_enabled
                     && provider_config.enabled
                     && !provider_config.endpoint.trim().is_empty()
+                    && scheduled_provider_has_evidence(&run)
                 {
-                    if let Ok(context) = scheduled_dream_provider_context(
-                        &self.store,
-                        profile.as_str(),
-                        &workspace,
-                        watermark_before.as_deref(),
-                        cfg.max_batch_size,
-                    ) {
+                    if let Ok(context) = scheduled_dream_provider_context(&run) {
                         if let Ok(observations) = crate::provider::generate_observations(
                             &provider_config.endpoint,
                             &provider_config.api_key,
@@ -2529,7 +2661,7 @@ impl Service {
                                     .into_iter()
                                     .filter_map(|value| serde_json::from_value(value).ok()),
                             );
-                            if mode == "apply" {
+                            if mode == "apply" && !cfg.automatic_apply {
                                 let deterministic_attempts =
                                     run.candidates.len().saturating_add(run.rejected.len());
                                 let remaining_candidates = if max_candidates_hit {
@@ -2557,12 +2689,36 @@ impl Service {
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
+                // A full bounded input window is not proof the entire frontier
+                // was covered, even when all selected candidates were consumed.
+                let input_window_full = cfg.max_batch_size > 0
+                    && evidence_window_count(&run.evidence_window) >= cfg.max_batch_size;
+                if input_window_full {
+                    limits_hit.push("max_input_records".to_string());
+                }
+                if cfg.automatic_apply && !command_mode {
+                    self.apply_governed_deterministic_batch(&mut run, &profile, &workspace, &now)?;
+                }
                 let status = if limits_hit.is_empty() {
                     "ok"
                 } else {
                     "ok_with_limits"
                 };
-                let watermark_after = Some(now.clone());
+                // A limited run has not durably covered the source frontier.
+                // Preserve a bounded source cursor for input-only limits; keep
+                // the previous cursor for runtime, provider, or candidate limits.
+                let watermark_after = if limits_hit.is_empty() {
+                    Some(now.clone())
+                } else if input_window_full
+                    && limits_hit.iter().all(|limit| limit == "max_input_records")
+                {
+                    dream::scheduler_watermark_after(
+                        watermark_before.as_deref(),
+                        &run.evidence_window,
+                    )?
+                } else {
+                    None
+                };
                 self.store.record_dream_run(&DreamRunRecord {
                     run_id: run.run_id.clone(),
                     profile_id: run.profile.clone(),
@@ -2609,6 +2765,321 @@ impl Service {
                 Err(err)
             }
         }
+    }
+
+    pub fn apply_stored_consolidation(
+        &self,
+        req: ConsolidationApplyRequest,
+    ) -> Result<ConsolidationApplyResponse> {
+        if !self.config.dream_scheduler.automatic_apply {
+            return Err(Error::policy(
+                "consolidation apply requires the operator automatic policy",
+            ));
+        }
+        let proposal = self
+            .store
+            .read_consolidation_proposal(&req.batch_id)?
+            .ok_or_else(|| Error::not_found("consolidation proposal not found"))?;
+        let decisions = proposal
+            .decisions
+            .ok_or_else(|| Error::invalid_request("consolidation proposal has no decisions"))?;
+        let profile = Profile::parse(&proposal.batch.profile)
+            .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
+        let policy = governed_deterministic_policy(&profile);
+        let record_ids =
+            self.store
+                .apply_consolidation_proposal(&req.batch_id, &policy, &decisions)?;
+        Ok(ConsolidationApplyResponse {
+            batch_id: req.batch_id,
+            status: "applied".to_string(),
+            record_ids,
+            authority: "recall_not_authority".to_string(),
+        })
+    }
+
+    pub fn undo_stored_consolidation(
+        &self,
+        req: ConsolidationUndoRequest,
+    ) -> Result<ConsolidationUndoResponse> {
+        if !self.config.dream_scheduler.automatic_apply {
+            return Err(Error::policy(
+                "consolidation undo requires the operator automatic policy",
+            ));
+        }
+        let record_ids = self.store.undo_consolidation_proposal(&req.batch_id)?;
+        Ok(ConsolidationUndoResponse {
+            batch_id: req.batch_id,
+            status: "reverted".to_string(),
+            record_ids,
+            authority: "recall_not_authority".to_string(),
+        })
+    }
+
+    fn apply_governed_deterministic_batch(
+        &self,
+        run: &mut DreamResponse,
+        profile: &Profile,
+        workspace: &str,
+        now: &str,
+    ) -> Result<()> {
+        let policy = governed_deterministic_policy(profile);
+        let candidate_repo_scope = |candidate: &DreamCandidate| -> Result<Option<String>> {
+            let mut boundary = run.repo_id.clone().map(Some);
+            let mut unresolved = false;
+            for source in &candidate.evidence_refs {
+                let source_boundary = if let Some(record) = self.store.get_record(&source.id)? {
+                    if record.profile_id != profile.as_str() || record.workspace_id != workspace {
+                        return Err(Error::policy(
+                            "consolidation evidence record is outside the run boundary",
+                        ));
+                    }
+                    Some(record.repo_id.filter(|repo_id| !repo_id.trim().is_empty()))
+                } else {
+                    resolve_synthetic_repo_boundary(
+                        &self.store,
+                        source,
+                        profile.as_str(),
+                        workspace,
+                    )?
+                };
+                let Some(source_boundary) = source_boundary else {
+                    unresolved = true;
+                    continue;
+                };
+                match boundary.as_ref() {
+                    Some(existing) if existing.as_ref() != source_boundary.as_ref() => {
+                        return Err(Error::policy(
+                            "consolidation candidate mixes repository boundaries",
+                        ));
+                    }
+                    None => boundary = Some(source_boundary),
+                    _ => {}
+                }
+            }
+            if unresolved && run.repo_id.is_none() {
+                return Err(Error::policy(
+                    "consolidation candidate has an unresolved repository boundary",
+                ));
+            }
+            Ok(boundary.flatten())
+        };
+        let scoped_candidates = run
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.apply_eligible && !candidate.evidence_ids.is_empty())
+            .map(|candidate| {
+                let identity = (
+                    &candidate.action,
+                    &candidate.proposed_type,
+                    &candidate.subject_key,
+                    &candidate.content,
+                    &candidate.supersedes,
+                );
+                let candidate_id = ids::sha256_hex(
+                    &serde_json::to_vec(&identity)
+                        .expect("deterministic candidate identity is serializable"),
+                );
+                let proposal = ConsolidationCandidate {
+                    candidate_id,
+                    output_digest: ids::sha256_hex(candidate.content.as_bytes()),
+                    claim: candidate.content.clone(),
+                    claim_class: candidate.proposed_type.clone(),
+                    subject: candidate.subject_key.clone(),
+                    inferred: false,
+                    source_ids: candidate.evidence_ids.clone(),
+                    supporting_spans: vec![candidate.content.clone()],
+                    supersedes: candidate.supersedes.clone(),
+                    temporal_state: Some(candidate.state.clone()),
+                    valid_until: candidate.valid_until.clone(),
+                    historical_reason: candidate.historical_reason.clone(),
+                };
+                let evidence = candidate
+                    .evidence_refs
+                    .iter()
+                    .flat_map(|source| {
+                        let roots = if source.root_ids.is_empty() {
+                            vec![source.id.clone()]
+                        } else {
+                            source.root_ids.clone()
+                        };
+                        let subject = proposal.subject.clone();
+                        roots.into_iter().map(move |id| {
+                            crate::consolidation::policy::EvidenceDescriptor {
+                                root_id: id.clone(),
+                                id,
+                                source_class: "deterministic_dream".to_string(),
+                                actor: source.actor.clone().unwrap_or_default(),
+                                subject: subject.clone(),
+                                content: source
+                                    .content
+                                    .clone()
+                                    .unwrap_or_else(|| candidate.content.clone()),
+                                supporting_span: Some(candidate.content.clone()),
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let decision = crate::consolidation::policy::evaluate_candidate(
+                    &policy,
+                    profile.as_str(),
+                    &proposal,
+                    &evidence,
+                    &[],
+                    &[],
+                    None,
+                );
+                if matches!(decision.operation, ConsolidationOperation::AdoptStatement) {
+                    Ok(Some((proposal, candidate_repo_scope(candidate)?)))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if scoped_candidates.is_empty() {
+            return Ok(());
+        }
+        let mut repository_scope: Option<Option<String>> = None;
+        for (_, candidate_repo_id) in &scoped_candidates {
+            match repository_scope.as_ref() {
+                Some(existing) if existing.as_ref() != candidate_repo_id.as_ref() => {
+                    return Err(Error::policy(
+                        "consolidation batch mixes repository boundaries",
+                    ));
+                }
+                None => repository_scope = Some(candidate_repo_id.clone()),
+                _ => {}
+            }
+        }
+        let repo_id = repository_scope.flatten();
+        let candidates = scoped_candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect::<Vec<_>>();
+        let candidate_set_digest =
+            ids::sha256_hex(&serde_json::to_vec(&(repo_id.clone(), &candidates))?);
+        let base_batch_id = format!("consolidation_{}", run.run_id);
+        let batch_id = match self.store.read_consolidation_batch(&base_batch_id)? {
+            None => base_batch_id.clone(),
+            Some(existing)
+                if existing.snapshot_digest == candidate_set_digest
+                    && existing.repo_id == repo_id
+                    && existing.candidates == candidates =>
+            {
+                base_batch_id.clone()
+            }
+            Some(_) => format!("{base_batch_id}_{candidate_set_digest}"),
+        };
+        let batch = ConsolidationBatch {
+            contract_version: CONSOLIDATION_CONTRACT_VERSION.to_string(),
+            batch_id,
+            policy_digest: policy.digest(),
+            profile: profile.as_str().to_string(),
+            workspace: workspace.to_string(),
+            repo_id,
+            scope: profile.as_str().to_string(),
+            source_cursor: ConsolidationSourceCursor {
+                since: None,
+                until: Some(now.to_string()),
+                explicit_since: false,
+            },
+            snapshot_digest: candidate_set_digest,
+            candidates,
+        };
+        let decisions = batch
+            .candidates
+            .iter()
+            .map(|candidate| ConsolidationDecision {
+                candidate_id: candidate.candidate_id.clone(),
+                output_digest: candidate.output_digest.clone(),
+                operation: ConsolidationOperation::AdoptStatement,
+                reason: "deterministic source-backed candidate".to_string(),
+                distinct_evidence_roots: candidate.source_ids.clone(),
+                supersedes: candidate.supersedes.clone(),
+                validator: None,
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .persist_consolidation_batch(&batch, Some(&decisions), "validated")?;
+        let canonical_id = self
+            .store
+            .consolidation_batch_id_by_digest(&batch.scope, &batch.snapshot_digest)?
+            .ok_or_else(|| Error::not_found("persisted consolidation proposal missing"))?;
+        run.created =
+            self.store
+                .apply_consolidation_proposal(&canonical_id, &policy, &decisions)?;
+        run.archived = batch
+            .candidates
+            .iter()
+            .flat_map(|candidate| candidate.supersedes.iter().cloned())
+            .collect();
+        run.archived.sort();
+        run.archived.dedup();
+        run.consolidation_batch_id = Some(canonical_id);
+        run.mode = "apply".to_string();
+        Ok(())
+    }
+
+    fn filter_applied_scheduled_candidates(
+        &self,
+        run: &mut DreamResponse,
+        profile: &Profile,
+        workspace: &str,
+        max_candidates: usize,
+    ) -> Result<bool> {
+        let mut pending = Vec::with_capacity(run.candidates.len());
+        for candidate in std::mem::take(&mut run.candidates) {
+            let record_type = RecordType::parse(&candidate.proposed_type).unwrap_or_else(|| {
+                policy::classify(&candidate.content, *profile, false).record_type
+            });
+            let classification =
+                policy::classify_as(&candidate.content, *profile, false, record_type);
+            let content_hash = ids::exact_content_hash(
+                profile.as_str(),
+                workspace,
+                None,
+                classification.record_type.as_str(),
+                classification.scope.as_str(),
+                &candidate.content,
+            );
+            let already_current =
+                self.store
+                    .find_by_content_hash(&content_hash)?
+                    .is_some_and(|record| {
+                        !record.archived && record.temporal_state == TemporalState::Current
+                    })
+                    || self
+                        .store
+                        .find_current_by_exact_content(
+                            profile.as_str(),
+                            workspace,
+                            None,
+                            classification.record_type.as_str(),
+                            classification.scope.as_str(),
+                            &candidate.content,
+                        )?
+                        .is_some_and(|record| {
+                            record
+                                .metadata
+                                .get("governed_consolidation_applied")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        });
+            if !already_current || !candidate.supersedes.is_empty() {
+                pending.push(candidate);
+            }
+        }
+        let mut max_candidates_hit = pending.len() > max_candidates;
+        pending.truncate(max_candidates);
+        run.candidates = pending;
+        let remaining = max_candidates.saturating_sub(run.candidates.len());
+        if run.rejected.len() > remaining {
+            max_candidates_hit = true;
+            run.rejected.truncate(remaining);
+        }
+        Ok(max_candidates_hit)
     }
 
     // ------------------------------------------------------------------
@@ -2937,6 +3408,62 @@ impl Service {
     }
 }
 
+fn resolve_synthetic_repo_boundary(
+    store: &Store,
+    source: &DreamEvidenceSource,
+    profile_id: &str,
+    workspace_id: &str,
+) -> Result<Option<Option<String>>> {
+    let mut boundary: Option<Option<String>> = None;
+    for root_id in &source.root_ids {
+        let root_boundary = match store.get_record(root_id)? {
+            Some(record) => {
+                if record.profile_id != profile_id || record.workspace_id != workspace_id {
+                    return Err(Error::policy(
+                        "consolidation evidence root is outside the run boundary",
+                    ));
+                }
+                Some(record.repo_id.filter(|value| !value.trim().is_empty()))
+            }
+            None => store.transaction(|tx| {
+                tx.query_row(
+                    "SELECT s.repo_id
+                     FROM visible_turns t
+                     JOIN sessions s ON s.id = t.session_id
+                     WHERE t.id = ?1 AND s.profile_id = ?2 AND s.workspace_id = ?3",
+                    rusqlite::params![root_id, profile_id, workspace_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|repo_id| {
+                    repo_id.map(|repo_id| repo_id.filter(|value| !value.trim().is_empty()))
+                })
+                .map_err(Into::into)
+            })?,
+        };
+        let Some(root_boundary) = root_boundary else {
+            continue;
+        };
+        match boundary.as_ref() {
+            Some(existing) if existing.as_ref() != root_boundary.as_ref() => {
+                return Err(Error::policy(
+                    "consolidation evidence roots mix repository boundaries",
+                ));
+            }
+            None => boundary = Some(root_boundary),
+            _ => {}
+        }
+    }
+
+    if boundary.is_some() {
+        return Ok(boundary);
+    }
+    if source.kind == "imported_memory" && source.root_ids.is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(None)
+}
+
 fn build_patch_preview_response(
     store: &Store,
     dream: DreamResponse,
@@ -3255,8 +3782,12 @@ fn persisted_dream_provider(
     let mut persisted = provider.clone();
     if let Some(resolved) = resolved {
         persisted.adapter = Some(resolved.adapter);
-        persisted.adapter_version =
-            Some(crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string());
+        persisted.adapter_version = Some(match resolved.adapter {
+            DreamProviderAdapter::Command => {
+                crate::provider::DREAM_COMMAND_ADAPTER_VERSION.to_string()
+            }
+            _ => crate::provider::DREAM_PROVIDER_ADAPTER_VERSION.to_string(),
+        });
         if persisted.model.is_none() {
             persisted.model = Some(resolved.model.clone());
         }
@@ -3273,6 +3804,14 @@ fn evidence_window_count(window: &DreamEvidenceWindow) -> usize {
         + window.checkpoints.count
         + window.imported_memories.count
         + window.active_memory_records.count
+}
+
+fn scheduled_provider_has_evidence(response: &DreamResponse) -> bool {
+    response.evidence_window.visible_turns.count > 0
+        || response.evidence_window.conclusions.count > 0
+        || response.evidence_window.checkpoints.count > 0
+        || response.evidence_window.imported_memories.count > 0
+        || response.evidence_window.active_memory_records.count > 0
 }
 
 fn dream_provider_context(response: &DreamResponse) -> Result<String> {
@@ -3306,10 +3845,48 @@ fn dream_provider_context(response: &DreamResponse) -> Result<String> {
         "profile": response.profile,
         "workspace": response.workspace,
         "repo_id": response.repo_id,
-        "evidence_window": {"start": response.evidence_window.start, "end": response.evidence_window.end},
+        "evidence_window": {
+            "start": response.evidence_window.start,
+            "end": response.evidence_window.end,
+            "visible_turns": provider_evidence_stream(&response.evidence_window.visible_turns),
+            "conclusions": provider_evidence_stream(&response.evidence_window.conclusions),
+            "checkpoints": provider_evidence_stream(&response.evidence_window.checkpoints),
+            "imported_memories": provider_evidence_stream(&response.evidence_window.imported_memories),
+            "active_memory_records": provider_evidence_stream(&response.evidence_window.active_memory_records),
+        },
         "evidence_content": evidence_content,
     }))
     .map_err(Error::from)
+}
+
+fn provider_evidence_stream(stream: &DreamEvidenceStream) -> Value {
+    let sources = stream
+        .sources
+        .iter()
+        .map(|source| {
+            let content = source.content.as_deref().map(|content| {
+                match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                    PolicyDecision::Accept(value) => value,
+                    PolicyDecision::Reject { .. } => "[screened]".to_string(),
+                }
+            });
+            json!({
+                "id": source.id,
+                "kind": source.kind,
+                "created_at": source.created_at,
+                "updated_at": source.updated_at,
+                "actor": source.actor,
+                "record_type": source.record_type,
+                "state": source.state,
+                "summary": source.summary,
+                "content": content,
+                "conversation_id": source.conversation_id,
+                "message_id": source.message_id,
+                "turn_index": source.turn_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"count": stream.count, "sources": sources})
 }
 
 fn validate_provider_scope(
@@ -4546,19 +5123,8 @@ fn sanitized_provider_metadata_string(value: &str) -> String {
     }
 }
 
-fn scheduled_dream_provider_context(
-    store: &Store,
-    profile: &str,
-    workspace: &str,
-    since: Option<&str>,
-    limit: usize,
-) -> Result<String> {
-    let visible_turns = store.dream_visible_turns(profile, workspace, None, since, limit)?;
-    let imported_memories = store.dream_memory_sources(profile, workspace, since, limit)?;
-    Ok(serde_json::to_string(&json!({
-        "visible_turns": visible_turns,
-        "imported_memories": imported_memories,
-    }))?)
+fn scheduled_dream_provider_context(response: &DreamResponse) -> Result<String> {
+    dream_provider_context(response)
 }
 
 fn add_seconds(value: &str, seconds: i64) -> Option<String> {
@@ -4613,6 +5179,7 @@ mod imported_provenance_tests {
     #[test]
     fn imported_patch_source_normalizes_and_escapes_adversarial_provenance() {
         let source = DreamEvidenceSource {
+            root_ids: Vec::new(),
             id: "src|\n# heading".to_string(),
             kind: "imported_chat_turn".to_string(),
             created_at: "2026-07-01T00:00:00Z".to_string(),
@@ -4867,6 +5434,7 @@ mod scheduled_dream_mode_tests {
         let mut observation = provider_observation("obs-evidence", "provider fact with evidence");
         observation.evidence_refs = vec![
             DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: existing_id.clone(),
                 kind: "memory_record".to_string(),
                 created_at: "2026-07-18T00:00:00Z".to_string(),
@@ -4883,6 +5451,7 @@ mod scheduled_dream_mode_tests {
                 turn_index: None,
             },
             DreamEvidenceSource {
+                root_ids: Vec::new(),
                 id: "hallucinated-evidence".to_string(),
                 kind: "memory_record".to_string(),
                 created_at: "2026-07-18T00:00:00Z".to_string(),
@@ -4978,5 +5547,247 @@ mod provider_projection_review_tests {
         assert!(!context.contains("private-title-sentinel"));
         assert!(!context.contains("private-path-sentinel"));
         assert!(context.contains("concise updates"));
+    }
+}
+
+#[cfg(test)]
+mod scheduled_provider_context_budget_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_provider_context_has_one_combined_source_budget() {
+        let store = Store::open(":memory:").expect("store");
+        store
+            .ensure_workspace("personal", "budget")
+            .expect("workspace");
+        store
+            .ensure_session(
+                "budget-session",
+                "personal",
+                "budget",
+                None,
+                None,
+                "fixture",
+            )
+            .expect("session");
+        for index in 0..2 {
+            store
+                .insert_visible_turn(&VisibleTurn {
+                    id: format!("budget-turn-{index}"),
+                    session_id: "budget-session".into(),
+                    actor: "user".into(),
+                    content: format!("budget turn {index}"),
+                    created_at: format!("2026-09-11T00:0{index}:00Z"),
+                    metadata: json!({}),
+                })
+                .expect("visible turn");
+            store
+                .upsert_source(
+                    "personal",
+                    "budget",
+                    "fixture",
+                    Some(&format!("budget:{index}")),
+                    &format!("budget-hash-{index}"),
+                    &json!({}),
+                )
+                .expect("imported source");
+        }
+
+        let response = Service::new(
+            store,
+            Config {
+                default_profile: "personal".into(),
+                default_workspace: "budget".into(),
+                ..Default::default()
+            },
+        )
+        .run_dream_job(DreamJobRunRequest {
+            job_id: Some("budget-job".into()),
+            profile: Some("personal".into()),
+            workspace: Some("budget".into()),
+            repo: None,
+            now: Some("2030-01-01T00:00:00Z".into()),
+            since: None,
+            since_explicit: false,
+            kind: "dream_preview".into(),
+            mode: Some("deterministic".into()),
+            budget: DreamJobBudget {
+                max_runtime_seconds: 10,
+                max_input_records: 2,
+                max_candidates: 3,
+                ..Default::default()
+            },
+            provider: None,
+        })
+        .expect("dream job")
+        .preview;
+        let raw = scheduled_dream_provider_context(&response).expect("provider context");
+        let context: Value = serde_json::from_str(&raw).expect("context json");
+        let total = [
+            "visible_turns",
+            "conclusions",
+            "checkpoints",
+            "imported_memories",
+            "active_memory_records",
+        ]
+        .into_iter()
+        .map(|key| {
+            context["evidence_window"][key]["sources"]
+                .as_array()
+                .unwrap()
+                .len()
+        })
+        .sum::<usize>();
+        assert!(
+            total <= 2,
+            "scheduled provider context used {total} records"
+        );
+    }
+}
+
+#[cfg(test)]
+mod governed_candidate_identity_tests {
+    use super::*;
+
+    fn candidate(proposed_type: &str, subject_key: &str, source_id: &str) -> DreamCandidate {
+        DreamCandidate {
+            action: "promote".into(),
+            proposed_type: proposed_type.into(),
+            content: "same durable claim".into(),
+            confidence: 0.8,
+            state: "active".into(),
+            drift_prone: false,
+            expires_at: None,
+            valid_until: None,
+            historical_reason: None,
+            supersedes: vec![],
+            policy: "accept".into(),
+            candidate_state: "accepted".into(),
+            subject_key: subject_key.into(),
+            threshold_reason: "explicit_conclusion".into(),
+            evidence_weight: 2.0,
+            evidence_classes: vec!["explicit_conclusion".into()],
+            evidence_ids: vec![source_id.into()],
+            evidence_refs: vec![DreamEvidenceSource {
+                root_ids: vec![],
+                id: source_id.into(),
+                kind: "conclusion".into(),
+                created_at: "2026-09-11T00:00:00Z".into(),
+                updated_at: None,
+                actor: Some("user".into()),
+                record_type: Some(proposed_type.into()),
+                state: Some("active".into()),
+                source_path: None,
+                summary: Some("same durable claim".into()),
+                content: Some("same durable claim".into()),
+                conversation_id: None,
+                conversation_title: None,
+                message_id: None,
+                turn_index: None,
+            }],
+            retires: vec![],
+            evidence_count: 1,
+            user_evidence_count: 1,
+            assistant_evidence_count: 0,
+            first_seen_at: "2026-09-11T00:00:00Z".into(),
+            last_seen_at: "2026-09-11T00:00:00Z".into(),
+            promotion_reason: "explicit conclusion".into(),
+            apply_eligible: true,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn governed_batch_candidate_ids_include_type_and_subject_identity() {
+        let service = Service::new(
+            Store::open(":memory:").expect("store"),
+            Config {
+                default_workspace: "ws".into(),
+                ..Default::default()
+            },
+        );
+        // Candidate references must resolve to real, scoped evidence records.
+        let source = |record_type: &str| {
+            service
+                .conclusions(ConclusionsRequest {
+                    profile: Some("personal".into()),
+                    workspace: Some("ws".into()),
+                    repo: None,
+                    target: Some("user".into()),
+                    conclusions: Some(vec!["same durable claim".into()]),
+                    metadata: None,
+                    record_type: Some(record_type.into()),
+                })
+                .expect("scoped evidence")
+                .record_ids[0]
+                .clone()
+        };
+        let source_a = source("preference");
+        let source_b = source("decision");
+        let mut run = DreamResponse {
+            run_id: "identity-run".into(),
+            mode: "preview".into(),
+            profile: "personal".into(),
+            workspace: "ws".into(),
+            repo_id: None,
+            now: "2030-01-01T00:00:00Z".into(),
+            evidence_window: DreamEvidenceWindow {
+                start: None,
+                end: "2030-01-01T00:00:00Z".into(),
+                visible_turns: DreamEvidenceStream {
+                    count: 0,
+                    sources: vec![],
+                },
+                conclusions: DreamEvidenceStream {
+                    count: 0,
+                    sources: vec![],
+                },
+                checkpoints: DreamEvidenceStream {
+                    count: 0,
+                    sources: vec![],
+                },
+                imported_memories: DreamEvidenceStream {
+                    count: 0,
+                    sources: vec![],
+                },
+                active_memory_records: DreamEvidenceStream {
+                    count: 0,
+                    sources: vec![],
+                },
+            },
+            candidates: vec![
+                candidate("preference", "subject-a", &source_a),
+                candidate("decision", "subject-b", &source_b),
+            ],
+            observations: vec![],
+            markers: vec![],
+            stale: vec![],
+            rejected: vec![],
+            archived: vec![],
+            created: vec![],
+            consolidation_batch_id: None,
+            authority: "recall_not_authority".into(),
+            provenance: None,
+        };
+
+        service
+            .apply_governed_deterministic_batch(
+                &mut run,
+                &Profile::Personal,
+                "ws",
+                "2030-01-01T00:00:00Z",
+            )
+            .expect("governed batch");
+
+        let batch = service
+            .store
+            .read_consolidation_batch("consolidation_identity-run")
+            .expect("read batch")
+            .expect("batch");
+        assert_ne!(
+            batch.candidates[0].candidate_id,
+            batch.candidates[1].candidate_id
+        );
+        assert_eq!(run.created.len(), 2);
     }
 }
