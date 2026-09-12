@@ -1239,8 +1239,9 @@ fn score_evidence(evidence: &[&MemoryRecord]) -> EvidenceScore {
                 EvidenceClass::ImportedMemory | EvidenceClass::ActiveMemory
             )
         });
-    let single_unconfirmed_preference =
-        evidence.len() == 1 && evidence[0].record_type == crate::domain::RecordType::Preference;
+    let single_unconfirmed_preference = evidence.len() == 1
+        && evidence[0].record_type == crate::domain::RecordType::Preference
+        && conclusions == 0;
 
     let (candidate_state, reason, apply_eligible) = if assistant_only {
         ("quarantined", "assistant_only_proposal_quarantined", false)

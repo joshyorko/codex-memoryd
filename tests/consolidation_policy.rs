@@ -95,6 +95,43 @@ fn positive_statement_and_inference_adopt_with_distinct_roots() {
 }
 
 #[test]
+fn inferred_candidate_without_bounded_validation_stays_deferred() {
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &candidate(true, "values concise communication"),
+        &evidence(),
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "semantic_validation_unavailable");
+}
+
+#[test]
+fn duplicate_source_ids_do_not_inflate_inference_roots() {
+    let mut repeated = candidate(true, "values concise communication");
+    repeated.source_ids = vec!["source-a".into(), "source-a".into(), "source-b".into()];
+    let validation = SemanticValidation {
+        supported: true,
+        validator: "fixture-validator".into(),
+        reason: "supported".into(),
+    };
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &repeated,
+        &evidence(),
+        &[],
+        &[],
+        Some(&validation),
+    );
+    assert_eq!(decision.operation, ConsolidationOperation::AdoptInference);
+    assert_eq!(decision.distinct_evidence_roots, vec!["root-a", "root-b"]);
+}
+
+#[test]
 fn valid_ids_without_semantic_support_do_not_adopt() {
     let validation = SemanticValidation {
         supported: false,
@@ -105,6 +142,29 @@ fn valid_ids_without_semantic_support_do_not_adopt() {
         &policy(),
         "personal",
         &candidate(true, "unrelated claim"),
+        &evidence(),
+        &[],
+        &[],
+        Some(&validation),
+    );
+    assert_eq!(decision.operation, ConsolidationOperation::Defer);
+    assert_eq!(decision.reason, "semantic_support_not_established");
+}
+
+#[test]
+fn compound_inference_with_unsupported_clause_is_deferred_as_a_whole() {
+    let validation = SemanticValidation {
+        supported: false,
+        validator: "fixture-validator".into(),
+        reason: "only the first clause is supported".into(),
+    };
+    let decision = evaluate_candidate(
+        &policy(),
+        "personal",
+        &candidate(
+            true,
+            "values concise communication and prefers an unsupported tool",
+        ),
         &evidence(),
         &[],
         &[],

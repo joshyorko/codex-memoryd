@@ -68,6 +68,65 @@ fn governed_adoption_survives_restart_and_fresh_recall() {
 }
 
 #[test]
+fn plain_preference_is_attributed_and_recalled_after_governed_adoption() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("plain-preference.sqlite");
+    let content = "I prefer concise status updates.";
+
+    let first = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    let captured = first
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            target: Some("user".into()),
+            conclusions: Some(vec![content.into()]),
+            metadata: None,
+            record_type: Some("preference".into()),
+        })
+        .unwrap();
+    let run = first
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap()
+        .run
+        .unwrap();
+
+    assert_eq!(run.created, captured.record_ids);
+    assert_eq!(first.store.count_records().unwrap(), 1);
+    let record = first
+        .store
+        .get_record(&captured.record_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.content, content);
+    assert_eq!(record.metadata["target"], "user");
+    assert_eq!(record.metadata["governed_consolidation_applied"], true);
+    drop(first);
+
+    let fresh = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
+    let recall = fresh
+        .recall(RecallRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            repo: None,
+            session: None,
+            query: Some("concise status updates".into()),
+            files: vec![],
+            max_tokens: Some(500),
+            pack_mode: Some("default".into()),
+            include_types: vec![],
+            exclude_types: vec![],
+            recency_days: None,
+            as_of: None,
+            include_history: false,
+            metadata: None,
+        })
+        .unwrap();
+    assert!(recall.facts.iter().any(|fact| fact.content == content));
+    assert_eq!(recall.authority, "recall_not_authority");
+}
+
+#[test]
 fn scheduled_adoption_fresh_consumer_correction_wins_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("correction.sqlite");
