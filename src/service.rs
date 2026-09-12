@@ -2225,7 +2225,11 @@ impl Service {
             if prior_cost.saturating_add(cost_micros) > limit {
                 let attempted_at = ids::now_rfc3339();
                 self.store.insert_dream_run(&DreamRunAudit {
-                    id: final_run_id,
+                    // A rejected provider call may still be billable. Keep
+                    // each recovery audit distinct because final_run_id is
+                    // deterministic for identical input and INSERT OR
+                    // REPLACE would otherwise erase prior usage.
+                    id: ids::new_id("dream"),
                     profile_id: response.profile.clone(),
                     workspace_id: response.workspace.clone(),
                     repo_id: response.repo_id.clone(),
