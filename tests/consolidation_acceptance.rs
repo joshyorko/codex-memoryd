@@ -373,6 +373,102 @@ fn capped_scheduled_run_preserves_and_continues_unprocessed_tail() {
 }
 
 #[test]
+fn capped_scheduled_run_advances_past_tied_source_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace("personal", "tied-frontier")
+        .expect("workspace");
+    store
+        .ensure_session(
+            "tied-frontier-session",
+            "personal",
+            "tied-frontier",
+            None,
+            None,
+            "fixture",
+        )
+        .expect("session");
+    for id in ["turn-a", "turn-b", "turn-c", "turn-d", "turn-e"] {
+        store
+            .insert_visible_turn(&VisibleTurn {
+                id: id.into(),
+                session_id: "tied-frontier-session".into(),
+                actor: "user".into(),
+                content: format!("generic source {id}"),
+                created_at: "2026-09-10T00:00:00Z".into(),
+                metadata: json!({}),
+            })
+            .expect("visible turn");
+    }
+
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "tied-frontier".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.automatic_apply = false;
+    config.dream_scheduler.scheduled_provider_enabled = false;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_scheduler.max_batch_size = 2;
+    config.dream_scheduler.max_candidates = 10;
+    let service = Service::new(store.clone(), config);
+
+    let first = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("first capped run");
+    assert_eq!(first.status, "ok_with_limits");
+    assert_eq!(
+        first
+            .run
+            .as_ref()
+            .expect("first run")
+            .evidence_window
+            .visible_turns
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-a", "turn-b"]
+    );
+    assert!(first.watermark_after.is_some());
+
+    let second = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("second capped run");
+    assert_eq!(
+        second
+            .run
+            .as_ref()
+            .expect("second run")
+            .evidence_window
+            .visible_turns
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-c", "turn-d"]
+    );
+
+    let third = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("third capped run");
+    assert_eq!(
+        third
+            .run
+            .as_ref()
+            .expect("third run")
+            .evidence_window
+            .visible_turns
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-e"]
+    );
+}
+
+#[test]
 fn low_volume_idle_scope_progresses_with_an_explicit_zero_turn_threshold() {
     let store = Store::open(":memory:").expect("store");
     let mut config = Config::default();
