@@ -156,7 +156,6 @@ export class MemoryDClient {
         profile: request.profile,
         workspace: request.workspace,
         target: "assistant",
-        type: "workflow_pattern",
         conclusions: [request.content],
         metadata: {
           source_kind: "omp_explicit_save",

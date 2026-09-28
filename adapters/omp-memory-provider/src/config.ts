@@ -66,6 +66,14 @@ function requiredScope(value: unknown, name: "profile" | "workspace"): string {
   }
   return value.trim();
 }
+const PROFILE_IDS = ["personal", "work", "oss", "homelab"] as const;
+function requiredProfile(value: unknown): string {
+  const profile = requiredScope(value, "profile");
+  if (!PROFILE_IDS.includes(profile as (typeof PROFILE_IDS)[number])) {
+    throw new MemoryDConfigError("invalid_value", "MemoryD profile is unsupported");
+  }
+  return profile;
+}
 
 type ConfigInput = Omit<Partial<MemoryDConfig>, "autoObserve"> & { autoObserve?: unknown };
 export function loadConfig(input: ConfigInput = {}): MemoryDConfig {
@@ -77,7 +85,7 @@ export function loadConfig(input: ConfigInput = {}): MemoryDConfig {
   }
   return {
     baseUrl: loopbackEndpoint(input.baseUrl ?? DEFAULT_CONFIG.baseUrl),
-    profile: requiredScope(input.profile, "profile"),
+    profile: requiredProfile(input.profile),
     workspace: requiredScope(input.workspace, "workspace"),
     autoRecall: input.autoRecall !== false,
     autoObserve: false,

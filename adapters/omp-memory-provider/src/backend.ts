@@ -1,3 +1,4 @@
+import { isRecord } from "./guards";
 import { MemoryDClient, MemoryDClientError } from "./client";
 import { formatRecall } from "./format";
 import type {
@@ -103,13 +104,19 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       const state = stateFor(context.session);
       if (!state) return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "Backend has not been started for this session" };
       try {
-        await client.status();
+        const data = await client.status();
+        const storage = isRecord(data.storage) ? data.storage : undefined;
+        const features = isRecord(data.features) ? data.features : undefined;
+        const providerStatus = typeof data.status === "string" ? data.status : "protocol-mismatch";
+        const writable = storage?.writable === true;
+        const searchable = features?.recall === true;
+        const active = (providerStatus === "local_only" || providerStatus === "degraded") && storage !== undefined;
         return {
           backend: "codex-memoryd",
-          active: true,
-          writable: true,
-          searchable: true,
-          message: `${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled`,
+          active,
+          writable,
+          searchable,
+          message: `${providerStatus}; ${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled`,
         };
       } catch (error) {
         return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: failureOutcome(error) };

@@ -31,6 +31,17 @@ export function formatRecall(data: RecallData, maxTokens: number): FormattedReca
     lines.push(line);
     count += 1;
   }
+  const checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints.slice(0, 4) : [];
+  for (const candidate of checkpoints) {
+    if (!isRecord(candidate) || typeof candidate.summary !== "string" || candidate.summary.trim() === "") continue;
+    const line = formatCheckpoint(candidate);
+    if (estimateTokens(lines.concat(line).join("\n")) > budget) {
+      truncated = true;
+      break;
+    }
+    lines.push(line);
+    count += 1;
+  }
   const withheld = Array.isArray(data.withheld)
     ? data.withheld.reduce((total, item) => total + (isRecord(item) && typeof item.count === "number" && Number.isFinite(item.count) ? Math.max(0, Math.floor(item.count)) : 0), 0)
     : 0;
@@ -62,6 +73,17 @@ function formatFact(fact: RecallFact): string {
   else if (typeof freshness?.age_days === "number" && Number.isFinite(freshness.age_days)) labels.push(`age_days: ${Math.max(0, Math.floor(freshness.age_days))}`);
   const prefix = labels.length === 0 ? "" : `[${labels.join("; ")}] `;
   return `- ${prefix}${String(fact.content).trim()}`;
+}
+
+function formatCheckpoint(checkpoint: Record<string, unknown>): string {
+  const labels: string[] = ["checkpoint", "recall_not_authority"];
+  for (const key of ["id", "branch", "commit", "created_at"]) {
+    const value = checkpoint[key];
+    if (typeof value === "string" && SAFE_ID.test(value)) labels.push(`${key}: ${value}`);
+  }
+  const nextSteps = Array.isArray(checkpoint.next_steps) ? checkpoint.next_steps.filter((step): step is string => typeof step === "string").slice(0, 3) : [];
+  const suffix = nextSteps.length > 0 ? `; next: ${nextSteps.join(" | ")}` : "";
+  return `- [${labels.join("; ")}] ${checkpoint.summary as string}${suffix}`;
 }
 
 function estimateTokens(value: string): number {
