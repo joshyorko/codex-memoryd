@@ -70,8 +70,9 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
     async save(context: BackendOperationContext, input: MemoryBackendSaveInput): Promise<MemoryBackendSaveResult> {
       if (input.content.length > 16_000) return { backend: "codex-memoryd", stored: 0, message: "Explicit save exceeds the 16000-character MemoryD limit" };
+      const owner = context.session ?? rootSession ?? activeSession;
       try {
-        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: context.session?.sessionId, repoId: context.session?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
+        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: owner?.sessionId, repoId: owner?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
         if (!Array.isArray(data.record_ids) && !Array.isArray(data.created) && !Array.isArray(data.rejected)) throw new MemoryDClientError("protocol-mismatch");
         const ids = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
         return { backend: "codex-memoryd", stored: ids.length, ids, message: Array.isArray(data.rejected) && data.rejected.length ? `${data.rejected.length} explicit save rejected by policy` : undefined };

@@ -175,3 +175,32 @@ describe("transport and lifecycle", () => {
     }
   });
 });
+
+  test("save uses active root scope and preserves repository metadata", async () => {
+    const original = globalThis.fetch;
+    let body: Record<string, any> | undefined;
+    globalThis.fetch = async (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return envelope({ record_ids: ["r1"] });
+    };
+    try {
+      const session = { sessionId: "s1", repoId: "repo-new" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      const saved = await backend.save?.({ agentDir: ".", cwd: "." }, { content: "explicit" });
+      expect(saved?.stored).toBe(1);
+      expect(body?.metadata?.session_id).toBe("s1");
+      expect(body?.repo?.repo_id).toBe("repo-new");
+
+      await new MemoryDClient(config).explicitSave({
+        profile: "personal",
+        workspace: "josh-personal",
+        content: "explicit",
+        repoId: "repo-new",
+        repo: { branch: "main", commit: "abc" },
+      });
+      expect(body?.repo).toEqual({ branch: "main", commit: "abc", repo_id: "repo-new" });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });

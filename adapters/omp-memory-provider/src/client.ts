@@ -148,6 +148,7 @@ export class MemoryDClient {
     source?: string;
     sessionId?: string;
     repoId?: string;
+    repo?: Readonly<Record<string, unknown>>;
     timeoutMs?: number;
   }): Promise<{ created?: unknown; record_ids?: unknown; rejected?: unknown }> {
     return this.requestData("/v1/conclusions", {
@@ -156,7 +157,7 @@ export class MemoryDClient {
       body: {
         profile: request.profile,
         workspace: request.workspace,
-        repo: request.repoId ? { repo_id: request.repoId } : undefined,
+        repo: request.repoId || request.repo ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}) } : undefined,
         conclusions: [request.content],
         metadata: {
           source_kind: "omp_explicit_save",
