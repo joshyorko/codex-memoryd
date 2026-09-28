@@ -353,6 +353,12 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
         || !object
             .get("segment")
             .and_then(Value::as_object)
+            .and_then(|segment| segment.get("content_sha256"))
+            .and_then(Value::as_str)
+            .is_some_and(valid_digest)
+        || !object
+            .get("segment")
+            .and_then(Value::as_object)
             .and_then(|segment| segment.get("ciphertext_sha256"))
             .and_then(Value::as_str)
             .is_some_and(valid_digest)
@@ -369,7 +375,9 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
     match cross_profile_boundary(source, target_profile) {
         BoundaryDecision::Deny { .. } => Some("profile-boundary-denied"),
         BoundaryDecision::AllowGenericPreferencesOnly => {
-            let record = object.get("record").and_then(Value::as_object)?;
+            let Some(record) = object.get("record").and_then(Value::as_object) else {
+                return Some("profile-boundary-filtered");
+            };
             let record_type = record
                 .get("record_type")
                 .or_else(|| record.get("type"))
@@ -382,8 +390,10 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
             let workspace_bound = ["workspace_id", "workspace", "repo_id", "repository", "repo"]
                 .iter()
                 .any(|key| record.get(*key).is_some_and(|value| !value.is_null()));
+            let profile_only = record.get("profile_only").and_then(Value::as_bool).unwrap_or(false);
             if !workspace_bound
-                && record.get("scope").and_then(Value::as_str) == Some("global")
+                && !profile_only
+                && record.get("scope").and_then(Value::as_str).is_some_and(|scope| scope == "global" || scope == "user")
                 && record_type.is_some_and(|kind| {
                     sensitivity.is_some_and(|level| policy::is_generic_preference(kind, level))
                 })
@@ -397,14 +407,15 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
     }
 }
 fn cross_profile_boundary(source: &str, target: &str) -> BoundaryDecision {
-    if source == target {
-        return BoundaryDecision::Allow;
-    }
-    match (Profile::parse(source), Profile::parse(target)) {
-        (Some(from), Some(to)) => policy::export_boundary(from, to),
-        _ => BoundaryDecision::Deny {
+    let (Some(from), Some(to)) = (Profile::parse(source), Profile::parse(target)) else {
+        return BoundaryDecision::Deny {
             reason: "unsupported profile pair".to_string(),
-        },
+        };
+    };
+    if from == to {
+        BoundaryDecision::Allow
+    } else {
+        policy::export_boundary(from, to)
     }
 }
 
@@ -461,9 +472,13 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
         quarantine(report, "summary-mismatch");
         return;
     }
-    match object.get("next_cursor") {
-        None | Some(Value::Null) => *cursor = Some(None),
-        Some(Value::String(value)) if validate_cursor(value).is_ok() => {
+    let Some(next_cursor) = object.get("next_cursor") else {
+        quarantine(report, "cursor-invalid");
+        return;
+    };
+    match next_cursor {
+        Value::Null => *cursor = Some(None),
+        Value::String(value) if validate_cursor(value).is_ok() => {
             *cursor = Some(Some(value.clone()))
         },
         _ => quarantine(report, "cursor-invalid"),
