@@ -94,7 +94,8 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       try {
         const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context ? truncateCodePoints(input.context, 2_000) : undefined, source: input.source ? truncateCodePoints(input.source, 200) : undefined, sessionId: owner?.sessionId, repoId: owner?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
         if (!Array.isArray(data.record_ids) && !Array.isArray(data.created) && !Array.isArray(data.rejected)) throw new MemoryDClientError("protocol-mismatch");
-        const ids = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
+        const recordIds = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
+        const ids = recordIds.length > 0 ? recordIds : Array.isArray(data.created) ? data.created.filter((id): id is string => typeof id === "string") : [];
         return { backend: "codex-memoryd", stored: ids.length, ids, message: Array.isArray(data.rejected) && data.rejected.length ? `${data.rejected.length} explicit save rejected by policy` : undefined };
       } catch (error) { return { backend: "codex-memoryd", stored: 0, message: failureOutcome(error) }; }
     },

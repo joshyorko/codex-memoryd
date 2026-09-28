@@ -227,6 +227,20 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+  test("counts an accepted conclusion when daemon omits a derived record id", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({ created: ["concl_1"], record_ids: [], rejected: [] });
+    try {
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session: { sessionId: "s1" }, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await expect(backend.save?.({ agentDir: ".", cwd: "." }, { content: "accepted" })).resolves.toMatchObject({
+        stored: 1,
+        ids: ["concl_1"],
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 
   test("counts Unicode code points for the explicit-save limit", async () => {
     const original = globalThis.fetch;
