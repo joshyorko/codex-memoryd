@@ -149,6 +149,7 @@ describe("transport and lifecycle", () => {
     globalThis.fetch = async () => envelope({});
     try {
       const client = new MemoryDClient(config);
+      await expect(client.status()).rejects.toMatchObject({ kind: "protocol-mismatch" });
       await expect(client.recall({ profile: "personal", workspace: "josh-personal", query: "q", maxTokens: 10 })).rejects.toMatchObject({ kind: "protocol-mismatch" });
       await expect(client.search({ profile: "personal", workspace: "josh-personal", query: "q" })).rejects.toMatchObject({ kind: "protocol-mismatch" });
       await expect(client.explicitSave({ profile: "personal", workspace: "josh-personal", content: "save" })).rejects.toMatchObject({ kind: "protocol-mismatch" });

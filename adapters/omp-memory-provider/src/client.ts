@@ -81,9 +81,8 @@ export class MemoryDClient {
       return false;
     }
   }
-
   async status(signal?: AbortSignal): Promise<StatusData> {
-    return this.requestData<StatusData>("/v1/status", { method: "GET", signal });
+    return this.requestData<StatusData>("/v1/status", { method: "GET", signal }, isStatusData);
   }
 
   async recall(
@@ -304,4 +303,15 @@ function isSearchData(data: Record<string, unknown>): boolean {
 
 function isExplicitSaveData(data: Record<string, unknown>): boolean {
   return Array.isArray(data.created) && Array.isArray(data.record_ids) && Array.isArray(data.rejected);
+}
+
+function isStatusData(data: Record<string, unknown>): boolean {
+  const storage = data.storage;
+  const features = data.features;
+  return typeof data.status === "string"
+    && isRecord(storage)
+    && typeof storage.writable === "boolean"
+    && isRecord(features)
+    && typeof features.recall === "boolean"
+    && typeof features.search === "boolean";
 }
