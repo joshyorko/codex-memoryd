@@ -669,6 +669,57 @@ mod tests {
     }
 
     #[test]
+    fn reconciles_multiple_records_and_mixed_quarantine_by_unique_indexes() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "workspace_id": "ws",
+            "destination": "room-destination",
+            "index_key": digest('d'),
+            "reason_code": "broken-chain"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "next_cursor": "opaque-cursor",
+            "complete": true,
+            "inspected_indexes": 1,
+            "records": 2,
+            "quarantined": 1
+        });
+        let input = format!(
+            "{}\n{}\n{}\n{}\n",
+            record("work", "ws", "one", "safe one"),
+            record("work", "ws", "two", "safe two"),
+            quarantine,
+            summary
+        );
+        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws")).unwrap();
+        assert_eq!(response.imported, 2);
+        assert_eq!(response.quarantined, 1);
+        assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
+    }
+
+    #[test]
+    fn changed_payload_with_replayed_key_is_rejected() {
+        let original = record("work", "ws", "one", "safe one");
+        let key = serde_json::from_str::<Value>(&original).unwrap()["idempotency_key"].as_str().unwrap().to_string();
+        let mut changed = serde_json::from_str::<Value>(&original).unwrap();
+        changed["record"]["text"] = Value::String("changed payload".to_string());
+        let response = run_reader(Cursor::new(format!("{}\n{}\n", changed, summary(None))), {
+            let mut params = PccImportParams::new("unused", "work", "ws");
+            params.seen_idempotency_keys.insert(key);
+            params
+        }).unwrap();
+        assert_eq!(response.imported, 0);
+        assert!(response.quarantine_reasons.contains(&"idempotency-key-mismatch".to_string()));
+    }
+
+    #[test]
     fn invalid_ciphertext_index_cannot_reconcile_or_advance_cursor() {
         let mut value = serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
         value["segment"]["ciphertext_sha256"] = Value::String("not-a-digest".to_string());
