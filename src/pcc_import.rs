@@ -175,6 +175,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                     .and_then(Value::as_object)
                     .and_then(|segment| segment.get("ciphertext_sha256"))
                     .and_then(Value::as_str)
+                    .filter(|value| valid_digest(value))
                 {
                     report.observed_indexes.insert(digest.to_string());
                 }
