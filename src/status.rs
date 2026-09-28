@@ -90,6 +90,7 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
     let features = json!({
         "fts5": store.fts_enabled(),
         "search_mode": if store.fts_enabled() { "fts5" } else { "like" },
+        "recall": true,
         "import_local": true,
         "search": true,
         "checkpoints": true,
