@@ -475,10 +475,9 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
                 .and_then(Value::as_object)
                 .and_then(|record| record.get("portability"))
                 .and_then(Value::as_str);
-            if matches!(portability, Some("never_export" | "profile_only")) {
-                Some("profile-boundary-denied")
-            } else {
-                None
+            match portability {
+                Some("portable" | "workspace_only") => None,
+                _ => Some("profile-boundary-denied"),
             }
         }
         BoundaryDecision::Allow => None,
@@ -1158,6 +1157,26 @@ mod tests {
         .unwrap();
         assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
         assert!(!response.quarantine_reasons.contains(&"input-limit".to_string()));
+    }
+
+    #[test]
+    fn cross_profile_record_requires_explicit_portability() {
+        let mut params = PccImportParams::new("unused", "oss", "ws", "room-destination");
+        params.target_profile = Some("personal".to_string());
+        let response = run_reader(
+            Cursor::new(format!(
+                "{}\n{}\n",
+                record("oss", "ws", "missing-portability", "safe"),
+                summary(Some("opaque-cursor"))
+            )),
+            params,
+        )
+        .unwrap();
+        assert_eq!(response.imported, 0);
+        assert_eq!(response.cursor, None);
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]

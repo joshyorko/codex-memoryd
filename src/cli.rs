@@ -3773,7 +3773,12 @@ mod tests {
         assert!(error.message.contains("NUL"));
     }
     #[test]
-    fn pcc_replay_preflight_allows_url_and_db_together() {
+    fn pcc_replay_dispatch_skips_runtime_and_url_db_preflights() {
+        let input = std::env::temp_dir().join(format!(
+            "codex-memoryd-pcc-replay-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&input, "{}\n").unwrap();
         let cli = Cli::try_parse_from([
             "codex-memoryd",
             "--url",
@@ -3788,9 +3793,18 @@ mod tests {
             "workspace",
             "--destination",
             "room-destination",
-            "/tmp/replay.jsonl",
+            input.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(validate_cli_preflight(&cli).is_ok());
+        let previous_runtime = std::env::var("CODEX_MEMORYD_RUNTIME").ok();
+        std::env::set_var("CODEX_MEMORYD_RUNTIME", "invalid-for-preflight-test");
+        let result = dispatch(cli);
+        if let Some(value) = previous_runtime {
+            std::env::set_var("CODEX_MEMORYD_RUNTIME", value);
+        } else {
+            std::env::remove_var("CODEX_MEMORYD_RUNTIME");
+        }
+        std::fs::remove_file(input).unwrap();
+        assert!(result.is_ok());
     }
 }
