@@ -133,13 +133,13 @@ struct Report {
     records_seen: usize,
     producer_quarantines: usize,
     observed_indexes: HashSet<String>,
-    unidentified_indexes: bool,
+    unidentified_indexes: usize,
     idempotency_keys: Vec<String>,
     quarantine_reasons: Vec<String>,
 }
 
 fn observed_index_count(report: &Report) -> usize {
-    report.observed_indexes.len() + usize::from(report.unidentified_indexes)
+    report.observed_indexes.len() + report.unidentified_indexes
 }
 
 /// Consume one bounded PCC JSONL export and return a safe receipt.
@@ -270,7 +270,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                     {
                         report.observed_indexes.insert(index.to_string());
                     } else {
-                        report.unidentified_indexes = true;
+                        report.unidentified_indexes += 1;
                     }
                 }
             }
@@ -464,6 +464,18 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
     match cross_profile_boundary(source, target_profile) {
         BoundaryDecision::Deny { .. } => Some("profile-boundary-denied"),
         BoundaryDecision::AllowGenericPreferencesOnly => Some("profile-boundary-filtered"),
+        BoundaryDecision::Allow if source != target_profile => {
+            let portability = object
+                .get("record")
+                .and_then(Value::as_object)
+                .and_then(|record| record.get("portability"))
+                .and_then(Value::as_str);
+            if matches!(portability, Some("never_export" | "profile_only" | "workspace_only")) {
+                Some("profile-boundary-denied")
+            } else {
+                None
+            }
+        }
         BoundaryDecision::Allow => None,
     }
 }
@@ -821,6 +833,38 @@ mod tests {
     }
 
     #[test]
+    fn counts_each_unkeyed_quarantine_index() {
+        let quarantine = |id: char| {
+            serde_json::json!({
+                "schema": INPUT_SCHEMA,
+                "schema_version": {"major": 1, "minor": 0},
+                "type": "quarantine",
+                "quarantine_id": digest(id),
+                "profile_id": "work",
+                "destination": "room-destination",
+                "reason_code": "index-read-failed"
+            })
+        };
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 2,
+            "records": 0,
+            "quarantined": 2,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n{}\n", quarantine('a'), quarantine('b'), summary)),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
+        assert_eq!(response.quarantined, 2);
+    }
+
+    #[test]
     fn work_quarantine_cannot_cross_to_personal() {
         let quarantine = serde_json::json!({
             "schema": INPUT_SCHEMA,
@@ -1022,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn work_to_personal_and_prompt_injection_are_quarantined() {
+    fn prompt_injection_is_quarantined() {
         let input = format!(
             "{}\n{}\n",
             record("work", "ws", &digest('c'), "safe"),
@@ -1036,6 +1080,37 @@ mod tests {
     }
 
     #[test]
+    fn work_to_personal_record_is_denied() {
+        let input = format!(
+            "{}\n{}\n",
+            record("work", "ws", "ignored", "safe"),
+            summary(Some("opaque-cursor"))
+        );
+        let mut params = PccImportParams::new("unused", "work", "ws", "room-destination");
+        params.target_profile = Some("personal".to_string());
+        let response = run_reader(Cursor::new(input), params).unwrap();
+        assert_eq!(response.imported, 0);
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+    }
+
+    #[test]
+    fn never_export_record_cannot_cross_an_allowed_profile_boundary() {
+        let mut value = serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
+        value["record"]["portability"] = Value::String("never_export".to_string());
+        let mut params = PccImportParams::new("unused", "oss", "ws", "room-destination");
+        params.target_profile = Some("personal".to_string());
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", value, summary(Some("opaque-cursor")))),
+            params,
+        )
+        .unwrap();
+        assert_eq!(response.imported, 0);
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+    }
+
+    #[test]
     fn personal_to_work_does_not_trust_producer_generic_labels() {
         let mut value = serde_json::from_str::<Value>(&record("personal", "ws", "ignored", "safe")).unwrap();
         value["record"]["record_type"] = Value::String("preference".to_string());
@@ -1046,6 +1121,21 @@ mod tests {
         let response = run_reader(Cursor::new(format!("{}\n{}\n", value, summary(None))), params).unwrap();
         assert_eq!(response.imported, 0);
         assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+    }
+
+    #[test]
+    fn exact_line_limit_at_eof_preserves_terminal_cursor() {
+        let mut lines = Vec::with_capacity(MAX_LINES);
+        lines.push(record("work", "ws", "ignored", "safe"));
+        lines.extend(std::iter::repeat(String::new()).take(MAX_LINES - 2));
+        lines.push(summary(Some("opaque-cursor")));
+        let response = run_reader(
+            Cursor::new(format!("{}\n", lines.join("\n"))),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
+        assert!(!response.quarantine_reasons.contains(&"input-limit".to_string()));
     }
 
     #[test]

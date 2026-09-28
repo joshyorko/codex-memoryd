@@ -1055,6 +1055,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         cli.command,
         Command::Bundle {
             command: BundleCommand::Inspect { .. }
+        } | Command::Import {
+            command: ImportCommand::PccReplay { .. }
         }
     );
     if cli.runtime.is_none() && !database_free_inspect {
