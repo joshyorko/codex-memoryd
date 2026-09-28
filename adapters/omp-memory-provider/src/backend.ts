@@ -52,7 +52,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     if (!query.trim()) return { count: 0, outcome: "healthy-empty" as string };
     try {
       const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, repo: repoFor(session), maxTokens: config.maxTokens, signal });
-      if (!Array.isArray(data.facts) && !Array.isArray(data.checkpoints)) throw new MemoryDClientError("protocol-mismatch");
+      if (!Array.isArray(data.facts) || !Array.isArray(data.checkpoints)) throw new MemoryDClientError("protocol-mismatch");
       const formatted = formatRecall(data, config.maxTokens);
       return { ...formatted, outcome: formatted.count ? "healthy-with-memory" : "healthy-empty" };
     } catch (error) { return { count: 0, outcome: failureOutcome(error) }; }
@@ -60,7 +60,15 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
   const backend: MemoryBackend = {
     id: "codex-memoryd",
     async start(context: BackendFactoryContext): Promise<void> {
-      if (context.taskDepth === 0) { rootSession = context.session; activeSession = context.session; }
+      if (context.taskDepth === 0) {
+        if (rootSession && rootSession !== context.session) {
+          epoch += 1;
+          activeSession = undefined;
+          rootSession = undefined;
+        }
+        rootSession = context.session;
+        activeSession = context.session;
+      }
       const key = context.session as object;
       const previous = states.get(key);
       states.set(key, { generation: (previous?.generation ?? 0) + 1, epoch, autoRecall: context.taskDepth === 0 && config.autoRecall, lastCount: 0, lastOutcome: context.taskDepth === 0 ? "ready" : "subagent-disabled" });

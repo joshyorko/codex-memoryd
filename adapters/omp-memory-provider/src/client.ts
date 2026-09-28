@@ -115,7 +115,7 @@ export class MemoryDClient {
         pack_mode: "active_task",
         metadata: { source_kind: "omp_native_recall" },
       },
-    });
+    }, isRecallData);
   }
 
   async search(
@@ -139,7 +139,7 @@ export class MemoryDClient {
         repo: request.repo || request.repoId ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}) } : undefined,
         limit: Math.max(1, Math.min(100, Math.floor(request.limit ?? 20))),
       },
-    });
+    }, isSearchData);
   }
   async explicitSave(request: {
     profile: string;
@@ -154,7 +154,7 @@ export class MemoryDClient {
   }): Promise<{ created: unknown; record_ids: unknown; rejected: unknown }> {
     return this.requestData("/v1/conclusions", {
       method: "POST",
-      timeoutMs: request.timeoutMs,
+      timeoutMs: request.timeoutMs ?? Math.max(this.config.recallTimeoutMs, 5_000),
       body: {
         profile: request.profile,
         workspace: request.workspace,
@@ -168,12 +168,12 @@ export class MemoryDClient {
           repo_identity: request.repo ? { status: "provided", ...request.repo } : request.repoId ? { status: "provided", repo_id: request.repoId } : { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
         },
       },
-    });
+    }, isExplicitSaveData);
   }
 
-  private async requestData<T>(path: string, options: RequestOptions): Promise<T> {
+  private async requestData<T>(path: string, options: RequestOptions, validate?: DataValidator): Promise<T> {
     const data = await this.request(path, options);
-    if (!isRecord(data) || data.ok !== true || !isRecord(data.data)) {
+    if (!isRecord(data) || data.ok !== true || !isRecord(data.data) || (validate !== undefined && !validate(data.data))) {
       throw new MemoryDClientError("protocol-mismatch");
     }
     return data.data as T;
@@ -290,4 +290,18 @@ async function readBoundedBody(
     offset += chunk.byteLength;
   }
   return result;
+}
+
+type DataValidator = (data: Record<string, unknown>) => boolean;
+
+function isRecallData(data: Record<string, unknown>): boolean {
+  return Array.isArray(data.facts) && Array.isArray(data.checkpoints);
+}
+
+function isSearchData(data: Record<string, unknown>): boolean {
+  return Array.isArray(data.matches);
+}
+
+function isExplicitSaveData(data: Record<string, unknown>): boolean {
+  return Array.isArray(data.created) && Array.isArray(data.record_ids) && Array.isArray(data.rejected);
 }

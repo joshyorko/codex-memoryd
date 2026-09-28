@@ -86,6 +86,16 @@ describe("recall formatting", () => {
     expect(rendered.count).toBe(1);
     expect(rendered.context).toContain("safe");
   });
+
+  test("renders checkpoint-only resume context", () => {
+    const rendered = formatRecall({
+      facts: [],
+      checkpoints: [{ id: "cp_1", summary: "Resume the release task", branch: "main", commit: "abc123", next_steps: ["run tests"] }],
+    }, 1200);
+    expect(rendered.count).toBe(1);
+    expect(rendered.context).toContain("Resume the release task");
+    expect(rendered.context).toContain("next: run tests");
+  });
 });
   test("renders withheld-only diagnostics without admitting memory", () => {
     const rendered = formatRecall({ withheld: [{ reason: "policy", count: 2 }, { reason: "quarantine", count: 3 }] }, 1200);
@@ -129,6 +139,19 @@ describe("transport and lifecycle", () => {
       await expect(client.status()).rejects.toMatchObject({ kind: "http", status: 500 });
       await expect(client.recall({ profile: "personal", workspace: "josh-personal", query: "q", maxTokens: 10 })).rejects.toMatchObject({ kind: "protocol-mismatch" });
       expect(cancelled).toBe(2);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("rejects endpoint payloads that omit required arrays", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({});
+    try {
+      const client = new MemoryDClient(config);
+      await expect(client.recall({ profile: "personal", workspace: "josh-personal", query: "q", maxTokens: 10 })).rejects.toMatchObject({ kind: "protocol-mismatch" });
+      await expect(client.search({ profile: "personal", workspace: "josh-personal", query: "q" })).rejects.toMatchObject({ kind: "protocol-mismatch" });
+      await expect(client.explicitSave({ profile: "personal", workspace: "josh-personal", content: "save" })).rejects.toMatchObject({ kind: "protocol-mismatch" });
     } finally {
       globalThis.fetch = original;
     }
@@ -178,7 +201,7 @@ describe("transport and lifecycle", () => {
 
   test("stale session results cannot commit", async () => {
     const original = globalThis.fetch;
-    globalThis.fetch = async () => envelope({ facts: [{ id: "m", content: "context" }], authority: "recall_not_authority" });
+    globalThis.fetch = async () => envelope({ facts: [{ id: "m", content: "context" }], checkpoints: [], authority: "recall_not_authority" });
     try {
       const session = { sessionId: "s1" };
       const backend = createMemoryDBackend(config);
@@ -186,6 +209,41 @@ describe("transport and lifecycle", () => {
       const preparation = await backend.beforeAgentStartPrompt?.(session, "prompt");
       await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
       expect(preparation?.commit()).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("root replacement invalidates an in-flight recall", async () => {
+    const original = globalThis.fetch;
+    const { promise, resolve } = Promise.withResolvers<Response>();
+    globalThis.fetch = async () => promise;
+    try {
+      const first = { sessionId: "first" };
+      const second = { sessionId: "second" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session: first, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      const pending = backend.beforeAgentStartPrompt?.(first, "prompt");
+      await backend.start({ session: second, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      resolve(envelope({ facts: [{ id: "m", content: "stale" }], checkpoints: [], authority: "recall_not_authority" }));
+      await expect(pending).resolves.toBeUndefined();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("global clear invalidates sessioned compaction recall", async () => {
+    const original = globalThis.fetch;
+    const { promise, resolve } = Promise.withResolvers<Response>();
+    globalThis.fetch = async () => promise;
+    try {
+      const session = { sessionId: "s1" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      const pending = backend.preCompactionContext?.([{ content: "prompt" }], {}, session);
+      await backend.clear(".", ".");
+      resolve(envelope({ facts: [{ id: "m", content: "stale" }], checkpoints: [], authority: "recall_not_authority" }));
+      await expect(pending).resolves.toBeUndefined();
     } finally {
       globalThis.fetch = original;
     }
@@ -330,7 +388,7 @@ describe("transport and lifecycle", () => {
     globalThis.fetch = async (input, init) => {
       const path = new URL(String(input)).pathname;
       bodies.set(path, [...(bodies.get(path) ?? []), JSON.parse(String(init?.body ?? "{}"))]);
-      if (path === "/v1/recall") return envelope({ facts: [], authority: "recall_not_authority" });
+      if (path === "/v1/recall") return envelope({ facts: [], checkpoints: [], authority: "recall_not_authority" });
       if (path === "/v1/search") return envelope({ matches: [] });
       return envelope({ created: [], record_ids: ["r1"], rejected: [] });
     };
