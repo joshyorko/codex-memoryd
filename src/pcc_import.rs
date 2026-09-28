@@ -30,6 +30,48 @@ const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_POLICY_VALUES: usize = 4_096;
 const MAX_POLICY_DEPTH: usize = 32;
 const MAX_REPORT_KEYS: usize = 1_024;
+const PRODUCER_REASON_CODES: &[&str] = &[
+    "broken-chain",
+    "capture-quarantined",
+    "ciphertext-size-invalid",
+    "ciphertext-too-large",
+    "corrupt-ciphertext",
+    "decrypt-failed",
+    "digest-mismatch",
+    "digest_mismatch",
+    "document_not_object",
+    "duplicate_asset_reference",
+    "evidence-invalid",
+    "evidence-read-failed",
+    "identity-unavailable",
+    "identifier_too_long",
+    "index-invalid",
+    "index-kind-mismatch",
+    "index-read-failed",
+    "index-reference-invalid",
+    "invalid_asset_reference",
+    "invalid_checkpoint",
+    "invalid_digest",
+    "invalid_enum",
+    "invalid_identifier",
+    "invalid_metadata",
+    "invalid_repository_provenance",
+    "invalid_timestamp",
+    "invalid_version",
+    "manifest-mismatch",
+    "missing-asset",
+    "missing_checkpoint",
+    "missing_field",
+    "policy-mismatch",
+    "profile-boundary-denied",
+    "segment-too-large",
+    "unknown-major",
+    "unknown_major",
+    "unknown_document_kind",
+    "unknown_field",
+    "unknown_schema",
+    "wrong_type",
+];
 
 #[derive(Debug, Clone)]
 pub struct PccImportParams {
@@ -592,11 +634,7 @@ fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 fn allowed_reason_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
+    PRODUCER_REASON_CODES.contains(&value)
         && matches!(policy::screen_string_value(value), PolicyDecision::Accept(_))
 }
 
@@ -905,6 +943,37 @@ mod tests {
         let input = format!("{}\n{}\n", quarantine, summary);
         let response = run_reader(
             Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+    }
+
+    #[test]
+    fn unrecognized_quarantine_reason_cannot_advance_cursor() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "destination": "room-destination",
+            "index_key": digest('d'),
+            "reason_code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 0,
+            "records": 0,
+            "quarantined": 1,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", quarantine, summary)),
             PccImportParams::new("unused", "work", "ws", "room-destination"),
         )
         .unwrap();
