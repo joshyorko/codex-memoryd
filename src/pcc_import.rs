@@ -432,6 +432,10 @@ fn cross_profile_boundary(source: &str, target: &str) -> BoundaryDecision {
     };
     if from == to {
         BoundaryDecision::Allow
+    } else if matches!((from, to), (Profile::Personal, Profile::Work)) {
+        BoundaryDecision::Deny {
+            reason: "personal-to-work import requires locally derived eligibility".to_string(),
+        }
     } else {
         policy::export_boundary(from, to)
     }
