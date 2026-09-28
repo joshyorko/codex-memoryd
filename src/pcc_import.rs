@@ -466,20 +466,21 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
 
 fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Option<&'static str> {
     let source = object.get("profile_id").and_then(Value::as_str).unwrap_or("");
+    let portability = object
+        .get("record")
+        .and_then(Value::as_object)
+        .and_then(|record| record.get("portability"))
+        .and_then(Value::as_str);
+    if portability == Some("never_export") {
+        return Some("profile-boundary-denied");
+    }
     match cross_profile_boundary(source, target_profile) {
         BoundaryDecision::Deny { .. } => Some("profile-boundary-denied"),
         BoundaryDecision::AllowGenericPreferencesOnly => Some("profile-boundary-filtered"),
-        BoundaryDecision::Allow if source != target_profile => {
-            let portability = object
-                .get("record")
-                .and_then(Value::as_object)
-                .and_then(|record| record.get("portability"))
-                .and_then(Value::as_str);
-            match portability {
-                Some("portable" | "workspace_only") => None,
-                _ => Some("profile-boundary-denied"),
-            }
-        }
+        BoundaryDecision::Allow if source != target_profile => match portability {
+            Some("portable" | "workspace_only") => None,
+            _ => Some("profile-boundary-denied"),
+        },
         BoundaryDecision::Allow => None,
     }
 }
@@ -525,6 +526,9 @@ fn consume_quarantine(
     let index_key_valid = object
         .get("index_key")
         .map_or(true, |value| value.as_str().is_some_and(valid_digest));
+    let ciphertext_sha256_valid = object
+        .get("ciphertext_sha256")
+        .map_or(true, |value| value.as_str().is_some_and(valid_digest));
     let reason_valid = object
         .get("reason_code")
         .and_then(Value::as_str)
@@ -534,6 +538,7 @@ fn consume_quarantine(
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
         || !index_key_valid
+        || !ciphertext_sha256_valid
         || !reason_valid
     {
         quarantine(report, "quarantine-invalid");
@@ -804,6 +809,39 @@ mod tests {
         let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
         assert_eq!(response.cursor, None);
         assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+    }
+
+    #[test]
+    fn malformed_quarantine_ciphertext_fallback_cannot_count_or_advance_cursor() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "destination": "room-destination",
+            "ciphertext_sha256": "not-a-digest",
+            "reason_code": "broken-chain"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 1,
+            "records": 0,
+            "quarantined": 1,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", quarantine, summary)),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.cursor, None);
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
@@ -1112,6 +1150,26 @@ mod tests {
         assert_eq!(response.imported, 0);
         assert_eq!(response.cursor, None);
         assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+    }
+
+    #[test]
+    fn never_export_record_is_denied_on_same_profile_replay() {
+        let mut value = serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
+        value["record"]["portability"] = Value::String("never_export".to_string());
+        value["idempotency_key"] =
+            Value::String(expected_idempotency_key(value.as_object().unwrap()).unwrap());
+        let mut params = PccImportParams::new("unused", "work", "ws", "room-destination");
+        params.target_profile = Some("work".to_string());
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", value, summary(Some("opaque-cursor")))),
+            params,
+        )
+        .unwrap();
+        assert_eq!(response.imported, 0);
+        assert_eq!(response.cursor, None);
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
