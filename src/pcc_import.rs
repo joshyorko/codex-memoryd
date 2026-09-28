@@ -255,6 +255,9 @@ fn validate_params(params: &PccImportParams) -> Result<()> {
     if params.profile.trim().is_empty() || params.profile.len() > 128 {
         return Err(Error::invalid_request("PCC profile is invalid"));
     }
+    if Profile::parse(&params.profile).is_none() {
+        return Err(Error::invalid_request("PCC profile is unsupported"));
+    }
     if params.workspace.trim().is_empty() || params.workspace.len() > 128 {
         return Err(Error::invalid_request("PCC workspace is invalid"));
     }
@@ -443,7 +446,7 @@ fn consume_quarantine(
         .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
         || object.get("workspace_id").and_then(Value::as_str) != Some(workspace)
-        || !object.get("index_key").and_then(Value::as_str).is_some_and(valid_digest)
+        || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
         || !reason_valid
     {
