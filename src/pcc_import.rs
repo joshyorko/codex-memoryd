@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::domain::Profile;
+use crate::error::{Error, Result};
 use crate::ids;
 use crate::policy::{self, BoundaryDecision, PolicyDecision};
 
