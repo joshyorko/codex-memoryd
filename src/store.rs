@@ -1889,7 +1889,7 @@ impl Store {
                 remote = COALESCE(excluded.remote, repos.remote),
                 branch = COALESCE(excluded.branch, repos.branch),
                 commit_sha = COALESCE(excluded.commit_sha, repos.commit_sha),
-                is_git = MAX(repos.is_git, excluded.is_git),
+                is_git = excluded.is_git,
                 updated_at = excluded.updated_at",
             params![repo_id, root, remote, branch, commit, is_git as i64, now],
         )?;
@@ -5662,7 +5662,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_repo_preserves_existing_metadata_when_partial_identity_arrives() {
+    fn ensure_repo_preserves_metadata_and_refreshes_git_status() {
         let store = mem_store();
         store
             .ensure_repo(
@@ -5692,7 +5692,7 @@ mod tests {
                 "https://example.test/repo.git".to_string(),
                 "main".to_string(),
                 "abc123".to_string(),
-                1,
+                0,
             )
         );
     }

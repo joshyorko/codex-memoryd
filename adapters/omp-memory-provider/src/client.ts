@@ -151,7 +151,7 @@ export class MemoryDClient {
     repoId?: string;
     repo?: Readonly<Record<string, unknown>>;
     timeoutMs?: number;
-  }): Promise<{ created?: unknown; record_ids?: unknown; rejected?: unknown }> {
+  }): Promise<{ created: unknown; record_ids: unknown; rejected: unknown }> {
     return this.requestData("/v1/conclusions", {
       method: "POST",
       timeoutMs: request.timeoutMs,

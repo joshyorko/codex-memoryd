@@ -250,7 +250,7 @@ describe("transport and lifecycle", () => {
     let body: Record<string, any> | undefined;
     globalThis.fetch = async (_input, init) => {
       body = JSON.parse(String(init?.body));
-      return envelope({ record_ids: ["r1"] });
+      return envelope({ created: [], record_ids: ["r1"], rejected: [] });
     };
     try {
       const session = { sessionId: "s1", repoId: "repo-new", repo: { repo_id: "repo-new", root: "/repo", remote: "https://example.test/repo.git", branch: "main", commit: "abc", is_git: true } };
@@ -289,12 +289,27 @@ describe("transport and lifecycle", () => {
     }
   });
 
+  test("fails closed on incomplete conclusion responses", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({ record_ids: ["r1"] });
+    try {
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session: { sessionId: "s1" }, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await expect(backend.save?.({ agentDir: ".", cwd: "." }, { content: "ambiguous" })).resolves.toMatchObject({
+        stored: 0,
+        message: "protocol-mismatch",
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   test("counts Unicode code points for the explicit-save limit", async () => {
     const original = globalThis.fetch;
     let calls = 0;
     globalThis.fetch = async () => {
       calls += 1;
-      return envelope({ record_ids: ["r1"] });
+      return envelope({ created: [], record_ids: ["r1"], rejected: [] });
     };
     try {
       const backend = createMemoryDBackend(config);
@@ -317,7 +332,7 @@ describe("transport and lifecycle", () => {
       bodies.set(path, [...(bodies.get(path) ?? []), JSON.parse(String(init?.body ?? "{}"))]);
       if (path === "/v1/recall") return envelope({ facts: [], authority: "recall_not_authority" });
       if (path === "/v1/search") return envelope({ matches: [] });
-      return envelope({ record_ids: ["r1"] });
+      return envelope({ created: [], record_ids: ["r1"], rejected: [] });
     };
     try {
       const session = { sessionId: "s1" };
