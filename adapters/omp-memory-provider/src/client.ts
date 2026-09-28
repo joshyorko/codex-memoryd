@@ -147,11 +147,11 @@ export class MemoryDClient {
     context?: string;
     source?: string;
     sessionId?: string;
-    signal?: AbortSignal;
+    timeoutMs?: number;
   }): Promise<{ created?: unknown; record_ids?: unknown; rejected?: unknown }> {
     return this.requestData("/v1/conclusions", {
       method: "POST",
-      signal: request.signal,
+      timeoutMs: request.timeoutMs,
       body: {
         profile: request.profile,
         workspace: request.workspace,
