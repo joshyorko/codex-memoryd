@@ -328,6 +328,11 @@ describe("transport and lifecycle", () => {
         repo: { branch: "main", commit: "abc" },
       });
       expect(body?.repo).toEqual({ branch: "main", commit: "abc", repo_id: "repo-new" });
+      const unbound = { sessionId: "s2" };
+      await backend.start({ session: unbound, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await backend.save?.({ agentDir: ".", cwd: "/workspace/other" }, { content: "unbound" });
+      expect(body?.repo).toBeUndefined();
+      expect(body?.metadata?.repo_identity?.status).toBe("unsupported");
     } finally {
       globalThis.fetch = original;
     }
