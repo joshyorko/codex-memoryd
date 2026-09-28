@@ -3,6 +3,7 @@ export type MemoryBackendId = "codex-memoryd";
 export interface SessionLike {
   readonly sessionId?: string;
   readonly cwd?: string;
+  readonly repoId?: string;
 }
 
 export interface SettingsLike {

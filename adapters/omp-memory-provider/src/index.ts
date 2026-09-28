@@ -49,7 +49,7 @@ export function configFromSettings(settings: Record<string, unknown>): MemoryDCo
     baseUrl: settings["codexMemoryd.baseUrl"] as string | undefined,
     profile: settings["codexMemoryd.profile"] as string | undefined,
     workspace: settings["codexMemoryd.workspace"] as string | undefined,
-    autoRecall: settings["codexMemoryd.autoRecall"] as boolean | undefined,
+    autoRecall: settings["codexMemoryd.autoRecall"],
     autoObserve: settings["codexMemoryd.autoObserve"],
     recallTimeoutMs: settings["codexMemoryd.recallTimeoutMs"] as number | undefined,
     maxTokens: settings["codexMemoryd.maxTokens"] as number | undefined,

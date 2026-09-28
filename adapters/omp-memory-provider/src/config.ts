@@ -75,13 +75,16 @@ function requiredProfile(value: unknown): string {
   return profile;
 }
 
-type ConfigInput = Omit<Partial<MemoryDConfig>, "autoObserve"> & { autoObserve?: unknown };
+type ConfigInput = Omit<Partial<MemoryDConfig>, "autoObserve" | "autoRecall"> & { autoObserve?: unknown; autoRecall?: unknown };
 export function loadConfig(input: ConfigInput = {}): MemoryDConfig {
   if (input.autoObserve === true) {
     throw new MemoryDConfigError(
       "writeback_unavailable",
       "Automatic OMP observation is disabled until the MemoryD host-observation receipt API is available",
     );
+  }
+  if (input.autoRecall !== undefined && typeof input.autoRecall !== "boolean") {
+    throw new MemoryDConfigError("invalid_value", "MemoryD codexMemoryd.autoRecall must be boolean");
   }
   return {
     baseUrl: loopbackEndpoint(input.baseUrl ?? DEFAULT_CONFIG.baseUrl),

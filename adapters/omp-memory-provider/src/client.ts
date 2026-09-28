@@ -147,6 +147,7 @@ export class MemoryDClient {
     context?: string;
     source?: string;
     sessionId?: string;
+    repoId?: string;
     timeoutMs?: number;
   }): Promise<{ created?: unknown; record_ids?: unknown; rejected?: unknown }> {
     return this.requestData("/v1/conclusions", {
@@ -162,7 +163,7 @@ export class MemoryDClient {
           source: request.source,
           context: request.context,
           session_id: request.sessionId,
-          repo_identity: { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
+          repo_identity: request.repoId ? { status: "provided", repo_id: request.repoId } : { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
         },
       },
     });

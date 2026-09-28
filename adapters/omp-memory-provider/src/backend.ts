@@ -12,11 +12,15 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
   let epoch = 0;
   let lastOutcome = "unstarted";
   let lastCount = 0;
-  const stateFor = (session: SessionLike | undefined) => session && typeof session === "object" ? states.get(session) : undefined;
+  const stateFor = (session: SessionLike | undefined) => {
+    if (!session || typeof session !== "object") return undefined;
+    const state = states.get(session);
+    return state?.epoch === epoch ? state : undefined;
+  };
   const recall = async (session: SessionLike | undefined, query: string, signal?: AbortSignal): Promise<{ context?: string; count: number; outcome: string }> => {
     if (!query.trim()) return { count: 0, outcome: "healthy-empty" as string };
     try {
-      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), sessionId: session?.sessionId, maxTokens: config.maxTokens, signal });
+      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, maxTokens: config.maxTokens, signal });
       if (!Array.isArray(data.facts) && !Array.isArray(data.checkpoints)) throw new MemoryDClientError("protocol-mismatch");
       const formatted = formatRecall(data, config.maxTokens);
       return { ...formatted, outcome: formatted.count ? "healthy-with-memory" : "healthy-empty" };
@@ -65,7 +69,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     async save(context: BackendOperationContext, input: MemoryBackendSaveInput): Promise<MemoryBackendSaveResult> {
       if (input.content.length > 16_000) return { backend: "codex-memoryd", stored: 0, message: "Explicit save exceeds the 16000-character MemoryD limit" };
       try {
-        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: context.session?.sessionId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
+        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: context.session?.sessionId, repoId: context.session?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
         if (!Array.isArray(data.record_ids) && !Array.isArray(data.created) && !Array.isArray(data.rejected)) throw new MemoryDClientError("protocol-mismatch");
         const ids = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
         return { backend: "codex-memoryd", stored: ids.length, ids, message: Array.isArray(data.rejected) && data.rejected.length ? `${data.rejected.length} explicit save rejected by policy` : undefined };
