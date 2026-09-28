@@ -135,6 +135,9 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
             quarantine(&mut report, "line-too-large");
             break;
         }
+        if summaries > 0 {
+            pending_cursor = None;
+        }
         let text = match std::str::from_utf8(&line) {
             Ok(text) => text.trim(),
             Err(_) => {
@@ -252,8 +255,13 @@ fn validate_params(params: &PccImportParams) -> Result<()> {
     if params.profile.trim().is_empty() || params.profile.len() > 128 {
         return Err(Error::invalid_request("PCC profile is invalid"));
     }
-    if params.workspace.trim().is_empty() || params.workspace.len() > 128 {
-        return Err(Error::invalid_request("PCC workspace is invalid"));
+    if Profile::parse(&params.profile).is_none() {
+        return Err(Error::invalid_request("PCC profile is unsupported"));
+    }
+    if let Some(target) = &params.target_profile {
+        if Profile::parse(target).is_none() {
+            return Err(Error::invalid_request("PCC target profile is unsupported"));
+        }
     }
     if let Some(target) = &params.target_profile {
         if target.trim().is_empty() || target.len() > 128 {
@@ -434,7 +442,7 @@ fn consume_quarantine(
         .and_then(Value::as_str)
         .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
-        || object.get("destination").and_then(Value::as_str) != Some(workspace)
+        || object.get("workspace_id").and_then(Value::as_str) != Some(workspace)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
         || !reason_valid
