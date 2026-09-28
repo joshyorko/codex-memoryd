@@ -89,8 +89,13 @@ struct Report {
     records_seen: usize,
     producer_quarantines: usize,
     observed_indexes: HashSet<String>,
+    unidentified_indexes: bool,
     idempotency_keys: Vec<String>,
     quarantine_reasons: Vec<String>,
+}
+
+fn observed_index_count(report: &Report) -> usize {
+    report.observed_indexes.len() + usize::from(report.unidentified_indexes)
 }
 
 /// Consume one bounded PCC JSONL export and return a safe receipt.
@@ -214,6 +219,14 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                         .filter(|value| valid_digest(value))
                     {
                         report.observed_indexes.insert(index.to_string());
+                    } else if let Some(index) = object
+                        .get("ciphertext_sha256")
+                        .and_then(Value::as_str)
+                        .filter(|value| valid_digest(value))
+                    {
+                        report.observed_indexes.insert(index.to_string());
+                    } else {
+                        report.unidentified_indexes = true;
                     }
                 }
             }
@@ -523,7 +536,7 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
     if object.get("complete") != Some(&Value::Bool(true))
         || records != report.records_seen as u64
         || quarantined != report.producer_quarantines as u64
-        || inspected != report.observed_indexes.len() as u64
+        || inspected != observed_index_count(report) as u64
     {
         quarantine(report, "summary-mismatch");
         return;
@@ -780,7 +793,7 @@ mod tests {
             "schema": INPUT_SCHEMA,
             "schema_version": {"major": 1, "minor": 0},
             "type": "summary",
-            "inspected_indexes": 0,
+            "inspected_indexes": 1,
             "records": 0,
             "quarantined": 1,
             "complete": true,
