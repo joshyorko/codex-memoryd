@@ -143,6 +143,9 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         if text.is_empty() {
             continue;
         }
+        if summaries > 0 {
+            pending_cursor = None;
+        }
         let value: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(_) => {
@@ -168,7 +171,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                 if let Some(digest) = object
                     .get("segment")
                     .and_then(Value::as_object)
-                    .and_then(|segment| segment.get("content_sha256"))
+                    .and_then(|segment| segment.get("ciphertext_sha256"))
                     .and_then(Value::as_str)
                 {
                     report.observed_indexes.insert(digest.to_string());
@@ -580,7 +583,7 @@ mod tests {
             "session": {"session_id": "s"},
             "source": {"surface": "josh-room"},
             "checkpoint": {},
-            "segment": {"content_sha256": "segment"},
+            "segment": {"content_sha256": "segment", "ciphertext_sha256": "index"},
             "record_index": 0,
             "record": {"role": "user", "text": text},
             "producer_trust": "untrusted"
