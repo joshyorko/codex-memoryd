@@ -35,6 +35,8 @@ describe("configuration and registration", () => {
 
   test("rejects non-boolean observation and recall settings", () => {
     expect(() => loadConfig({ profile: "personal", workspace: "work", autoObserve: "false" })).toThrow("autoObserve must be boolean");
+    expect(() => loadConfig({ profile: "personal", workspace: "work", autoObserve: "true" })).toThrow("autoObserve must be boolean");
+    expect(() => loadConfig({ profile: "personal", workspace: "work", autoObserve: true })).toThrow("Automatic OMP observation is disabled");
     expect(() => loadConfig({ profile: "personal", workspace: "work", autoRecall: "true" })).toThrow("autoRecall must be boolean");
   });
 
@@ -90,6 +92,12 @@ describe("recall formatting", () => {
     expect(rendered.count).toBe(0);
     expect(rendered.context).toContain("recall_not_authority");
     expect(rendered.context).toContain("withheld: 5");
+  });
+  test("does not exceed a tiny budget for withheld-only diagnostics", () => {
+    const rendered = formatRecall({ withheld: [{ reason: "policy", count: 1 }] }, 1);
+    expect(rendered.count).toBe(0);
+    expect(rendered.context).toBeUndefined();
+    expect(rendered.truncated).toBe(true);
   });
 
 describe("transport and lifecycle", () => {
