@@ -1050,20 +1050,24 @@ fn validate_runtime_environment() -> Result<()> {
     }
 }
 
-fn dispatch(cli: Cli) -> Result<()> {
-    let database_free_inspect = matches!(
-        cli.command,
+fn is_database_free_command(command: &Command) -> bool {
+    matches!(
+        command,
         Command::Bundle {
             command: BundleCommand::Inspect { .. }
         } | Command::Import {
             command: ImportCommand::PccReplay { .. }
         }
-    );
+    )
+}
+
+fn validate_cli_preflight(cli: &Cli) -> Result<()> {
+    let database_free_inspect = is_database_free_command(&cli.command);
     if cli.runtime.is_none() && !database_free_inspect {
         validate_runtime_environment()?;
     }
 
-    if client_url_is_present(&cli)
+    if client_url_is_present(cli)
         && cli.db.is_some()
         && !cli.local
         && !database_free_inspect
@@ -1083,6 +1087,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             "--url and --db conflict unless --local makes direct SQLite mode explicit",
         ));
     }
+    Ok(())
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
+    validate_cli_preflight(&cli)?;
 
     match &cli.command {
         Command::Init {
@@ -3762,5 +3771,26 @@ mod tests {
         let error = toml_basic_string("unsafe\0value", "test value").unwrap_err();
         assert!(error.message.contains("cannot represent"));
         assert!(error.message.contains("NUL"));
+    }
+    #[test]
+    fn pcc_replay_preflight_allows_url_and_db_together() {
+        let cli = Cli::try_parse_from([
+            "codex-memoryd",
+            "--url",
+            "http://127.0.0.1:8787",
+            "--db",
+            "/tmp/pcc-replay.sqlite",
+            "import",
+            "pcc-replay",
+            "--profile",
+            "work",
+            "--workspace",
+            "workspace",
+            "--destination",
+            "room-destination",
+            "/tmp/replay.jsonl",
+        ])
+        .unwrap();
+        assert!(validate_cli_preflight(&cli).is_ok());
     }
 }

@@ -201,9 +201,6 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         if text.is_empty() {
             continue;
         }
-        if summaries > 0 {
-            pending_cursor = None;
-        }
         let value: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(_) => {
@@ -216,7 +213,15 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
             continue;
         };
         if summaries > 0 {
-            pending_cursor = None;
+            quarantine(
+                &mut report,
+                if object.get("type").and_then(Value::as_str) == Some("summary") {
+                    "duplicate-summary"
+                } else {
+                    "trailing-after-summary"
+                },
+            );
+            continue;
         }
         if !valid_envelope(object) {
             quarantine(&mut report, "schema-unsupported");
@@ -470,7 +475,7 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
                 .and_then(Value::as_object)
                 .and_then(|record| record.get("portability"))
                 .and_then(Value::as_str);
-            if matches!(portability, Some("never_export" | "profile_only" | "workspace_only")) {
+            if matches!(portability, Some("never_export" | "profile_only")) {
                 Some("profile-boundary-denied")
             } else {
                 None
@@ -1111,6 +1116,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_only_record_can_cross_profiles_within_same_workspace() {
+        let mut value = serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
+        value["record"]["portability"] = Value::String("workspace_only".to_string());
+        value["idempotency_key"] =
+            Value::String(expected_idempotency_key(value.as_object().unwrap()).unwrap());
+        let mut params = PccImportParams::new("unused", "oss", "ws", "room-destination");
+        params.target_profile = Some("personal".to_string());
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", value, summary(Some("opaque-cursor")))),
+            params,
+        )
+        .unwrap();
+        assert_eq!(response.imported, 1);
+        assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
+    }
+
+    #[test]
     fn personal_to_work_does_not_trust_producer_generic_labels() {
         let mut value = serde_json::from_str::<Value>(&record("personal", "ws", "ignored", "safe")).unwrap();
         value["record"]["record_type"] = Value::String("preference".to_string());
@@ -1136,6 +1158,26 @@ mod tests {
         .unwrap();
         assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
         assert!(!response.quarantine_reasons.contains(&"input-limit".to_string()));
+    }
+
+    #[test]
+    fn trailing_record_after_summary_cannot_import_or_advance_cursor() {
+        let input = format!(
+            "{}\n{}\n{}\n",
+            record("work", "ws", "first", "first"),
+            summary(Some("opaque-cursor")),
+            record("work", "ws", "trailing", "trailing"),
+        );
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.imported, 1);
+        assert_eq!(response.cursor, None);
+        assert!(response
+            .quarantine_reasons
+            .contains(&"trailing-after-summary".to_string()));
     }
 
     #[test]
