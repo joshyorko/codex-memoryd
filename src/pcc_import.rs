@@ -419,35 +419,7 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
     let source = object.get("profile_id").and_then(Value::as_str).unwrap_or("");
     match cross_profile_boundary(source, target_profile) {
         BoundaryDecision::Deny { .. } => Some("profile-boundary-denied"),
-        BoundaryDecision::AllowGenericPreferencesOnly => {
-            let Some(record) = object.get("record").and_then(Value::as_object) else {
-                return Some("profile-boundary-filtered");
-            };
-            let record_type = record
-                .get("record_type")
-                .or_else(|| record.get("type"))
-                .and_then(Value::as_str)
-                .and_then(RecordType::parse);
-            let sensitivity = record
-                .get("sensitivity")
-                .and_then(Value::as_str)
-                .and_then(Sensitivity::parse);
-            let workspace_bound = ["workspace_id", "workspace", "repo_id", "repository", "repo"]
-                .iter()
-                .any(|key| record.get(*key).is_some_and(|value| !value.is_null()));
-            let profile_only = record.get("profile_only").and_then(Value::as_bool).unwrap_or(false);
-            if !workspace_bound
-                && !profile_only
-                && record.get("scope").and_then(Value::as_str).is_some_and(|scope| scope == "global" || scope == "user")
-                && record_type.is_some_and(|kind| {
-                    sensitivity.is_some_and(|level| policy::is_generic_preference(kind, level))
-                })
-            {
-                None
-            } else {
-                Some("profile-boundary-filtered")
-            }
-        }
+        BoundaryDecision::AllowGenericPreferencesOnly => Some("profile-boundary-filtered"),
         BoundaryDecision::Allow => None,
     }
 }
@@ -990,6 +962,19 @@ mod tests {
         let response = run_reader(Cursor::new(input), params).unwrap();
         assert_eq!(response.imported, 1);
         assert!(response.quarantine_reasons.contains(&"policy-denied".to_string()));
+    }
+
+    #[test]
+    fn personal_to_work_does_not_trust_producer_generic_labels() {
+        let mut value = serde_json::from_str::<Value>(&record("personal", "ws", "ignored", "safe")).unwrap();
+        value["record"]["record_type"] = Value::String("preference".to_string());
+        value["record"]["sensitivity"] = Value::String("public".to_string());
+        value["record"]["scope"] = Value::String("user".to_string());
+        let mut params = PccImportParams::new("unused", "personal", "ws", "room-destination");
+        params.target_profile = Some("work".to_string());
+        let response = run_reader(Cursor::new(format!("{}\n{}\n", value, summary(None))), params).unwrap();
+        assert_eq!(response.imported, 0);
+        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
