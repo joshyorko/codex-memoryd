@@ -64,7 +64,14 @@ function requiredScope(value: unknown, name: "profile" | "workspace"): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new MemoryDConfigError("missing_scope", `MemoryD ${name} must be configured explicitly`);
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (name === "workspace") {
+    const canonical = trimmed.replace(/[^A-Za-z0-9._:-]/g, "-").replace(/^-+|-+$/g, "") || "default";
+    if (canonical !== trimmed || canonical === "default" && trimmed !== "default") {
+      throw new MemoryDConfigError("invalid_value", "MemoryD workspace must already be canonical");
+    }
+  }
+  return trimmed;
 }
 const PROFILE_IDS = ["personal", "work", "oss", "homelab"] as const;
 function requiredProfile(value: unknown): string {

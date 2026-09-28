@@ -6,7 +6,25 @@ import type { BackendFactoryContext, BackendOperationContext, MemoryBackend, Mem
 interface SessionState { generation: number; epoch: number; autoRecall: boolean; lastOutcome?: string; lastCount: number }
 
 export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryDClient(config)): MemoryBackend {
-  const truncateCodePoints = (value: string, limit: number): string => [...value].slice(0, limit).join("");
+  const truncateCodePoints = (value: string, limit: number): string => {
+    let end = 0;
+    let count = 0;
+    while (end < value.length && count < limit) {
+      end += value.codePointAt(end)! > 0xffff ? 2 : 1;
+      count += 1;
+    }
+    return value.slice(0, end);
+  };
+  const truncateTailCodePoints = (value: string, limit: number): string => {
+    let end = value.length;
+    let count = 0;
+    while (end > 0 && count < limit) {
+      const last = value.charCodeAt(end - 1);
+      end -= last >= 0xdc00 && last <= 0xdfff && end > 1 && value.charCodeAt(end - 2) >= 0xd800 && value.charCodeAt(end - 2) <= 0xdbff ? 2 : 1;
+      count += 1;
+    }
+    return value.slice(end);
+  };
   const states = new WeakMap<object, SessionState>();
   let rootSession: SessionLike | undefined;
   let activeSession: SessionLike | undefined;
@@ -88,7 +106,11 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
     async preCompactionContext(messages: readonly unknown[], _settings: SettingsLike, session?: SessionLike): Promise<string | undefined> {
       const owner = session ?? rootSession ?? activeSession; const state = stateFor(owner); if (!state?.autoRecall) return undefined; const generation = state.generation; const startEpoch = epoch;
-      const query = [...messages.flatMap(messageContent).join("\n")].slice(-8_000).join(""); const result = await recall(owner, query); const current = stateFor(owner); if (current !== state || current.generation !== generation || startEpoch !== epoch) return undefined;
+      let query = "";
+      for (const message of messages) {
+        for (const content of messageContent(message)) query = truncateTailCodePoints(`${query}\n${content}`, 8_000);
+      }
+      const result = await recall(owner, query); const current = stateFor(owner); if (current !== state || current.generation !== generation || startEpoch !== epoch) return undefined;
       state.lastOutcome = result.outcome; state.lastCount = result.count; return result.context;
     },
   };

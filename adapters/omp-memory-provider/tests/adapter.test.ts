@@ -29,6 +29,8 @@ describe("configuration and registration", () => {
     expect(() => loadConfig({ profile: "", workspace: "work" })).toThrow(MemoryDConfigError);
     expect(() => loadConfig({ profile: "personal", workspace: "work", baseUrl: "https://example.test" })).toThrow(MemoryDConfigError);
     expect(loadConfig({ profile: "personal", workspace: "work" }).recallTimeoutMs).toBe(500);
+    expect(() => loadConfig({ profile: "personal", workspace: "work/team" })).toThrow("canonical");
+    expect(() => loadConfig({ profile: "personal", workspace: " -- " })).toThrow("canonical");
   });
 
   test("automatic observation cannot be enabled before #233", () => {
@@ -91,6 +93,27 @@ describe("transport and lifecycle", () => {
       const client = new MemoryDClient(config);
       await expect(client.status()).rejects.toMatchObject({ kind: "http", status: 500 });
       await expect(client.recall({ profile: "personal", workspace: "josh-personal", query: "private query", maxTokens: 10 })).rejects.toBeInstanceOf(MemoryDClientError);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("closes response bodies before HTTP and content-type protocol errors", async () => {
+    const original = globalThis.fetch;
+    let cancelled = 0;
+    globalThis.fetch = async input => {
+      const status = String(input).endsWith("/status") ? 500 : 200;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode("error")); },
+        cancel() { cancelled += 1; },
+      });
+      return new Response(body, { status, headers: { "content-type": status === 200 ? "text/plain" : "application/json" } });
+    };
+    try {
+      const client = new MemoryDClient(config);
+      await expect(client.status()).rejects.toMatchObject({ kind: "http", status: 500 });
+      await expect(client.recall({ profile: "personal", workspace: "josh-personal", query: "q", maxTokens: 10 })).rejects.toMatchObject({ kind: "protocol-mismatch" });
+      expect(cancelled).toBe(2);
     } finally {
       globalThis.fetch = original;
     }

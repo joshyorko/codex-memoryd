@@ -201,6 +201,7 @@ export class MemoryDClient {
         signal: controller.signal,
       });
       if (!response.ok) {
+        await closeResponseBody(response);
         if (response.status === 401 || response.status === 403 || response.status === 404) {
           throw new MemoryDClientError("scope-denied", response.status);
         }
@@ -208,6 +209,7 @@ export class MemoryDClient {
       }
       const contentType = response.headers.get("content-type") ?? "";
       if (path !== "/healthz" && !contentType.toLowerCase().includes("application/json")) {
+        await closeResponseBody(response);
         throw new MemoryDClientError("protocol-mismatch", response.status);
       }
       const bytes = await readBoundedBody(response, this.config.maxResponseBytes, controller.signal, options.signal, timedOut);
@@ -236,6 +238,15 @@ interface RequestOptions {
   body?: Record<string, unknown>;
   signal?: AbortSignal;
   timeoutMs?: number;
+}
+
+async function closeResponseBody(response: Response): Promise<void> {
+  if (!response.body) return;
+  try {
+    await response.body.cancel();
+  } catch {
+    // The transport is already closed; preserve the protocol error.
+  }
 }
 
 async function readBoundedBody(
