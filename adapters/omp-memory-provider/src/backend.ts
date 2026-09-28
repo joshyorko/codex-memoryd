@@ -47,7 +47,8 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       const state = stateFor(session); if (state) state.lastOutcome = "unsupported-no-queue"; lastOutcome = "unsupported-no-queue";
     },
     async status(context: BackendOperationContext): Promise<MemoryBackendStatus> {
-      const state = stateFor(context.session); if (!state) return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "Backend has not been started for this session" };
+      const owner = context.session ?? rootSession ?? activeSession;
+      const state = stateFor(owner); if (!state) return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "Backend has not been started for this session" };
       try {
         const data = await client.status();
         const storage = isRecord(data.storage) ? data.storage : undefined;
@@ -60,7 +61,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
     async search(_context: BackendOperationContext, query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult> {
       try {
-        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), limit: options?.limit, signal: options?.signal });
+        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), repoId: (_context.session ?? rootSession ?? activeSession)?.repoId, limit: options?.limit, signal: options?.signal });
         if (!Array.isArray(data.matches)) throw new MemoryDClientError("protocol-mismatch");
         const items = data.matches.flatMap(match => { if (!isRecord(match) || typeof match.content !== "string") return []; return [{ id: typeof match.id === "string" ? match.id : undefined, content: match.content, source: typeof match.scope === "string" ? match.scope : undefined, timestamp: typeof match.updated_at === "string" ? match.updated_at : undefined, score: typeof match.confidence === "number" ? match.confidence : undefined }]; });
         return { backend: "codex-memoryd", query, count: items.length, items };

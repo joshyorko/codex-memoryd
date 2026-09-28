@@ -156,7 +156,7 @@ export class MemoryDClient {
       body: {
         profile: request.profile,
         workspace: request.workspace,
-        target: "assistant",
+        repo: request.repoId ? { repo_id: request.repoId } : undefined,
         conclusions: [request.content],
         metadata: {
           source_kind: "omp_explicit_save",
