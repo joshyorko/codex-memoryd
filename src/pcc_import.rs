@@ -429,6 +429,7 @@ fn consume_quarantine(
         .filter(|value| allowed_reason_code(value))
         .unwrap_or("producer-quarantine");
     quarantine(report, reason);
+    true
 }
 
 fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<String>>, report: &mut Report) {
