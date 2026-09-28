@@ -3,7 +3,7 @@
 //! `sync-local`, `export`, and `forget` exercise identical code paths. `serve`
 //! launches the daemon; `doctor` runs self-checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
 use codex_memoryd::chatgpt_export_import::ChatgptExportSelection;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
+use codex_memoryd::pcc_import;
 use codex_memoryd::config::ConfigLoadSource;
 use codex_memoryd::conformance;
 use codex_memoryd::domain;
@@ -592,6 +593,21 @@ pub enum ImportCommand {
         workspace: Option<String>,
         #[arg(value_name = "EXPORT")]
         export_path: PathBuf,
+    },
+    /// Consume Josh Room's neutral PCC replay/export JSONL without writing memory.
+    PccReplay {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        target_profile: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long = "seen-idempotency-key")]
+        seen_idempotency_keys: Vec<String>,
+        #[arg(value_name = "JSONL")]
+        input: PathBuf,
     },
 }
 
@@ -1731,7 +1747,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Import { command } => {
-            let service = cli.open_service(None)?;
             match command {
                 ImportCommand::ChatgptExport {
                     list,
@@ -1748,6 +1763,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     workspace,
                     export_path,
                 } => {
+                    let service = cli.open_service(None)?;
                     let mode = if *apply {
                         ChatgptExportMode::Apply
                     } else if *list {
@@ -1775,6 +1791,26 @@ fn dispatch(cli: Cli) -> Result<()> {
                         },
                     )?;
                     print_json(&resp)?;
+                }
+                ImportCommand::PccReplay {
+                    profile,
+                    workspace,
+                    target_profile,
+                    cursor,
+                    seen_idempotency_keys,
+                    input,
+                } => {
+                    let mut params = pcc_import::PccImportParams::new(
+                        input.clone(),
+                        profile.clone(),
+                        workspace.clone(),
+                    );
+                    params.target_profile = target_profile.clone();
+                    params.cursor = cursor.clone();
+                    params.seen_idempotency_keys =
+                        seen_idempotency_keys.iter().cloned().collect::<HashSet<_>>();
+                    let response = pcc_import::run(params)?;
+                    print_json(&response)?;
                 }
             }
             Ok(())
