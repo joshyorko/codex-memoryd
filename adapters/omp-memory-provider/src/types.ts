@@ -1,9 +1,18 @@
 export type MemoryBackendId = "codex-memoryd";
+export interface RepoIdentity {
+  readonly repo_id: string;
+  readonly root?: string;
+  readonly remote?: string;
+  readonly branch?: string;
+  readonly commit?: string;
+  readonly is_git?: boolean;
+}
 
 export interface SessionLike {
   readonly sessionId?: string;
   readonly cwd?: string;
   readonly repoId?: string;
+  readonly repo?: RepoIdentity;
 }
 
 export interface SettingsLike {

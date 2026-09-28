@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { createMemoryDBackend } from "../src/backend";
 import { MemoryDClient, MemoryDClientError } from "../src/client";
 import { loadConfig, MemoryDConfigError } from "../src/config";
@@ -33,8 +33,9 @@ describe("configuration and registration", () => {
     expect(() => loadConfig({ profile: "personal", workspace: " -- " })).toThrow("canonical");
   });
 
-  test("automatic observation cannot be enabled before #233", () => {
-    expect(() => loadConfig({ profile: "personal", workspace: "work", autoObserve: true })).toThrow("receipt API");
+  test("rejects non-boolean observation and recall settings", () => {
+    expect(() => loadConfig({ profile: "personal", workspace: "work", autoObserve: "false" })).toThrow("autoObserve must be boolean");
+    expect(() => loadConfig({ profile: "personal", workspace: "work", autoRecall: "true" })).toThrow("autoRecall must be boolean");
   });
 
   test("uses the native registration entrypoint", () => {
@@ -84,6 +85,12 @@ describe("recall formatting", () => {
     expect(rendered.context).toContain("safe");
   });
 });
+  test("renders withheld-only diagnostics without admitting memory", () => {
+    const rendered = formatRecall({ withheld: [{ reason: "policy", count: 2 }, { reason: "quarantine", count: 3 }] }, 1200);
+    expect(rendered.count).toBe(0);
+    expect(rendered.context).toContain("recall_not_authority");
+    expect(rendered.context).toContain("withheld: 5");
+  });
 
 describe("transport and lifecycle", () => {
   test("fails open on non-JSON and never exposes response text", async () => {
@@ -141,6 +148,25 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+  test("classifies a drip response timeout after headers", async () => {
+    vi.useFakeTimers();
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{"));
+        setTimeout(() => controller.error(new DOMException("drip ended", "AbortError")), 60);
+      },
+    }), { headers: { "content-type": "application/json" } });
+    try {
+      const pending = new MemoryDClient({ ...config, recallTimeoutMs: 25 }).status();
+      vi.advanceTimersByTime(60);
+      await expect(pending).rejects.toMatchObject({ kind: "timeout" });
+    } finally {
+      globalThis.fetch = original;
+      vi.useRealTimers();
+    }
+  });
+
 
   test("stale session results cannot commit", async () => {
     const original = globalThis.fetch;
@@ -197,6 +223,18 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+  test("rejects malformed capability status as protocol mismatch", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({ status: "local_only", storage: {}, features: { recall: true } });
+    try {
+      const session = { sessionId: "s1" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await expect(backend.status?.({ agentDir: ".", cwd: ".", session })).resolves.toMatchObject({ active: false, message: "protocol-mismatch" });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });
 
   test("save uses active root scope and preserves repository metadata", async () => {
@@ -207,13 +245,14 @@ describe("transport and lifecycle", () => {
       return envelope({ record_ids: ["r1"] });
     };
     try {
-      const session = { sessionId: "s1", repoId: "repo-new" };
+      const session = { sessionId: "s1", repoId: "repo-new", repo: { repo_id: "repo-new", root: "/repo", remote: "https://example.test/repo.git", branch: "main", commit: "abc", is_git: true } };
       const backend = createMemoryDBackend(config);
       await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
       const saved = await backend.save?.({ agentDir: ".", cwd: "." }, { content: "explicit" });
       expect(saved?.stored).toBe(1);
       expect(body?.metadata?.session_id).toBe("s1");
       expect(body?.repo?.repo_id).toBe("repo-new");
+      expect(body?.repo).toMatchObject({ repo_id: "repo-new", root: "/repo", remote: "https://example.test/repo.git", branch: "main", commit: "abc", is_git: true });
 
       await new MemoryDClient(config).explicitSave({
         profile: "personal",
@@ -295,7 +334,7 @@ describe("transport and lifecycle", () => {
     globalThis.fetch = async () => envelope({
       status: "local_only",
       storage: { writable: true },
-      features: { recall: true },
+      features: { recall: true, search: true },
     });
     try {
       const backend = createMemoryDBackend(config);

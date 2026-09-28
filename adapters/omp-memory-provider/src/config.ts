@@ -84,6 +84,9 @@ function requiredProfile(value: unknown): string {
 
 type ConfigInput = Omit<Partial<MemoryDConfig>, "autoObserve" | "autoRecall"> & { autoObserve?: unknown; autoRecall?: unknown };
 export function loadConfig(input: ConfigInput = {}): MemoryDConfig {
+  if (input.autoObserve !== undefined && typeof input.autoObserve !== "boolean") {
+    throw new MemoryDConfigError("invalid_value", "MemoryD codexMemoryd.autoObserve must be boolean");
+  }
   if (input.autoObserve === true) {
     throw new MemoryDConfigError(
       "writeback_unavailable",

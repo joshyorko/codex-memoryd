@@ -93,6 +93,7 @@ export class MemoryDClient {
       query: string;
       sessionId?: string;
       repoId?: string;
+      repo?: Readonly<Record<string, unknown>>;
       branch?: string;
       commit?: string;
       files?: readonly string[];
@@ -108,7 +109,7 @@ export class MemoryDClient {
         workspace: request.workspace,
         query: request.query,
         session: request.sessionId ? { id: request.sessionId, source: "omp" } : undefined,
-        repo: request.repoId ? { repo_id: request.repoId, branch: request.branch, commit: request.commit } : undefined,
+        repo: request.repo || request.repoId ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}), ...(request.branch ? { branch: request.branch } : {}), ...(request.commit ? { commit: request.commit } : {}) } : undefined,
         files: request.files?.slice(0, 32),
         max_tokens: request.maxTokens,
         pack_mode: "active_task",
@@ -123,6 +124,7 @@ export class MemoryDClient {
       workspace: string;
       query: string;
       repoId?: string;
+      repo?: Readonly<Record<string, unknown>>;
       limit?: number;
       signal?: AbortSignal;
     },
@@ -134,12 +136,11 @@ export class MemoryDClient {
         profile: request.profile,
         workspace: request.workspace,
         query: request.query,
-        repo: request.repoId ? { repo_id: request.repoId } : undefined,
+        repo: request.repo || request.repoId ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}) } : undefined,
         limit: Math.max(1, Math.min(100, Math.floor(request.limit ?? 20))),
       },
     });
   }
-
   async explicitSave(request: {
     profile: string;
     workspace: string;
@@ -157,14 +158,14 @@ export class MemoryDClient {
       body: {
         profile: request.profile,
         workspace: request.workspace,
-        repo: request.repoId || request.repo ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}) } : undefined,
+        repo: request.repo || request.repoId ? { ...(request.repo ?? {}), ...(request.repoId ? { repo_id: request.repoId } : {}) } : undefined,
         conclusions: [request.content],
         metadata: {
           source_kind: "omp_explicit_save",
           source: request.source,
           context: request.context,
           session_id: request.sessionId,
-          repo_identity: request.repoId ? { status: "provided", repo_id: request.repoId } : { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
+          repo_identity: request.repo ? { status: "provided", ...request.repo } : request.repoId ? { status: "provided", repo_id: request.repoId } : { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
         },
       },
     });
@@ -212,7 +213,7 @@ export class MemoryDClient {
         await closeResponseBody(response);
         throw new MemoryDClientError("protocol-mismatch", response.status);
       }
-      const bytes = await readBoundedBody(response, this.config.maxResponseBytes, controller.signal, options.signal, timedOut);
+      const bytes = await readBoundedBody(response, this.config.maxResponseBytes, controller.signal, options.signal, () => timedOut);
       if (path === "/healthz") return { ok: true };
       let parsed: unknown;
       try {
@@ -254,7 +255,7 @@ async function readBoundedBody(
   limit: number,
   signal: AbortSignal,
   userSignal: AbortSignal | undefined,
-  timedOut: boolean,
+  timedOut: () => boolean,
 ): Promise<Uint8Array> {
   if (response.body === null) {
     const raw = new Uint8Array(await response.arrayBuffer());
@@ -277,7 +278,7 @@ async function readBoundedBody(
     }
   } catch (error) {
     if (error instanceof MemoryDClientError) throw error;
-    if (signal.aborted) throw classifyAbort(userSignal ?? signal, timedOut);
+    if (signal.aborted) throw classifyAbort(userSignal ?? signal, timedOut());
     throw new MemoryDClientError("unavailable");
   } finally {
     reader.releaseLock();

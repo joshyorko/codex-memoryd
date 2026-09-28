@@ -1,11 +1,19 @@
 import { MemoryDClient, MemoryDClientError } from "./client";
 import { formatRecall } from "./format";
+import type { BackendFactoryContext, BackendOperationContext, MemoryBackend, MemoryBackendSaveInput, MemoryBackendSaveResult, MemoryBackendSearchOptions, MemoryBackendSearchResult, MemoryBackendStatus, MemoryDConfig, PromptPreparation, RepoIdentity, SessionLike, SettingsLike } from "./types";
 import { isRecord } from "./guards";
-import type { BackendFactoryContext, BackendOperationContext, MemoryBackend, MemoryBackendSaveInput, MemoryBackendSaveResult, MemoryBackendSearchOptions, MemoryBackendSearchResult, MemoryBackendStatus, MemoryDConfig, PromptPreparation, SessionLike, SettingsLike } from "./types";
 
 interface SessionState { generation: number; epoch: number; autoRecall: boolean; lastOutcome?: string; lastCount: number }
 
 export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryDClient(config)): MemoryBackend {
+  const countCodePoints = (value: string, limit: number): number => {
+    let count = 0;
+    for (const _ of value) {
+      count += 1;
+      if (count > limit) return count;
+    }
+    return count;
+  };
   const truncateCodePoints = (value: string, limit: number): string => {
     let end = 0;
     let count = 0;
@@ -36,10 +44,14 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     const state = states.get(session);
     return state?.epoch === epoch ? state : undefined;
   };
+  const repoFor = (session: SessionLike | undefined): Readonly<RepoIdentity> | undefined => {
+    if (session?.repo) return session.repo;
+    return session?.repoId ? { repo_id: session.repoId } : undefined;
+  };
   const recall = async (session: SessionLike | undefined, query: string, signal?: AbortSignal): Promise<{ context?: string; count: number; outcome: string }> => {
     if (!query.trim()) return { count: 0, outcome: "healthy-empty" as string };
     try {
-      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, maxTokens: config.maxTokens, signal });
+      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, repo: repoFor(session), maxTokens: config.maxTokens, signal });
       if (!Array.isArray(data.facts) && !Array.isArray(data.checkpoints)) throw new MemoryDClientError("protocol-mismatch");
       const formatted = formatRecall(data, config.maxTokens);
       return { ...formatted, outcome: formatted.count ? "healthy-with-memory" : "healthy-empty" };
@@ -73,26 +85,33 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
         const data = await client.status();
         const storage = isRecord(data.storage) ? data.storage : undefined;
         const features = isRecord(data.features) ? data.features : undefined;
-        const providerStatus = typeof data.status === "string" ? data.status : "protocol-mismatch";
-        const active = (providerStatus === "local_only" || providerStatus === "degraded") && storage !== undefined;
-        const writable = active && storage?.writable === true;
-        const searchable = active && features?.recall === true;
+        const providerStatus = data.status;
+        const validStatus = providerStatus === "local_only" || providerStatus === "degraded";
+        const validStorage = storage !== undefined && typeof storage.writable === "boolean";
+        const validFeatures = features !== undefined && typeof features.recall === "boolean" && typeof features.search === "boolean";
+        if (!validStatus || !validStorage || !validFeatures) {
+          return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "protocol-mismatch" };
+        }
+        const active = true;
+        const writable = storage?.writable === true;
+        const searchable = features?.recall === true && features?.search === true;
         return { backend: "codex-memoryd", active, writable, searchable, message: `${providerStatus}; ${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled` };
       } catch (error) { return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: failureOutcome(error) }; }
     },
     async search(_context: BackendOperationContext, query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult> {
       try {
-        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), repoId: (_context.session ?? rootSession ?? activeSession)?.repoId, limit: options?.limit, signal: options?.signal });
+        const owner = _context.session ?? rootSession ?? activeSession;
+        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), repoId: owner?.repoId, repo: repoFor(owner), limit: options?.limit, signal: options?.signal });
         if (!Array.isArray(data.matches)) throw new MemoryDClientError("protocol-mismatch");
         const items = data.matches.flatMap(match => { if (!isRecord(match) || typeof match.content !== "string") return []; return [{ id: typeof match.id === "string" ? match.id : undefined, content: match.content, source: typeof match.scope === "string" ? match.scope : undefined, timestamp: typeof match.updated_at === "string" ? match.updated_at : undefined, score: typeof match.confidence === "number" ? match.confidence : undefined }]; });
         return { backend: "codex-memoryd", query, count: items.length, items };
       } catch (error) { return { backend: "codex-memoryd", query, count: 0, items: [], message: failureOutcome(error) }; }
     },
     async save(context: BackendOperationContext, input: MemoryBackendSaveInput): Promise<MemoryBackendSaveResult> {
-      if ([...input.content].length > 16_000) return { backend: "codex-memoryd", stored: 0, message: "Explicit save exceeds the 16000-character MemoryD limit" };
+      if (countCodePoints(input.content, 16_000) > 16_000) return { backend: "codex-memoryd", stored: 0, message: "Explicit save exceeds the 16000-character MemoryD limit" };
       const owner = context.session ?? rootSession ?? activeSession;
       try {
-        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context ? truncateCodePoints(input.context, 2_000) : undefined, source: input.source ? truncateCodePoints(input.source, 200) : undefined, sessionId: owner?.sessionId, repoId: owner?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
+        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context ? truncateCodePoints(input.context, 2_000) : undefined, source: input.source ? truncateCodePoints(input.source, 200) : undefined, sessionId: owner?.sessionId, repoId: owner?.repoId, repo: repoFor(owner), timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
         if (!Array.isArray(data.record_ids) && !Array.isArray(data.created) && !Array.isArray(data.rejected)) throw new MemoryDClientError("protocol-mismatch");
         const recordIds = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
         const ids = recordIds.length > 0 ? recordIds : Array.isArray(data.created) ? data.created.filter((id): id is string => typeof id === "string") : [];
