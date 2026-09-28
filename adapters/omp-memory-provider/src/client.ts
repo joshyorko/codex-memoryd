@@ -162,6 +162,7 @@ export class MemoryDClient {
           source: request.source,
           context: request.context,
           session_id: request.sessionId,
+          repo_identity: { status: "unsupported", reason: "OMP operation context has no sanitized remote identity" },
         },
       },
     });
