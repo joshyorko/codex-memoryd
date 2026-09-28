@@ -80,6 +80,9 @@ struct Report {
     imported: usize,
     skipped: usize,
     quarantined: usize,
+    records_seen: usize,
+    producer_quarantines: usize,
+    observed_indexes: HashSet<String>,
     idempotency_keys: Vec<String>,
     quarantine_reasons: Vec<String>,
 }
@@ -109,7 +112,12 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
 
     loop {
         if lines >= MAX_LINES {
-            quarantine(&mut report, "input-limit");
+            let extra = read_bounded_line(&mut reader).map_err(|error| {
+                Error::invalid_request(format!("failed to read PCC replay input: {error}"))
+            })?;
+            if extra.is_some() {
+                quarantine(&mut report, "input-limit");
+            }
             break;
         }
         let Some(line) = read_bounded_line(&mut reader).map_err(|error| {
@@ -120,7 +128,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         lines += 1;
         if line.len() > MAX_LINE_BYTES {
             quarantine(&mut report, "line-too-large");
-            continue;
+            break;
         }
         let text = match std::str::from_utf8(&line) {
             Ok(text) => text.trim(),
@@ -150,6 +158,15 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         match object.get("type").and_then(Value::as_str) {
             Some("record") => {
                 records += 1;
+                report.records_seen += 1;
+                if let Some(digest) = object
+                    .get("segment")
+                    .and_then(Value::as_object)
+                    .and_then(|segment| segment.get("content_sha256"))
+                    .and_then(Value::as_str)
+                {
+                    report.observed_indexes.insert(digest.to_string());
+                }
                 if records > MAX_RECORDS {
                     quarantine(&mut report, "record-limit");
                     break;
@@ -163,7 +180,13 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                     &mut report,
                 );
             }
-            Some("quarantine") => consume_quarantine(object, &params.profile, &mut report),
+            Some("quarantine") => {
+                report.producer_quarantines += 1;
+                if let Some(index) = object.get("index_key").and_then(Value::as_str) {
+                    report.observed_indexes.insert(index.to_string());
+                }
+                consume_quarantine(object, &params.profile, &mut report)
+            }
             Some("summary") => {
                 summaries += 1;
                 if summaries > 1 {
@@ -322,6 +345,7 @@ fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Op
                 .iter()
                 .any(|key| record.get(*key).is_some_and(|value| !value.is_null()));
             if !workspace_bound
+                && record.get("scope").and_then(Value::as_str) == Some("global")
                 && record_type.is_some_and(|kind| {
                     sensitivity.is_some_and(|level| policy::is_generic_preference(kind, level))
                 })
@@ -340,7 +364,9 @@ fn cross_profile_boundary(source: &str, target: &str) -> BoundaryDecision {
     }
     match (Profile::parse(source), Profile::parse(target)) {
         (Some(from), Some(to)) => policy::export_boundary(from, to),
-        _ => BoundaryDecision::Allow,
+        _ => BoundaryDecision::Deny {
+            reason: "unsupported profile pair".to_string(),
+        },
     }
 }
 
@@ -369,12 +395,24 @@ fn consume_quarantine(object: &Map<String, Value>, profile: &str, report: &mut R
 }
 
 fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<String>, report: &mut Report) {
-    if !object.get("complete").and_then(Value::as_bool).is_some()
-        || !object.get("inspected_indexes").and_then(Value::as_u64).is_some()
-        || !object.get("records").and_then(Value::as_u64).is_some()
-        || !object.get("quarantined").and_then(Value::as_u64).is_some()
-    {
+    let Some(inspected) = object.get("inspected_indexes").and_then(Value::as_u64) else {
         quarantine(report, "summary-invalid");
+        return;
+    };
+    let Some(records) = object.get("records").and_then(Value::as_u64) else {
+        quarantine(report, "summary-invalid");
+        return;
+    };
+    let Some(quarantined) = object.get("quarantined").and_then(Value::as_u64) else {
+        quarantine(report, "summary-invalid");
+        return;
+    };
+    if object.get("complete").and_then(Value::as_bool).is_none()
+        || records != report.records_seen as u64
+        || quarantined != report.producer_quarantines as u64
+        || inspected != report.observed_indexes.len() as u64
+    {
+        quarantine(report, "summary-mismatch");
         return;
     }
     match object.get("next_cursor") {
@@ -417,7 +455,12 @@ fn valid_reason_code(value: &str) -> bool {
 }
 
 fn validate_cursor(value: &str) -> Result<()> {
-    if value.is_empty() || value.len() > MAX_CURSOR_BYTES || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+    if value.is_empty()
+        || value.len() > MAX_CURSOR_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return Err(Error::invalid_request("PCC cursor is invalid"));
     }
     Ok(())
@@ -432,28 +475,22 @@ fn quarantine(report: &mut Report, reason: &str) {
 
 fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    let mut oversized = false;
     loop {
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
-            return if line.is_empty() && !oversized {
-                Ok(None)
-            } else {
-                Ok(Some(if oversized { vec![0; MAX_LINE_BYTES + 1] } else { line }))
-            };
+            return Ok(if line.is_empty() { None } else { Some(line) });
         }
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(buffer.len(), |position| position + 1);
-        if !oversized {
-            if line.len() + take > MAX_LINE_BYTES + 1 {
-                oversized = true;
-            } else {
-                line.extend_from_slice(&buffer[..take]);
-            }
+        if line.len() + take > MAX_LINE_BYTES + 1 {
+            let remaining = MAX_LINE_BYTES + 1 - line.len();
+            reader.consume(remaining);
+            return Ok(Some(vec![0; MAX_LINE_BYTES + 1]));
         }
+        line.extend_from_slice(&buffer[..take]);
         reader.consume(take);
         if newline.is_some() {
-            return Ok(Some(if oversized { vec![0; MAX_LINE_BYTES + 1] } else { line }));
+            return Ok(Some(line));
         }
     }
 }
@@ -478,7 +515,7 @@ mod tests {
             "session": {"session_id": "s"},
             "source": {"surface": "josh-room"},
             "checkpoint": {},
-            "segment": {},
+            "segment": {"content_sha256": key},
             "record_index": 0,
             "record": {"role": "user", "text": text},
             "producer_trust": "untrusted"
