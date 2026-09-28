@@ -1885,9 +1885,12 @@ impl Store {
             "INSERT INTO repos(repo_id, root, remote, branch, commit_sha, is_git, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
              ON CONFLICT(repo_id) DO UPDATE SET
-                root = excluded.root, remote = excluded.remote,
-                branch = excluded.branch, commit_sha = excluded.commit_sha,
-                is_git = excluded.is_git, updated_at = excluded.updated_at",
+                root = COALESCE(excluded.root, repos.root),
+                remote = COALESCE(excluded.remote, repos.remote),
+                branch = COALESCE(excluded.branch, repos.branch),
+                commit_sha = COALESCE(excluded.commit_sha, repos.commit_sha),
+                is_git = MAX(repos.is_git, excluded.is_git),
+                updated_at = excluded.updated_at",
             params![repo_id, root, remote, branch, commit, is_git as i64, now],
         )?;
         Ok(())
@@ -5656,6 +5659,42 @@ mod tests {
         assert!(info.backup_supported);
         assert!(!info.sync_supported);
         assert_eq!(info.degraded_reasons.as_slice(), store.degraded_reasons());
+    }
+
+    #[test]
+    fn ensure_repo_preserves_existing_metadata_when_partial_identity_arrives() {
+        let store = mem_store();
+        store
+            .ensure_repo(
+                "repo-1",
+                Some("/workspace/repo"),
+                Some("https://example.test/repo.git"),
+                Some("main"),
+                Some("abc123"),
+                true,
+            )
+            .expect("insert repository");
+        store
+            .ensure_repo("repo-1", None, None, None, None, false)
+            .expect("merge partial repository");
+        let conn = store.conn().expect("connection");
+        let metadata: (String, String, String, String, i64) = conn
+            .query_row(
+                "SELECT root, remote, branch, commit_sha, is_git FROM repos WHERE repo_id = 'repo-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("repository metadata");
+        assert_eq!(
+            metadata,
+            (
+                "/workspace/repo".to_string(),
+                "https://example.test/repo.git".to_string(),
+                "main".to_string(),
+                "abc123".to_string(),
+                1,
+            )
+        );
     }
 
     fn sample_record(content: &str) -> NewRecord {
