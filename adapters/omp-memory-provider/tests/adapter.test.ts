@@ -7,7 +7,7 @@ import { registration, registerMemoryD, safeConfigFromSettings } from "../src/in
 import type { MemoryDConfig } from "../src/types";
 
 const config: MemoryDConfig = {
-  baseUrl: "http://127.0.0.1:8989",
+  baseUrl: "http://127.0.0.1:8787",
   profile: "personal",
   workspace: "josh-personal",
   autoRecall: true,

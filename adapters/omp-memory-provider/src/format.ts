@@ -10,7 +10,7 @@ export interface FormattedRecall {
 }
 
 export function formatRecall(data: RecallData, maxTokens: number): FormattedRecall {
-  const budget = Math.max(1, Math.floor(maxTokens)) * 4;
+  const budget = Math.max(1, Math.floor(maxTokens));
   const facts = Array.isArray(data.facts) ? data.facts : [];
   const lines = [
     "## MemoryD contextual memory",
@@ -31,7 +31,9 @@ export function formatRecall(data: RecallData, maxTokens: number): FormattedReca
     lines.push(line);
     count += 1;
   }
-  const withheld = Array.isArray(data.withheld) ? data.withheld.length : 0;
+  const withheld = Array.isArray(data.withheld)
+    ? data.withheld.reduce((total, item) => total + (isRecord(item) && typeof item.count === "number" && Number.isFinite(item.count) ? Math.max(0, Math.floor(item.count)) : 0), 0)
+    : 0;
   if (withheld > 0 && estimateTokens(lines.concat(`[withheld: ${withheld} result(s); reason not included in prompt]`).join("\n")) <= budget) {
     lines.push(`[withheld: ${withheld} result(s); reason not included in prompt]`);
   }

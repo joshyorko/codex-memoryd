@@ -24,6 +24,7 @@ interface SessionState {
 
 export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryDClient(config)): MemoryBackend {
   const states = new WeakMap<object, SessionState>();
+  const sessions = new Set<object>();
   let lastOutcome = "unstarted";
   let lastCount = 0;
 
@@ -31,11 +32,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     return session && typeof session === "object" ? states.get(session) : undefined;
   }
 
-  async function recall(
-    session: SessionLike | undefined,
-    promptText: string,
-    signal: AbortSignal | undefined,
-  ): Promise<{ context?: string; count: number; outcome?: string }> {
+  async function recall(session: SessionLike | undefined, promptText: string, signal: AbortSignal | undefined): Promise<{ context?: string; count: number; outcome?: string }> {
     if (!promptText.trim()) return { count: 0, outcome: "healthy-empty" };
     try {
       const data = await client.recall({
@@ -57,17 +54,20 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     id: "codex-memoryd",
 
     async start(context: BackendFactoryContext): Promise<void> {
+      const session = context.session as object;
       if (context.taskDepth > 0) {
-        states.set(context.session as object, { generation: 1, autoRecall: false, lastCount: 0, lastOutcome: "subagent-disabled" });
+        states.set(session, { generation: 1, autoRecall: false, lastCount: 0, lastOutcome: "subagent-disabled" });
+        sessions.add(session);
         return;
       }
-      const previous = states.get(context.session as object);
-      states.set(context.session as object, {
+      const previous = states.get(session);
+      states.set(session, {
         generation: (previous?.generation ?? 0) + 1,
         autoRecall: config.autoRecall,
         lastCount: 0,
         lastOutcome: "ready",
       });
+      sessions.add(session);
       lastOutcome = "ready";
       lastCount = 0;
     },
@@ -82,13 +82,20 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
 
     async clear(_agentDir: string, _cwd: string, session?: SessionLike): Promise<void> {
-      if (session && typeof session === "object") states.delete(session);
+      if (session && typeof session === "object") {
+        states.delete(session);
+        sessions.delete(session);
+      } else {
+        for (const current of sessions) states.delete(current);
+        sessions.clear();
+      }
       lastOutcome = "cleared-local-state";
       lastCount = 0;
     },
 
-    async enqueue(): Promise<void> {
-      // There is no local queue and automatic writeback is deliberately disabled.
+    async enqueue(_agentDir: string, _cwd: string, session?: SessionLike): Promise<void> {
+      const state = stateFor(session);
+      if (state) state.lastOutcome = "unsupported-no-queue";
       lastOutcome = "unsupported-no-queue";
     },
 
@@ -105,25 +112,13 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
           message: `${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled`,
         };
       } catch (error) {
-        return {
-          backend: "codex-memoryd",
-          active: false,
-          writable: false,
-          searchable: false,
-          message: failureOutcome(error),
-        };
+        return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: failureOutcome(error) };
       }
     },
 
     async search(context: BackendOperationContext, query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult> {
       try {
-        const data = await client.search({
-          profile: config.profile,
-          workspace: config.workspace,
-          query: query.slice(0, 8_000),
-          limit: options?.limit,
-          signal: options?.signal,
-        });
+        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), limit: options?.limit, signal: options?.signal });
         const matches = Array.isArray(data.matches) ? data.matches : [];
         const items = matches.flatMap(match => {
           if (!match || typeof match !== "object") return [];
@@ -143,17 +138,10 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       }
     },
 
-    async save(context: BackendOperationContext, input: MemoryBackendSaveInput) {
+    async save(context: BackendOperationContext, input: MemoryBackendSaveInput): Promise<MemoryBackendSaveResult> {
       if (!input.content.trim()) return { backend: "codex-memoryd", stored: 0, message: "Empty explicit save" };
       try {
-        const data = await client.explicitSave({
-          profile: config.profile,
-          workspace: config.workspace,
-          content: input.content.slice(0, 16_000),
-          context: input.context?.slice(0, 2_000),
-          source: input.source?.slice(0, 200),
-          sessionId: context.session?.sessionId,
-        });
+        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content.slice(0, 16_000), context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: context.session?.sessionId });
         const ids = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
         const rejected = Array.isArray(data.rejected) ? data.rejected.length : 0;
         return { backend: "codex-memoryd", stored: ids.length, ids, message: rejected ? `${rejected} explicit save rejected by policy` : undefined };
@@ -167,6 +155,8 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       if (!state?.autoRecall || signal?.aborted) return undefined;
       const generation = state.generation;
       const result = await recall(session, promptText, signal);
+      const current = stateFor(session);
+      if (current !== state || current.generation !== generation) return undefined;
       state.lastOutcome = result.outcome;
       state.lastCount = result.count;
       lastOutcome = result.outcome ?? "healthy-empty";
@@ -175,8 +165,8 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       return {
         context: result.context,
         commit: () => {
-          const current = stateFor(session);
-          return current === state && current.generation === generation && !signal?.aborted;
+          const active = stateFor(session);
+          return active === state && active.generation === generation && !signal?.aborted;
         },
       };
     },
@@ -184,15 +174,15 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     async preCompactionContext(messages: readonly unknown[], _settings: SettingsLike, session?: SessionLike): Promise<string | undefined> {
       const state = stateFor(session);
       if (!state?.autoRecall) return undefined;
-      const query = messages
-        .flatMap(message => {
-          if (!message || typeof message !== "object") return [];
-          const content = (message as Record<string, unknown>).content;
-          return typeof content === "string" ? [content] : [];
-        })
-        .join("\n")
-        .slice(-8_000);
+      const generation = state.generation;
+      const query = messages.flatMap(message => {
+        if (!message || typeof message !== "object") return [];
+        const content = (message as Record<string, unknown>).content;
+        return typeof content === "string" ? [content] : [];
+      }).join("\n").slice(-8_000);
       const result = await recall(session, query, undefined);
+      const current = stateFor(session);
+      if (current !== state || current.generation !== generation) return undefined;
       state.lastOutcome = result.outcome;
       state.lastCount = result.count;
       return result.context;
@@ -201,34 +191,19 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
 
   return backend;
 }
+
 export function createUnavailableMemoryDBackend(message: string): MemoryBackend {
   return {
     id: "codex-memoryd",
     async start(): Promise<void> {},
-    async buildDeveloperInstructions(): Promise<undefined> {
-      return undefined;
-    },
+    async buildDeveloperInstructions(): Promise<undefined> { return undefined; },
     async clear(): Promise<void> {},
     async enqueue(): Promise<void> {},
-    async status(): Promise<MemoryBackendStatus> {
-      return {
-        backend: "codex-memoryd",
-        active: false,
-        writable: false,
-        searchable: false,
-        message: "misconfigured",
-        error: message,
-      };
-    },
-    async search(_context, query): Promise<MemoryBackendSearchResult> {
-      return { backend: "codex-memoryd", query, count: 0, items: [], message };
-    },
-    async save(): Promise<MemoryBackendSaveResult> {
-      return { backend: "codex-memoryd", stored: 0, message };
-    },
+    async status(): Promise<MemoryBackendStatus> { return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "misconfigured", error: message }; },
+    async search(_context, query): Promise<MemoryBackendSearchResult> { return { backend: "codex-memoryd", query, count: 0, items: [], message }; },
+    async save(): Promise<MemoryBackendSaveResult> { return { backend: "codex-memoryd", stored: 0, message }; },
   };
 }
-
 
 function failureOutcome(error: unknown): string {
   if (error instanceof MemoryDClientError) return error.kind;

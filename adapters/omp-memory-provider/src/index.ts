@@ -13,7 +13,7 @@ export const registration: RegisteredMemoryBackend = {
   label: "MemoryD",
   description: "Local codex-memoryd contextual memory with bounded fail-open recall",
   settings: [
-    { id: "codexMemoryd.baseUrl", type: "string", description: "Loopback MemoryD URL", default: "http://127.0.0.1:8989", required: true },
+    { id: "codexMemoryd.baseUrl", type: "string", description: "Loopback MemoryD URL", default: "http://127.0.0.1:8787", required: true },
     { id: "codexMemoryd.profile", type: "string", description: "Explicit MemoryD profile", required: true },
     { id: "codexMemoryd.workspace", type: "string", description: "Explicit MemoryD workspace", required: true },
     { id: "codexMemoryd.autoRecall", type: "boolean", description: "Recall before each user turn", default: true },

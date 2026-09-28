@@ -5,7 +5,7 @@ const MAX_TOKENS = 16_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export const DEFAULT_CONFIG: MemoryDConfig = {
-  baseUrl: "http://127.0.0.1:8989",
+  baseUrl: "http://127.0.0.1:8787",
   profile: "",
   workspace: "",
   autoRecall: true,

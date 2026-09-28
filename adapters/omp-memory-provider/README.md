@@ -45,7 +45,7 @@ The registration declares these trusted settings:
 memory:
   backend: codex-memoryd
 codexMemoryd:
-  baseUrl: http://127.0.0.1:8989
+  baseUrl: http://127.0.0.1:8787
   profile: personal
   workspace: josh-personal
   autoRecall: true
