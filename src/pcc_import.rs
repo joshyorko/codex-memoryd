@@ -221,7 +221,10 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         }
     }
 
-    if reached_eof && pending_cursor.is_some() && report.quarantined == report.producer_quarantines {
+    if !reached_eof || summaries != 1 || pending_cursor.is_none() {
+        quarantine(&mut report, "missing-summary");
+    }
+    if reached_eof && summaries == 1 && pending_cursor.is_some() && report.quarantined == report.producer_quarantines {
         cursor = pending_cursor.flatten();
     } else {
         cursor = initial_cursor;
@@ -347,8 +350,12 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
     if !object.get("session").is_some_and(Value::is_object)
         || !object.get("source").is_some_and(Value::is_object)
         || !object.get("checkpoint").is_some_and(Value::is_object)
-        || !object.get("segment").is_some_and(Value::is_object)
-        || !object.get("record").is_some_and(Value::is_object)
+        || !object
+            .get("segment")
+            .and_then(Value::as_object)
+            .and_then(|segment| segment.get("ciphertext_sha256"))
+            .and_then(Value::as_str)
+            .is_some_and(valid_digest)
         || !object.get("record_index").and_then(Value::as_u64).is_some()
         || object.get("producer_trust").and_then(Value::as_str) != Some("untrusted")
     {
