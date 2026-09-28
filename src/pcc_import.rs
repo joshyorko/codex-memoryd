@@ -119,6 +119,8 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
             })?;
             if extra.is_some() {
                 quarantine(&mut report, "input-limit");
+            } else {
+                reached_eof = true;
             }
             break;
         }
@@ -190,11 +192,21 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                 );
             }
             Some("quarantine") => {
-                report.producer_quarantines += 1;
-                if let Some(index) = object.get("index_key").and_then(Value::as_str) {
-                    report.observed_indexes.insert(index.to_string());
+                if consume_quarantine(
+                    object,
+                    &params.profile,
+                    &params.workspace,
+                    &mut report,
+                ) {
+                    report.producer_quarantines += 1;
+                    if let Some(index) = object
+                        .get("index_key")
+                        .and_then(Value::as_str)
+                        .filter(|value| valid_digest(value))
+                    {
+                        report.observed_indexes.insert(index.to_string());
+                    }
                 }
-                consume_quarantine(object, &params.profile, &mut report)
             }
             Some("summary") => {
                 summaries += 1;
@@ -388,7 +400,12 @@ fn cross_profile_boundary(source: &str, target: &str) -> BoundaryDecision {
     }
 }
 
-fn consume_quarantine(object: &Map<String, Value>, profile: &str, report: &mut Report) {
+fn consume_quarantine(
+    object: &Map<String, Value>,
+    profile: &str,
+    workspace: &str,
+    report: &mut Report,
+) -> bool {
     let destination_valid = object
         .get("destination")
         .and_then(Value::as_str)
@@ -398,12 +415,13 @@ fn consume_quarantine(object: &Map<String, Value>, profile: &str, report: &mut R
         .and_then(Value::as_str)
         .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
+        || object.get("destination").and_then(Value::as_str) != Some(workspace)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
         || !reason_valid
     {
         quarantine(report, "quarantine-invalid");
-        return;
+        return false;
     }
     let reason = object
         .get("reason_code")
@@ -426,7 +444,7 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
         quarantine(report, "summary-invalid");
         return;
     };
-    if object.get("complete").and_then(Value::as_bool).is_none()
+    if object.get("complete") != Some(&Value::Bool(true))
         || records != report.records_seen as u64
         || quarantined != report.producer_quarantines as u64
         || inspected != report.observed_indexes.len() as u64
