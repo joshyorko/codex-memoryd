@@ -225,7 +225,13 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         quarantine(&mut report, "missing-summary");
     }
     if reached_eof && summaries == 1 && pending_cursor.is_some() && report.quarantined == report.producer_quarantines {
-        cursor = pending_cursor.flatten();
+        let candidate = pending_cursor.clone().flatten();
+        if candidate.is_some() && candidate == initial_cursor {
+            quarantine(&mut report, "cursor-unchanged");
+            cursor = initial_cursor;
+        } else {
+            cursor = candidate;
+        }
     } else {
         cursor = initial_cursor;
     }
@@ -249,18 +255,21 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
 }
 
 fn validate_params(params: &PccImportParams) -> Result<()> {
-    if params.profile.trim().is_empty() || params.profile.len() > 128 {
-        return Err(Error::invalid_request("PCC profile is invalid"));
-    }
-    if Profile::parse(&params.profile).is_none() {
-        return Err(Error::invalid_request("PCC profile is unsupported"));
+    if params.profile.trim().is_empty()
+        || params.profile.len() > 128
+        || Profile::parse(&params.profile).is_none()
+        || Profile::parse(&params.profile).is_some_and(|profile| profile.as_str() != params.profile)
+    {
+        return Err(Error::invalid_request("PCC profile is invalid or unsupported"));
     }
     if params.workspace.trim().is_empty() || params.workspace.len() > 128 {
         return Err(Error::invalid_request("PCC workspace is invalid"));
     }
     if let Some(target) = &params.target_profile {
-        if Profile::parse(target).is_none() {
-            return Err(Error::invalid_request("PCC target profile is unsupported"));
+        if Profile::parse(target).is_none()
+            || Profile::parse(target).is_some_and(|profile| profile.as_str() != target)
+        {
+            return Err(Error::invalid_request("PCC target profile is invalid or unsupported"));
         }
     }
     if let Some(target) = &params.target_profile {
@@ -355,7 +364,8 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
             return Some("record-invalid");
         }
     }
-    if !object.get("session").is_some_and(Value::is_object)
+    if !object.get("record").is_some_and(Value::is_object)
+        || !object.get("session").is_some_and(Value::is_object)
         || !object.get("source").is_some_and(Value::is_object)
         || !object.get("checkpoint").is_some_and(Value::is_object)
         || !object
@@ -444,7 +454,7 @@ fn consume_quarantine(
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
         || object.get("workspace_id").and_then(Value::as_str) != Some(workspace)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
-        || !destination_valid
+        || !object.get("index_key").and_then(Value::as_str).is_some_and(valid_digest)
         || !reason_valid
     {
         quarantine(report, "quarantine-invalid");
