@@ -1,0 +1,15 @@
+{
+  "name": "@codex-memoryd/omp-memory-provider",
+  "version": "0.1.0",
+  "description": "Native Oh My Pi MemoryBackend adapter for a local codex-memoryd daemon",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test tests"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}

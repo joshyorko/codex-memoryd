@@ -8,6 +8,7 @@ or a host-specific database.
 
 | Package | Host target | Installed surface |
 | --- | --- | --- |
+| [`omp-memory-provider`](./omp-memory-provider/README.md) | Oh My Pi | native `MemoryBackend` registration packet and MemoryD client |
 | [`codex-mcp`](./codex-mcp/README.md) | Codex MCP config | `~/.codex/config.toml` server snippet |
 | [`claude-local`](./claude-local/README.md) | Claude-style local MCP config | local MCP server JSON snippet |
 | [`copilot-instructions`](./copilot-instructions/README.md) | GitHub Copilot | generated instructions markdown |
