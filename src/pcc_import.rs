@@ -13,8 +13,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::domain::{Profile, RecordType, Sensitivity};
-use crate::error::{Error, Result};
+use crate::ids;
 use crate::policy::{self, BoundaryDecision, PolicyDecision};
 
 pub const SCHEMA: &str = "josh-room.pcc-replay.receipt";
@@ -106,9 +105,12 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
     let mut report = Report::default();
     let mut seen = params.seen_idempotency_keys.clone();
     let mut cursor = params.cursor.clone();
+    let initial_cursor = cursor.clone();
+    let mut reached_eof = false;
     let mut summaries = 0usize;
     let mut lines = 0usize;
     let mut records = 0usize;
+    let mut pending_cursor: Option<Option<String>> = None;
 
     loop {
         if lines >= MAX_LINES {
@@ -123,6 +125,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         let Some(line) = read_bounded_line(&mut reader).map_err(|error| {
             Error::invalid_request(format!("failed to read PCC replay input: {error}"))
         })? else {
+            reached_eof = true;
             break;
         };
         lines += 1;
@@ -151,6 +154,9 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
             quarantine(&mut report, "record-invalid");
             continue;
         };
+        if summaries > 0 {
+            pending_cursor = None;
+        }
         if !valid_envelope(object) {
             quarantine(&mut report, "schema-unsupported");
             continue;
@@ -193,12 +199,17 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                     quarantine(&mut report, "duplicate-summary");
                     continue;
                 }
-                consume_summary(object, &mut cursor, &mut report);
+                consume_summary(object, &mut pending_cursor, &mut report);
             }
             _ => quarantine(&mut report, "record-type-unsupported"),
         }
     }
 
+    if reached_eof && pending_cursor.is_some() && report.quarantined == report.producer_quarantines {
+        cursor = pending_cursor.flatten();
+    } else {
+        cursor = initial_cursor;
+    }
     report.idempotency_keys.truncate(MAX_REPORT_KEYS);
     Ok(PccImportResponse {
         schema: SCHEMA,
@@ -291,6 +302,10 @@ fn consume_record(
             quarantine(report, "policy-denied");
             return;
         }
+        if expected_idempotency_key(object).as_deref() != Some(idempotency_key) {
+            quarantine(report, "idempotency-key-mismatch");
+            return;
+        }
         if !seen.insert(idempotency_key.to_string()) {
             report.skipped += 1;
             return;
@@ -378,7 +393,7 @@ fn consume_quarantine(object: &Map<String, Value>, profile: &str, report: &mut R
     let reason_valid = object
         .get("reason_code")
         .and_then(Value::as_str)
-        .is_some_and(valid_reason_code);
+        .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
@@ -390,11 +405,12 @@ fn consume_quarantine(object: &Map<String, Value>, profile: &str, report: &mut R
     let reason = object
         .get("reason_code")
         .and_then(Value::as_str)
-        .unwrap_or("quarantine-invalid");
+        .filter(|value| allowed_reason_code(value))
+        .unwrap_or("producer-quarantine");
     quarantine(report, reason);
 }
 
-fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<String>, report: &mut Report) {
+fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<String>>, report: &mut Report) {
     let Some(inspected) = object.get("inspected_indexes").and_then(Value::as_u64) else {
         quarantine(report, "summary-invalid");
         return;
@@ -416,8 +432,10 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<String>, rep
         return;
     }
     match object.get("next_cursor") {
-        None | Some(Value::Null) => *cursor = None,
-        Some(Value::String(value)) if validate_cursor(value).is_ok() => *cursor = Some(value.clone()),
+        None | Some(Value::Null) => *cursor = Some(None),
+        Some(Value::String(value)) if validate_cursor(value).is_ok() => {
+            *cursor = Some(Some(value.clone()))
+        },
         _ => quarantine(report, "cursor-invalid"),
     }
 }
@@ -425,9 +443,10 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<String>, rep
 
 fn policy_safe_object(value: &Map<String, Value>) -> bool {
     let mut count = 0;
-    value
-        .values()
-        .all(|item| policy_visit(item, 0, &mut count))
+    value.iter().all(|(key, item)| {
+        matches!(policy::screen_string_value(key), PolicyDecision::Accept(_))
+            && policy_visit(item, 0, &mut count)
+    })
 }
 
 fn policy_visit(value: &Value, depth: usize, count: &mut usize) -> bool {
@@ -438,20 +457,66 @@ fn policy_visit(value: &Value, depth: usize, count: &mut usize) -> bool {
     match value {
         Value::String(text) => matches!(policy::screen_string_value(text), PolicyDecision::Accept(_)),
         Value::Array(items) => items.iter().all(|item| policy_visit(item, depth + 1, count)),
-        Value::Object(items) => items.values().all(|item| policy_visit(item, depth + 1, count)),
+        Value::Object(items) => items.iter().all(|(key, item)| {
+            matches!(policy::screen_string_value(key), PolicyDecision::Accept(_))
+                && policy_visit(item, depth + 1, count)
+        }),
         _ => true,
+    }
+}
+fn expected_idempotency_key(object: &Map<String, Value>) -> Option<String> {
+    let session = object.get("session")?.as_object()?;
+    let segment = object.get("segment")?.as_object()?;
+    let identity = serde_json::json!({
+        "profile_id": object.get("profile_id")?,
+        "workspace_id": object.get("workspace_id")?,
+        "session_id": session.get("session_id"),
+        "segment_event_id": segment.get("event_id"),
+        "segment_content_sha256": segment.get("content_sha256"),
+        "checkpoint": object.get("checkpoint")?,
+        "record_index": object.get("record_index")?,
+        "record": object.get("record")?,
+    });
+    let bytes = serde_json::to_vec(&canonicalize(&identity)).ok()?;
+    Some(ids::sha256_hex(&bytes).trim_start_matches("sha256:").to_string())
+}
+
+fn canonicalize(value: &Value) -> Value {
+    match value {
+        Value::Object(items) => {
+            let mut keys = items.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = Map::new();
+            for key in keys {
+                out.insert(key.clone(), canonicalize(&items[key]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+        _ => value.clone(),
     }
 }
 
 fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
-fn valid_reason_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
+fn allowed_reason_code(value: &str) -> bool {
+    matches!(
+        value,
+        "broken-chain"
+            | "missing-asset"
+            | "unknown-major"
+            | "unknown-minor"
+            | "corrupt-ciphertext"
+            | "digest-mismatch"
+            | "policy-mismatch"
+            | "untrusted-producer"
+            | "capture-gap"
+            | "evidence-invalid"
+            | "ciphertext-too-large"
+            | "ciphertext-size-invalid"
+            | "producer-quarantine"
+    )
 }
 
 fn validate_cursor(value: &str) -> Result<()> {
@@ -504,23 +569,25 @@ mod tests {
         std::iter::repeat(ch).take(64).collect()
     }
 
-    fn record(profile: &str, workspace: &str, key: &str, text: &str) -> String {
-        serde_json::json!({
+    fn record(profile: &str, workspace: &str, _key: &str, text: &str) -> String {
+        let mut value = serde_json::json!({
             "schema": INPUT_SCHEMA,
             "schema_version": {"major": 1, "minor": 0},
             "type": "record",
-            "idempotency_key": key,
+            "idempotency_key": "",
             "profile_id": profile,
             "workspace_id": workspace,
             "session": {"session_id": "s"},
             "source": {"surface": "josh-room"},
             "checkpoint": {},
-            "segment": {"content_sha256": key},
+            "segment": {"content_sha256": "segment"},
             "record_index": 0,
             "record": {"role": "user", "text": text},
             "producer_trust": "untrusted"
-        })
-        .to_string()
+        });
+        let key = expected_idempotency_key(value.as_object().unwrap()).unwrap();
+        value["idempotency_key"] = Value::String(key);
+        value.to_string()
     }
 
     fn summary(cursor: Option<&str>) -> String {
@@ -550,10 +617,16 @@ mod tests {
 
     #[test]
     fn exact_replay_is_skipped_by_consumer_owned_key() {
-        let key = digest('b');
+        let input = record("work", "ws", "ignored", "safe");
+        let key = serde_json::from_str::<Value>(&input)
+            .unwrap()
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
         let mut params = PccImportParams::new("unused", "work", "ws");
-        params.seen_idempotency_keys.insert(key.clone());
-        let response = run_reader(Cursor::new(record("work", "ws", &key, "safe")), params).unwrap();
+        params.seen_idempotency_keys.insert(key);
+        let response = run_reader(Cursor::new(input), params).unwrap();
         assert_eq!((response.imported, response.skipped), (0, 1));
     }
 
