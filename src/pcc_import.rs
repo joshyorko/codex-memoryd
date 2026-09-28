@@ -196,7 +196,6 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                 if consume_quarantine(
                     object,
                     &params.profile,
-                    &params.workspace,
                     &mut report,
                 ) {
                     report.producer_quarantines += 1;
@@ -444,7 +443,6 @@ fn cross_profile_boundary(source: &str, target: &str) -> BoundaryDecision {
 fn consume_quarantine(
     object: &Map<String, Value>,
     profile: &str,
-    workspace: &str,
     report: &mut Report,
 ) -> bool {
     let destination_valid = object
@@ -460,7 +458,6 @@ fn consume_quarantine(
         .and_then(Value::as_str)
         .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
-        || object.get("workspace_id").and_then(Value::as_str) != Some(workspace)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
         || !index_key_valid
@@ -702,7 +699,6 @@ mod tests {
             "type": "quarantine",
             "quarantine_id": digest('f'),
             "profile_id": "work",
-            "workspace_id": "ws",
             "destination": "",
             "index_key": digest('d'),
             "reason_code": "broken-chain"
@@ -731,7 +727,6 @@ mod tests {
             "type": "quarantine",
             "quarantine_id": digest('f'),
             "profile_id": "work",
-            "workspace_id": "ws",
             "destination": "room-destination",
             "index_key": "not-a-digest",
             "reason_code": "broken-chain"
@@ -753,14 +748,13 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_multiple_records_and_mixed_quarantine_by_unique_indexes() {
+    fn reconciles_multiple_records_and_published_quarantine_without_workspace_id() {
         let quarantine = serde_json::json!({
             "schema": INPUT_SCHEMA,
             "schema_version": {"major": 1, "minor": 0},
             "type": "quarantine",
             "quarantine_id": digest('f'),
             "profile_id": "work",
-            "workspace_id": "ws",
             "destination": "room-destination",
             "index_key": digest('d'),
             "reason_code": "broken-chain"
