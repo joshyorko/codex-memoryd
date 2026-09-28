@@ -451,6 +451,10 @@ fn consume_quarantine(
         .get("destination")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty() && value.len() <= 128);
+    let index_key_valid = object
+        .get("index_key")
+        .and_then(Value::as_str)
+        .is_some_and(valid_digest);
     let reason_valid = object
         .get("reason_code")
         .and_then(Value::as_str)
@@ -459,6 +463,7 @@ fn consume_quarantine(
         || object.get("workspace_id").and_then(Value::as_str) != Some(workspace)
         || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
         || !destination_valid
+        || !index_key_valid
         || !reason_valid
     {
         quarantine(report, "quarantine-invalid");
@@ -700,6 +705,35 @@ mod tests {
             "workspace_id": "ws",
             "destination": "",
             "index_key": digest('d'),
+            "reason_code": "broken-chain"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 0,
+            "records": 0,
+            "quarantined": 1,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let input = format!("{}\n{}\n", quarantine, summary);
+        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws")).unwrap();
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+    }
+
+    #[test]
+    fn malformed_quarantine_index_cannot_count_or_advance_cursor() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "workspace_id": "ws",
+            "destination": "room-destination",
+            "index_key": "not-a-digest",
             "reason_code": "broken-chain"
         });
         let summary = serde_json::json!({
