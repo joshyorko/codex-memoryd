@@ -1,3 +1,4 @@
+import { isRecord } from "./guards";
 import type { RecallData, RecallFact } from "./client";
 
 const SAFE_ID = /^[A-Za-z0-9_.:/-]{1,160}$/;
@@ -19,6 +20,7 @@ export function formatRecall(data: RecallData, maxTokens: number): FormattedReca
   let count = 0;
   let truncated = Boolean(data.truncated === true);
   for (const candidate of facts) {
+    if (!isRecord(candidate)) continue;
     const fact = candidate as RecallFact;
     if (typeof fact.content !== "string" || fact.content.trim() === "") continue;
     const line = formatFact(fact);

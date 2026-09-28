@@ -5,6 +5,7 @@ import type {
   BackendOperationContext,
   MemoryBackend,
   MemoryBackendSaveInput,
+  MemoryBackendSaveResult,
   MemoryBackendSearchOptions,
   MemoryBackendSearchResult,
   MemoryBackendStatus,
@@ -93,7 +94,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
 
     async status(context: BackendOperationContext): Promise<MemoryBackendStatus> {
       const state = stateFor(context.session);
-      if (!state) return { backend: "codex-memoryd", active: false, writable: true, searchable: true, message: "Backend has not been started for this session" };
+      if (!state) return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: "Backend has not been started for this session" };
       try {
         await client.status();
         return {
@@ -101,14 +102,14 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
           active: true,
           writable: true,
           searchable: true,
-          message: `${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}`,
+          message: `${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled`,
         };
       } catch (error) {
         return {
           backend: "codex-memoryd",
           active: false,
-          writable: true,
-          searchable: true,
+          writable: false,
+          searchable: false,
           message: failureOutcome(error),
         };
       }

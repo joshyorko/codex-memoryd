@@ -67,7 +67,8 @@ function requiredScope(value: unknown, name: "profile" | "workspace"): string {
   return value.trim();
 }
 
-export function loadConfig(input: Partial<MemoryDConfig> & { autoObserve?: unknown } = {}): MemoryDConfig {
+type ConfigInput = Omit<Partial<MemoryDConfig>, "autoObserve"> & { autoObserve?: unknown };
+export function loadConfig(input: ConfigInput = {}): MemoryDConfig {
   if (input.autoObserve === true) {
     throw new MemoryDConfigError(
       "writeback_unavailable",
@@ -86,7 +87,7 @@ export function loadConfig(input: Partial<MemoryDConfig> & { autoObserve?: unkno
   };
 }
 
-export function tryLoadConfig(input: Partial<MemoryDConfig> & { autoObserve?: unknown } = {}):
+export function tryLoadConfig(input: ConfigInput = {}):
   | { config: MemoryDConfig; error?: undefined }
   | { config?: undefined; error: MemoryDConfigError } {
   try {

@@ -10,12 +10,17 @@ pre-compaction recall. Recall is contextual evidence and is always rendered as
 
 The exact OMP `main` audited for this package is `can1357/oh-my-pi`
 `cabfa74e1f6b4e8f53d1afb71b652c024db339fd` (`v18.4.2-18-gcabfa74e1f`). Its
-`MemoryBackendId`, settings enum, and resolver remain closed; upstream issues
-[#2148](https://github.com/can1357/oh-my-pi/issues/2148) and
+`MemoryBackendId` in `packages/coding-agent/src/memory-backend/types.ts`,
+the `memory.backend` enum in
+`packages/coding-agent/src/memory-backend/settings.ts`, and the hard-coded
+`resolveMemoryBackend()` branches in
+`packages/coding-agent/src/memory-backend/resolve.ts` remain closed; upstream
+issues [#2148](https://github.com/can1357/oh-my-pi/issues/2148) and
 [#7902](https://github.com/can1357/oh-my-pi/issues/7902) are still open. The
-adapter therefore does **not** add extension lifecycle hooks, shadow memory
-tools, or an OMP fork. It exports the smallest registration packet required by
-the intended public seam:
+extension `ExtensionAPI` has no `registerMemoryBackend` method. The adapter
+therefore does **not** add extension lifecycle hooks, shadow memory tools, or
+an OMP fork. It exports the smallest registration packet required by the
+intended public seam:
 
 ```ts
 registerMemoryBackend({

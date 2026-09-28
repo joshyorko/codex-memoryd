@@ -76,6 +76,11 @@ describe("recall formatting", () => {
     expect(rendered.count).toBe(0);
     expect(rendered.truncated).toBe(true);
   });
+  test("ignores malformed recall entries", () => {
+    const rendered = formatRecall({ facts: [null, "not-an-object", 42, { content: "safe" }] }, 1200);
+    expect(rendered.count).toBe(1);
+    expect(rendered.context).toContain("safe");
+  });
 });
 
 describe("transport and lifecycle", () => {
