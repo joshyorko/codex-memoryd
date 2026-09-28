@@ -1,0 +1,13 @@
+{
+  "schema": "josh-room.pcc-replay.receipt",
+  "schema_version": {"major": 1, "minor": 0},
+  "profile_id": "profile-synthetic",
+  "workspace_id": "workspace-synthetic",
+  "cursor": "consumer-owned-example",
+  "imported": 1,
+  "skipped": 0,
+  "quarantined": 2,
+  "idempotency_keys": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  "quarantine_reasons": ["broken-chain", "missing-asset"],
+  "content": "omitted"
+}

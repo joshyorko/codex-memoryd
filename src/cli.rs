@@ -3,7 +3,7 @@
 //! `sync-local`, `export`, and `forget` exercise identical code paths. `serve`
 //! launches the daemon; `doctor` runs self-checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
 use codex_memoryd::chatgpt_export_import::ChatgptExportSelection;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
+use codex_memoryd::pcc_import;
 use codex_memoryd::config::ConfigLoadSource;
 use codex_memoryd::conformance;
 use codex_memoryd::domain;
@@ -593,6 +594,23 @@ pub enum ImportCommand {
         #[arg(value_name = "EXPORT")]
         export_path: PathBuf,
     },
+    /// Consume Josh Room's neutral PCC replay/export JSONL without writing memory.
+    PccReplay {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        destination: String,
+        #[arg(long)]
+        target_profile: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long = "seen-idempotency-key")]
+        seen_idempotency_keys: Vec<String>,
+        #[arg(value_name = "JSONL")]
+        input: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1032,18 +1050,24 @@ fn validate_runtime_environment() -> Result<()> {
     }
 }
 
-fn dispatch(cli: Cli) -> Result<()> {
-    let database_free_inspect = matches!(
-        cli.command,
+fn is_database_free_command(command: &Command) -> bool {
+    matches!(
+        command,
         Command::Bundle {
             command: BundleCommand::Inspect { .. }
+        } | Command::Import {
+            command: ImportCommand::PccReplay { .. }
         }
-    );
+    )
+}
+
+fn validate_cli_preflight(cli: &Cli) -> Result<()> {
+    let database_free_inspect = is_database_free_command(&cli.command);
     if cli.runtime.is_none() && !database_free_inspect {
         validate_runtime_environment()?;
     }
 
-    if client_url_is_present(&cli)
+    if client_url_is_present(cli)
         && cli.db.is_some()
         && !cli.local
         && !database_free_inspect
@@ -1063,6 +1087,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             "--url and --db conflict unless --local makes direct SQLite mode explicit",
         ));
     }
+    Ok(())
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
+    validate_cli_preflight(&cli)?;
 
     match &cli.command {
         Command::Init {
@@ -1731,7 +1760,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Import { command } => {
-            let service = cli.open_service(None)?;
             match command {
                 ImportCommand::ChatgptExport {
                     list,
@@ -1748,6 +1776,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     workspace,
                     export_path,
                 } => {
+                    let service = cli.open_service(None)?;
                     let mode = if *apply {
                         ChatgptExportMode::Apply
                     } else if *list {
@@ -1775,6 +1804,28 @@ fn dispatch(cli: Cli) -> Result<()> {
                         },
                     )?;
                     print_json(&resp)?;
+                }
+                ImportCommand::PccReplay {
+                    profile,
+                    workspace,
+                    destination,
+                    target_profile,
+                    cursor,
+                    seen_idempotency_keys,
+                    input,
+                } => {
+                    let mut params = pcc_import::PccImportParams::new(
+                        input.clone(),
+                        profile.clone(),
+                        workspace.clone(),
+                        destination.clone(),
+                    );
+                    params.target_profile = target_profile.clone();
+                    params.cursor = cursor.clone();
+                    params.seen_idempotency_keys =
+                        seen_idempotency_keys.iter().cloned().collect::<HashSet<_>>();
+                    let response = pcc_import::run(params)?;
+                    print_json(&response)?;
                 }
             }
             Ok(())
@@ -3720,5 +3771,40 @@ mod tests {
         let error = toml_basic_string("unsafe\0value", "test value").unwrap_err();
         assert!(error.message.contains("cannot represent"));
         assert!(error.message.contains("NUL"));
+    }
+    #[test]
+    fn pcc_replay_dispatch_skips_runtime_and_url_db_preflights() {
+        let input = std::env::temp_dir().join(format!(
+            "codex-memoryd-pcc-replay-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&input, "{}\n").unwrap();
+        let cli = Cli::try_parse_from([
+            "codex-memoryd",
+            "--url",
+            "http://127.0.0.1:8787",
+            "--db",
+            "/tmp/pcc-replay.sqlite",
+            "import",
+            "pcc-replay",
+            "--profile",
+            "work",
+            "--workspace",
+            "workspace",
+            "--destination",
+            "room-destination",
+            input.to_str().unwrap(),
+        ])
+        .unwrap();
+        let previous_runtime = std::env::var("CODEX_MEMORYD_RUNTIME").ok();
+        std::env::set_var("CODEX_MEMORYD_RUNTIME", "invalid-for-preflight-test");
+        let result = dispatch(cli);
+        if let Some(value) = previous_runtime {
+            std::env::set_var("CODEX_MEMORYD_RUNTIME", value);
+        } else {
+            std::env::remove_var("CODEX_MEMORYD_RUNTIME");
+        }
+        std::fs::remove_file(input).unwrap();
+        assert!(result.is_ok());
     }
 }
