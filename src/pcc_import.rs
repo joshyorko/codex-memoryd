@@ -135,9 +135,6 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
             quarantine(&mut report, "line-too-large");
             break;
         }
-        if summaries > 0 {
-            pending_cursor = None;
-        }
         let text = match std::str::from_utf8(&line) {
             Ok(text) => text.trim(),
             Err(_) => {
@@ -475,6 +472,10 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
         quarantine(report, "summary-invalid");
         return;
     };
+    if report.records_seen == 0 && report.producer_quarantines == 0 {
+        quarantine(report, "summary-no-scope");
+        return;
+    }
     if object.get("complete") != Some(&Value::Bool(true))
         || records != report.records_seen as u64
         || quarantined != report.producer_quarantines as u64
@@ -489,7 +490,10 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
     };
     match next_cursor {
         Value::Null => *cursor = Some(None),
-        Value::String(value) if validate_cursor(value).is_ok() => {
+        Value::String(value)
+            if validate_cursor(value).is_ok()
+                && matches!(policy::screen_string_value(value), PolicyDecision::Accept(_)) =>
+        {
             *cursor = Some(Some(value.clone()))
         },
         _ => quarantine(report, "cursor-invalid"),
