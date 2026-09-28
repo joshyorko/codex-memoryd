@@ -349,7 +349,7 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
     }
     if !object.get("session").is_some_and(Value::is_object)
         || !object.get("source").is_some_and(Value::is_object)
-        || !object.get("record").is_some_and(Value::is_object)
+        || !object.get("checkpoint").is_some_and(Value::is_object)
         || !object
             .get("segment")
             .and_then(Value::as_object)
