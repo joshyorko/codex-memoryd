@@ -485,21 +485,23 @@ completing an import.
 
 `import pcc-replay` consumes the versioned `josh-room.pcc-replay` JSONL stream
 from Josh Room's public replay seam. It is a bounded, policy-gated consumer:
-it validates schema versions, profile/workspace bindings, producer trust, and
-the local secret/injection policy, then prints a receipt only. It never parses
-R2 objects, imports Josh Room modules, executes transcript/tool text, calls a
-model, or writes MemoryD records.
+it validates schema versions, profile/workspace/destination bindings, producer
+trust, and the local secret/injection policy, then prints a receipt only. It
+never parses R2 objects, imports Josh Room modules, executes transcript/tool
+text, calls a model, or writes MemoryD records.
 
 ```bash
 target/release/codex-memoryd import pcc-replay \
-  --profile work --workspace josh-work replay.jsonl
+  --profile work --workspace josh-work --destination private-r2 replay.jsonl
 ```
 
 The receipt carries the opaque producer cursor and accepted idempotency keys.
-Pass those keys again on exact replay with `--seen-idempotency-key`; pass the
-cursor back with `--cursor` when resuming. Cross-profile work-to-personal
-consumption is denied by default. The receipt contains counts and reason codes,
-never transcript content.
+Quarantine envelopes must match the explicitly supplied producer destination;
+records must match the requested profile and workspace. Pass those keys again
+on exact replay with `--seen-idempotency-key`; pass the cursor back with
+`--cursor` when resuming. Cross-profile work-to-personal consumption is denied
+by default. The receipt contains counts and reason codes, never transcript
+content.
 
 ### MCP read-only dogfood
 

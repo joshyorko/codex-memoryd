@@ -601,6 +601,8 @@ pub enum ImportCommand {
         #[arg(long)]
         workspace: String,
         #[arg(long)]
+        destination: String,
+        #[arg(long)]
         target_profile: Option<String>,
         #[arg(long)]
         cursor: Option<String>,
@@ -1795,6 +1797,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ImportCommand::PccReplay {
                     profile,
                     workspace,
+                    destination,
                     target_profile,
                     cursor,
                     seen_idempotency_keys,
@@ -1804,6 +1807,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         input.clone(),
                         profile.clone(),
                         workspace.clone(),
+                        destination.clone(),
                     );
                     params.target_profile = target_profile.clone();
                     params.cursor = cursor.clone();
