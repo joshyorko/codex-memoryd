@@ -204,3 +204,21 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+
+  test("counts Unicode code points for the explicit-save limit", async () => {
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return envelope({ record_ids: ["r1"] });
+    };
+    try {
+      const backend = createMemoryDBackend(config);
+      const context = { agentDir: ".", cwd: "." };
+      expect((await backend.save?.(context, { content: "🙂".repeat(16_000) }))?.stored).toBe(1);
+      expect((await backend.save?.(context, { content: "🙂".repeat(16_001) }))?.stored).toBe(0);
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
