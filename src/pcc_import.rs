@@ -204,6 +204,7 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
                     object,
                     &params.profile,
                     &params.destination,
+                    target_profile,
                     &mut report,
                 ) {
                     report.producer_quarantines += 1;
@@ -458,16 +459,27 @@ fn consume_quarantine(
     object: &Map<String, Value>,
     profile: &str,
     destination: &str,
+    target_profile: &str,
     report: &mut Report,
 ) -> bool {
+    match cross_profile_boundary(profile, target_profile) {
+        BoundaryDecision::Allow => {}
+        BoundaryDecision::Deny { .. } => {
+            quarantine(report, "profile-boundary-denied");
+            return false;
+        }
+        BoundaryDecision::AllowGenericPreferencesOnly => {
+            quarantine(report, "profile-boundary-filtered");
+            return false;
+        }
+    }
     let destination_valid = object
         .get("destination")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty() && value.len() <= 128);
     let index_key_valid = object
         .get("index_key")
-        .and_then(Value::as_str)
-        .is_some_and(valid_digest);
+        .map_or(true, |value| value.as_str().is_some_and(valid_digest));
     let reason_valid = object
         .get("reason_code")
         .and_then(Value::as_str)
@@ -751,6 +763,68 @@ mod tests {
         let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
         assert_eq!(response.cursor, None);
         assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+    }
+
+    #[test]
+    fn accepts_published_quarantine_without_optional_index_key() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "destination": "room-destination",
+            "reason_code": "index-read-failed"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 0,
+            "records": 0,
+            "quarantined": 1,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", quarantine, summary)),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
+        assert_eq!(response.quarantined, 1);
+        assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
+    }
+
+    #[test]
+    fn work_quarantine_cannot_cross_to_personal() {
+        let quarantine = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "quarantine",
+            "quarantine_id": digest('f'),
+            "profile_id": "work",
+            "destination": "room-destination",
+            "reason_code": "index-read-failed"
+        });
+        let summary = serde_json::json!({
+            "schema": INPUT_SCHEMA,
+            "schema_version": {"major": 1, "minor": 0},
+            "type": "summary",
+            "inspected_indexes": 0,
+            "records": 0,
+            "quarantined": 1,
+            "complete": true,
+            "next_cursor": "opaque-cursor"
+        });
+        let mut params = PccImportParams::new("unused", "work", "ws", "room-destination");
+        params.target_profile = Some("personal".to_string());
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", quarantine, summary)),
+            params,
+        )
+        .unwrap();
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
