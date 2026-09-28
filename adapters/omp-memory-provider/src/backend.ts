@@ -6,6 +6,7 @@ import type { BackendFactoryContext, BackendOperationContext, MemoryBackend, Mem
 interface SessionState { generation: number; epoch: number; autoRecall: boolean; lastOutcome?: string; lastCount: number }
 
 export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryDClient(config)): MemoryBackend {
+  const truncateCodePoints = (value: string, limit: number): string => [...value].slice(0, limit).join("");
   const states = new WeakMap<object, SessionState>();
   let rootSession: SessionLike | undefined;
   let activeSession: SessionLike | undefined;
@@ -20,7 +21,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
   const recall = async (session: SessionLike | undefined, query: string, signal?: AbortSignal): Promise<{ context?: string; count: number; outcome: string }> => {
     if (!query.trim()) return { count: 0, outcome: "healthy-empty" as string };
     try {
-      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, maxTokens: config.maxTokens, signal });
+      const data = await client.recall({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), sessionId: session?.sessionId, repoId: session?.repoId, maxTokens: config.maxTokens, signal });
       if (!Array.isArray(data.facts) && !Array.isArray(data.checkpoints)) throw new MemoryDClientError("protocol-mismatch");
       const formatted = formatRecall(data, config.maxTokens);
       return { ...formatted, outcome: formatted.count ? "healthy-with-memory" : "healthy-empty" };
@@ -44,7 +45,8 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       lastOutcome = "cleared-local-state"; lastCount = 0;
     },
     async enqueue(_agentDir: string, _cwd: string, session?: SessionLike): Promise<void> {
-      const state = stateFor(session); if (state) state.lastOutcome = "unsupported-no-queue"; lastOutcome = "unsupported-no-queue";
+      const owner = session ?? rootSession ?? activeSession;
+      const state = stateFor(owner); if (state) state.lastOutcome = "unsupported-no-queue"; lastOutcome = "unsupported-no-queue";
     },
     async status(context: BackendOperationContext): Promise<MemoryBackendStatus> {
       const owner = context.session ?? rootSession ?? activeSession;
@@ -62,7 +64,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
     async search(_context: BackendOperationContext, query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult> {
       try {
-        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: query.slice(0, 8_000), repoId: (_context.session ?? rootSession ?? activeSession)?.repoId, limit: options?.limit, signal: options?.signal });
+        const data = await client.search({ profile: config.profile, workspace: config.workspace, query: truncateCodePoints(query, 8_000), repoId: (_context.session ?? rootSession ?? activeSession)?.repoId, limit: options?.limit, signal: options?.signal });
         if (!Array.isArray(data.matches)) throw new MemoryDClientError("protocol-mismatch");
         const items = data.matches.flatMap(match => { if (!isRecord(match) || typeof match.content !== "string") return []; return [{ id: typeof match.id === "string" ? match.id : undefined, content: match.content, source: typeof match.scope === "string" ? match.scope : undefined, timestamp: typeof match.updated_at === "string" ? match.updated_at : undefined, score: typeof match.confidence === "number" ? match.confidence : undefined }]; });
         return { backend: "codex-memoryd", query, count: items.length, items };
@@ -72,7 +74,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
       if ([...input.content].length > 16_000) return { backend: "codex-memoryd", stored: 0, message: "Explicit save exceeds the 16000-character MemoryD limit" };
       const owner = context.session ?? rootSession ?? activeSession;
       try {
-        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context?.slice(0, 2_000), source: input.source?.slice(0, 200), sessionId: owner?.sessionId, repoId: owner?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
+        const data = await client.explicitSave({ profile: config.profile, workspace: config.workspace, content: input.content, context: input.context ? truncateCodePoints(input.context, 2_000) : undefined, source: input.source ? truncateCodePoints(input.source, 200) : undefined, sessionId: owner?.sessionId, repoId: owner?.repoId, timeoutMs: Math.max(config.recallTimeoutMs, 5_000) });
         if (!Array.isArray(data.record_ids) && !Array.isArray(data.created) && !Array.isArray(data.rejected)) throw new MemoryDClientError("protocol-mismatch");
         const ids = Array.isArray(data.record_ids) ? data.record_ids.filter((id): id is string => typeof id === "string") : [];
         return { backend: "codex-memoryd", stored: ids.length, ids, message: Array.isArray(data.rejected) && data.rejected.length ? `${data.rejected.length} explicit save rejected by policy` : undefined };
@@ -86,7 +88,7 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
     },
     async preCompactionContext(messages: readonly unknown[], _settings: SettingsLike, session?: SessionLike): Promise<string | undefined> {
       const owner = session ?? rootSession ?? activeSession; const state = stateFor(owner); if (!state?.autoRecall) return undefined; const generation = state.generation; const startEpoch = epoch;
-      const query = messages.flatMap(messageContent).join("\n").slice(-8_000); const result = await recall(owner, query); const current = stateFor(owner); if (current !== state || current.generation !== generation || startEpoch !== epoch) return undefined;
+      const query = [...messages.flatMap(messageContent).join("\n")].slice(-8_000).join(""); const result = await recall(owner, query); const current = stateFor(owner); if (current !== state || current.generation !== generation || startEpoch !== epoch) return undefined;
       state.lastOutcome = result.outcome; state.lastCount = result.count; return result.context;
     },
   };

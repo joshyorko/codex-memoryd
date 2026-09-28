@@ -222,3 +222,53 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+
+  test("keeps bounded text truncation on Unicode boundaries", async () => {
+    const original = globalThis.fetch;
+    const bodies = new Map<string, any[]>();
+    const boundary = (limit: number) => "a".repeat(limit - 2) + "🙂" + "a";
+    const suffixBoundary = "a".repeat(8_000) + "🙂";
+    globalThis.fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      bodies.set(path, [...(bodies.get(path) ?? []), JSON.parse(String(init?.body ?? "{}"))]);
+      if (path === "/v1/recall") return envelope({ facts: [], authority: "recall_not_authority" });
+      if (path === "/v1/search") return envelope({ matches: [] });
+      return envelope({ record_ids: ["r1"] });
+    };
+    try {
+      const session = { sessionId: "s1" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await backend.beforeAgentStartPrompt?.(session, boundary(8_001));
+      await backend.search?.({ agentDir: ".", cwd: ".", session }, boundary(8_001));
+      await backend.preCompactionContext?.([{ content: suffixBoundary }], {}, session);
+      await backend.save?.({ agentDir: ".", cwd: ".", session }, { content: "save", context: boundary(2_001), source: boundary(201) });
+      const recalls = bodies.get("/v1/recall") ?? [];
+      expect(recalls[0]?.query.endsWith("🙂")).toBe(true);
+      expect(recalls[1]?.query.endsWith("🙂")).toBe(true);
+      expect(bodies.get("/v1/search")?.[0]?.query.endsWith("🙂")).toBe(true);
+      expect(bodies.get("/v1/conclusions")?.[0]?.metadata.context.endsWith("🙂")).toBe(true);
+      expect(bodies.get("/v1/conclusions")?.[0]?.metadata.source.endsWith("🙂")).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+  test("sessionless enqueue updates the retained root status", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({
+      status: "local_only",
+      storage: { writable: true },
+      features: { recall: true },
+    });
+    try {
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session: { sessionId: "s1" }, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await backend.enqueue?.(".", ".");
+      await expect(backend.status?.({ agentDir: ".", cwd: "." })).resolves.toMatchObject({
+        active: true,
+        message: expect.stringContaining("unsupported-no-queue"),
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
