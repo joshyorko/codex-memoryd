@@ -153,4 +153,25 @@ describe("transport and lifecycle", () => {
       globalThis.fetch = original;
     }
   });
+
+  test("does not advertise capabilities for an unavailable daemon", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => envelope({
+      status: "auth_missing",
+      storage: { writable: true },
+      features: { recall: true },
+    });
+    try {
+      const session = { sessionId: "s1" };
+      const backend = createMemoryDBackend(config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      await expect(backend.status?.({ agentDir: ".", cwd: ".", session })).resolves.toMatchObject({
+        active: false,
+        writable: false,
+        searchable: false,
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });

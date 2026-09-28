@@ -54,9 +54,10 @@ export function createMemoryDBackend(config: MemoryDConfig, client = new MemoryD
         const storage = isRecord(data.storage) ? data.storage : undefined;
         const features = isRecord(data.features) ? data.features : undefined;
         const providerStatus = typeof data.status === "string" ? data.status : "protocol-mismatch";
-        const writable = storage?.writable === true;
-        const searchable = features?.recall === true;
-        return { backend: "codex-memoryd", active: (providerStatus === "local_only" || providerStatus === "degraded") && storage !== undefined, writable, searchable, message: `${providerStatus}; ${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled` };
+        const active = (providerStatus === "local_only" || providerStatus === "degraded") && storage !== undefined;
+        const writable = active && storage?.writable === true;
+        const searchable = active && features?.recall === true;
+        return { backend: "codex-memoryd", active, writable, searchable, message: `${providerStatus}; ${state.lastOutcome ?? lastOutcome}; recalled=${state.lastCount}; automatic observation disabled` };
       } catch (error) { return { backend: "codex-memoryd", active: false, writable: false, searchable: false, message: failureOutcome(error) }; }
     },
     async search(_context: BackendOperationContext, query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult> {
