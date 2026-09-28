@@ -639,6 +639,16 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ciphertext_index_cannot_reconcile_or_advance_cursor() {
+        let mut value = serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
+        value["segment"]["ciphertext_sha256"] = Value::String("not-a-digest".to_string());
+        let input = format!("{}\n{}\n", value, summary(Some("opaque-cursor")));
+        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws")).unwrap();
+        assert_eq!(response.cursor, None);
+        assert!(response.quarantine_reasons.contains(&"summary-mismatch".to_string()));
+    }
+
+    #[test]
     fn exact_replay_is_skipped_by_consumer_owned_key() {
         let input = record("work", "ws", "ignored", "safe");
         let key = serde_json::from_str::<Value>(&input)
