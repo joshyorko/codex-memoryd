@@ -9,6 +9,9 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: release-v0.1.0
+  cancel-in-progress: false
 permissions:
   contents: read
   packages: write
@@ -17,6 +20,7 @@ env:
   TAG: v0.1.0
   IMAGE: ghcr.io/joshyorko/codex-memoryd
   EXPECTED_DIGEST: sha256:70465d5250f693d15408fe904d30e3035360d8a46ac6f1caea8c3660eac09996
+  EXPECTED_SOURCE_COMMIT: 45b5ef31e0d027bd03260d0731d7d5da09a611ef
 jobs:
   repair:
     name: Verify v0.1.0 and repair latest
@@ -32,6 +36,7 @@ jobs:
           test "${{ inputs.confirm }}" = true
 
       - name: Verify the immutable release and exact tag
+        id: release
         shell: bash
         run: |
           set -euo pipefail
@@ -46,7 +51,32 @@ jobs:
             '.tag_name == $tag and .draft == false and .immutable == true' \
             <<<"$release_json" >/dev/null
           [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]]
+          echo "source_commit=$tag_object" >> "$GITHUB_OUTPUT"
           echo "Release source commit: $tag_object" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify release provenance for the pinned image
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern provenance.json \
+            --dir "$work"
+          jq -e \
+            --arg tag "$TAG" \
+            --arg source_commit "$EXPECTED_SOURCE_COMMIT" \
+            --arg release_commit "${{ steps.release.outputs.source_commit }}" \
+            '.repository == "joshyorko/codex-memoryd"
+             and .ref == ("refs/tags/" + $tag)
+             and .package_version == ($tag | ltrimstr("v"))
+             and .commit == $source_commit
+             and .commit == $release_commit' \
+            "$work/provenance.json" >/dev/null
+          echo "Pinned GHCR digest is bound to source commit $EXPECTED_SOURCE_COMMIT by release provenance." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
