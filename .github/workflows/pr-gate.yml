@@ -1,0 +1,53 @@
+name: PR gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    name: v0.1 release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustup component add rustfmt
+
+      - name: Run the release gate
+        run: scripts/v0.1-release-gate.sh
+
+      - name: Build the locked release binary
+        run: cargo build --locked --release --bin codex-memoryd
+
+      - name: Smoke the native CLI lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/release/codex-memoryd"
+          "$bin" --help >/dev/null
+          "$bin" --version | grep -F '0.1.0'
+
+          home="$(mktemp -d)"
+          runtime="$home/runtime"
+          mkdir -p "$home/home" "$runtime"
+          export HOME="$home/home"
+          export CODEX_MEMORYD_HOME="$runtime"
+          trap '"$bin" down >/dev/null 2>&1 || true; rm -rf "$home"' EXIT
+
+          "$bin" init --host 127.0.0.1 --port 18787
+          "$bin" up
+          "$bin" status
+          "$bin" down

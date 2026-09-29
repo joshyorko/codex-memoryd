@@ -19,7 +19,6 @@ use codex_memoryd::chatgpt_export_import::ChatgptExportParams;
 use codex_memoryd::chatgpt_export_import::ChatgptExportSelection;
 use codex_memoryd::config::CliOverrides;
 use codex_memoryd::config::Config;
-use codex_memoryd::pcc_import;
 use codex_memoryd::config::ConfigLoadSource;
 use codex_memoryd::conformance;
 use codex_memoryd::domain;
@@ -35,6 +34,7 @@ use codex_memoryd::native_runtime;
 use codex_memoryd::native_runtime::InitMode;
 use codex_memoryd::native_runtime::RuntimeKind;
 use codex_memoryd::native_runtime::RuntimeOptions;
+use codex_memoryd::pcc_import;
 use codex_memoryd::portable_bundle;
 use codex_memoryd::portable_bundle::{BundleExportOptions, BundleImportOptions};
 use codex_memoryd::protocol::*;
@@ -1822,8 +1822,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                     );
                     params.target_profile = target_profile.clone();
                     params.cursor = cursor.clone();
-                    params.seen_idempotency_keys =
-                        seen_idempotency_keys.iter().cloned().collect::<HashSet<_>>();
+                    params.seen_idempotency_keys = seen_idempotency_keys
+                        .iter()
+                        .cloned()
+                        .collect::<HashSet<_>>();
                     let response = pcc_import::run(params)?;
                     print_json(&response)?;
                 }

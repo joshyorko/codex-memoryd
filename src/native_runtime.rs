@@ -675,15 +675,8 @@ fn down_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         let _ = fs::remove_file(&opts.pid_file);
         return Ok(status(opts));
     };
-    let ok = Command::new("kill")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(Error::from)?
-        .success();
-    if !ok {
-        return Err(Error::storage(format!("failed to stop pid {pid}")));
-    }
+    terminate_process(pid)
+        .map_err(|err| Error::storage(format!("failed to stop pid {pid}: {err}")))?;
     for _ in 0..40 {
         if running_pid(&opts.pid_file).is_none() {
             let _ = fs::remove_file(&opts.pid_file);
@@ -775,14 +768,61 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
 fn running_pid(pid_file: &Path) -> Option<u32> {
     let raw = fs::read_to_string(pid_file).ok()?;
     let pid = raw.trim().parse::<u32>().ok()?;
-    let ok = Command::new("kill")
+    process_exists(pid).then_some(pid)
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Some(pid) = valid_pid(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn valid_pid(pid: u32) -> Option<libc::pid_t> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    (pid > 0).then_some(pid)
+}
+
+#[cfg(not(unix))]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .stderr(Stdio::null())
         .status()
-        .ok()?
-        .success();
-    ok.then_some(pid)
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> std::io::Result<()> {
+    let pid = valid_pid(pid).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid process id")
+    })?;
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(pid: u32) -> std::io::Result<()> {
+    Command::new("kill")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("kill command failed"))
+            }
+        })
 }
 
 pub fn container_runtime(opts: &RuntimeOptions) -> Result<String> {

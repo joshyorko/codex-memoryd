@@ -7,3 +7,15 @@ target/
 docs/
 README.md
 SPEC.md
+.dogfood/
+.github/
+.gitignore
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.log
+logs/
+tests/*.rs
+tests/**/*.rs

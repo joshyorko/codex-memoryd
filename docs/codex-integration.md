@@ -187,7 +187,7 @@ Response `data`:
   "checkpoints": [
     { "id": "ckpt_…", "summary": "…", "branch": "main", "commit": null, "next_steps": ["…"], "created_at": "…" }
   ],
-  "citations": [ { "memory_id": "mem_…", "source_id": "src_…", "source_path": "memory_summary.md" } ],
+  "citations": [ { "memory_id": "mr_…", "source_id": "msrc_…", "source_path": null } ],
   "withheld": [
     { "reason": "secret_blocked", "count": 1, "gates": ["secret_blocked"] },
     { "reason": "policy_quarantined", "count": 1, "gates": ["admission_policy", "quarantine"] },

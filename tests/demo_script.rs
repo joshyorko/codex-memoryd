@@ -4,8 +4,8 @@ use std::process::Command;
 fn demo_script_uses_configured_profile_and_workspace_in_mcp_canary() {
     let output = Command::new("bash")
         .arg("scripts/demo-substrate.sh")
-        .env("DEMO_PROFILE", "team")
-        .env("DEMO_WORKSPACE", "fixture-team")
+        .env("DEMO_PROFILE", "work")
+        .env("DEMO_WORKSPACE", "fixture-work")
         .env("CODEX_MEMORYD_DEMO_KEEP", "1")
         .output()
         .expect("run demo script with custom profile/workspace");

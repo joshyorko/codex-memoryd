@@ -179,14 +179,12 @@ fn recall_is_advisory_budgeted_and_cited() {
     );
     assert_eq!(resp.facts.len(), 1);
     assert_eq!(resp.citations.len(), 1);
+    let expected_source_id = ids::public_handle(ids::PublicHandleKind::SourceRef, "turn:recall-1");
     assert_eq!(
         resp.citations[0].source_id.as_deref(),
-        Some("turn:recall-1")
+        Some(expected_source_id.as_str())
     );
-    assert_eq!(
-        resp.citations[0].source_path.as_deref(),
-        Some("memory/recall-1.md")
-    );
+    assert!(resp.citations[0].source_path.is_none());
     assert!(resp.facts[0]
         .content
         .contains("portable adapter preferences"));
