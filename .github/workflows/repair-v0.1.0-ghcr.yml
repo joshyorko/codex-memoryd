@@ -20,7 +20,7 @@ env:
   TAG: v0.1.0
   IMAGE: ghcr.io/joshyorko/codex-memoryd
   EXPECTED_DIGEST: sha256:70465d5250f693d15408fe904d30e3035360d8a46ac6f1caea8c3660eac09996
-  EXPECTED_DIGEST_SOURCE_RUN: https://github.com/joshyorko/codex-memoryd/actions/runs/36598108986
+  EXPECTED_DIGEST_SOURCE_RUN: https://github.com/joshyorko/codex-memoryd/actions/runs/36607462432
   EXPECTED_SOURCE_COMMIT: 45b5ef31e0d027bd03260d0731d7d5da09a611ef
 jobs:
   repair:
