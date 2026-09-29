@@ -276,8 +276,14 @@ jobs:
       - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/v0.1.0
+          ref: ${{ github.sha }}
           fetch-depth: 1
+
+      - name: Assert the GHCR build source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Refuse an existing version tag
         shell: bash
@@ -351,6 +357,34 @@ jobs:
             printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
           done
 
+      - name: Smoke the published image on loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          container_name="codex-memoryd-release-smoke"
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            rm -rf "$home"
+          }
+          trap cleanup EXIT
+          chmod 0777 "$home"
+          docker run --detach \
+            --name "$container_name" \
+            --publish 127.0.0.1:18788:8787 \
+            --volume "$home:/data" \
+            --env CODEX_MEMORYD_DB=/data/memory.db \
+            --env CODEX_MEMORYD_BIND=0.0.0.0:8787 \
+            "$IMAGE:$TAG"
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18788/healthz >/tmp/codex-memoryd-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18788/healthz | jq -e '.ok == true'
+          test -s "$home/memory.db"
+
   publish-release:
     name: Publish immutable release and verify public assets
     needs: [verify-tag, stage-release, publish-ghcr]
@@ -372,7 +406,7 @@ jobs:
         run: |
           set -euo pipefail
           release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
-          release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -F make_latest=true)"
+          release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -f draft=false -f make_latest=true)"
           jq -e '.draft == false and .immutable == true' <<<"$release_json"
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$TAG"
           test "$(jq -r '.target_commitish' <<<"$release_json")" != ""
