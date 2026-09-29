@@ -773,8 +773,17 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
 
 #[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let Some(pid) = valid_pid(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(pid, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn valid_pid(pid: u32) -> Option<libc::pid_t> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    (pid > 0).then_some(pid)
 }
 
 #[cfg(not(unix))]
@@ -790,7 +799,10 @@ fn process_exists(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let pid = valid_pid(pid).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid process id")
+    })?;
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result == 0 {
         Ok(())
     } else {

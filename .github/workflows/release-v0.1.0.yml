@@ -285,29 +285,41 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Refuse an existing version tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
-            echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
-            exit 1
-          fi
-
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
       - name: Refuse an existing version tag after authentication
         shell: bash
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
-            echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
-            exit 1
-          fi
+          versions="$(mktemp)"
+          status="$(curl --silent --show-error --location \
+            --output "$versions" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/user/packages/container/codex-memoryd/versions?per_page=100")"
+          case "$status" in
+            200)
+              jq -e 'type == "array"' "$versions" >/dev/null
+              if jq -e --arg tag "$TAG" \
+                '[.[]?.metadata.container.tags[]?] | index($tag) != null' "$versions" >/dev/null; then
+                echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+                exit 1
+              fi
+              ;;
+            404)
+              ;;
+            *)
+              echo "could not prove that $IMAGE:$TAG is absent; refusing to publish" >&2
+              cat "$versions" >&2
+              exit 1
+              ;;
+          esac
 
 
       - name: Set up QEMU
@@ -339,23 +351,18 @@ jobs:
           gh api --method PATCH user/packages/container/codex-memoryd/visibility -f visibility=public >/dev/null
           digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
           test "$digest" =~ ^sha256:[0-9a-f]{64}$
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$digest"
           version_digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
-          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')"
           test "$version_digest" = "$digest"
-          test "$latest_digest" = "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify both tags anonymously
+      - name: Verify the version tag anonymously
         shell: bash
         run: |
           set -euo pipefail
           docker logout ghcr.io >/dev/null 2>&1 || true
-          for tag in "$TAG" latest; do
-            output="$(docker pull --platform linux/amd64 "$IMAGE:$tag")"
-            printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
-          done
+          output="$(docker pull --platform linux/amd64 "$IMAGE:$TAG")"
+          printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
 
       - name: Smoke the published image on loopback
         shell: bash
@@ -384,6 +391,29 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:18788/healthz | jq -e '.ok == true'
           test -s "$home/memory.db"
+
+      - name: Log in again to assign latest
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Assign latest from the verified version digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@${{ steps.digest.outputs.digest }}"
+          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')"
+          test "$latest_digest" = "${{ steps.digest.outputs.digest }}"
+
+      - name: Verify latest anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          output="$(docker pull --platform linux/amd64 "$IMAGE:latest")"
+          printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
 
   publish-release:
     name: Publish immutable release and verify public assets
