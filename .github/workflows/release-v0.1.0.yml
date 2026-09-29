@@ -626,7 +626,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_object="$(jq -r '.object.sha' <<<"$tag_ref")"
+          if [ "$tag_type" = "tag" ]; then
+            tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
+          fi
+          test "$tag_object" = "$GITHUB_SHA"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' <<<"$release_json" >/dev/null
+          release_id="$(jq -r '.id' <<<"$release_json")"
           release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true)"
           jq -e '.draft == false and .immutable == true' <<<"$release_json"
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$TAG"
