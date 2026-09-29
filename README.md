@@ -8,6 +8,26 @@ current user, repo, or policy state.
 
 For the shortest install-to-first-recall path, see [`docs/getting-started.md`](./docs/getting-started.md).
 
+## v0.1.0 distribution
+
+Install the native daemon from the immutable Homebrew tap:
+
+```bash
+brew install joshyorko/tools/codex-memoryd
+codex-memoryd init
+codex-memoryd up
+codex-memoryd status
+```
+
+Native mode is the default and remains loopback-only. The persistent database
+is `~/.codex-memoryd/memory.db`; upgrading or uninstalling the formula does
+not delete it. The optional managed container image is
+`ghcr.io/joshyorko/codex-memoryd:v0.1.0`.
+
+v0.1.0 supports Linux x86_64/aarch64 and macOS x86_64/arm64 native archives.
+For direct downloads, SHA-256 verification, provenance, container setup,
+upgrade, and uninstall, see [`docs/getting-started.md`](./docs/getting-started.md).
+
 ## Current Surface
 
 This is the landed MVP surface today:
