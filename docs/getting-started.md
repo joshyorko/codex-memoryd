@@ -85,8 +85,10 @@ brew uninstall codex-memoryd
 ```
 
 Stopping or uninstalling the formula does not delete
-`~/.codex-memoryd/memory.db`. Delete that file separately only when you
-intentionally want to discard stored memory.
+`~/.codex-memoryd/memory.db`. For a direct install, stop the daemon, replace
+or remove `~/.local/bin/codex-memoryd`; the database is retained in the same
+way. Delete the database separately only when you intentionally want to
+discard stored memory.
 
 ## Optional managed container
 
