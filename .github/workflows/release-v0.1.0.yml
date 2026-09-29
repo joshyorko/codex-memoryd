@@ -406,7 +406,7 @@ jobs:
         run: |
           set -euo pipefail
           release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
-          release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -f draft=false -f make_latest=true)"
+          release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true)"
           jq -e '.draft == false and .immutable == true' <<<"$release_json"
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$TAG"
           test "$(jq -r '.target_commitish' <<<"$release_json")" != ""
