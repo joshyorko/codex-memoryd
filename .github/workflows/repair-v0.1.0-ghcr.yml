@@ -20,6 +20,7 @@ env:
   TAG: v0.1.0
   IMAGE: ghcr.io/joshyorko/codex-memoryd
   EXPECTED_DIGEST: sha256:70465d5250f693d15408fe904d30e3035360d8a46ac6f1caea8c3660eac09996
+  EXPECTED_DIGEST_SOURCE_RUN: https://github.com/joshyorko/codex-memoryd/actions/runs/36598108986
   EXPECTED_SOURCE_COMMIT: 45b5ef31e0d027bd03260d0731d7d5da09a611ef
 jobs:
   repair:
@@ -53,7 +54,7 @@ jobs:
           [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]]
           echo "source_commit=$tag_object" >> "$GITHUB_OUTPUT"
           echo "Release source commit: $tag_object" >> "$GITHUB_STEP_SUMMARY"
-      - name: Verify release provenance for the pinned image
+      - name: Verify release provenance for the pinned release source
         shell: bash
         run: |
           set -euo pipefail
@@ -76,7 +77,10 @@ jobs:
              and .commit == $source_commit
              and .commit == $release_commit' \
             "$work/provenance.json" >/dev/null
-          echo "Pinned GHCR digest is bound to source commit $EXPECTED_SOURCE_COMMIT by release provenance." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "GHCR digest pin source: $EXPECTED_DIGEST_SOURCE_RUN"
+            echo "Release provenance independently validates source commit: $EXPECTED_SOURCE_COMMIT"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
