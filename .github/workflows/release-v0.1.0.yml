@@ -51,7 +51,6 @@ jobs:
           package_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
           test "$package_version" = "$VERSION"
           grep -Fqx 'repository = "https://github.com/joshyorko/codex-memoryd"' Cargo.toml
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
           release_json="$(mktemp)"
           release_status="$(curl --silent --show-error --location \
             --output "$release_json" \
@@ -370,9 +369,18 @@ jobs:
                   raise SystemExit(f"provenance hash mismatch: {name}")
           PY
 
+      - name: Reconfirm the mutable draft before external publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == true and (.immutable != true)' \
+            <<<"$release_json" >/dev/null
+
   publish-ghcr:
     name: Publish and verify GHCR image
-    needs: [verify-tag, stage-release]
+    needs: [verify-tag, stage-release, publish-release]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -406,30 +414,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          versions="$(mktemp)"
-          status="$(curl --silent --show-error --location \
-            --output "$versions" \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/user/packages/container/codex-memoryd/versions?per_page=100")"
-          case "$status" in
-            200)
-              jq -e 'type == "array"' "$versions" >/dev/null
-              if jq -e --arg tag "$TAG" \
-                '[.[]?.metadata.container.tags[]?] | index($tag) != null' "$versions" >/dev/null; then
-                echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+          page=1
+          while :; do
+            versions="$(mktemp)"
+            status="$(curl --silent --show-error --location \
+              --output "$versions" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/user/packages/container/codex-memoryd/versions?per_page=100&page=$page")"
+            case "$status" in
+              200)
+                jq -e 'type == "array"' "$versions" >/dev/null
+                if jq -e --arg tag "$TAG" \
+                  '[.[]?.metadata.container.tags[]?] | index($tag) != null' "$versions" >/dev/null; then
+                  echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+                  exit 1
+                fi
+                [ "$(jq 'length' "$versions")" -lt 100 ] && break
+                page=$((page + 1))
+                ;;
+              404)
+                [ "$page" -eq 1 ] && break
+                echo "GHCR version pagination failed on page $page; refusing to publish" >&2
+                cat "$versions" >&2
                 exit 1
-              fi
-              ;;
-            404)
-              ;;
-            *)
-              echo "could not prove that $IMAGE:$TAG is absent; refusing to publish" >&2
-              cat "$versions" >&2
-              exit 1
-              ;;
-          esac
+                ;;
+              *)
+                echo "could not prove that $IMAGE:$TAG is absent; refusing to publish" >&2
+                cat "$versions" >&2
+                exit 1
+                ;;
+            esac
+          done
 
       - name: Revalidate the release tag before image publication
         shell: bash
@@ -539,7 +556,7 @@ jobs:
 
   publish-release:
     name: Publish immutable release and verify public assets
-    needs: [verify-tag, stage-release, publish-ghcr]
+    needs: [verify-tag, stage-release]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
