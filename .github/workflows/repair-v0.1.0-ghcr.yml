@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
           digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
-          test "$digest" =~ ^sha256:[0-9a-f]{64}$
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
 
