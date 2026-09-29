@@ -51,25 +51,24 @@ jobs:
           package_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
           test "$package_version" = "$VERSION"
           grep -Fqx 'repository = "https://github.com/joshyorko/codex-memoryd"' Cargo.toml
-          release_json="$(mktemp)"
-          release_status="$(curl --silent --show-error --location \
-            --output "$release_json" \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
-          case "$release_status" in
-            200)
-              jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' "$release_json" >/dev/null
-              ;;
-            404)
-              ;;
-            *)
-              echo "could not prove that release $TAG is absent or an exact draft" >&2
-              cat "$release_json" >&2
-              exit 1
-              ;;
-          esac
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length > 1 then error("multiple releases use the same tag")
+                  elif length == 1 then .[0]
+                  else {}
+                  end
+              '
+          )"
+          jq -e --arg tag "$TAG" '
+            if has("tag_name")
+            then .tag_name == $tag and .draft == true and (.immutable != true)
+            else true
+            end
+          ' <<<"$release_json" >/dev/null
 
       - name: Run the v0.1 release gate
         run: scripts/v0.1-release-gate.sh
@@ -274,27 +273,40 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          release_json="$(mktemp)"
-          release_status="$(curl --silent --show-error --location \
-            --output "$release_json" \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
-          case "$release_status" in
-            404)
-              gh release create "$TAG" --draft --verify-tag --title "codex-memoryd $TAG" \
-                --notes "Reproducible native artifacts and GHCR image for the exact $TAG source tag."
-              ;;
-            200)
-              jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' "$release_json" >/dev/null
-              ;;
-            *)
-              echo "could not create or resume release $TAG safely" >&2
-              cat "$release_json" >&2
-              exit 1
-              ;;
-          esac
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length > 1 then error("multiple releases use the same tag")
+                  elif length == 1 then .[0]
+                  else {}
+                  end
+              '
+          )"
+          if jq -e 'has("tag_name")' <<<"$release_json" >/dev/null; then
+            jq -e --arg tag "$TAG" \
+              '.tag_name == $tag and .draft == true and (.immutable != true)' \
+              <<<"$release_json" >/dev/null
+          else
+            gh release create "$TAG" --draft --verify-tag --title "codex-memoryd $TAG" \
+              --notes "Reproducible native artifacts and GHCR image for the exact $TAG source tag."
+          fi
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length == 1 then .[0]
+                  else error("release was not created exactly once")
+                  end
+              '
+          )"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == true and (.immutable != true)' \
+            <<<"$release_json" >/dev/null
           expected=(
             codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
             codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
@@ -303,7 +315,7 @@ jobs:
             SHA256SUMS
             provenance.json
           )
-          asset_names="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[].name')"
+          asset_names="$(jq -r '.assets[]?.name' <<<"$release_json")"
           for asset in "${expected[@]}"; do
             if printf '%s\n' "$asset_names" | grep -Fqx "$asset"; then
               continue
@@ -373,7 +385,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length == 1 then .[0]
+                  else error("release was not found exactly once")
+                  end
+              '
+          )"
           jq -e --arg tag "$TAG" \
             '.tag_name == $tag and .draft == true and (.immutable != true)' \
             <<<"$release_json" >/dev/null
@@ -588,8 +610,20 @@ jobs:
             tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
           fi
           test "$tag_object" = "$GITHUB_SHA"
-          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' <<<"$release_json" >/dev/null
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length == 1 then .[0]
+                  else error("release was not found exactly once")
+                  end
+              '
+          )"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == true and (.immutable != true)' \
+            <<<"$release_json" >/dev/null
 
       - name: Revalidate every draft asset before publication
         shell: bash
@@ -662,8 +696,20 @@ jobs:
             tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
           fi
           test "$tag_object" = "$GITHUB_SHA"
-          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' <<<"$release_json" >/dev/null
+          release_json="$(
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --arg tag "$TAG" '
+                add
+                | map(select(.tag_name == $tag))
+                | if length == 1 then .[0]
+                  else error("release was not found exactly once")
+                  end
+              '
+          )"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == true and (.immutable != true)' \
+            <<<"$release_json" >/dev/null
           release_id="$(jq -r '.id' <<<"$release_json")"
           release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true)"
           jq -e '.draft == false and .immutable == true' <<<"$release_json"
