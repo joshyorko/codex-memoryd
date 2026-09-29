@@ -35,6 +35,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup default 1.88.0
+          rustup component add rustfmt
 
       - name: Refuse mismatched or previously published release state
         env:

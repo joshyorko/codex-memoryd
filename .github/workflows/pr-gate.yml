@@ -24,6 +24,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup default 1.88.0
+          rustup component add rustfmt
 
       - name: Run the release gate
         run: scripts/v0.1-release-gate.sh
