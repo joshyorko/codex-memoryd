@@ -184,6 +184,7 @@ fn recall_is_advisory_budgeted_and_cited() {
         resp.citations[0].source_id.as_deref(),
         Some(expected_source_id.as_str())
     );
+    assert!(resp.citations[0].source_path.is_none());
     assert!(resp.facts[0]
         .content
         .contains("portable adapter preferences"));

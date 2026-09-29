@@ -52,10 +52,25 @@ jobs:
           test "$package_version" = "$VERSION"
           grep -Fqx 'repository = "https://github.com/joshyorko/codex-memoryd"' Cargo.toml
           test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists" >&2
-            exit 1
-          fi
+          release_json="$(mktemp)"
+          release_status="$(curl --silent --show-error --location \
+            --output "$release_json" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          case "$release_status" in
+            200)
+              jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' "$release_json" >/dev/null
+              ;;
+            404)
+              ;;
+            *)
+              echo "could not prove that release $TAG is absent or an exact draft" >&2
+              cat "$release_json" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Run the v0.1 release gate
         run: scripts/v0.1-release-gate.sh
@@ -122,17 +137,37 @@ jobs:
           "$bin" up >/dev/null
           "$bin" status | jq -e '.ok == true and .data.status == "local_only"'
           "$bin" down >/dev/null
-          "$bin" status | jq -e '(.process == "stopped") or (.data.status == "local_only")'
+          "$bin" status | jq -e '.process == "stopped"'
+          test ! -e "$CODEX_MEMORYD_HOME/codex-memoryd.pid"
+          ! curl --fail --silent "http://$CODEX_MEMORYD_BIND/healthz"
           test -s "$CODEX_MEMORYD_HOME/memory.db"
 
-      - name: Archive only the binary
+      - name: Archive only the binary with normalized metadata
         shell: bash
         run: |
           set -euo pipefail
           asset="codex-memoryd-v${VERSION}-${{ matrix.target }}.tar.gz"
           staging="$(mktemp -d)"
           install -m 0755 "target/${{ matrix.target }}/release/codex-memoryd" "$staging/codex-memoryd"
-          tar -czf "$asset" -C "$staging" codex-memoryd
+          python3 - "$staging/codex-memoryd" "$asset" <<'PY'
+          import gzip
+          import os
+          import sys
+          import tarfile
+
+          binary, archive = sys.argv[1:]
+          with open(archive, "wb") as raw:
+              with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w") as bundle:
+                      info = bundle.gettarinfo(binary, arcname="codex-memoryd")
+                      info.mtime = 0
+                      info.uid = 0
+                      info.gid = 0
+                      info.uname = ""
+                      info.gname = ""
+                      with open(binary, "rb") as source:
+                          bundle.addfile(info, source)
+          PY
           test "$(tar -tzf "$asset" | wc -l)" -eq 1
           test "$(tar -tzf "$asset")" = codex-memoryd
 
@@ -181,18 +216,25 @@ jobs:
           import os
           from pathlib import Path
 
-          archives = sorted(Path('.').glob('*.tar.gz'))
+          version = os.environ["VERSION"]
+          archives = sorted(Path(".").glob("*.tar.gz"))
+          artifacts = [
+              {
+                  "name": path.name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size_bytes": path.stat().st_size,
+                  "target": path.name.removeprefix(f"codex-memoryd-v{version}-").removesuffix(".tar.gz"),
+              }
+              for path in archives
+          ]
           provenance = {
               "schema_version": 1,
-              "artifact_hashes": {
-                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                  for path in archives
-              },
+              "artifacts": artifacts,
               "commit": os.environ["GITHUB_SHA"],
-              "package_version": os.environ["VERSION"],
+              "package_version": version,
               "ref": os.environ["GITHUB_REF"],
               "repository": os.environ["GITHUB_REPOSITORY"],
-              "targets": [path.name.removeprefix("codex-memoryd-v0.1.0-").removesuffix(".tar.gz") for path in archives],
+              "targets": [artifact["target"] for artifact in artifacts],
               "workflow_run": int(os.environ["GITHUB_RUN_ID"]),
           }
           Path("provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -228,20 +270,46 @@ jobs:
           name: release-bundle
           path: dist
 
-      - name: Create a new draft without overwriting anything
+      - name: Create or resume the exact draft without overwriting assets
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists" >&2
-            exit 1
-          fi
-          gh release create "$TAG" --draft --verify-tag --title "codex-memoryd $TAG" \
-            --notes "Reproducible native artifacts and GHCR image for the exact $TAG source tag."
-          test -z "$(gh release view "$TAG" --json assets --jq '.assets[].name')"
-          for asset in dist/*.tar.gz dist/SHA256SUMS dist/provenance.json; do
-            gh release upload "$TAG" "$asset"
+          release_json="$(mktemp)"
+          release_status="$(curl --silent --show-error --location \
+            --output "$release_json" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          case "$release_status" in
+            404)
+              gh release create "$TAG" --draft --verify-tag --title "codex-memoryd $TAG" \
+                --notes "Reproducible native artifacts and GHCR image for the exact $TAG source tag."
+              ;;
+            200)
+              jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' "$release_json" >/dev/null
+              ;;
+            *)
+              echo "could not create or resume release $TAG safely" >&2
+              cat "$release_json" >&2
+              exit 1
+              ;;
+          esac
+          expected=(
+            codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-x86_64-apple-darwin.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-apple-darwin.tar.gz
+            SHA256SUMS
+            provenance.json
+          )
+          asset_names="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[].name')"
+          for asset in "${expected[@]}"; do
+            if printf '%s\n' "$asset_names" | grep -Fqx "$asset"; then
+              continue
+            fi
+            gh release upload "$TAG" "dist/$asset"
           done
 
       - name: Verify draft assets by downloading them again
@@ -251,14 +319,56 @@ jobs:
           download_dir="$(mktemp -d)"
           gh release download "$TAG" --dir "$download_dir"
           cd "$download_dir"
+          expected=(
+            codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-x86_64-apple-darwin.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-apple-darwin.tar.gz
+            SHA256SUMS
+            provenance.json
+          )
+          actual="$(find . -maxdepth 1 -type f -printf '%f\n' | sort)"
+          expected_actual="$(printf '%s\n' "${expected[@]}" | sort)"
+          test "$actual" = "$expected_actual"
           sha256sum -c SHA256SUMS
-          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
           for archive in *.tar.gz; do
             test "$(tar -tzf "$archive" | wc -l)" -eq 1
             test "$(tar -tzf "$archive")" = codex-memoryd
           done
-          jq -e --arg commit "$GITHUB_SHA" --arg version "$VERSION" \
-            '.commit == $commit and .package_version == $version and (.targets | length == 4)' provenance.json
+          python3 - "$GITHUB_SHA" "$VERSION" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          commit, version = sys.argv[1:]
+          targets = (
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+          )
+          expected = {
+              f"codex-memoryd-v{version}-{target}.tar.gz": target
+              for target in targets
+          }
+          provenance = json.loads(Path("provenance.json").read_text(encoding="utf-8"))
+          if provenance["commit"] != commit or provenance["package_version"] != version:
+              raise SystemExit("provenance source identity mismatch")
+          records = {item["name"]: item for item in provenance["artifacts"]}
+          if set(records) != set(expected):
+              raise SystemExit("provenance artifact set mismatch")
+          for name, target in expected.items():
+              path = Path(name)
+              record = records[name]
+              if record["target"] != target:
+                  raise SystemExit(f"provenance target mismatch: {name}")
+              if record["size_bytes"] != path.stat().st_size:
+                  raise SystemExit(f"provenance size mismatch: {name}")
+              if record["sha256"] != hashlib.sha256(path.read_bytes()).hexdigest():
+                  raise SystemExit(f"provenance hash mismatch: {name}")
+          PY
 
   publish-ghcr:
     name: Publish and verify GHCR image
@@ -428,8 +538,89 @@ jobs:
       - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/v0.1.0
+          ref: ${{ github.sha }}
           fetch-depth: 1
+
+      - name: Download the trusted assembled release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-bundle
+          path: trusted-dist
+
+      - name: Revalidate the tag and staged draft before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_object="$(jq -r '.object.sha' <<<"$tag_ref")"
+          if [ "$tag_type" = "tag" ]; then
+            tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
+          fi
+          test "$tag_object" = "$GITHUB_SHA"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and (.immutable != true)' <<<"$release_json" >/dev/null
+
+      - name: Revalidate every draft asset before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d)"
+          gh release download "$TAG" --dir "$download_dir"
+          cd "$download_dir"
+          expected=(
+            codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-x86_64-apple-darwin.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-apple-darwin.tar.gz
+            SHA256SUMS
+            provenance.json
+          )
+          actual="$(find . -maxdepth 1 -type f -printf '%f\n' | sort)"
+          expected_actual="$(printf '%s\n' "${expected[@]}" | sort)"
+          test "$actual" = "$expected_actual"
+          for asset in "${expected[@]}"; do
+            cmp "$GITHUB_WORKSPACE/trusted-dist/$asset" "$download_dir/$asset"
+          done
+          sha256sum -c SHA256SUMS
+          for archive in *.tar.gz; do
+            test "$(tar -tzf "$archive" | wc -l)" -eq 1
+            test "$(tar -tzf "$archive")" = codex-memoryd
+          done
+          python3 - "$GITHUB_SHA" "$VERSION" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          commit, version = sys.argv[1:]
+          targets = (
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+          )
+          expected = {
+              f"codex-memoryd-v{version}-{target}.tar.gz": target
+              for target in targets
+          }
+          provenance = json.loads(Path("provenance.json").read_text(encoding="utf-8"))
+          if provenance["commit"] != commit or provenance["package_version"] != version:
+              raise SystemExit("provenance source identity mismatch")
+          records = {item["name"]: item for item in provenance["artifacts"]}
+          if set(records) != set(expected):
+              raise SystemExit("provenance artifact set mismatch")
+          for name, target in expected.items():
+              path = Path(name)
+              record = records[name]
+              if record["target"] != target:
+                  raise SystemExit(f"provenance target mismatch: {name}")
+              if record["size_bytes"] != path.stat().st_size:
+                  raise SystemExit(f"provenance size mismatch: {name}")
+              if record["sha256"] != hashlib.sha256(path.read_bytes()).hexdigest():
+                  raise SystemExit(f"provenance hash mismatch: {name}")
+          PY
 
       - name: Publish the staged draft once
         shell: bash
@@ -448,12 +639,54 @@ jobs:
           download_dir="$(mktemp -d)"
           gh release download "$TAG" --dir "$download_dir"
           cd "$download_dir"
+          expected=(
+            codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-x86_64-apple-darwin.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-apple-darwin.tar.gz
+            SHA256SUMS
+            provenance.json
+          )
+          expected_actual="$(printf '%s\n' "${expected[@]}" | sort)"
+          actual="$(find . -maxdepth 1 -type f -printf '%f\n' | sort)"
+          test "$actual" = "$expected_actual"
+          remote_assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[].name' | sort)"
+          test "$remote_assets" = "$expected_actual"
           sha256sum -c SHA256SUMS
-          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
           for archive in *.tar.gz; do
             test "$(tar -tzf "$archive" | wc -l)" -eq 1
             test "$(tar -tzf "$archive")" = codex-memoryd
           done
-          jq -e --arg commit "$GITHUB_SHA" --arg version "$VERSION" \
-            '.commit == $commit and .package_version == $version and (.targets | length == 4)' provenance.json
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '{tag_name,draft,immutable,target_commitish,assets:[.assets[].name]}'
+          python3 - "$GITHUB_SHA" "$VERSION" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          commit, version = sys.argv[1:]
+          targets = (
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+          )
+          expected = {
+              f"codex-memoryd-v{version}-{target}.tar.gz": target
+              for target in targets
+          }
+          provenance = json.loads(Path("provenance.json").read_text(encoding="utf-8"))
+          if provenance["commit"] != commit or provenance["package_version"] != version:
+              raise SystemExit("provenance source identity mismatch")
+          records = {item["name"]: item for item in provenance["artifacts"]}
+          if set(records) != set(expected):
+              raise SystemExit("provenance artifact set mismatch")
+          for name, target in expected.items():
+              path = Path(name)
+              record = records[name]
+              if record["target"] != target:
+                  raise SystemExit(f"provenance target mismatch: {name}")
+              if record["size_bytes"] != path.stat().st_size:
+                  raise SystemExit(f"provenance size mismatch: {name}")
+              if record["sha256"] != hashlib.sha256(path.read_bytes()).hexdigest():
+                  raise SystemExit(f"provenance hash mismatch: {name}")
+          PY
