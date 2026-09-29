@@ -3,19 +3,19 @@
 # ---- Builder ----------------------------------------------------------------
 # Build a static-ish release binary. SQLite is bundled (compiled from source via
 # the `bundled` feature), so the runtime image needs no libsqlite3.
-FROM rust:1-bookworm AS builder
+FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 WORKDIR /build
 
 # Cache dependencies: copy manifests first, build a stub, then the real source.
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 # Create a stub lib/bin so `cargo build` can resolve+compile dependencies and
 # cache them in a separate layer before the real sources are copied.
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && cargo build --release --quiet || true
+    && cargo build --release --locked --quiet
 
 # Now copy the real source and build for real.
 COPY src ./src
@@ -26,11 +26,11 @@ COPY src ./src
 COPY tests/fixtures ./tests/fixtures
 # Touch sources so cargo rebuilds them (stub timestamps are older).
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && strip target/release/codex-memoryd
 
 # ---- Runtime ----------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # curl is used by the container HEALTHCHECK; ca-certificates for safety.
 RUN apt-get update \

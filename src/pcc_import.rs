@@ -154,10 +154,7 @@ pub fn run(params: PccImportParams) -> Result<PccImportResponse> {
 /// Test/adapter seam for a stream that has already been opened by its caller.
 pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<PccImportResponse> {
     validate_params(&params)?;
-    let target_profile = params
-        .target_profile
-        .as_deref()
-        .unwrap_or(&params.profile);
+    let target_profile = params.target_profile.as_deref().unwrap_or(&params.profile);
     let mut report = Report::default();
     let mut seen = params.seen_idempotency_keys.clone();
     let mut cursor = params.cursor.clone();
@@ -182,7 +179,8 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
         }
         let Some(line) = read_bounded_line(&mut reader).map_err(|error| {
             Error::invalid_request(format!("failed to read PCC replay input: {error}"))
-        })? else {
+        })?
+        else {
             reached_eof = true;
             break;
         };
@@ -294,7 +292,11 @@ pub fn run_reader<R: BufRead>(mut reader: R, params: PccImportParams) -> Result<
     if !reached_eof || summaries != 1 || pending_cursor.is_none() {
         quarantine(&mut report, "missing-summary");
     }
-    if reached_eof && summaries == 1 && pending_cursor.is_some() && report.quarantined == report.producer_quarantines {
+    if reached_eof
+        && summaries == 1
+        && pending_cursor.is_some()
+        && report.quarantined == report.producer_quarantines
+    {
         let candidate = pending_cursor.clone().flatten();
         if candidate.is_some() && candidate == initial_cursor {
             quarantine(&mut report, "cursor-unchanged");
@@ -330,14 +332,19 @@ fn validate_params(params: &PccImportParams) -> Result<()> {
         || Profile::parse(&params.profile).is_none()
         || Profile::parse(&params.profile).is_some_and(|profile| profile.as_str() != params.profile)
     {
-        return Err(Error::invalid_request("PCC profile is invalid or unsupported"));
+        return Err(Error::invalid_request(
+            "PCC profile is invalid or unsupported",
+        ));
     }
     if params.workspace.trim().is_empty() || params.workspace.len() > 128 {
         return Err(Error::invalid_request("PCC workspace is invalid"));
     }
     if params.destination.trim().is_empty()
         || params.destination.len() > 128
-        || params.destination.chars().any(|character| character < '\u{21}')
+        || params
+            .destination
+            .chars()
+            .any(|character| character < '\u{21}')
     {
         return Err(Error::invalid_request("PCC destination is invalid"));
     }
@@ -345,7 +352,9 @@ fn validate_params(params: &PccImportParams) -> Result<()> {
         if Profile::parse(target).is_none()
             || Profile::parse(target).is_some_and(|profile| profile.as_str() != target)
         {
-            return Err(Error::invalid_request("PCC target profile is invalid or unsupported"));
+            return Err(Error::invalid_request(
+                "PCC target profile is invalid or unsupported",
+            ));
         }
     }
     if let Some(target) = &params.target_profile {
@@ -356,7 +365,11 @@ fn validate_params(params: &PccImportParams) -> Result<()> {
     if let Some(cursor) = &params.cursor {
         validate_cursor(cursor)?;
     }
-    if params.seen_idempotency_keys.iter().any(|key| !valid_digest(key)) {
+    if params
+        .seen_idempotency_keys
+        .iter()
+        .any(|key| !valid_digest(key))
+    {
         return Err(Error::invalid_request("PCC idempotency key is invalid"));
     }
     Ok(())
@@ -388,8 +401,14 @@ fn consume_record(
     report: &mut Report,
 ) {
     let Some(reason) = validate_record_shape(object) else {
-        let source_profile = object.get("profile_id").and_then(Value::as_str).unwrap_or("");
-        let source_workspace = object.get("workspace_id").and_then(Value::as_str).unwrap_or("");
+        let source_profile = object
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let source_workspace = object
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if source_profile != profile {
             quarantine(report, "profile-mismatch");
             return;
@@ -432,11 +451,19 @@ fn consume_record(
 }
 
 fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
-    if !object.get("idempotency_key").and_then(Value::as_str).is_some_and(valid_digest) {
+    if !object
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .is_some_and(valid_digest)
+    {
         return Some("idempotency-key-invalid");
     }
     for key in ["profile_id", "workspace_id"] {
-        if !object.get(key).and_then(Value::as_str).is_some_and(|value| !value.is_empty() && value.len() <= 128) {
+        if !object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+        {
             return Some("record-invalid");
         }
     }
@@ -465,7 +492,10 @@ fn validate_record_shape(object: &Map<String, Value>) -> Option<&'static str> {
 }
 
 fn cross_profile_reason(object: &Map<String, Value>, target_profile: &str) -> Option<&'static str> {
-    let source = object.get("profile_id").and_then(Value::as_str).unwrap_or("");
+    let source = object
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let portability = object
         .get("record")
         .and_then(Value::as_object)
@@ -535,7 +565,10 @@ fn consume_quarantine(
         .is_some_and(allowed_reason_code);
     if object.get("profile_id").and_then(Value::as_str) != Some(profile)
         || object.get("destination").and_then(Value::as_str) != Some(destination)
-        || !object.get("quarantine_id").and_then(Value::as_str).is_some_and(valid_digest)
+        || !object
+            .get("quarantine_id")
+            .and_then(Value::as_str)
+            .is_some_and(valid_digest)
         || !destination_valid
         || !index_key_valid
         || !ciphertext_sha256_valid
@@ -553,7 +586,11 @@ fn consume_quarantine(
     true
 }
 
-fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<String>>, report: &mut Report) {
+fn consume_summary(
+    object: &Map<String, Value>,
+    cursor: &mut Option<Option<String>>,
+    report: &mut Report,
+) {
     let Some(inspected) = object.get("inspected_indexes").and_then(Value::as_u64) else {
         quarantine(report, "summary-invalid");
         return;
@@ -586,14 +623,16 @@ fn consume_summary(object: &Map<String, Value>, cursor: &mut Option<Option<Strin
         Value::Null => *cursor = Some(None),
         Value::String(value)
             if validate_cursor(value).is_ok()
-                && matches!(policy::screen_string_value(value), PolicyDecision::Accept(_)) =>
+                && matches!(
+                    policy::screen_string_value(value),
+                    PolicyDecision::Accept(_)
+                ) =>
         {
             *cursor = Some(Some(value.clone()))
-        },
+        }
         _ => quarantine(report, "cursor-invalid"),
     }
 }
-
 
 fn policy_safe_object(value: &Map<String, Value>) -> bool {
     let mut count = 0;
@@ -609,8 +648,12 @@ fn policy_visit(value: &Value, depth: usize, count: &mut usize) -> bool {
     }
     *count += 1;
     match value {
-        Value::String(text) => matches!(policy::screen_string_value(text), PolicyDecision::Accept(_)),
-        Value::Array(items) => items.iter().all(|item| policy_visit(item, depth + 1, count)),
+        Value::String(text) => {
+            matches!(policy::screen_string_value(text), PolicyDecision::Accept(_))
+        }
+        Value::Array(items) => items
+            .iter()
+            .all(|item| policy_visit(item, depth + 1, count)),
         Value::Object(items) => items.iter().all(|(key, item)| {
             matches!(policy::screen_string_value(key), PolicyDecision::Accept(_))
                 && policy_visit(item, depth + 1, count)
@@ -632,7 +675,11 @@ fn expected_idempotency_key(object: &Map<String, Value>) -> Option<String> {
         "record": object.get("record")?,
     });
     let bytes = serde_json::to_vec(&canonicalize(&identity)).ok()?;
-    Some(ids::sha256_hex(&bytes).trim_start_matches("sha256:").to_string())
+    Some(
+        ids::sha256_hex(&bytes)
+            .trim_start_matches("sha256:")
+            .to_string(),
+    )
 }
 
 fn canonicalize(value: &Value) -> Value {
@@ -652,11 +699,17 @@ fn canonicalize(value: &Value) -> Value {
 }
 
 fn valid_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 fn allowed_reason_code(value: &str) -> bool {
     PRODUCER_REASON_CODES.contains(&value)
-        && matches!(policy::screen_string_value(value), PolicyDecision::Accept(_))
+        && matches!(
+            policy::screen_string_value(value),
+            PolicyDecision::Accept(_)
+        )
 }
 
 fn validate_cursor(value: &str) -> Result<()> {
@@ -746,7 +799,11 @@ mod tests {
 
     #[test]
     fn accepts_inert_record_and_preserves_cursor_without_writing() {
-        let input = format!("{}\n{}\n", record("work", "ws", &digest('a'), "safe turn"), summary(Some("opaque-cursor")));
+        let input = format!(
+            "{}\n{}\n",
+            record("work", "ws", &digest('a'), "safe turn"),
+            summary(Some("opaque-cursor"))
+        );
         let mut params = PccImportParams::new("unused", "work", "ws", "room-destination");
         params.target_profile = Some("work".to_string());
         let response = run_reader(Cursor::new(input), params).unwrap();
@@ -778,9 +835,15 @@ mod tests {
             "next_cursor": "opaque-cursor"
         });
         let input = format!("{}\n{}\n", quarantine, summary);
-        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
@@ -806,9 +869,15 @@ mod tests {
             "next_cursor": "opaque-cursor"
         });
         let input = format!("{}\n{}\n", quarantine, summary);
-        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
@@ -898,7 +967,12 @@ mod tests {
             "next_cursor": "opaque-cursor"
         });
         let response = run_reader(
-            Cursor::new(format!("{}\n{}\n{}\n", quarantine('a'), quarantine('b'), summary)),
+            Cursor::new(format!(
+                "{}\n{}\n{}\n",
+                quarantine('a'),
+                quarantine('b'),
+                summary
+            )),
             PccImportParams::new("unused", "work", "ws", "room-destination"),
         )
         .unwrap();
@@ -935,7 +1009,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
@@ -967,7 +1043,11 @@ mod tests {
             quarantine,
             summary
         );
-        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
         assert_eq!(response.imported, 2);
         assert_eq!(response.quarantined, 1);
         assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
@@ -1001,7 +1081,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
@@ -1033,7 +1115,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
@@ -1064,32 +1148,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"quarantine-invalid".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"quarantine-invalid".to_string()));
     }
 
     #[test]
     fn changed_payload_with_replayed_key_is_rejected() {
         let original = record("work", "ws", "one", "safe one");
-        let key = serde_json::from_str::<Value>(&original).unwrap()["idempotency_key"].as_str().unwrap().to_string();
+        let key = serde_json::from_str::<Value>(&original).unwrap()["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let mut changed = serde_json::from_str::<Value>(&original).unwrap();
         changed["record"]["text"] = Value::String("changed payload".to_string());
         let response = run_reader(Cursor::new(format!("{}\n{}\n", changed, summary(None))), {
             let mut params = PccImportParams::new("unused", "work", "ws", "room-destination");
             params.seen_idempotency_keys.insert(key);
             params
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(response.imported, 0);
-        assert!(response.quarantine_reasons.contains(&"idempotency-key-mismatch".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"idempotency-key-mismatch".to_string()));
     }
 
     #[test]
     fn invalid_ciphertext_index_cannot_reconcile_or_advance_cursor() {
-        let mut value = serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
+        let mut value =
+            serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
         value["segment"]["ciphertext_sha256"] = Value::String("not-a-digest".to_string());
         let input = format!("{}\n{}\n", value, summary(Some("opaque-cursor")));
-        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"summary-mismatch".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"summary-mismatch".to_string()));
     }
 
     #[test]
@@ -1118,7 +1217,9 @@ mod tests {
         params.target_profile = Some("work".to_string());
         let response = run_reader(Cursor::new(input), params).unwrap();
         assert_eq!(response.imported, 1);
-        assert!(response.quarantine_reasons.contains(&"policy-denied".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"policy-denied".to_string()));
     }
 
     #[test]
@@ -1133,12 +1234,15 @@ mod tests {
         let response = run_reader(Cursor::new(input), params).unwrap();
         assert_eq!(response.imported, 0);
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
     fn never_export_record_cannot_cross_an_allowed_profile_boundary() {
-        let mut value = serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
+        let mut value =
+            serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
         value["record"]["portability"] = Value::String("never_export".to_string());
         let mut params = PccImportParams::new("unused", "oss", "ws", "room-destination");
         params.target_profile = Some("personal".to_string());
@@ -1149,12 +1253,15 @@ mod tests {
         .unwrap();
         assert_eq!(response.imported, 0);
         assert_eq!(response.cursor, None);
-        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
     fn never_export_record_is_denied_on_same_profile_replay() {
-        let mut value = serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
+        let mut value =
+            serde_json::from_str::<Value>(&record("work", "ws", "ignored", "safe")).unwrap();
         value["record"]["portability"] = Value::String("never_export".to_string());
         value["idempotency_key"] =
             Value::String(expected_idempotency_key(value.as_object().unwrap()).unwrap());
@@ -1174,7 +1281,8 @@ mod tests {
 
     #[test]
     fn workspace_only_record_can_cross_profiles_within_same_workspace() {
-        let mut value = serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
+        let mut value =
+            serde_json::from_str::<Value>(&record("oss", "ws", "ignored", "safe")).unwrap();
         value["record"]["portability"] = Value::String("workspace_only".to_string());
         value["idempotency_key"] =
             Value::String(expected_idempotency_key(value.as_object().unwrap()).unwrap());
@@ -1191,15 +1299,22 @@ mod tests {
 
     #[test]
     fn personal_to_work_does_not_trust_producer_generic_labels() {
-        let mut value = serde_json::from_str::<Value>(&record("personal", "ws", "ignored", "safe")).unwrap();
+        let mut value =
+            serde_json::from_str::<Value>(&record("personal", "ws", "ignored", "safe")).unwrap();
         value["record"]["record_type"] = Value::String("preference".to_string());
         value["record"]["sensitivity"] = Value::String("public".to_string());
         value["record"]["scope"] = Value::String("user".to_string());
         let mut params = PccImportParams::new("unused", "personal", "ws", "room-destination");
         params.target_profile = Some("work".to_string());
-        let response = run_reader(Cursor::new(format!("{}\n{}\n", value, summary(None))), params).unwrap();
+        let response = run_reader(
+            Cursor::new(format!("{}\n{}\n", value, summary(None))),
+            params,
+        )
+        .unwrap();
         assert_eq!(response.imported, 0);
-        assert!(response.quarantine_reasons.contains(&"profile-boundary-denied".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"profile-boundary-denied".to_string()));
     }
 
     #[test]
@@ -1214,7 +1329,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.cursor.as_deref(), Some("opaque-cursor"));
-        assert!(!response.quarantine_reasons.contains(&"input-limit".to_string()));
+        assert!(!response
+            .quarantine_reasons
+            .contains(&"input-limit".to_string()));
     }
 
     #[test]
@@ -1264,10 +1381,22 @@ mod tests {
             "schema_version": {"major": 2, "minor": 0},
             "type": "record"
         });
-        let input = format!("{}\n{}\n", value, record("work", "other", &digest('e'), "safe"));
-        let response = run_reader(Cursor::new(input), PccImportParams::new("unused", "work", "ws", "room-destination")).unwrap();
+        let input = format!(
+            "{}\n{}\n",
+            value,
+            record("work", "other", &digest('e'), "safe")
+        );
+        let response = run_reader(
+            Cursor::new(input),
+            PccImportParams::new("unused", "work", "ws", "room-destination"),
+        )
+        .unwrap();
         assert_eq!(response.imported, 0);
-        assert!(response.quarantine_reasons.contains(&"schema-unsupported".to_string()));
-        assert!(response.quarantine_reasons.contains(&"workspace-mismatch".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"schema-unsupported".to_string()));
+        assert!(response
+            .quarantine_reasons
+            .contains(&"workspace-mismatch".to_string()));
     }
 }

@@ -24,7 +24,10 @@ fn omp_adapter_is_native_registration_only_and_read_only_by_default() {
         "src/types.ts",
         "tests/adapter.test.ts",
     ] {
-        assert!(package.join(path).exists(), "missing OMP adapter file: {path}");
+        assert!(
+            package.join(path).exists(),
+            "missing OMP adapter file: {path}"
+        );
     }
 
     let index = read("adapters/omp-memory-provider/src/index.ts");

@@ -1,0 +1,394 @@
+name: Release v0.1.0
+
+on:
+  push:
+    tags:
+      - v0.1.0
+
+concurrency:
+  group: release-v0.1.0
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TAG: v0.1.0
+  VERSION: 0.1.0
+  IMAGE: ghcr.io/joshyorko/codex-memoryd
+
+jobs:
+  verify-tag:
+    name: Verify exact release source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v0.1.0
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+
+      - name: Refuse mismatched or previously published release state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/tags/$TAG"
+          test "$GITHUB_REF_NAME" = "$TAG"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$TAG^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+          package_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          test "$package_version" = "$VERSION"
+          grep -Fqx 'repository = "https://github.com/joshyorko/codex-memoryd"' Cargo.toml
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Run the v0.1 release gate
+        run: scripts/v0.1-release-gate.sh
+
+  native-artifacts:
+    name: Native ${{ matrix.target }}
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v0.1.0
+          fetch-depth: 1
+
+      - name: Install the pinned Rust toolchain and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build the locked release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cargo build --locked --release --target "${{ matrix.target }}" --bin codex-memoryd
+          test -x "target/${{ matrix.target }}/release/codex-memoryd"
+
+      - name: Smoke the native CLI lifecycle on the native runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/${{ matrix.target }}/release/codex-memoryd"
+          home="$(mktemp -d)"
+          export HOME="$home/home"
+          export CODEX_MEMORYD_HOME="$home/runtime"
+          export CODEX_MEMORYD_BIND=127.0.0.1:18787
+          mkdir -p "$HOME"
+          cleanup() {
+            "$bin" down >/dev/null 2>&1 || true
+            rm -rf "$home"
+          }
+          trap cleanup EXIT
+
+          "$bin" --help >/dev/null
+          "$bin" --version | grep -F "0.1.0"
+          "$bin" init --bind "$CODEX_MEMORYD_BIND" >/dev/null
+          "$bin" up >/dev/null
+          "$bin" status | jq -e '.ok == true and .data.status == "local_only"'
+          "$bin" down >/dev/null
+          "$bin" status | jq -e '(.process == "stopped") or (.data.status == "local_only")'
+          test -s "$CODEX_MEMORYD_HOME/memory.db"
+
+      - name: Archive only the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="codex-memoryd-v${VERSION}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          install -m 0755 "target/${{ matrix.target }}/release/codex-memoryd" "$staging/codex-memoryd"
+          tar -czf "$asset" -C "$staging" codex-memoryd
+          test "$(tar -tzf "$asset" | wc -l)" -eq 1
+          test "$(tar -tzf "$asset")" = codex-memoryd
+
+      - name: Upload native archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: native-${{ matrix.target }}
+          path: codex-memoryd-v${{ env.VERSION }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble-release:
+    name: Assemble checksums and provenance
+    needs: native-artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Download native archives
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create bounded checksums and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          expected=(
+            codex-memoryd-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+            codex-memoryd-v${VERSION}-x86_64-apple-darwin.tar.gz
+            codex-memoryd-v${VERSION}-aarch64-apple-darwin.tar.gz
+          )
+          for asset in "${expected[@]}"; do
+            test -f "$asset"
+            test "$(tar -tzf "$asset" | wc -l)" -eq 1
+            test "$(tar -tzf "$asset")" = codex-memoryd
+          done
+          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
+          sha256sum "${expected[@]}" > SHA256SUMS
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          archives = sorted(Path('.').glob('*.tar.gz'))
+          provenance = {
+              "schema_version": 1,
+              "artifact_hashes": {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in archives
+              },
+              "commit": os.environ["GITHUB_SHA"],
+              "package_version": os.environ["VERSION"],
+              "ref": os.environ["GITHUB_REF"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "targets": [path.name.removeprefix("codex-memoryd-v0.1.0-").removesuffix(".tar.gz") for path in archives],
+              "workflow_run": int(os.environ["GITHUB_RUN_ID"]),
+          }
+          Path("provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-bundle
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  stage-release:
+    name: Stage and verify draft release
+    needs: [verify-tag, assemble-release]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v0.1.0
+          fetch-depth: 1
+
+      - name: Download release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-bundle
+          path: dist
+
+      - name: Create a new draft without overwriting anything
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists" >&2
+            exit 1
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "codex-memoryd $TAG" \
+            --notes "Reproducible native artifacts and GHCR image for the exact $TAG source tag."
+          test -z "$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for asset in dist/*.tar.gz dist/SHA256SUMS dist/provenance.json; do
+            gh release upload "$TAG" "$asset"
+          done
+
+      - name: Verify draft assets by downloading them again
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d)"
+          gh release download "$TAG" --dir "$download_dir"
+          cd "$download_dir"
+          sha256sum -c SHA256SUMS
+          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
+          for archive in *.tar.gz; do
+            test "$(tar -tzf "$archive" | wc -l)" -eq 1
+            test "$(tar -tzf "$archive")" = codex-memoryd
+          done
+          jq -e --arg commit "$GITHUB_SHA" --arg version "$VERSION" \
+            '.commit == $commit and .package_version == $version and (.targets | length == 4)' provenance.json
+
+  publish-ghcr:
+    name: Publish and verify GHCR image
+    needs: [verify-tag, stage-release]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v0.1.0
+          fetch-depth: 1
+
+      - name: Refuse an existing version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Refuse an existing version tag after authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+            exit 1
+          fi
+
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push the version tag only
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: false
+          sbom: false
+
+      - name: Make the package public and capture the verified digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method PATCH user/packages/container/codex-memoryd/visibility -f visibility=public >/dev/null
+          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
+          test "$digest" =~ ^sha256:[0-9a-f]{64}$
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$digest"
+          version_digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
+          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')"
+          test "$version_digest" = "$digest"
+          test "$latest_digest" = "$digest"
+          echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify both tags anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          for tag in "$TAG" latest; do
+            output="$(docker pull --platform linux/amd64 "$IMAGE:$tag")"
+            printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
+          done
+
+  publish-release:
+    name: Publish immutable release and verify public assets
+    needs: [verify-tag, stage-release, publish-ghcr]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v0.1.0
+          fetch-depth: 1
+
+      - name: Publish the staged draft once
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          release_json="$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -F make_latest=true)"
+          jq -e '.draft == false and .immutable == true' <<<"$release_json"
+          test "$(jq -r '.tag_name' <<<"$release_json")" = "$TAG"
+          test "$(jq -r '.target_commitish' <<<"$release_json")" != ""
+
+      - name: Re-download every published asset and verify it
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d)"
+          gh release download "$TAG" --dir "$download_dir"
+          cd "$download_dir"
+          sha256sum -c SHA256SUMS
+          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
+          for archive in *.tar.gz; do
+            test "$(tar -tzf "$archive" | wc -l)" -eq 1
+            test "$(tar -tzf "$archive")" = codex-memoryd
+          done
+          jq -e --arg commit "$GITHUB_SHA" --arg version "$VERSION" \
+            '.commit == $commit and .package_version == $version and (.targets | length == 4)' provenance.json
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '{tag_name,draft,immutable,target_commitish,assets:[.assets[].name]}'
