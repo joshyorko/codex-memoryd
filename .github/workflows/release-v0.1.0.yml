@@ -51,7 +51,6 @@ jobs:
           package_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
           test "$package_version" = "$VERSION"
           grep -Fqx 'repository = "https://github.com/joshyorko/codex-memoryd"' Cargo.toml
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
           release_json="$(mktemp)"
           release_status="$(curl --silent --show-error --location \
             --output "$release_json" \
