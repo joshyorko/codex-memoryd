@@ -45,7 +45,7 @@ jobs:
           jq -e --arg tag "$TAG" \
             '.tag_name == $tag and .draft == false and .immutable == true' \
             <<<"$release_json" >/dev/null
-          test "$tag_object" =~ ^[0-9a-f]{40}$
+          [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]]
           echo "Release source commit: $tag_object" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to GHCR
