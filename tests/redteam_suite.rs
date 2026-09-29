@@ -202,7 +202,9 @@ fn work_confidential_never_bleeds_into_personal_recall() {
         .iter()
         .all(|f| !f.content.contains("work confidential")));
     assert!(
-        r.facts.iter().any(|f| f.id == personal),
+        r.facts
+            .iter()
+            .any(|f| { f.id == ids::public_handle(ids::PublicHandleKind::MemoryRef, &personal) }),
         "gate that fired: profile boundary (work withheld, personal kept)"
     );
 }
