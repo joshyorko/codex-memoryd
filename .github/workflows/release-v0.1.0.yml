@@ -504,23 +504,22 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Make the package public and capture the verified digest
+      - name: Capture the verified version digest
         id: digest
         shell: bash
         run: |
           set -euo pipefail
-          gh api --method PATCH user/packages/container/codex-memoryd/visibility -f visibility=public >/dev/null
-          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
-          test "$digest" =~ ^sha256:[0-9a-f]{64}$
-          version_digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
-          test "$version_digest" = "$digest"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          version_digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$version_digest" == "$digest" ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify the version tag anonymously
         shell: bash
         run: |
-          set -euo pipefail
+          # An anonymous pull is the public-visibility assertion.
           docker logout ghcr.io >/dev/null 2>&1 || true
           output="$(docker pull --platform linux/amd64 "$IMAGE:$TAG")"
           printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
@@ -565,7 +564,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@${{ steps.digest.outputs.digest }}"
-          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')"
+          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -er '.digest')"
           test "$latest_digest" = "${{ steps.digest.outputs.digest }}"
 
       - name: Verify latest anonymously

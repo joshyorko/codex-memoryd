@@ -1,0 +1,128 @@
+name: Repair GHCR v0.1.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Confirm that the existing immutable v0.1.0 release and versioned image may be used to repair latest
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  TAG: v0.1.0
+  IMAGE: ghcr.io/joshyorko/codex-memoryd
+
+jobs:
+  repair:
+    name: Verify v0.1.0 and repair latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require explicit repair confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.confirm }}" = true
+
+      - name: Verify the immutable release and exact tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_object="$(jq -r '.object.sha' <<<"$tag_ref")"
+          if [ "$tag_type" = "tag" ]; then
+            tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
+          fi
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          jq -e --arg tag "$TAG" \
+            '.tag_name == $tag and .draft == false and .immutable == true' \
+            <<<"$release_json" >/dev/null
+          [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]]
+          echo "Release source commit: $tag_object" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Capture the existing public version digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the version tag anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          output="$(docker pull --platform linux/amd64 "$IMAGE:$TAG")"
+          printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
+
+      - name: Smoke the existing version image on loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          container_name="codex-memoryd-v0-1-0-repair-smoke"
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            rm -rf "$home"
+          }
+          trap cleanup EXIT
+          chmod 0777 "$home"
+          docker run --detach \
+            --name "$container_name" \
+            --publish 127.0.0.1:18789:8787 \
+            --volume "$home:/data" \
+            --env CODEX_MEMORYD_DB=/data/memory.db \
+            --env CODEX_MEMORYD_BIND=0.0.0.0:8787 \
+            "$IMAGE:$TAG"
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18789/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18789/healthz | jq -e '.ok == true'
+          test -s "$home/memory.db"
+
+      - name: Log in again to assign latest
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Assign latest from the verified version digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@${{ steps.digest.outputs.digest }}"
+          latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -er '.digest')"
+          test "$latest_digest" = "${{ steps.digest.outputs.digest }}"
+
+      - name: Verify latest anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          output="$(docker pull --platform linux/amd64 "$IMAGE:latest")"
+          printf '%s\n' "$output" | grep -F "Digest: ${{ steps.digest.outputs.digest }}"
