@@ -414,30 +414,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          versions="$(mktemp)"
-          status="$(curl --silent --show-error --location \
-            --output "$versions" \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/user/packages/container/codex-memoryd/versions?per_page=100")"
-          case "$status" in
-            200)
-              jq -e 'type == "array"' "$versions" >/dev/null
-              if jq -e --arg tag "$TAG" \
-                '[.[]?.metadata.container.tags[]?] | index($tag) != null' "$versions" >/dev/null; then
-                echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+          page=1
+          while :; do
+            versions="$(mktemp)"
+            status="$(curl --silent --show-error --location \
+              --output "$versions" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/user/packages/container/codex-memoryd/versions?per_page=100&page=$page")"
+            case "$status" in
+              200)
+                jq -e 'type == "array"' "$versions" >/dev/null
+                if jq -e --arg tag "$TAG" \
+                  '[.[]?.metadata.container.tags[]?] | index($tag) != null' "$versions" >/dev/null; then
+                  echo "$IMAGE:$TAG already exists; refusing overwrite" >&2
+                  exit 1
+                fi
+                [ "$(jq 'length' "$versions")" -lt 100 ] && break
+                page=$((page + 1))
+                ;;
+              404)
+                [ "$page" -eq 1 ] && break
+                echo "GHCR version pagination failed on page $page; refusing to publish" >&2
+                cat "$versions" >&2
                 exit 1
-              fi
-              ;;
-            404)
-              ;;
-            *)
-              echo "could not prove that $IMAGE:$TAG is absent; refusing to publish" >&2
-              cat "$versions" >&2
-              exit 1
-              ;;
-          esac
+                ;;
+              *)
+                echo "could not prove that $IMAGE:$TAG is absent; refusing to publish" >&2
+                cat "$versions" >&2
+                exit 1
+                ;;
+            esac
+          done
 
       - name: Revalidate the release tag before image publication
         shell: bash
