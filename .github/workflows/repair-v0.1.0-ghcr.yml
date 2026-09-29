@@ -16,7 +16,7 @@ permissions:
 env:
   TAG: v0.1.0
   IMAGE: ghcr.io/joshyorko/codex-memoryd
-
+  EXPECTED_DIGEST: sha256:70465d5250f693d15408fe904d30e3035360d8a46ac6f1caea8c3660eac09996
 jobs:
   repair:
     name: Verify v0.1.0 and repair latest
@@ -58,13 +58,13 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Capture the existing public version digest
+      - name: Capture and pin the existing public version digest
         id: digest
         shell: bash
         run: |
           set -euo pipefail
           digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$digest" = "$EXPECTED_DIGEST"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "GHCR digest: $digest" >> "$GITHUB_STEP_SUMMARY"
 
@@ -104,20 +104,44 @@ jobs:
           curl --fail --silent http://127.0.0.1:18789/healthz | jq -e '.ok == true'
           test -s "$home/memory.db"
 
-      - name: Log in again to assign latest
+      - name: Log in again before assigning latest
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Refuse a mismatched existing latest tag
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          error_file="$(mktemp)"
+          cleanup() {
+            rm -f "$error_file"
+          }
+          trap cleanup EXIT
+          if latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' 2>"$error_file" | jq -er '.digest')"; then
+            test "$latest_digest" = "$EXPECTED_DIGEST"
+            echo "already_matching=true" >> "$GITHUB_OUTPUT"
+            echo "GHCR latest already matches $latest_digest" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! grep -Eqi 'manifest unknown|no such manifest|not found' "$error_file"; then
+            cat "$error_file" >&2
+            exit 1
+          fi
+          echo "already_matching=false" >> "$GITHUB_OUTPUT"
+          echo "GHCR latest is absent; assigning the verified v0.1.0 digest." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Assign latest from the verified version digest
+        if: steps.latest.outputs.already_matching != 'true'
         shell: bash
         run: |
           set -euo pipefail
           docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@${{ steps.digest.outputs.digest }}"
           latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -er '.digest')"
-          test "$latest_digest" = "${{ steps.digest.outputs.digest }}"
+          test "$latest_digest" = "$EXPECTED_DIGEST"
 
       - name: Verify latest anonymously
         shell: bash
