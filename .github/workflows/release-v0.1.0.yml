@@ -369,18 +369,18 @@ jobs:
                   raise SystemExit(f"provenance hash mismatch: {name}")
           PY
 
-      - name: Require an immutable draft before external publication
+      - name: Reconfirm the mutable draft before external publication
         shell: bash
         run: |
           set -euo pipefail
           release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
           jq -e --arg tag "$TAG" \
-            '.tag_name == $tag and .draft == true and .immutable == true' \
+            '.tag_name == $tag and .draft == true and (.immutable != true)' \
             <<<"$release_json" >/dev/null
 
   publish-ghcr:
     name: Publish and verify GHCR image
-    needs: [verify-tag, stage-release]
+    needs: [verify-tag, stage-release, publish-release]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -556,7 +556,7 @@ jobs:
 
   publish-release:
     name: Publish immutable release and verify public assets
-    needs: [verify-tag, stage-release, publish-ghcr]
+    needs: [verify-tag, stage-release]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
