@@ -357,7 +357,7 @@ write_diff_report() {
   fingerprint_db "$SANDBOX_DB" "sandbox" "$sandbox_fp"
 
   python3 - "$REAL_DB" "$SANDBOX_DB" "$before" "$after" "$sandbox_fp" "$report" <<'PY'
-import datetime as dt
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -462,7 +462,7 @@ real_counts = table_counts(after)
 sandbox_counts = table_counts(sandbox_fp)
 all_tables = sorted(set(real_counts) | set(sandbox_counts))
 report = {
-    "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "real_db": os.path.abspath(real_db),
     "sandbox_db": os.path.abspath(sandbox_db),
     "real_unchanged": real_unchanged,
