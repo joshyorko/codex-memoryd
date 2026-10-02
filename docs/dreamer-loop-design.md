@@ -23,7 +23,7 @@ recall / store boundaries.
   - Durable dream run audit + watermark rows are persisted in the store.
   - Status includes last Dreamer run and scheduler state.
   - Test coverage includes promotion/rejection/supersession/stale-facts/secrets/user
-    adoption/explicit conclusions/repeated steering/self-reinforcement blocking.
+    adoption/conclusion provenance/repeated steering/self-reinforcement blocking.
 - Remaining work:
   - The loop is not fully productized; the report now exposes a first-class
     evidence window with per-stream counts and safe source refs, but synthesis
@@ -155,18 +155,18 @@ state (`planned`, `active`, `blocked`, `completed`, `historical`,
       "content": "Storage uses rusqlite bundled SQLite (replaces earlier 'TBD storage').",
       "confidence": 0.9,
       "candidate_state": "accepted",
-      "threshold_reason": "explicit conclusion plus active-record conflict on same subject_key",
-      "evidence": [ { "kind": "conclusion", "id": "concl_…", "class": "conclusion", "weight": 2.0 } ],
+      "threshold_reason": "checkpoint plus active-record conflict on same subject_key",
+      "evidence": [ { "kind": "checkpoint", "id": "ckpt_…", "class": "checkpoint", "weight": 1.5 } ],
       "evidence_counts": {
-        "visible_turns": 0, "conclusions": 1, "checkpoints": 0,
+        "visible_turns": 0, "conclusions": 0, "checkpoints": 1,
         "imported_memories": 0, "active_records": 1
       },
       "evidence_weights": {
-        "user_turns": 0.0, "assistant_turns": 0.0, "conclusions": 2.0,
-        "checkpoints": 0.0, "imported_memories": 0.0, "active_records": 0.0,
-        "total_primary": 2.0, "total_corrob": 0.0
+        "user_turns": 0.0, "assistant_turns": 0.0, "conclusions": 0.0,
+        "checkpoints": 1.5, "imported_memories": 0.0, "active_records": 0.0,
+        "total_primary": 1.5, "total_corrob": 0.0
       },
-      "promotion_reason": "newer explicit conclusion supersedes stale active record",
+      "promotion_reason": "newer checkpoint supersedes stale active record",
       "state": "completed",
       "drift_prone": false,
       "expires_at": null,
@@ -268,19 +268,58 @@ Initial evidence classes are weighted asymmetrically:
 
 | Class | Weight | Role |
 | --- | --- | --- |
-| `user_turn` | `1.0` | Strong primary evidence. |
-| `conclusion` | `2.0` | Strong explicit evidence. |
+| `user_visible_turn` | `1.0` | Strong primary evidence. |
+| `adopted_assistant_proposal` | `1.25` | Captured assistant proposal supported by a separately captured user adoption; mirrors are not original proposals. |
 | `checkpoint` | `1.5` | Strong for task/repo state, next steps, gotchas, and conventions. |
-| `assistant_turn` | `0.25` | Weak unless adopted by later user/checkpoint/conclusion evidence. |
+| `assistant_visible_turn` | `0.25` | Weak unless adopted by a separately captured user turn. |
+| `assistant_memory` | `0.25` | An attributed assistant note or mirror, not an original user turn. |
+| `unknown_conclusion` | `0.0` | Retained conclusion without proven primary adoption; endpoint and target do not establish its author. |
+| `memoryd_derived` | `0.0` | Known MemoryD-derived provenance or retained derivation references never add promotion weight. |
 | `imported_memory` | `0.5` | Corroborating only; cannot create active memory alone. |
 | `active_record` | `0.0` | Conflict/supersession/expiry input only; never self-reinforcement. |
 
-Threshold rules are deterministic and family-specific. Examples: repeated user
-steering must cross the preference threshold across distinct evidence; durable
-project decisions may promote from explicit conclusions; checkpoints can promote
-task state; assistant-only proposals and imported-summary-only candidates are
-quarantined or rejected. Same-turn repetition does not boost, explicit user
-adoption boosts, and hedging language lowers confidence.
+Threshold rules are deterministic and family-specific. Repeated user steering
+requires actual user evidence; weak copies and different ingestion dates cannot
+meet a primary threshold. Only primary classes contribute to that threshold.
+Checkpoints can promote task state. A separately captured user adoption can
+support an assistant proposal. Assistant-only, imported-only and unknown
+conclusion candidates remain non-applicable.
+
+This projection uses preserved nested provenance and supported legacy top-level
+attribution in `src/dream.rs::evidence_class`, `score_evidence` and the evidence
+report builders. `target=user` names a conclusion destination, not its speaker.
+Unknown authors remain absent in provider-facing evidence windows. Caller
+labels cannot prove primary adoption. Copied nested attribution, including an
+imported `actor=user` label, cannot create a visible-user capture classification.
+The existing capture-authored top-level actor remains necessary for that class.
+Known weakening labels in either supported metadata location keep their ceiling
+when a different label is added elsewhere. Accepted statements, types, state,
+confidence, support references and time bounds come from primary support;
+later weak contradictions remain inspectable context in the evidence window.
+Supporting time uses the retained observation time when available and original
+creation time otherwise, not a later metadata/source-attachment modification.
+Legacy records remain stored and eligible
+for ordinary policy-permitted recall; this change does not migrate their
+identity, status or timestamps. `created_at` and `updated_at` remain creation
+and modification fields, not verification dates.
+
+`Service::conclusions` still directly persists current records, and visible
+turns still derive some records. This bounded Dreamer repair does not make every
+host contribution low authority or establish authenticated producer identity.
+
+Bundle v1 `src/portable_bundle.rs::safe_metadata` preserves nested source-kind
+and write-origin provenance but omits top-level source-kind and array-only
+`derived_from`/`derived_from_memory_ids` markers. Zero weight survives transfer
+when those supported nested labels are preserved. Array-only legacy lineage
+still needs #233/#234 transfer work; this slice cannot promise its preservation
+or a complete zero-gain handoff for #246.
+
+Run `cargo test --test evidence_independence` for real-service mirror, mixed
+legacy evidence, separate visible-user capture, recall round trip and bundle
+import/re-export canaries. These cover known provenance and retained references,
+not perfect semantic ancestry detection. #233 still owns authenticated producer
+identity, stable observation receipts and episodic recall; #234 still owns
+reviewed legacy reconciliation and suppression across replay/import.
 
 ## 4. Synthesis backend boundary
 
@@ -477,7 +516,7 @@ Seeded scenarios:
 | `assistant_proposal_without_adoption.jsonl` | Assistant-only proposal is quarantined until user validates/adopts it. |
 | `single_mention_preference_not_promoted.jsonl` | A single preference statement remains quarantined as unconfirmed. |
 | `imported_memory_self_reinforcement_blocked.jsonl` | Imported memory cannot self-reinforce into active candidates without fresh evidence. |
-| `explicit_conclusion_promotes.jsonl` | Explicit conclusion evidence promotes a `decision` when clear. |
+| `conclusion_without_adoption.jsonl` | A conclusion with unknown adoption remains inspectable and cannot promote itself. |
 | `repeated_user_steering_promotes.jsonl` | Repeated user steering promotes to a durable `command` candidate. |
 
 ### Eval assertions

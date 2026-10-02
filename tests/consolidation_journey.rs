@@ -1,3 +1,6 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::config::Config;
 use codex_memoryd::protocol::{ConclusionsRequest, RecallRequest};
 use codex_memoryd::service::Service;
@@ -24,17 +27,13 @@ fn governed_adoption_survives_restart_and_fresh_recall() {
     let first_config = config(&path);
     let first_store = Store::open(path.to_str().unwrap()).unwrap();
     let first = Service::new(first_store, first_config);
-    first
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("journey".into()),
-            repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec!["Decision: use concise summaries".into()]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .unwrap();
+    primary_checkpoint::capture(
+        &first,
+        "personal",
+        "journey",
+        None,
+        "Decision: use concise summaries",
+    );
     let applied = first
         .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
         .unwrap();
@@ -68,7 +67,7 @@ fn governed_adoption_survives_restart_and_fresh_recall() {
 }
 
 #[test]
-fn plain_preference_is_attributed_and_recalled_after_governed_adoption() {
+fn plain_legacy_preference_retains_recall_without_unproven_adoption() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("plain-preference.sqlite");
     let content = "I prefer concise status updates.";
@@ -91,7 +90,11 @@ fn plain_preference_is_attributed_and_recalled_after_governed_adoption() {
         .run
         .unwrap();
 
-    assert_eq!(run.created, captured.record_ids);
+    assert!(run.created.is_empty());
+    assert!(run
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.apply_eligible));
     assert_eq!(first.store.count_records().unwrap(), 1);
     let record = first
         .store
@@ -100,7 +103,10 @@ fn plain_preference_is_attributed_and_recalled_after_governed_adoption() {
         .unwrap();
     assert_eq!(record.content, content);
     assert_eq!(record.metadata["target"], "user");
-    assert_eq!(record.metadata["governed_consolidation_applied"], true);
+    assert!(record
+        .metadata
+        .get("governed_consolidation_applied")
+        .is_none());
     drop(first);
 
     let fresh = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
@@ -135,17 +141,7 @@ fn scheduled_adoption_fresh_consumer_correction_wins_after_restart() {
         "Correction: project cobalt uses amber lanterns for release ceremonies instead of violet lanterns.";
 
     let first = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
-    first
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("journey".into()),
-            repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec![old.into()]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .unwrap();
+    primary_checkpoint::capture(&first, "personal", "journey", None, old);
     let first_run = first
         .scheduled_dream(Some("2000-01-01T00:00:00Z".into()))
         .unwrap()
@@ -175,18 +171,8 @@ fn scheduled_adoption_fresh_consumer_correction_wins_after_restart() {
         .unwrap();
     assert!(before.facts.iter().any(|fact| fact.content == old));
 
-    let correction = second
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("journey".into()),
-            repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec![new.into()]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .unwrap();
-    let new_id = correction.record_ids[0].clone();
+    let correction = primary_checkpoint::capture(&second, "personal", "journey", None, new);
+    let new_id = correction.id;
     let second_run = second
         .scheduled_dream(Some("2100-01-01T00:00:00Z".into()))
         .unwrap()
@@ -237,23 +223,56 @@ fn review_underlying_source_ids_remain_resolvable_during_adoption() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source-ids.sqlite");
     let service = Service::new(Store::open(path.to_str().unwrap()).unwrap(), config(&path));
-    let captured = service
-        .conclusions(ConclusionsRequest {
+    let user_capture = service
+        .turns(codex_memoryd::protocol::TurnsRequest {
             profile: Some("personal".into()),
             workspace: Some("journey".into()),
             repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec!["I prefer concise status updates.".into()]),
-            metadata: None,
-            record_type: Some("preference".into()),
+            session: Some(codex_memoryd::protocol::TurnSession {
+                id: Some("source-capture".into()),
+                thread_id: None,
+                source: Some("test-visible-capture".into()),
+                metadata: None,
+            }),
+            messages: Some(vec![codex_memoryd::protocol::TurnMessage {
+                actor: "user".into(),
+                content: "Task checkpoint: task alpha uses cargo test for validation.".into(),
+                created_at: None,
+                metadata: None,
+            }]),
+            write_policy: None,
         })
         .unwrap();
+    let source_id = user_capture.source_ids[0].clone();
+    assert!(service.store.get_source(&source_id).unwrap().is_some());
+    // Keep one current projection over this retained source. The existing
+    // consolidation boundary refuses duplicate descriptors for one root.
+    service
+        .forget(codex_memoryd::protocol::ForgetRequest {
+            profile: Some("personal".into()),
+            workspace: Some("journey".into()),
+            ids: Some(user_capture.derived_record_ids),
+            mode: Some("archive".into()),
+            reason: None,
+        })
+        .unwrap();
+    assert!(service.store.get_source(&source_id).unwrap().is_some());
+    let captured = primary_checkpoint::capture(
+        &service,
+        "personal",
+        "journey",
+        None,
+        "Task checkpoint: task alpha uses cargo test for validation.",
+    );
     service
         .store
         .transaction(|tx| {
             tx.execute(
                 "UPDATE memory_records SET source_ids = ?1 WHERE id = ?2",
-                rusqlite::params!["[\"source-user-event\"]", &captured.record_ids[0]],
+                rusqlite::params![
+                    serde_json::to_string(&vec![source_id.clone()])?,
+                    captured.id
+                ],
             )?;
             Ok(())
         })
@@ -263,9 +282,9 @@ fn review_underlying_source_ids_remain_resolvable_during_adoption() {
         .unwrap()
         .run
         .unwrap();
-    assert_eq!(run.created, captured.record_ids);
+    assert_eq!(run.created, vec![captured.id]);
     let adopted = service.store.get_record(&run.created[0]).unwrap().unwrap();
-    assert!(adopted.source_ids.contains(&"source-user-event".into()));
+    assert!(adopted.source_ids.contains(&source_id));
     assert_eq!(adopted.metadata["governed_consolidation_applied"], true);
 }
 

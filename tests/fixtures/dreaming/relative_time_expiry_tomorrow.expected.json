@@ -4,7 +4,7 @@
       {
         "subject_key": "daemon-failing-patch",
         "action": "rewrite_historical",
-        "record_type": "other",
+        "record_type": "task_checkpoint",
         "promotion_reason": "expired relative-time content",
         "evidence_count": 1,
         "must_contain": [
@@ -15,8 +15,8 @@
       {
         "subject_key": "daemon-failing-patch",
         "action": "promote",
-        "record_type": "other",
-        "promotion_reason": "explicit_conclusion",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "checkpoint_backed_task_state",
         "evidence_count": 1,
         "must_contain": [
           "Right now the daemon is failing on startup, planning to patch it tomorrow."

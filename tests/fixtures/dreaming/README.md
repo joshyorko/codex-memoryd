@@ -63,7 +63,7 @@ idempotent. Recall expectations compare the store before and after apply.
 | `assistant_proposal_without_adoption.jsonl` | Assistant-only proposal is quarantined without user adoption. |
 | `single_mention_preference_not_promoted.jsonl` | Single user preference mention stays low-confidence and does not promote. |
 | `imported_memory_self_reinforcement_blocked.jsonl` | Imported/active memory self-reinforcement is blocked without fresh primary evidence. |
-| `explicit_conclusion_promotes.jsonl` | Explicit conclusion in evidence is accepted when it is clear and authoritative. |
+| `conclusion_without_adoption.jsonl` | A retained conclusion without primary adoption stays non-applicable. |
 | `repeated_user_steering_promotes.jsonl` | Repeated user steering is promoted to one stable `command`. |
 
 See the design doc §7 for the per-scenario eval assertions, including

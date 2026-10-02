@@ -67,6 +67,40 @@ fn conclude(svc: &Service, content: &str) -> String {
     resp.record_ids[0].clone()
 }
 
+fn checkpoint(svc: &Service, content: &str) -> String {
+    let response = svc
+        .checkpoint(CheckpointRequest {
+            profile: Some("personal".into()),
+            workspace: Some("ws".into()),
+            repo: None,
+            session: None,
+            summary: Some(content.into()),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+        })
+        .unwrap();
+    let record = svc
+        .store
+        .find_by_content_hash(&ids::content_hash(
+            "personal",
+            "ws",
+            None,
+            "task_checkpoint",
+            "session",
+            content,
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.metadata["checkpoint_id"], response.id);
+    record.id
+}
+
 fn dream(svc: &Service, mode: &str, now: &str) -> DreamResponse {
     dream_since(svc, mode, now, None).unwrap()
 }
@@ -292,9 +326,9 @@ fn relative_time_fact_is_drift_prone_and_expires() {
 #[test]
 fn newer_same_subject_fact_supersedes_and_archives_old_record() {
     let svc = service();
-    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    let old_id = checkpoint(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
-    conclude(
+    checkpoint(
         &svc,
         "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
     );
@@ -358,9 +392,9 @@ fn newer_same_subject_fact_supersedes_and_archives_old_record() {
 #[test]
 fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
     let svc = service();
-    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    let old_id = checkpoint(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
-    let new_id = conclude(
+    let new_id = checkpoint(
         &svc,
         "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
     );
@@ -400,7 +434,7 @@ fn preview_and_apply_emit_observations_with_evidence_refs_and_retirements() {
     assert!(observation
         .evidence_refs
         .iter()
-        .all(|reference| reference.kind == "conclusion"));
+        .all(|reference| reference.kind == "checkpoint"));
     assert!(applied.archived.contains(&old_id));
 }
 
@@ -482,7 +516,7 @@ fn preview_and_apply_emit_experience_markers_with_required_fields() {
 #[test]
 fn apply_persists_marker_provenance_for_created_records() {
     let svc = service();
-    conclude(
+    checkpoint(
         &svc,
         "Battle scar: the cache writes failed tomorrow, but we recovered by switching to the fallback path.",
     );
@@ -609,7 +643,7 @@ fn counter_evidence_can_retire_and_invert_markers_through_preview_apply() {
             }
         }),
     );
-    conclude(
+    checkpoint(
         &svc,
         "Comfort path: cache warmup is now the known-good path after two clean runs; it counters the old scar.",
     );
@@ -884,7 +918,7 @@ fn metadata_subject_key_is_used_for_matching_and_candidate_subject_key() {
         json!({
             "subject_key": "oauth-sync",
             "state": "planned",
-            "origin": "conclusion",
+            "origin": "checkpoint",
         }),
     );
     std::thread::sleep(Duration::from_millis(5));
@@ -894,7 +928,7 @@ fn metadata_subject_key_is_used_for_matching_and_candidate_subject_key() {
         json!({
             "subject_key": "oauth-sync",
             "state": "completed",
-            "origin": "conclusion",
+            "origin": "checkpoint",
         }),
     );
 
@@ -950,7 +984,7 @@ fn non_transitive_bridge_matches_do_not_create_one_promotion_group() {
 #[test]
 fn apply_is_idempotent_and_records_required_dreamer_metadata() {
     let svc = service();
-    let old_id = conclude(
+    let old_id = checkpoint(
         &svc,
         "Right now the daemon is failing on startup, planning to patch it tomorrow.",
     );
@@ -968,7 +1002,7 @@ fn apply_is_idempotent_and_records_required_dreamer_metadata() {
     assert_eq!(created.metadata["dream_run_id"], first.run_id);
     assert!(created.metadata["subject_key"].as_str().is_some());
     assert_eq!(created.metadata["evidence_count"], 1);
-    assert_eq!(created.metadata["user_evidence_count"], 1);
+    assert_eq!(created.metadata["user_evidence_count"], 0);
     assert_eq!(created.metadata["assistant_evidence_count"], 0);
     assert_eq!(created.metadata["state"], "historical");
     assert_eq!(created.metadata["drift_prone"], false);
@@ -1137,9 +1171,9 @@ fn scheduled_dreamer_runs_when_idle_and_uses_watermark() {
     let mut config = scheduler_config();
     config.automatic_apply = true;
     let svc = scheduled_service(config);
-    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    let old_id = checkpoint(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
-    conclude(
+    checkpoint(
         &svc,
         "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
     );
@@ -1436,9 +1470,9 @@ fn successful_preview_records_safe_audit_without_memory_writes() {
 #[test]
 fn successful_apply_records_audit_and_advances_watermark() {
     let svc = service();
-    let old_id = conclude(&svc, "Storage backend is still TBD; evaluating options.");
+    let old_id = checkpoint(&svc, "Storage backend is still TBD; evaluating options.");
     std::thread::sleep(Duration::from_millis(5));
-    conclude(
+    checkpoint(
         &svc,
         "Decision: storage uses rusqlite with bundled SQLite. The backend is no longer TBD.",
     );
@@ -1950,7 +1984,7 @@ fn imported_memory_self_reinforcement_blocked() {
 }
 
 #[test]
-fn explicit_conclusion_promotes() {
+fn conclusion_without_adoption_remains_weak() {
     let svc = service();
     conclude(
         &svc,
@@ -1960,13 +1994,14 @@ fn explicit_conclusion_promotes() {
     let report = dream(&svc, "preview", "2026-06-02T00:00:00Z");
 
     assert!(report.candidates.iter().any(|candidate| {
-        candidate.candidate_state == "accepted"
-            && candidate.threshold_reason == "explicit_conclusion"
+        candidate.candidate_state == "quarantined"
+            && candidate.threshold_reason
+                == "imported_or_active_memory_without_fresh_primary_evidence"
             && candidate
                 .evidence_classes
-                .contains(&"explicit_conclusion".to_string())
-            && candidate.evidence_weight >= 2.0
-            && candidate.apply_eligible
+                .contains(&"unknown_conclusion".to_string())
+            && candidate.evidence_weight == 0.0
+            && !candidate.apply_eligible
     }));
 }
 

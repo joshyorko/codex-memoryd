@@ -4,8 +4,8 @@
       {
         "subject_key": "are-migration-storage",
         "action": "promote",
-        "record_type": "other",
-        "promotion_reason": "explicit_conclusion",
+        "record_type": "task_checkpoint",
+        "promotion_reason": "checkpoint_backed_task_state",
         "evidence_count": 1,
         "must_contain": ["We are currently blocked on the storage migration"],
         "must_not_contain": []
