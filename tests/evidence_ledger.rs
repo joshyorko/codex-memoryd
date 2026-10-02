@@ -1,3 +1,6 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::config::Config;
 use codex_memoryd::domain::RepoIdentity;
 use codex_memoryd::protocol::*;
@@ -476,18 +479,13 @@ fn sync_apply_dedupes_repeated_multimodal_artifact_hash_across_paths() {
 fn dream_apply_is_idempotent_for_ledger_rows() {
     let (svc, _tmp, db_path) = temp_service();
 
-    svc.conclusions(ConclusionsRequest {
-        profile: Some("personal".to_string()),
-        workspace: Some("ws".to_string()),
-        repo: None,
-        target: Some("user".to_string()),
-        conclusions: Some(vec![
-            "Decision: use cargo test for the repository".to_string()
-        ]),
-        metadata: None,
-        record_type: None,
-    })
-    .expect("seed conclusion");
+    primary_checkpoint::capture(
+        &svc,
+        "personal",
+        "ws",
+        None,
+        "Decision: use cargo test for the repository",
+    );
 
     let before = ledger_count(&db_path);
     let req = DreamRequest {

@@ -934,7 +934,7 @@ fn dreaming_jsonl_fixture_loader_parses_existing_fixtures() {
         "assistant_proposal_without_adoption.jsonl",
         "single_mention_preference_not_promoted.jsonl",
         "imported_memory_self_reinforcement_blocked.jsonl",
-        "explicit_conclusion_promotes.jsonl",
+        "conclusion_without_adoption.jsonl",
         "repeated_user_steering_promotes.jsonl",
     ];
     for fixture in fixtures {

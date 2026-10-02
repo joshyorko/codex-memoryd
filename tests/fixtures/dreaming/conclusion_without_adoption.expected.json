@@ -1,0 +1,27 @@
+{
+  "expect_preview": {
+    "accepted": [],
+    "rejected": [],
+    "quarantined": [
+      {
+        "subject_key": "cargo-command-supported",
+        "action": "promote",
+        "record_type": "decision",
+        "promotion_reason": "imported_or_active_memory_without_fresh_primary_evidence",
+        "evidence_count": 1,
+        "must_contain": [
+          "cargo test",
+          "validation command"
+        ],
+        "must_not_contain": []
+      }
+    ],
+    "stale": [],
+    "rejected_items": []
+  },
+  "expect_apply": {
+    "created": 0,
+    "archived": 0,
+    "idempotent_second_apply": true
+  }
+}

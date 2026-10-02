@@ -1,3 +1,6 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::domain::{Portability, RecordType, Scope, Sensitivity, VisibleTurn};
 use codex_memoryd::ids;
 use codex_memoryd::protocol::ConclusionsRequest;
@@ -188,16 +191,13 @@ fn deterministic_automatic_schedule_uses_governed_apply_boundary() {
     config.dream_scheduler.min_session_age_seconds = 0;
     config.dream_scheduler.min_turn_count = 0;
     let svc = codex_memoryd::service::Service::new(store.clone(), config);
-    svc.conclusions(codex_memoryd::protocol::ConclusionsRequest {
-        profile: Some("personal".into()),
-        workspace: Some("ws".into()),
-        repo: None,
-        target: Some("user".into()),
-        conclusions: Some(vec!["Decision: use concise summaries".into()]),
-        metadata: None,
-        record_type: Some("decision".into()),
-    })
-    .unwrap();
+    primary_checkpoint::capture(
+        &svc,
+        "personal",
+        "ws",
+        None,
+        "Decision: use concise summaries",
+    );
     let result = svc
         .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
         .unwrap();

@@ -2,6 +2,9 @@
 //! database and assert real behavior (record creation, secret rejection,
 //! idempotent local import, forget, doctor).
 
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -2816,7 +2819,36 @@ fn cli_patch_preview_renders_markdown() {
         .assert()
         .success()
         .stdout(predicate::str::contains("# Memory patch preview"))
-        .stdout(predicate::str::contains("+ decision"));
+        .stdout(predicate::str::contains("+ decision").not());
+
+    let service = codex_memoryd::service::Service::new(
+        codex_memoryd::store::Store::open(&db).unwrap(),
+        codex_memoryd::config::Config::default(),
+    );
+    primary_checkpoint::capture(
+        &service,
+        "personal",
+        "josh-personal",
+        None,
+        "Decision: use rusqlite with bundled SQLite",
+    );
+    bin()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "patch",
+            "preview",
+            "--profile",
+            "personal",
+            "--workspace",
+            "josh-personal",
+            "--format",
+            "markdown",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Memory patch preview"))
+        .stdout(predicate::str::contains("+ task_checkpoint"));
 }
 
 #[test]

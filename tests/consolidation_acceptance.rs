@@ -1,3 +1,6 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::config::{Config, DreamProviderConfig};
 use codex_memoryd::domain::{Checkpoint, Conclusion, VisibleTurn};
 use codex_memoryd::protocol::{
@@ -318,20 +321,12 @@ fn capped_scheduled_run_preserves_and_continues_unprocessed_tail() {
     config.dream_scheduler.max_batch_size = 20;
     config.dream_scheduler.max_candidates = 1;
     let service = Service::new(store.clone(), config);
-    service
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("tail".into()),
-            repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec![
-                "Decision: alpha service uses blue deployment.".into(),
-                "Decision: beta database uses green migration.".into(),
-            ]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .expect("conclusions");
+    for content in [
+        "Decision: alpha service uses blue deployment.",
+        "Decision: beta database uses green migration.",
+    ] {
+        primary_checkpoint::capture(&service, "personal", "tail", None, content);
+    }
 
     let first = service
         .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
