@@ -276,7 +276,7 @@ Initial evidence classes are weighted asymmetrically:
 | `unknown_conclusion` | `0.0` | Retained conclusion without proven primary adoption; endpoint and target do not establish its author. |
 | `memoryd_derived` | `0.0` | Known MemoryD-derived provenance or retained derivation references never add promotion weight. |
 | `imported_memory` | `0.5` | Corroborating only; cannot create active memory alone. |
-| `active_record` | `0.0` | Conflict/supersession/expiry input only; never self-reinforcement. |
+| `active_memory` | `0.0` | Conflict/supersession/expiry input only; never self-reinforcement. |
 
 Threshold rules are deterministic and family-specific. Repeated user steering
 requires actual user evidence; weak copies and different ingestion dates cannot
