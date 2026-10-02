@@ -1446,3 +1446,138 @@ mod managed_readiness_tests {
         assert!(!ready(&local_status(), "personal", "other-workspace"));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod container_readiness_regressions {
+    use super::{up, RuntimeKind, RuntimeOptions};
+    use crate::store::STORAGE_SCHEMA_VERSION;
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    fn container_status(path: &str) -> Value {
+        json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": path, "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none"}
+        }})
+    }
+
+    fn status_server(
+        status: Value,
+    ) -> (String, Arc<AtomicBool>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let status_body = status.to_string();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop_server.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let read = stream.read(&mut request).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&request[..read]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body = if path == "/healthz" {
+                            "{}"
+                        } else {
+                            status_body.as_str()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}"), stop, server)
+    }
+
+    fn fake_container_runtime(path: &std::path::Path) {
+        fs::write(
+            path,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ \"$3\" = \"--format\" ]; then printf true; fi; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn run_managed_container_up(status_path: &str) -> crate::error::Result<super::RuntimeStatusReport> {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("fake-container-runtime");
+        fake_container_runtime(&runtime);
+        let (url, stop, server) = status_server(container_status(status_path));
+        let address = url.strip_prefix("http://").unwrap();
+        let port = address.rsplit_once(':').unwrap().1.parse().unwrap();
+        let options = RuntimeOptions {
+            runtime: RuntimeKind::Container,
+            home: temp.path().join("runtime-home"),
+            url,
+            host: "127.0.0.1".into(),
+            port,
+            bind: format!("127.0.0.1:{port}"),
+            db: PathBuf::from("/tmp/host-memory.db"),
+            pid_file: temp.path().join("unused.pid"),
+            log_file: temp.path().join("unused.log"),
+            profile: "personal".into(),
+            workspace: "synthetic-scope".into(),
+            log_level: "info".into(),
+            binary: PathBuf::from("unused-binary"),
+            allow_non_loopback: false,
+            image: "synthetic-image".into(),
+            container_name: "synthetic-memoryd".into(),
+            container_runtime: Some(runtime.to_string_lossy().into_owned()),
+            codex_memories_dir: temp.path().join("synthetic-memories"),
+            uid: None,
+            gid: None,
+            endpoint_configured: true,
+        };
+
+        let result = up(&options);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn up_accepts_healthy_container_status_at_container_database_path() {
+        let result = run_managed_container_up("/data/memory.db");
+        assert!(result.is_ok(), "managed container startup failed: {result:?}");
+        assert_eq!(result.unwrap().health, "ok");
+    }
+
+    #[test]
+    fn up_rejects_container_status_for_wrong_database_path() {
+        let result = run_managed_container_up("/data/wrong.db");
+        let error = result.expect_err("wrong managed-container storage path must fail readiness");
+        assert!(error.message.contains("core readiness requirements are not met"));
+    }
+}
