@@ -24,6 +24,29 @@ For write-capable MCP testing, use the separate sandbox lane in
 - Recall is `recall_not_authority`; user instructions, repo files, and tests override memory.
 - No automatic memory writes, hidden reasoning storage, secret storage, prompt injection, or Dreamer auto-apply.
 
+## Existing-daemon attachment
+
+For a synthetic daemon already running on loopback, use its explicit HTTP
+endpoint and scope instead of opening its SQLite file:
+
+```bash
+codex-memoryd --url http://127.0.0.1:8989 mcp stdio --daemon \
+  --profile personal --workspace default
+```
+
+This mode does not load local config, initialize storage, start a daemon, or
+fall back to a database if HTTP fails. It permits only the three read tools.
+Stopping the MCP adapter leaves the daemon usable. Profile/workspace arguments
+are fixed to the selected scope; write, local, database, runtime, and config
+options conflict with daemon attachment. See
+[`mcp-v2.md`](./mcp-v2.md#attach-to-an-existing-daemon) for limits, status
+projection, and error behavior.
+
+The managed `mcp codex` block below still generates the direct-store command.
+Configure an explicit daemon command separately when testing attachment.
+Synthetic local attachment tests do not prove a hosted ChatGPT connection.
+Secure MCP Tunnel setup and its hosted canary remain separate work in #247.
+
 ## Create Sandbox DB
 
 Use SQLite backup so the running daemon's WAL is handled safely without touching the real database:
