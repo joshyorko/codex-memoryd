@@ -1,19 +1,71 @@
-# MCP v2 Surface
+# MCP adapter v2
 
-`codex-memoryd` exposes MCP as an adapter surface over the existing local-first
-daemon semantics. MCP does not become a separate source of truth and does not
-get adapter-specific write policy.
+“MCP v2” is the name of MemoryD's internal adapter/tool-tier generation from
+issue #81. It is **not** an official MCP wire-protocol revision. The wire
+revisions and transport implemented by this adapter are listed separately
+below.
 
-## Local stdio
+## Wire revisions and lifecycle
 
-Local stdio is the default safe path:
+The current MCP specification is [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28).
+MemoryD supports it and the handshake-based revisions
+[`2025-11-25`](https://modelcontextprotocol.io/specification/2025-11-25) and
+[`2025-06-18`](https://modelcontextprotocol.io/specification/2025-06-18).
+The 2026 revision is stateless: each request carries protocol version, client
+identity, and client capabilities in `params._meta`, and clients may use
+`server/discover` to obtain supported versions and capabilities. `initialize`
+and `notifications/initialized` belong to the 2025-and-earlier lifecycle, not
+the 2026 revision.
+
+The server advertises `2026-07-28`, `2025-11-25`, and `2025-06-18`. A modern stdio process
+uses per-request metadata and `server/discover`; a legacy process negotiates
+the requested supported legacy revision, then must receive
+`notifications/initialized` before serving tools. The `2025-11-25` initialize
+response is the fallback for other legacy versions; that client must support
+the returned revision or disconnect. This includes the legacy `2025-06-18`
+mode currently selected by public Codex MCP client source. A 2026 client must use `server/discover`,
+not `initialize`. A stdio process selects one lifecycle era and does not mix
+modern and legacy requests.
+
+The current SDK-level interop test uses the official Rust MCP SDK client
+`rmcp 3.5.0` with its `2026-07-28` discovery lifecycle, then lists tools,
+calls `memory_status`, and shuts down over stdio. It is not a hosted
+Codex/ChatGPT/Tunnel canary. Public tunnel-client source version `0.0.15`
+depends on Go MCP SDK `v1.7.0` and uses its 2026 discovery path and 2025-11-25
+legacy fallback; this is source-level evidence, not a test of an installed
+tunnel binary. Public Codex
+source currently defaults to the 2025-06-18 legacy lifecycle, with
+2026-07-28 behind an experimental opt-in. Neither public-source version
+identifies the binaries installed in a particular hosted or local environment.
+The tunnel client's `2026-08-25` control-plane wire header is a separate
+version from MCP's `2026-07-28` protocol version.
+References: [Codex protocol-mode source](https://github.com/openai/codex/blob/ca466061d64f0b44f416135c7fd06aa7af850bbc/codex-rs/rmcp-client/src/protocol_mode.rs),
+[tunnel-client version source](https://github.com/openai/tunnel-client/blob/c8aeedec334db55bbd69bb16db6b71276993d708/pkg/version/VERSION),
+and the [Go MCP SDK compatibility notes](https://github.com/modelcontextprotocol/go-sdk/blob/v1.7.0/README.md#version-compatibility).
+
+## Stdio transport
+
+The only MCP transport implemented here is local stdio:
 
 ```bash
 codex-memoryd --db ~/.codex-memoryd/memory.db mcp stdio
 ```
 
+Messages are UTF-8 JSON-RPC objects, one newline-delimited message per line.
+Each incoming line is limited to 1 MiB. `stdout` is reserved for MCP
+JSON-RPC; diagnostics go to `stderr`. EOF on stdin exits cleanly. An output
+failure (including a disconnected client) is returned as an error rather than
+reported as a successful session.
+
+MemoryD does **not** implement MCP over Streamable HTTP or the deprecated
+HTTP+SSE transport. The existing MemoryD HTTP API is not an MCP endpoint.
+Secure MCP Tunnel is an external stdio consumer/adapter, not a transport
+implemented by MemoryD.
+
+## Tool tiers and safety
+
 `mcp stdio` defaults to the read-only tier. `--read-only` is accepted as an
-explicit no-write adapter marker:
+explicit no-write-tool marker:
 
 ```bash
 codex-memoryd --db ~/.codex-memoryd/memory.db mcp stdio --read-only
@@ -25,17 +77,11 @@ Read-only tools:
 - `memory_recall`
 - `memory_search`
 
-This tier is the only tier intended for current Codex sandbox dogfood.
-
-## Write tier
-
-Write tools are exposed only with an explicit opt-in:
+Write-capable tools require explicit `--write-tools`:
 
 ```bash
 codex-memoryd --db ~/.codex-memoryd/memory.db mcp stdio --write-tools
 ```
-
-Write-capable tools:
 
 - `memory_create`
 - `memory_conclude`
@@ -44,60 +90,53 @@ Write-capable tools:
 - `memory_import_apply`
 
 `memory_import_preview` never writes durable records. `memory_import_apply`
-uses the same sync/import service path as the CLI and HTTP API, including
-idempotency, policy screening, profile/workspace scoping, and provenance.
+uses the existing sync/import service path, including idempotency, policy
+screening, profile/workspace scoping, and provenance. `memory_create` and
+`memory_conclude` use the existing conclusions service; denied content is
+returned as a rejected entry rather than stored.
 
-`memory_create` and `memory_conclude` both write through the existing
-conclusions service. Policy-denied content is returned in structured
-`rejected` entries rather than being stored.
+Tool schemas reject unknown arguments. Read tools advertise `readOnlyHint`;
+write tools advertise `readOnlyHint = false`, and import tools advertise their
+respective `destructiveHint`. These MCP annotations are advisory metadata, not
+authorization. The server-side `--write-tools` gate and existing service
+policy remain authoritative.
 
-## Tool schemas
+Successful tool calls return text and `structuredContent`. Tool execution
+failures use an MCP tool result with `isError = true`; malformed requests and
+unknown methods use JSON-RPC errors with the originating request ID when it
+can be read. Notifications, including unsupported notifications, never
+receive a JSON-RPC response.
 
-Tool list responses include MCP annotations:
-
-- read tools set `readOnlyHint = true`
-- write tools set `readOnlyHint = false`
-- import preview sets `destructiveHint = false`
-- import apply sets `destructiveHint = true`
-
-The write-tier schema snapshot is checked in at
+The write-tier schema snapshot remains at
 [`tests/fixtures/mcp_tools.write.json`](../tests/fixtures/mcp_tools.write.json)
-and is verified by `cargo test --test mcp_stdio`.
+and is checked by `cargo test --test mcp_stdio`.
 
-## Recall authority
+## Recall authority and storage boundary
 
-MCP recall and search responses preserve normal `codex-memoryd` semantics:
-memory is `recall_not_authority`. User instructions, repository files, current
-tool output, and test results override recalled memory. Responses carry the
-same structured content as the service APIs, including evidence and provenance
-metadata where those APIs provide it.
+MCP recall and search preserve the normal MemoryD contract:
+`recall_not_authority`. Current user instructions, repository files, tool
+output, and test results override recalled memory. Results retain the
+structured content, evidence, and provenance provided by the service.
 
-## Self-hosted proxy path
+The stdio CLI currently opens its configured local store; it does **not**
+attach to an already-running daemon's store owner. Protocol conformance does
+not implement or claim daemon-backed attachment. That is separate work tracked
+by [issue #247](https://github.com/joshyorko/codex-memoryd/issues/247).
 
-The supported remote shape is a small self-hosted MCP proxy that runs next to a
-`codex-memoryd` daemon and forwards to local loopback or stdio. The proxy must
-own:
+## Compatibility and live evidence
 
-- authentication
-- network TLS
-- client identity
-- capability policy
-- rate limits and audit logs
-- read-only versus write-tier selection
+| Check | MemoryD version | Client version | Result |
+| --- | --- | --- | --- |
+| Official Rust SDK stdio discovery, tool listing/call, and shutdown | `0.1.0` (`Cargo.toml`) | `rmcp 3.5.0` | **PASS**; automated `mcp_stdio` test |
+| Hosted discovery and synthetic tool call through Secure MCP Tunnel | `0.1.0` | Runtime Codex/hosted-client and `tunnel-client` versions unavailable in this environment (public tunnel-client source is `0.0.15`) | **NOT RUN**; no hosted credentials or tunnel client |
 
-Do not publish the raw local daemon or a write-tier MCP process directly to the
-internet. A remote deployment that only exposes the read-only tier can be
-reviewed independently from one that exposes `--write-tools`.
+A disconnected local stdout consumer was manually reproduced and causes the
+stdio process to exit non-zero. The prior tunnel-specific broken-pipe failure
+has not been reproduced because `tunnel-client` and the hosted client are
+unavailable here; its cause remains **unresolved**. A successful SDK stdio test
+does not establish why that earlier tunnel attempt closed its pipe.
 
-## Capability gate expectation
-
-Issue #52 is the long-term capability gate. Until that lands as a first-class
-policy model, the MCP adapter uses the narrowest enforceable gate:
-
-- default: read-only
-- write tier: explicit `--write-tools`
-- Codex sandbox configs: read-only tools only
-
-When #52 lands, `--write-tools` should become necessary but not sufficient:
-the adapter should also require the configured client capability policy to
-allow each write tool.
+For remote integrations, use a separately reviewed proxy that owns
+authentication, TLS, client identity, rate limits, audit logging, and tool
+policy. Do not publish the raw local daemon or a write-enabled stdio process
+directly to the internet.

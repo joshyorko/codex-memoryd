@@ -22,7 +22,12 @@ use crate::PROVIDER_VERSION;
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[MCP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
+const CODEX_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION,
+    LEGACY_PROTOCOL_VERSION,
+    CODEX_LEGACY_PROTOCOL_VERSION,
+];
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
 const CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
@@ -413,6 +418,14 @@ fn handle_message(
                     format!("missing required MCP request metadata '{missing}'"),
                 ));
             }
+            if let Some(client_info) = request_meta.and_then(|meta| meta.get(CLIENT_INFO_META)) {
+                if !valid_client_info(client_info) {
+                    return Some(invalid_params(
+                        response_id,
+                        format!("invalid MCP client identity metadata '{CLIENT_INFO_META}'"),
+                    ));
+                }
+            }
             if state.connection_mode == ConnectionMode::Legacy {
                 return Some(invalid_request(
                     response_id,
@@ -445,7 +458,6 @@ fn handle_message(
                 params,
                 write_tools,
                 true,
-                state,
             ));
         }
     }
@@ -462,18 +474,7 @@ fn handle_message(
             format!("modern MCP requests require '{PROTOCOL_VERSION_META}' metadata"),
         ));
     }
-    if !matches!(
-        state.legacy_phase,
-        LegacyPhase::Ready | LegacyPhase::AwaitingInitialized
-    ) {
-        return Some(server_error(
-            response_id,
-            -32002,
-            "MCP session is not initialized",
-            Some(json!({ "code": "server_not_initialized" })),
-        ));
-    }
-    if state.legacy_phase == LegacyPhase::AwaitingInitialized {
+    if state.legacy_phase != LegacyPhase::Ready {
         return Some(server_error(
             response_id,
             -32002,
@@ -488,7 +489,6 @@ fn handle_message(
         params,
         write_tools,
         false,
-        state,
     ))
 }
 
@@ -508,7 +508,7 @@ fn initialize(state: &mut ServerState, id: Value, params: Option<Value>) -> RpcR
     let Some(requested) = params.get("protocolVersion").and_then(Value::as_str) else {
         return invalid_params(id, "initialize requires a protocolVersion string");
     };
-    if !params.get("clientInfo").is_some_and(Value::is_object)
+    if !params.get("clientInfo").is_some_and(valid_client_info)
         || !params.get("capabilities").is_some_and(Value::is_object)
     {
         return invalid_params(
@@ -524,10 +524,9 @@ fn initialize(state: &mut ServerState, id: Value, params: Option<Value>) -> RpcR
             Some(json!({ "supported": SUPPORTED_PROTOCOL_VERSIONS })),
         );
     }
-    let negotiated = if requested == LEGACY_PROTOCOL_VERSION {
-        requested
-    } else {
-        LEGACY_PROTOCOL_VERSION
+    let negotiated = match requested {
+        LEGACY_PROTOCOL_VERSION | CODEX_LEGACY_PROTOCOL_VERSION => requested,
+        _ => LEGACY_PROTOCOL_VERSION,
     };
     state.connection_mode = ConnectionMode::Legacy;
     state.legacy_phase = LegacyPhase::AwaitingInitialized;
@@ -548,6 +547,13 @@ fn initialize(state: &mut ServerState, id: Value, params: Option<Value>) -> RpcR
     )
 }
 
+fn valid_client_info(value: &Value) -> bool {
+    value.as_object().is_some_and(|info| {
+        info.get("name").is_some_and(Value::is_string)
+            && info.get("version").is_some_and(Value::is_string)
+    })
+}
+
 fn handle_request(
     service: &Service,
     id: Value,
@@ -555,18 +561,9 @@ fn handle_request(
     params: Option<Value>,
     write_tools: bool,
     modern: bool,
-    state: &ServerState,
 ) -> RpcResponse {
     match method {
         "tools/list" => {
-            if !modern && state.legacy_phase != LegacyPhase::Ready {
-                return server_error(
-                    id,
-                    -32002,
-                    "MCP session is not initialized",
-                    Some(json!({ "code": "server_not_initialized" })),
-                );
-            }
             let mut result = json!({ "tools": tool_definitions(write_tools) });
             if modern {
                 result["ttlMs"] = json!(0);
@@ -575,14 +572,6 @@ fn handle_request(
             ok_versioned(id, result, modern)
         }
         "tools/call" => {
-            if !modern && state.legacy_phase != LegacyPhase::Ready {
-                return server_error(
-                    id,
-                    -32002,
-                    "MCP session is not initialized",
-                    Some(json!({ "code": "server_not_initialized" })),
-                );
-            }
             let params = params.and_then(|mut params| {
                 params.as_object_mut()?.remove("_meta");
                 serde_json::from_value::<ToolCallParams>(params).ok()

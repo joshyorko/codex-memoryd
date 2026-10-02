@@ -257,13 +257,15 @@ requests = [
         "id": "init",
         "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "clientInfo": {
                 "name": "codex-memoryd-fixture-demo",
                 "version": "1",
             },
+            "capabilities": {},
         },
     },
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
     {"jsonrpc": "2.0", "id": "tools", "method": "tools/list", "params": {}},
     {"jsonrpc": "2.0", "id": "status", "method": "tools/call", "params": {"name": "memory_status", "arguments": {}}},
     {

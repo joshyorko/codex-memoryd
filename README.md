@@ -588,7 +588,7 @@ operator polish rather than reopen the old stale snapshot.
 | `#69` | multimodal evidence | landed artifact metadata, redaction policy, and non-text evidence import shape |
 | `#70` | adapter conformance | `conformance adapters` report now certifies adapter authority, provenance, and budget behavior |
 | `#80` | deployment runtime | landed local runtime helper and restart-survival smoke path |
-| `#81` | MCP v2 | landed default read-only tier plus explicit write-tool tier |
+| `#81` | MCP adapter v2 | landed read-only/write tool tiers; not an official MCP wire revision |
 | `#82` | hosted app adapter | landed design doc for hosted app memory adapter boundaries |
 | `#83` | plugin packages | landed installable adapter package templates |
 | `#84` | native Codex migration | landed migration plan, parity canaries, and duplicate-loop guardrails |
@@ -602,6 +602,7 @@ operator polish rather than reopen the old stale snapshot.
 - [`docs/codex-integration.md`](./docs/codex-integration.md)
 - [`docs/dogfood-local.md`](./docs/dogfood-local.md)
 - [`docs/dogfood-mcp.md`](./docs/dogfood-mcp.md)
+- [`docs/mcp-v2.md`](./docs/mcp-v2.md)
 - [`docs/eval-substrate.md`](./docs/eval-substrate.md)
 - [`docs/native-codex-memory-migration.md`](./docs/native-codex-memory-migration.md)
 - [`docs/evidence-ledger.md`](./docs/evidence-ledger.md)

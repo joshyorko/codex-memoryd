@@ -253,6 +253,49 @@ fn mcp_stdio_rejects_unknown_tool_args_field() {
 }
 
 #[test]
+fn mcp_stdio_tool_execution_errors_use_mcp_error_results() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let responses = run_mcp(
+        &db,
+        &[],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "failed-call",
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_recall",
+                    "arguments": {
+                        "profile": "not-configured",
+                        "workspace": "not-configured",
+                        "query": "synthetic"
+                    }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses[1]["id"], "failed-call");
+    assert!(responses[1].get("error").is_none());
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        "unknown_profile"
+    );
+}
+
+#[test]
 fn mcp_stdio_accepts_tool_call_meta() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
@@ -649,6 +692,33 @@ fn mcp_stdio_legacy_version_negotiation_reports_the_supported_revision() {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
     }
 
+    let responses = run_mcp(
+        &db,
+        &[],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": "codex-legacy",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": { "name": "codex-legacy-test", "version": "1.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "codex-tools",
+                "method": "tools/list",
+                "params": {}
+            }),
+        ],
+    );
+    assert_eq!(responses[0]["id"], "codex-legacy");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(responses[1]["id"], "codex-tools");
+    assert!(responses[1]["result"].get("resultType").is_none());
+
     let malformed = json!({
         "jsonrpc": "2.0",
         "id": 7,
@@ -703,6 +773,18 @@ fn mcp_stdio_modern_metadata_discovery_and_error_ids() {
     });
     let missing_metadata =
         json!({ "jsonrpc": "2.0", "id": 26, "method": "server/discover", "params": {} });
+    let mut malformed_client_info = json!({
+        "jsonrpc": "2.0",
+        "id": 27,
+        "method": "tools/list"
+    });
+    malformed_client_info["params"] = json!({
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    });
     let mut unknown = json!({ "jsonrpc": "2.0", "id": "unknown", "method": "not/a/method" });
     unknown["params"] = json!({ "_meta": metadata });
     let notifications = json!({
@@ -717,6 +799,7 @@ fn mcp_stdio_modern_metadata_discovery_and_error_ids() {
             discovery,
             unsupported,
             missing_metadata,
+            malformed_client_info,
             unknown,
             notifications,
         ]
@@ -726,24 +809,26 @@ fn mcp_stdio_modern_metadata_discovery_and_error_ids() {
         .join("\n"),
     );
 
-    assert_eq!(responses.len(), 4);
+    assert_eq!(responses.len(), 5);
     assert_eq!(responses[0]["id"], "discovery");
     assert_eq!(responses[0]["result"]["resultType"], "complete");
     assert_eq!(
         responses[0]["result"]["supportedVersions"],
-        json!(["2026-07-28", "2025-11-25"])
+        json!(["2026-07-28", "2025-11-25", "2025-06-18"])
     );
     assert_eq!(responses[1]["id"], 25);
     assert_eq!(responses[1]["error"]["code"], -32022);
     assert_eq!(responses[1]["error"]["data"]["requested"], "2026-08-01");
     assert_eq!(
         responses[1]["error"]["data"]["supported"],
-        json!(["2026-07-28", "2025-11-25"])
+        json!(["2026-07-28", "2025-11-25", "2025-06-18"])
     );
     assert_eq!(responses[2]["id"], 26);
     assert_eq!(responses[2]["error"]["code"], -32602);
-    assert_eq!(responses[3]["id"], "unknown");
-    assert_eq!(responses[3]["error"]["code"], -32601);
+    assert_eq!(responses[3]["id"], 27);
+    assert_eq!(responses[3]["error"]["code"], -32602);
+    assert_eq!(responses[4]["id"], "unknown");
+    assert_eq!(responses[4]["error"]["code"], -32601);
 }
 
 #[test]
