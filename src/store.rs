@@ -1812,6 +1812,17 @@ impl Store {
         Ok(())
     }
 
+    /// Check the exact scope without creating it or combining global lists.
+    pub fn workspace_exists(&self, profile_id: &str, workspace_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE profile_id = ?1 AND id = ?2)",
+            params![profile_id, workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
+    }
+
     pub fn active_profiles(&self) -> Result<Vec<String>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT id FROM profiles ORDER BY id")?;

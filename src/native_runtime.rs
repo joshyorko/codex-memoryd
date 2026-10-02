@@ -586,7 +586,7 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         fs::write(&opts.pid_file, child.id().to_string()).map_err(Error::from)?;
     }
 
-    wait_for_ready(opts)?;
+    wait_for_ready(opts, &opts.db.to_string_lossy())?;
     Ok(status(opts))
 }
 
@@ -666,7 +666,7 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         )?;
     }
 
-    wait_for_ready(opts)?;
+    wait_for_ready(opts, "/data/memory.db")?;
     Ok(status_container(opts))
 }
 
@@ -708,18 +708,13 @@ fn wait_for_health(opts: &RuntimeOptions) -> Result<()> {
     Err(Error::storage(format!("timed out waiting for {url}")))
 }
 
-fn wait_for_ready(opts: &RuntimeOptions) -> Result<()> {
+fn wait_for_ready(opts: &RuntimeOptions, db_path: &str) -> Result<()> {
     wait_for_health(opts)?;
     let status_url = format!("{}/v1/status", opts.url.trim_end_matches('/'));
     for _ in 0..30 {
         if let Ok(body) = http_get(&status_url) {
             let parsed: serde_json::Value = serde_json::from_str(&body)?;
-            if managed_status_ready(
-                &parsed,
-                &opts.profile,
-                &opts.workspace,
-                &opts.db.to_string_lossy(),
-            ) {
+            if managed_status_ready(&parsed, &opts.profile, &opts.workspace, db_path) {
                 return Ok(());
             }
             if let Some(status) = parsed.pointer("/data/status").and_then(|v| v.as_str()) {
@@ -796,16 +791,23 @@ fn managed_scope_available(
     else {
         return false;
     };
-    if profiles.is_empty() && workspaces.is_empty() {
-        return status == Some("local_only");
-    }
-    if profiles.is_empty() || workspaces.is_empty() {
+    let Some(scope) = data.pointer("/features/configured_scope") else {
         return false;
+    };
+    if scope.get("profile").and_then(|value| value.as_str()) != Some(profile)
+        || scope.get("workspace").and_then(|value| value.as_str()) != Some(workspace)
+    {
+        return false;
+    }
+    if profiles.is_empty() && workspaces.is_empty() {
+        return status == Some("local_only")
+            && scope.get("available").and_then(|value| value.as_bool()) == Some(false);
     }
     profiles.iter().any(|value| value.as_str() == Some(profile))
         && workspaces
             .iter()
             .any(|value| value.as_str() == Some(workspace))
+        && scope.get("available").and_then(|value| value.as_bool()) == Some(true)
 }
 
 fn degraded_only_by_dreamer(data: &serde_json::Value, reasons: &[serde_json::Value]) -> bool {
@@ -1308,7 +1310,8 @@ mod managed_readiness_tests {
             "active_workspaces": ["synthetic-scope"],
             "last_dream": null,
             "degraded_reasons": [],
-            "features": {"exposure": "local_only", "auth": "none"}
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
         }})
     }
 
@@ -1325,7 +1328,8 @@ mod managed_readiness_tests {
                 "error_summary": "dream provider input byte budget exhausted"
             },
             "degraded_reasons": ["last Dreamer run failed: dream provider input byte budget exhausted"],
-            "features": {"exposure": "local_only", "auth": "none"}
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
         }})
     }
 
@@ -1350,7 +1354,8 @@ mod managed_readiness_tests {
             "active_workspaces": [],
             "last_dream": null,
             "degraded_reasons": [],
-            "features": {"exposure": "local_only", "auth": "none"}
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "default", "available": false}}
         }});
         assert!(managed_status_ready(
             &empty_store,
@@ -1367,6 +1372,58 @@ mod managed_readiness_tests {
             "personal",
             "synthetic-scope"
         ));
+    }
+
+    #[test]
+    fn rejects_profile_workspace_cross_product_from_real_status() {
+        let store = crate::store::Store::open(":memory:").unwrap();
+        store
+            .ensure_workspace("personal", "other-workspace")
+            .unwrap();
+        store.ensure_workspace("work", "synthetic-scope").unwrap();
+        let mut config = crate::config::Config::default();
+        config.default_profile = "personal".into();
+        config.default_workspace = "synthetic-scope".into();
+        let service = crate::service::Service::new(store.clone(), config);
+        let status = serde_json::to_value(service.status().unwrap()).unwrap();
+        let path = status["storage"]["path"].as_str().unwrap().to_string();
+        assert!(
+            !managed_status_ready(
+                &json!({"data": status}),
+                "personal",
+                "synthetic-scope",
+                &path
+            ),
+            "unrelated profile and workspace must not establish a ready scope"
+        );
+
+        store
+            .ensure_workspace("personal", "synthetic-scope")
+            .unwrap();
+        let status = serde_json::to_value(service.status().unwrap()).unwrap();
+        assert!(managed_status_ready(
+            &json!({"data": status}),
+            "personal",
+            "synthetic-scope",
+            &path
+        ));
+    }
+
+    #[test]
+    fn rejects_inconsistent_empty_scope_claims() {
+        let mut status = local_status();
+        status["data"]["active_profiles"] = json!([]);
+        status["data"]["active_workspaces"] = json!([]);
+        assert!(!ready(&status, "personal", "synthetic-scope"));
+        status["data"]["features"]["configured_scope"]["available"] = json!(false);
+        assert!(ready(&status, "personal", "synthetic-scope"));
+        assert!(!ready(&status, "work", "synthetic-scope"));
+        assert!(!ready(&status, "personal", "other-workspace"));
+        status["data"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("configured_scope");
+        assert!(!ready(&status, "personal", "synthetic-scope"));
     }
 
     #[test]
@@ -1471,13 +1528,12 @@ mod container_readiness_regressions {
             "active_workspaces": ["synthetic-scope"],
             "last_dream": null,
             "degraded_reasons": [],
-            "features": {"exposure": "local_only", "auth": "none"}
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
         }})
     }
 
-    fn status_server(
-        status: Value,
-    ) -> (String, Arc<AtomicBool>, JoinHandle<()>) {
+    fn status_server(status: Value) -> (String, Arc<AtomicBool>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1530,7 +1586,9 @@ mod container_readiness_regressions {
         fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn run_managed_container_up(status_path: &str) -> crate::error::Result<super::RuntimeStatusReport> {
+    fn run_managed_container_up(
+        status_path: &str,
+    ) -> crate::error::Result<super::RuntimeStatusReport> {
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("fake-container-runtime");
         fake_container_runtime(&runtime);
@@ -1570,7 +1628,10 @@ mod container_readiness_regressions {
     #[test]
     fn up_accepts_healthy_container_status_at_container_database_path() {
         let result = run_managed_container_up("/data/memory.db");
-        assert!(result.is_ok(), "managed container startup failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "managed container startup failed: {result:?}"
+        );
         assert_eq!(result.unwrap().health, "ok");
     }
 
@@ -1578,6 +1639,8 @@ mod container_readiness_regressions {
     fn up_rejects_container_status_for_wrong_database_path() {
         let result = run_managed_container_up("/data/wrong.db");
         let error = result.expect_err("wrong managed-container storage path must fail readiness");
-        assert!(error.message.contains("core readiness requirements are not met"));
+        assert!(error
+            .message
+            .contains("core readiness requirements are not met"));
     }
 }

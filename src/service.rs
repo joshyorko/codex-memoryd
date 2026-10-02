@@ -1672,20 +1672,22 @@ impl Service {
     }
 
     pub fn run_dream_job(&self, req: DreamJobRunRequest) -> Result<DreamJobRunResponse> {
-        self.run_dream_job_inner(req, false)
+        self.run_dream_job_inner(req, false, None)
     }
 
     fn run_scheduled_command_dream_job(
         &self,
         req: DreamJobRunRequest,
+        deadline: Instant,
     ) -> Result<DreamJobRunResponse> {
-        self.run_dream_job_inner(req, true)
+        self.run_dream_job_inner(req, true, Some(deadline))
     }
 
     fn run_dream_job_inner(
         &self,
         req: DreamJobRunRequest,
         skip_empty_provider_input: bool,
+        scheduler_deadline: Option<Instant>,
     ) -> Result<DreamJobRunResponse> {
         let profile = self.resolve_profile(&req.profile)?;
         let workspace = self.resolve_workspace(&req.workspace);
@@ -1738,6 +1740,9 @@ impl Service {
                 "dream job max_runtime_seconds is too large",
             ));
         };
+        // Sizing retries share the scheduler's original deadline, including
+        // fractional seconds already spent selecting and serializing sources.
+        let deadline = scheduler_deadline.map_or(deadline, |outer| outer.min(deadline));
         let job_id = req.job_id.unwrap_or_else(|| ids::new_id("dream_job"));
         let provider = req.provider.unwrap_or_default();
         let resolved_provider = self.resolve_dream_provider(adapter, &provider, &req.budget)?;
@@ -1800,7 +1805,7 @@ impl Service {
                 skip_empty_provider_input,
             )
         });
-        if started.elapsed().as_secs() >= req.budget.max_runtime_seconds && result.is_ok() {
+        if Instant::now() >= deadline && result.is_ok() {
             let completed_at = ids::now_rfc3339();
             let summary = sanitize_error_summary("dream job exceeded max_runtime_seconds");
             let audit = dream_error_audit(
@@ -1840,7 +1845,7 @@ impl Service {
                 if max_candidates_hit {
                     limits_hit.push("max_candidates".to_string());
                 }
-                if started.elapsed().as_secs() >= req.budget.max_runtime_seconds {
+                if Instant::now() >= deadline {
                     limits_hit.push("max_runtime_seconds".to_string());
                 }
                 let status = if limits_hit.is_empty() {
@@ -2589,6 +2594,11 @@ impl Service {
         }
 
         let started = Instant::now();
+        let deadline = started
+            .checked_add(StdDuration::from_secs(cfg.max_runtime_seconds))
+            .ok_or_else(|| {
+                Error::invalid_request("dream scheduler max_runtime_seconds is too large")
+            })?;
         let command_mode = cfg.scheduled_provider_enabled
             && self.config.dream_provider.enabled
             && DreamProviderAdapter::parse(&self.config.dream_provider.adapter)
@@ -2603,40 +2613,40 @@ impl Service {
             } else {
                 let mut max_input_records = cfg.max_batch_size;
                 loop {
-                    let remaining_runtime = cfg
-                        .max_runtime_seconds
-                        .saturating_sub(started.elapsed().as_secs());
-                    if remaining_runtime == 0 {
+                    if Instant::now() >= deadline {
                         break Err(Error::internal("dream runtime budget exhausted"));
                     }
-                    match self.run_scheduled_command_dream_job(DreamJobRunRequest {
-                        job_id: None,
-                        profile: Some(profile.as_str().to_string()),
-                        workspace: Some(workspace.clone()),
-                        repo: None,
-                        now: Some(now.clone()),
-                        since: watermark_before.clone(),
-                        since_explicit: false,
-                        kind: "dream_preview".to_string(),
-                        mode: Some("command".to_string()),
-                        provider: None,
-                        budget: DreamJobBudget {
-                            max_runtime_seconds: remaining_runtime,
-                            max_input_records,
-                            max_candidates: cfg.max_candidates,
-                            max_input_tokens: 8000,
-                            max_output_tokens: 2048,
-                            max_input_bytes: 32000,
-                            max_output_bytes: 262144,
-                            max_provider_calls: 1,
-                            max_retries: 0,
-                            max_cost_micros: 0,
-                            daily_cost_ceiling_micros: self
-                                .config
-                                .dream_provider
-                                .daily_cost_ceiling_micros,
+                    match self.run_scheduled_command_dream_job(
+                        DreamJobRunRequest {
+                            job_id: None,
+                            profile: Some(profile.as_str().to_string()),
+                            workspace: Some(workspace.clone()),
+                            repo: None,
+                            now: Some(now.clone()),
+                            since: watermark_before.clone(),
+                            since_explicit: false,
+                            kind: "dream_preview".to_string(),
+                            mode: Some("command".to_string()),
+                            provider: None,
+                            budget: DreamJobBudget {
+                                max_runtime_seconds: cfg.max_runtime_seconds,
+                                max_input_records,
+                                max_candidates: cfg.max_candidates,
+                                max_input_tokens: 8000,
+                                max_output_tokens: 2048,
+                                max_input_bytes: 32000,
+                                max_output_bytes: 262144,
+                                max_provider_calls: 1,
+                                max_retries: 0,
+                                max_cost_micros: 0,
+                                daily_cost_ceiling_micros: self
+                                    .config
+                                    .dream_provider
+                                    .daily_cost_ceiling_micros,
+                            },
                         },
-                    }) {
+                        deadline,
+                    ) {
                         Ok(job) if job.status != "error" => {
                             input_window_limited |= max_input_records < cfg.max_batch_size;
                             break Ok((job.preview, !job.limits_hit.is_empty()));
@@ -2660,13 +2670,6 @@ impl Service {
                                 max_input_records = max_input_records / 2 + max_input_records % 2;
                                 continue;
                             }
-                            let Some(deadline) = started
-                                .checked_add(StdDuration::from_secs(cfg.max_runtime_seconds))
-                            else {
-                                break Err(Error::invalid_request(
-                                    "dream scheduler max_runtime_seconds is too large",
-                                ));
-                            };
                             break dream::run(
                                 &self.store,
                                 &dream::DreamParams {
@@ -3906,6 +3909,8 @@ fn scheduled_provider_has_evidence(response: &DreamResponse) -> bool {
 }
 
 fn dream_provider_context(response: &DreamResponse) -> Result<String> {
+    // Durable record limits do not authorize shortening provider evidence.
+    // Screen whole source text; complete-envelope budgets decide whether it fits.
     let evidence_content = response
         .evidence_window
         .visible_turns
@@ -3924,7 +3929,7 @@ fn dream_provider_context(response: &DreamResponse) -> Result<String> {
         .filter_map(|source| {
             source.content.as_deref().map(|content| {
                 json!({"id": source.id, "kind": source.kind, "content":
-                match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                match policy::screen_content(content, content.len()) {
                     PolicyDecision::Accept(value) => value,
                     PolicyDecision::Reject { .. } => "[screened]".to_string(),
                 }})
@@ -3956,7 +3961,7 @@ fn provider_evidence_stream(stream: &DreamEvidenceStream) -> Value {
         .iter()
         .map(|source| {
             let content = source.content.as_deref().map(|content| {
-                match policy::screen_content(content, policy::MAX_RECORD_CHARS) {
+                match policy::screen_content(content, content.len()) {
                     PolicyDecision::Accept(value) => value,
                     PolicyDecision::Reject { .. } => "[screened]".to_string(),
                 }
@@ -5618,6 +5623,103 @@ mod scheduled_dream_mode_tests {
 #[cfg(test)]
 mod provider_projection_review_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scheduled_job_honors_partially_consumed_absolute_deadline() {
+        let store = Store::open(":memory:").unwrap();
+        store.ensure_workspace("personal", "ws").unwrap();
+        store
+            .ensure_session("deadline-session", "personal", "ws", None, None, "fixture")
+            .unwrap();
+        store
+            .insert_visible_turn(&VisibleTurn {
+                id: "deadline-turn".into(),
+                session_id: "deadline-session".into(),
+                actor: "user".into(),
+                content: "ordinary synthetic test evidence".into(),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                metadata: json!({}),
+            })
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("completed-provider");
+        let mut config = Config::default();
+        config.dream_provider.enabled = true;
+        config.dream_provider.adapter = "command".into();
+        config.dream_provider.model = "synthetic-model".into();
+        config.dream_provider.command = vec!["/bin/sh".into(), "-c".into(), format!(
+            "cat >/dev/null; sleep 0.7; touch '{}'; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"ws\",\"candidates\":[]}}'", marker.display()
+        )];
+        let svc = Service::new(store, config);
+        let started = Instant::now();
+        let result = svc.run_scheduled_command_dream_job(
+            DreamJobRunRequest {
+                job_id: Some("deadline-job".into()),
+                profile: Some("personal".into()),
+                workspace: Some("ws".into()),
+                repo: None,
+                now: None,
+                since: None,
+                since_explicit: true,
+                kind: "dream_preview".into(),
+                mode: Some("command".into()),
+                budget: DreamJobBudget {
+                    max_runtime_seconds: 1,
+                    max_input_records: 1,
+                    max_candidates: 5,
+                    max_provider_calls: 1,
+                    ..Default::default()
+                },
+                provider: None,
+            },
+            started + StdDuration::from_millis(150),
+        );
+        let error = result.expect_err("a sizing retry must not grant a fresh whole second");
+        assert!(
+            matches!(
+                error.message.as_str(),
+                "provider command timed out"
+                    | "dream provider runtime budget exhausted"
+                    | "dream job exceeded max_runtime_seconds"
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < StdDuration::from_millis(600));
+        // Wait beyond the original command's completion time to catch children
+        // that escaped timeout cleanup and would write the marker later.
+        std::thread::sleep(StdDuration::from_millis(750));
+        assert!(
+            !marker.exists(),
+            "timed-out owned command must not complete later"
+        );
+    }
+
+    #[test]
+    fn provider_projection_retains_whole_screened_ascii_evidence() {
+        let svc = Service::new(Store::open(":memory:").unwrap(), Config::default());
+        svc.conclusions(serde_json::from_value(json!({"profile":"personal","workspace":"ws","conclusions":["Preference: concise updates"]})).unwrap()).unwrap();
+        let mut response = svc
+            .dream(
+                serde_json::from_value(
+                    json!({"profile":"personal","workspace":"ws","mode":"preview"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let content = format!("synthetic {} END-OF-WHOLE-RECORD", "a".repeat(9_000));
+        response.evidence_window.conclusions.sources[0].content = Some(content.clone());
+        let context: Value =
+            serde_json::from_str(&dream_provider_context(&response).unwrap()).unwrap();
+        assert!(
+            context["evidence_content"][0]["content"] == content,
+            "provider evidence must retain its ASCII tail"
+        );
+        assert!(
+            context["evidence_window"]["conclusions"]["sources"][0]["content"] == content,
+            "window evidence must retain its ASCII tail"
+        );
+    }
+
     #[test]
     fn provider_projection_omits_unneeded_raw_evidence_metadata() {
         let svc = Service::new(Store::open(":memory:").unwrap(), Config::default());

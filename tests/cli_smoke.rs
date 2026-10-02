@@ -6005,93 +6005,99 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
     drop(service);
     drop(store);
 
-    let mut up = bin();
-    clear_runtime_env(&mut up);
-    let up_output = up
-        .env("HOME", &home)
-        .env("CODEX_MEMORYD_HOME", &home)
-        .env("CODEX_MEMORYD_DB", &db)
-        .env("CODEX_MEMORYD_HOST", "127.0.0.1")
-        .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
-        .env("CODEX_MEMORYD_PROFILE", "personal")
-        .env("CODEX_MEMORYD_WORKSPACE", "synthetic-scope")
-        .args(["--runtime", "native", "up"])
-        .output()
-        .unwrap();
-
-    let mut status_ok = false;
-    let mut recall_ok = false;
-    if up_output.status.success() {
-        let http = reqwest::blocking::Client::new();
-        let response = http.get(format!("{url}/v1/status")).send().unwrap();
-        let body: serde_json::Value = response.json().unwrap();
-        status_ok = body.pointer("/data/status").and_then(Value::as_str) == Some("degraded")
-            && body
-                .pointer("/data/storage/writable")
-                .and_then(Value::as_bool)
-                == Some(true)
-            && body
-                .pointer("/data/degraded_reasons")
-                .and_then(Value::as_array)
-                .is_some_and(|reasons| {
-                    reasons.iter().any(|reason| {
-                        reason.as_str().is_some_and(|text| {
-                            text.contains("dream provider input byte budget exhausted")
-                        })
-                    })
-                });
-        let mut recall = bin();
-        clear_runtime_env(&mut recall);
-        let recall_output = recall
+    for _ in 0..3 {
+        let mut up = bin();
+        clear_runtime_env(&mut up);
+        let up_output = up
             .env("HOME", &home)
             .env("CODEX_MEMORYD_HOME", &home)
-            .arg("--url")
-            .arg(&url)
-            .args([
-                "recall",
-                "--profile",
-                "personal",
-                "--workspace",
-                "synthetic-scope",
-                "--query",
-                "lifecycle sentinel",
-            ])
+            .env("CODEX_MEMORYD_DB", &db)
+            .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+            .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
+            .env("CODEX_MEMORYD_PROFILE", "personal")
+            .env("CODEX_MEMORYD_WORKSPACE", "synthetic-scope")
+            .args(["--runtime", "native", "up"])
             .output()
             .unwrap();
-        recall_ok = recall_output.status.success()
-            && String::from_utf8_lossy(&recall_output.stdout)
-                .contains("synthetic lifecycle sentinel remains recallable");
+
+        let mut status_ok = false;
+        let mut recall_ok = false;
+        if up_output.status.success() {
+            let http = reqwest::blocking::Client::new();
+            let response = http.get(format!("{url}/v1/status")).send().unwrap();
+            let body: serde_json::Value = response.json().unwrap();
+            status_ok = body.pointer("/data/status").and_then(Value::as_str) == Some("degraded")
+                && body
+                    .pointer("/data/storage/writable")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && body
+                    .pointer("/data/degraded_reasons")
+                    .and_then(Value::as_array)
+                    .is_some_and(|reasons| {
+                        reasons.iter().any(|reason| {
+                            reason.as_str().is_some_and(|text| {
+                                text.contains("dream provider input byte budget exhausted")
+                            })
+                        })
+                    });
+            let mut recall = bin();
+            clear_runtime_env(&mut recall);
+            let recall_output = recall
+                .env("HOME", &home)
+                .env("CODEX_MEMORYD_HOME", &home)
+                .arg("--url")
+                .arg(&url)
+                .args([
+                    "recall",
+                    "--profile",
+                    "personal",
+                    "--workspace",
+                    "synthetic-scope",
+                    "--query",
+                    "lifecycle sentinel",
+                ])
+                .output()
+                .unwrap();
+            recall_ok = recall_output.status.success()
+                && String::from_utf8_lossy(&recall_output.stdout)
+                    .contains("synthetic lifecycle sentinel remains recallable");
+        }
+
+        let mut down = bin();
+        clear_runtime_env(&mut down);
+        let down_output = down
+            .env("HOME", &home)
+            .env("CODEX_MEMORYD_HOME", &home)
+            .env("CODEX_MEMORYD_DB", &db)
+            .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+            .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
+            .args(["--runtime", "native", "down"])
+            .output()
+            .unwrap();
+
+        assert!(
+            up_output.status.success(),
+            "native up failed: {}",
+            String::from_utf8_lossy(&up_output.stderr)
+        );
+        assert!(
+            status_ok,
+            "degraded Dreamer receipt was not preserved in live status"
+        );
+        assert!(
+            recall_ok,
+            "configured-scope recall failed after native startup"
+        );
+        assert!(
+            down_output.status.success(),
+            "native down failed: {}",
+            String::from_utf8_lossy(&down_output.stderr)
+        );
     }
-
-    let mut down = bin();
-    clear_runtime_env(&mut down);
-    let down_output = down
-        .env("HOME", &home)
-        .env("CODEX_MEMORYD_HOME", &home)
-        .env("CODEX_MEMORYD_DB", &db)
-        .env("CODEX_MEMORYD_HOST", "127.0.0.1")
-        .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
-        .args(["--runtime", "native", "down"])
-        .output()
-        .unwrap();
-
     assert!(
-        up_output.status.success(),
-        "native up failed: {}",
-        String::from_utf8_lossy(&up_output.stderr)
-    );
-    assert!(
-        status_ok,
-        "degraded Dreamer receipt was not preserved in live status"
-    );
-    assert!(
-        recall_ok,
-        "configured-scope recall failed after native startup"
-    );
-    assert!(
-        down_output.status.success(),
-        "native down failed: {}",
-        String::from_utf8_lossy(&down_output.stderr)
+        !provider_called.exists(),
+        "restart cycles must not dispatch the failed oversized job"
     );
 }
 

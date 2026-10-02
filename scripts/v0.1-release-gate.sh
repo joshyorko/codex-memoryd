@@ -31,6 +31,7 @@ dry_run() {
 v0.1 local release gate:
 - cargo fmt --all --check
 - git diff --check
+- isolated Linux child-reaper checks
 - cargo test
 - codex-memoryd doctor --format json against a temp DB
 - codex-memoryd eval substrate --compare --format json
@@ -223,6 +224,7 @@ PY
 
 : >"$ARTIFACT_DIR/steps.jsonl"
 
+run "child-reaper-tests" python3 -m unittest discover -s tests -p test_child_reaper.py -v
 run "cargo-fmt" cargo fmt --all --check
 run "git-diff-check" git diff --check
 

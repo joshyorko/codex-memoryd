@@ -85,6 +85,20 @@ fn failed_scheduled_command_does_not_advance_success_watermark() {
 #[cfg(target_os = "linux")]
 #[test]
 fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail() {
+    check_oversized_command_preview(format!("synthetic {}", "🦉".repeat(9_000)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_ascii_record_is_not_dispatched_with_a_missing_tail() {
+    check_oversized_command_preview(format!(
+        "# synthetic {} END-OF-WHOLE-RECORD",
+        "a".repeat(17_000)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+fn check_oversized_command_preview(content: String) {
     let store = Store::open(":memory:").unwrap();
     store.ensure_workspace("personal", "ws").unwrap();
     store
@@ -95,7 +109,7 @@ fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail(
             id: "oversized-turn".into(),
             session_id: "oversized-session".into(),
             actor: "user".into(),
-            content: format!("synthetic {}", "🦉".repeat(9_000)),
+            content,
             created_at: "2026-10-01T00:00:00Z".into(),
             metadata: json!({}),
         })
@@ -161,6 +175,14 @@ fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail(
     let second = service.scheduled_dream(None).unwrap();
     assert_ne!(second.watermark_before, first.watermark_before);
     assert!(!marker.exists());
+    for _ in 0..4 {
+        let idle = service.scheduled_dream(None).unwrap();
+        assert_eq!(idle.status, "ok");
+        assert!(
+            !marker.exists(),
+            "unchanged ticks must not redispatch oversized evidence"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
