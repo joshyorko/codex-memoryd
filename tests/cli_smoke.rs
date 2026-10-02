@@ -5940,7 +5940,10 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
         let response = http.get(format!("{url}/v1/status")).send().unwrap();
         let body: serde_json::Value = response.json().unwrap();
         status_ok = body.pointer("/data/status").and_then(Value::as_str) == Some("degraded")
-            && body.pointer("/data/storage/writable").and_then(Value::as_bool) == Some(true)
+            && body
+                .pointer("/data/storage/writable")
+                .and_then(Value::as_bool)
+                == Some(true)
             && body
                 .pointer("/data/degraded_reasons")
                 .and_then(Value::as_array)
@@ -5968,7 +5971,8 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
             .output()
             .unwrap();
         recall_ok = recall_output.status.success()
-            && String::from_utf8_lossy(&recall_output.stdout).contains("synthetic lifecycle sentinel remains recallable");
+            && String::from_utf8_lossy(&recall_output.stdout)
+                .contains("synthetic lifecycle sentinel remains recallable");
     }
 
     let mut down = bin();
@@ -5987,8 +5991,14 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
         "native up failed: {}",
         String::from_utf8_lossy(&up_output.stderr)
     );
-    assert!(status_ok, "degraded Dreamer receipt was not preserved in live status");
-    assert!(recall_ok, "configured-scope recall failed after native startup");
+    assert!(
+        status_ok,
+        "degraded Dreamer receipt was not preserved in live status"
+    );
+    assert!(
+        recall_ok,
+        "configured-scope recall failed after native startup"
+    );
     assert!(
         down_output.status.success(),
         "native down failed: {}",

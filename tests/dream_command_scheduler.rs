@@ -64,14 +64,7 @@ fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail(
     let store = Store::open(":memory:").unwrap();
     store.ensure_workspace("personal", "ws").unwrap();
     store
-        .ensure_session(
-            "oversized-session",
-            "personal",
-            "ws",
-            None,
-            None,
-            "fixture",
-        )
+        .ensure_session("oversized-session", "personal", "ws", None, None, "fixture")
         .unwrap();
     store
         .insert_visible_turn(&VisibleTurn {
@@ -117,7 +110,10 @@ fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail(
         .iter()
         .any(|limit| limit == "max_input_bytes"));
     assert!(first.watermark_after.is_some());
-    assert!(!marker.exists(), "oversized evidence must not reach the provider");
+    assert!(
+        !marker.exists(),
+        "oversized evidence must not reach the provider"
+    );
 
     let second = service
         .scheduled_dream(Some("2030-01-02T00:00:00Z".into()))
@@ -184,13 +180,31 @@ fn command_budget_reduces_a_window_then_processes_its_source_tail() {
         .limits_hit
         .iter()
         .any(|limit| limit == "max_input_tokens" || limit == "max_input_bytes"));
-    assert_eq!(first.run.as_ref().unwrap().evidence_window.visible_turns.count, 1);
+    assert_eq!(
+        first
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence_window
+            .visible_turns
+            .count,
+        1
+    );
     assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
 
     let second = service
         .scheduled_dream(Some("2030-01-02T00:00:00Z".into()))
         .unwrap();
-    assert_eq!(second.run.as_ref().unwrap().evidence_window.visible_turns.count, 1);
+    assert_eq!(
+        second
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence_window
+            .visible_turns
+            .count,
+        1
+    );
     assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
 }
 
