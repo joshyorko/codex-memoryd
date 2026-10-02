@@ -54,8 +54,23 @@ Scheduled command mode uses the existing typed preview job: one provider call,
 zero provider retries, bounded input/output, and a deadline covering pipe I/O.
 The Linux runner uses nonblocking pipes, not detached reader/writer threads.
 An oversized response is stopped at the smaller job/configured byte limit.
-Failure does not advance the successful scheduled watermark. Process-group
-children are terminated; orphan reaping remains the operating system's job.
+Input byte/token checks include the complete serialized provider envelope and
+response schema. If pre-dispatch sizing exceeds an input budget, scheduled
+command mode reselects fewer whole evidence records before its single provider
+call, under the same byte, token, candidate, call, and runtime limits; it does
+not truncate evidence text. If one selected record still cannot fit, the
+command is not dispatched. A deterministic preview processes that one record,
+records the input limit, and advances only that source-kind cursor so later
+evidence remains eligible. Other provider failures do not advance the successful
+scheduled watermark. Process-group children are terminated; orphan reaping
+remains the operating system's job.
+
+Native managed readiness accepts `local_only`, or `degraded` only when the
+reported store is the configured writable SQLite path at the current schema,
+the configured scope is available, exposure/auth fields are loopback-only, and
+the sole degradation reason matches a persisted failed Dreamer receipt.
+Storage, schema, scope, authorization, exposure, malformed-status, and other
+degradation failures still block startup.
 
 The scheduled command path is **preview-only**. Candidates preserve scoped
 source references and remain subject to normal MemoryD validation and review.

@@ -1672,6 +1672,21 @@ impl Service {
     }
 
     pub fn run_dream_job(&self, req: DreamJobRunRequest) -> Result<DreamJobRunResponse> {
+        self.run_dream_job_inner(req, false)
+    }
+
+    fn run_scheduled_command_dream_job(
+        &self,
+        req: DreamJobRunRequest,
+    ) -> Result<DreamJobRunResponse> {
+        self.run_dream_job_inner(req, true)
+    }
+
+    fn run_dream_job_inner(
+        &self,
+        req: DreamJobRunRequest,
+        skip_empty_provider_input: bool,
+    ) -> Result<DreamJobRunResponse> {
         let profile = self.resolve_profile(&req.profile)?;
         let workspace = self.resolve_workspace(&req.workspace);
         let repo_id = self.register_repo(&req.repo)?;
@@ -1782,6 +1797,7 @@ impl Service {
                 resolved_provider.as_ref(),
                 &req.budget,
                 deadline,
+                skip_empty_provider_input,
             )
         });
         if started.elapsed().as_secs() >= req.budget.max_runtime_seconds && result.is_ok() {
@@ -2102,6 +2118,7 @@ impl Service {
         provider: Option<&ResolvedDreamProvider>,
         budget: &DreamJobBudget,
         deadline: Instant,
+        skip_empty_provider_input: bool,
     ) -> Result<(
         DreamResponse,
         bool,
@@ -2124,6 +2141,17 @@ impl Service {
         }
         let provider = provider
             .ok_or_else(|| Error::internal("model-backed Dream provider was not resolved"))?;
+        if skip_empty_provider_input && !scheduled_provider_has_evidence(&response) {
+            return Ok((
+                response,
+                max_candidates_hit,
+                None,
+                Some(DreamBudgetUsage {
+                    input_records,
+                    ..DreamBudgetUsage::default()
+                }),
+            ));
+        }
         if adapter == DreamProviderAdapter::Provider && budget.max_cost_micros == 0 {
             return Err(Error::invalid_request(
                 "provider jobs require max_cost_micros > 0",
@@ -2565,47 +2593,101 @@ impl Service {
             && self.config.dream_provider.enabled
             && DreamProviderAdapter::parse(&self.config.dream_provider.adapter)
                 == Some(DreamProviderAdapter::Command);
+        let mut input_window_limited = false;
+        let mut input_budget_limit = None;
         let result = if command_mode {
             if cfg.automatic_apply {
                 Err(Error::invalid_request(
                     "scheduled command providers are preview-only",
                 ))
             } else {
-                self.run_dream_job(DreamJobRunRequest {
-                    job_id: None,
-                    profile: Some(profile.as_str().to_string()),
-                    workspace: Some(workspace.clone()),
-                    repo: None,
-                    now: Some(now.clone()),
-                    since: watermark_before.clone(),
-                    since_explicit: false,
-                    kind: "dream_preview".to_string(),
-                    mode: Some("command".to_string()),
-                    provider: None,
-                    budget: DreamJobBudget {
-                        max_runtime_seconds: cfg.max_runtime_seconds,
-                        max_input_records: cfg.max_batch_size,
-                        max_candidates: cfg.max_candidates,
-                        max_input_tokens: 8000,
-                        max_output_tokens: 2048,
-                        max_input_bytes: 32000,
-                        max_output_bytes: 262144,
-                        max_provider_calls: 1,
-                        max_retries: 0,
-                        max_cost_micros: 0,
-                        daily_cost_ceiling_micros: self
-                            .config
-                            .dream_provider
-                            .daily_cost_ceiling_micros,
-                    },
-                })
-                .and_then(|job| {
-                    if job.status == "error" {
-                        Err(Error::internal("scheduled native provider preview failed"))
-                    } else {
-                        Ok((job.preview, !job.limits_hit.is_empty()))
+                let mut max_input_records = cfg.max_batch_size;
+                loop {
+                    let remaining_runtime = cfg
+                        .max_runtime_seconds
+                        .saturating_sub(started.elapsed().as_secs());
+                    if remaining_runtime == 0 {
+                        break Err(Error::internal("dream runtime budget exhausted"));
                     }
-                })
+                    match self.run_scheduled_command_dream_job(DreamJobRunRequest {
+                        job_id: None,
+                        profile: Some(profile.as_str().to_string()),
+                        workspace: Some(workspace.clone()),
+                        repo: None,
+                        now: Some(now.clone()),
+                        since: watermark_before.clone(),
+                        since_explicit: false,
+                        kind: "dream_preview".to_string(),
+                        mode: Some("command".to_string()),
+                        provider: None,
+                        budget: DreamJobBudget {
+                            max_runtime_seconds: remaining_runtime,
+                            max_input_records,
+                            max_candidates: cfg.max_candidates,
+                            max_input_tokens: 8000,
+                            max_output_tokens: 2048,
+                            max_input_bytes: 32000,
+                            max_output_bytes: 262144,
+                            max_provider_calls: 1,
+                            max_retries: 0,
+                            max_cost_micros: 0,
+                            daily_cost_ceiling_micros: self
+                                .config
+                                .dream_provider
+                                .daily_cost_ceiling_micros,
+                        },
+                    }) {
+                        Ok(job) if job.status != "error" => {
+                            input_window_limited |= max_input_records < cfg.max_batch_size;
+                            break Ok((job.preview, !job.limits_hit.is_empty()));
+                        }
+                        Ok(_) => {
+                            break Err(Error::internal("scheduled native provider preview failed"));
+                        }
+                        Err(error)
+                            if error.message == "dream provider input byte budget exhausted"
+                                || error.message
+                                    == "dream provider input token budget exhausted" =>
+                        {
+                            input_window_limited = true;
+                            input_budget_limit = Some(if error.message.contains("byte budget") {
+                                "max_input_bytes"
+                            } else {
+                                "max_input_tokens"
+                            });
+                            if max_input_records > 1 {
+                                // Keep re-selection bounded even if the configured batch cap is large.
+                                max_input_records = max_input_records / 2 + max_input_records % 2;
+                                continue;
+                            }
+                            let Some(deadline) = started
+                                .checked_add(StdDuration::from_secs(cfg.max_runtime_seconds))
+                            else {
+                                break Err(Error::invalid_request(
+                                    "dream scheduler max_runtime_seconds is too large",
+                                ));
+                            };
+                            break dream::run(
+                                &self.store,
+                                &dream::DreamParams {
+                                    profile: profile.clone(),
+                                    workspace: &workspace,
+                                    repo_id: None,
+                                    mode: "preview",
+                                    now: &now,
+                                    source_window_end: Some(&now),
+                                    recency_cutoff: watermark_before.as_deref(),
+                                    include_archived_sources: false,
+                                    max_records: 1,
+                                    max_candidates: Some(cfg.max_candidates),
+                                    patch_run_id: None,
+                                    deadline: Some(deadline),
+                                },
+                            );
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
             }
         } else {
             dream::run(
@@ -2633,6 +2715,9 @@ impl Service {
         }
         match result {
             Ok((mut run, mut max_candidates_hit)) => {
+                if let Some(limit) = input_budget_limit {
+                    limits_hit.push(limit.to_string());
+                }
                 if cfg.automatic_apply && !command_mode {
                     max_candidates_hit |= self.filter_applied_scheduled_candidates(
                         &mut run,
@@ -2692,7 +2777,8 @@ impl Service {
                 // A full bounded input window is not proof the entire frontier
                 // was covered, even when all selected candidates were consumed.
                 let input_window_full = cfg.max_batch_size > 0
-                    && evidence_window_count(&run.evidence_window) >= cfg.max_batch_size;
+                    && (evidence_window_count(&run.evidence_window) >= cfg.max_batch_size
+                        || input_window_limited);
                 if input_window_full {
                     limits_hit.push("max_input_records".to_string());
                 }
@@ -2710,7 +2796,12 @@ impl Service {
                 let watermark_after = if limits_hit.is_empty() {
                     Some(now.clone())
                 } else if input_window_full
-                    && limits_hit.iter().all(|limit| limit == "max_input_records")
+                    && limits_hit.iter().all(|limit| {
+                        matches!(
+                            limit.as_str(),
+                            "max_input_records" | "max_input_bytes" | "max_input_tokens"
+                        )
+                    })
                 {
                     dream::scheduler_watermark_after(
                         watermark_before.as_deref(),

@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::config;
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Store, STORAGE_SCHEMA_VERSION};
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8787";
 
@@ -714,16 +714,17 @@ fn wait_for_ready(opts: &RuntimeOptions) -> Result<()> {
     for _ in 0..30 {
         if let Ok(body) = http_get(&status_url) {
             let parsed: serde_json::Value = serde_json::from_str(&body)?;
-            if parsed
-                .pointer("/data/status")
-                .and_then(|v| v.as_str())
-                .is_some_and(|status| status == "local_only")
-            {
+            if managed_status_ready(
+                &parsed,
+                &opts.profile,
+                &opts.workspace,
+                &opts.db.to_string_lossy(),
+            ) {
                 return Ok(());
             }
             if let Some(status) = parsed.pointer("/data/status").and_then(|v| v.as_str()) {
                 return Err(Error::storage(format!(
-                    "daemon status is '{status}', expected local_only"
+                    "daemon status is '{status}', core readiness requirements are not met"
                 )));
             }
         }
@@ -732,6 +733,100 @@ fn wait_for_ready(opts: &RuntimeOptions) -> Result<()> {
     Err(Error::storage(format!(
         "timed out waiting for {status_url}"
     )))
+}
+
+fn managed_status_ready(
+    body: &serde_json::Value,
+    profile: &str,
+    workspace: &str,
+    db_path: &str,
+) -> bool {
+    let Some(data) = body.get("data") else {
+        return false;
+    };
+    let status = data.get("status").and_then(|value| value.as_str());
+    let Some(storage) = data.get("storage") else {
+        return false;
+    };
+    let Some(features) = data.get("features") else {
+        return false;
+    };
+    if storage.get("kind").and_then(|value| value.as_str()) != Some("sqlite")
+        || storage.get("path").and_then(|value| value.as_str()) != Some(db_path)
+        || storage.get("writable").and_then(|value| value.as_bool()) != Some(true)
+        || data
+            .get("storage_schema_version")
+            .and_then(|value| value.as_i64())
+            != Some(STORAGE_SCHEMA_VERSION)
+        || features.get("exposure").and_then(|value| value.as_str()) != Some("local_only")
+        || features.get("auth").and_then(|value| value.as_str()) != Some("none")
+        || !managed_scope_available(data, status, profile, workspace)
+    {
+        return false;
+    }
+
+    let Some(reasons) = data
+        .get("degraded_reasons")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    match status {
+        Some("local_only") => reasons.is_empty(),
+        Some("degraded") => degraded_only_by_dreamer(data, reasons),
+        _ => false,
+    }
+}
+
+fn managed_scope_available(
+    data: &serde_json::Value,
+    status: Option<&str>,
+    profile: &str,
+    workspace: &str,
+) -> bool {
+    let Some(profiles) = data
+        .get("active_profiles")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    let Some(workspaces) = data
+        .get("active_workspaces")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    if profiles.is_empty() && workspaces.is_empty() {
+        return status == Some("local_only");
+    }
+    if profiles.is_empty() || workspaces.is_empty() {
+        return false;
+    }
+    profiles.iter().any(|value| value.as_str() == Some(profile))
+        && workspaces
+            .iter()
+            .any(|value| value.as_str() == Some(workspace))
+}
+
+fn degraded_only_by_dreamer(data: &serde_json::Value, reasons: &[serde_json::Value]) -> bool {
+    let Some(last_dream) = data.get("last_dream") else {
+        return false;
+    };
+    if last_dream.get("status").and_then(|value| value.as_str()) != Some("error")
+        || last_dream.get("mode").and_then(|value| value.as_str()) != Some("preview")
+        || reasons.len() != 1
+    {
+        return false;
+    }
+    let error = last_dream
+        .get("error_summary")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let expected = error.map_or_else(
+        || "last Dreamer run failed".to_string(),
+        |error| format!("last Dreamer run failed: {error}"),
+    );
+    reasons[0].as_str() == Some(expected.as_str())
 }
 
 fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
@@ -1196,4 +1291,158 @@ fn parse_loopback_url(url: &str) -> Result<ParsedUrl> {
         host_header: host_port.to_string(),
         path: format!("/{}", path),
     })
+}
+
+#[cfg(test)]
+mod managed_readiness_tests {
+    use super::managed_status_ready;
+    use crate::store::STORAGE_SCHEMA_VERSION;
+    use serde_json::json;
+
+    fn local_status() -> serde_json::Value {
+        json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/synthetic.db", "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none"}
+        }})
+    }
+
+    fn dreamer_degraded_status() -> serde_json::Value {
+        json!({"data": {
+            "status": "degraded",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/synthetic.db", "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": {
+                "mode": "preview",
+                "status": "error",
+                "error_summary": "dream provider input byte budget exhausted"
+            },
+            "degraded_reasons": ["last Dreamer run failed: dream provider input byte budget exhausted"],
+            "features": {"exposure": "local_only", "auth": "none"}
+        }})
+    }
+
+    fn ready(body: &serde_json::Value, profile: &str, workspace: &str) -> bool {
+        managed_status_ready(body, profile, workspace, "/tmp/synthetic.db")
+    }
+
+    #[test]
+    fn accepts_core_ready_and_dreamer_only_degraded_statuses() {
+        assert!(ready(&local_status(), "personal", "synthetic-scope"));
+        assert!(ready(
+            &dreamer_degraded_status(),
+            "personal",
+            "synthetic-scope"
+        ));
+
+        let empty_store = json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/empty.db", "writable": true},
+            "active_profiles": [],
+            "active_workspaces": [],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none"}
+        }});
+        assert!(managed_status_ready(
+            &empty_store,
+            "personal",
+            "default",
+            "/tmp/empty.db"
+        ));
+
+        let mut missing_degraded_scope = dreamer_degraded_status();
+        missing_degraded_scope["data"]["active_profiles"] = json!([]);
+        missing_degraded_scope["data"]["active_workspaces"] = json!([]);
+        assert!(!ready(
+            &missing_degraded_scope,
+            "personal",
+            "synthetic-scope"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_dreamer_and_unverifiable_degradation() {
+        let mut mixed_reason = dreamer_degraded_status();
+        mixed_reason["data"]["degraded_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("storage is not writable"));
+        assert!(!ready(&mixed_reason, "personal", "synthetic-scope"));
+
+        let mut no_receipt = dreamer_degraded_status();
+        no_receipt["data"]["last_dream"] = json!(null);
+        assert!(!ready(&no_receipt, "personal", "synthetic-scope"));
+
+        let mut failed_apply = dreamer_degraded_status();
+        failed_apply["data"]["last_dream"]["mode"] = json!("apply");
+        assert!(!ready(&failed_apply, "personal", "synthetic-scope"));
+
+        let mut no_reason = dreamer_degraded_status();
+        no_reason["data"]["degraded_reasons"] = json!([]);
+        assert!(!ready(&no_reason, "personal", "synthetic-scope"));
+
+        let caller_boolean = json!({"ready": true, "data": {"status": "degraded"}});
+        assert!(!ready(&caller_boolean, "personal", "synthetic-scope"));
+    }
+
+    #[test]
+    fn rejects_storage_schema_authorization_exposure_and_scope_failures() {
+        let mut unreadable = local_status();
+        unreadable["data"]["storage"]["writable"] = json!(false);
+        assert!(!ready(&unreadable, "personal", "synthetic-scope"));
+
+        let mut malformed_storage = local_status();
+        malformed_storage["data"]["storage"] = json!(null);
+        assert!(!ready(&malformed_storage, "personal", "synthetic-scope"));
+
+        let mut wrong_schema = local_status();
+        wrong_schema["data"]["storage_schema_version"] = json!(STORAGE_SCHEMA_VERSION - 1);
+        assert!(!ready(&wrong_schema, "personal", "synthetic-scope"));
+
+        let mut missing_schema = local_status();
+        missing_schema["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("storage_schema_version");
+        assert!(!ready(&missing_schema, "personal", "synthetic-scope"));
+
+        let mut remote_exposure = local_status();
+        remote_exposure["data"]["features"]["exposure"] = json!("auth_missing");
+        assert!(!ready(&remote_exposure, "personal", "synthetic-scope"));
+
+        let mut missing_exposure = local_status();
+        missing_exposure["data"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exposure");
+        assert!(!ready(&missing_exposure, "personal", "synthetic-scope"));
+
+        let mut other_database = local_status();
+        other_database["data"]["storage"]["path"] = json!("/tmp/other.db");
+        assert!(!ready(&other_database, "personal", "synthetic-scope"));
+
+        let mut authorization_failure = local_status();
+        authorization_failure["data"]["features"]["auth"] = json!("required");
+        assert!(!ready(
+            &authorization_failure,
+            "personal",
+            "synthetic-scope"
+        ));
+
+        let mut inconsistent_status = local_status();
+        inconsistent_status["data"]["degraded_reasons"] = json!(["storage is not writable"]);
+        assert!(!ready(&inconsistent_status, "personal", "synthetic-scope"));
+
+        assert!(!ready(&local_status(), "other-profile", "synthetic-scope"));
+        assert!(!ready(&local_status(), "personal", "other-workspace"));
+    }
 }
