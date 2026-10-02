@@ -226,7 +226,62 @@ struct ToolAnnotations {
     destructive_hint: Option<bool>,
 }
 
+enum Backend {
+    Local(Service),
+    Daemon(crate::daemon_client::DaemonClient),
+}
+
+impl Backend {
+    fn status(&self) -> Result<Value> {
+        match self {
+            Self::Local(service) => service.status().map(|data| json!(data)),
+            Self::Daemon(client) => client.status(),
+        }
+    }
+    fn recall(&self, request: RecallRequest) -> Result<Value> {
+        match self {
+            Self::Local(service) => service.recall(request).map(|data| json!(data)),
+            Self::Daemon(client) => client.recall(request),
+        }
+    }
+    fn search(&self, request: SearchRequest) -> Result<Value> {
+        match self {
+            Self::Local(service) => service.search(request).map(|data| json!(data)),
+            Self::Daemon(client) => client.search(request),
+        }
+    }
+    fn local(&self) -> Result<&Service> {
+        match self {
+            Self::Local(service) => Ok(service),
+            Self::Daemon(_) => Err(error::Error::policy("daemon MCP attachment is read-only")),
+        }
+    }
+    fn conclusions(
+        &self,
+        request: ConclusionsRequest,
+    ) -> Result<crate::protocol::ConclusionsResponse> {
+        self.local()?.conclusions(request)
+    }
+    fn checkpoint(
+        &self,
+        request: CheckpointRequest,
+    ) -> Result<crate::protocol::CheckpointResponse> {
+        self.local()?.checkpoint(request)
+    }
+    fn sync_local(&self, request: SyncRequest) -> Result<crate::protocol::SyncResponse> {
+        self.local()?.sync_local(request)
+    }
+}
+
 pub fn run_stdio(service: Service, write_tools: bool) -> Result<()> {
+    run_backend(Backend::Local(service), write_tools)
+}
+
+pub fn run_stdio_daemon(client: crate::daemon_client::DaemonClient) -> Result<()> {
+    run_backend(Backend::Daemon(client), false)
+}
+
+fn run_backend(service: Backend, write_tools: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -332,7 +387,7 @@ fn read_bounded_line(
 }
 
 fn handle_message(
-    service: &Service,
+    service: &Backend,
     state: &mut ServerState,
     raw: &str,
     write_tools: bool,
@@ -555,7 +610,7 @@ fn valid_client_info(value: &Value) -> bool {
 }
 
 fn handle_request(
-    service: &Service,
+    service: &Backend,
     id: Value,
     method: &str,
     params: Option<Value>,
@@ -606,7 +661,7 @@ fn invalid_request(id: Value, message: impl Into<String>) -> RpcResponse {
 }
 
 fn handle_tool_call(
-    service: &Service,
+    service: &Backend,
     id: Value,
     params: ToolCallParams,
     write_tools: bool,
@@ -754,7 +809,7 @@ fn handle_tool_call(
 }
 
 fn handle_import_tool(
-    service: &Service,
+    service: &Backend,
     id: Value,
     arguments: Option<Value>,
     mode: &'static str,

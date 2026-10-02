@@ -21,6 +21,7 @@ pub mod chatgpt_export_import;
 pub mod config;
 pub mod conformance;
 pub mod consolidation;
+pub mod daemon_client;
 pub mod doctor;
 pub mod domain;
 pub mod dream;

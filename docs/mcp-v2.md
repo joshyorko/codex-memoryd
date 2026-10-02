@@ -140,3 +140,66 @@ For remote integrations, use a separately reviewed proxy that owns
 authentication, TLS, client identity, rate limits, audit logging, and tool
 policy. Do not publish the raw local daemon or a write-enabled stdio process
 directly to the internet.
+
+## Attach to an existing daemon
+
+To attach without opening a second SQLite connection, supply an explicit
+loopback HTTP origin and fixed scope:
+
+```bash
+codex-memoryd --url http://127.0.0.1:8989 mcp stdio --daemon \
+  --profile personal --workspace default
+```
+
+Daemon mode branches before local configuration loading or `Store::open`.
+It exposes only `memory_status`, `memory_recall`, and `memory_search`.
+It never starts or manages the daemon, opens a local database, or falls back
+when HTTP is unavailable. EOF and adapter shutdown leave the daemon running.
+A later read can reconnect without replaying writes.
+
+The endpoint must use HTTP, a literal loopback IP, and an explicit port. Credentials, DNS names,
+paths, query strings, fragments, redirects, and environment HTTP proxies are
+rejected or disabled. The explicit URL is required; ambient managed-runtime selection and endpoint
+configuration are not used. `--daemon` conflicts with `--write-tools`, `--local`,
+`--db` including `CODEX_MEMORYD_DB`, `--config`, and `--runtime`.
+Both `--profile` and `--workspace` are required. Profile must use its canonical
+name; workspace must use 1–128 ASCII letters, digits, dots, underscores,
+colons, or hyphens, without leading or trailing hyphens. Tool arguments may
+omit scope or repeat the configured values; changing either is denied.
+The upstream daemon remains responsible for privacy, admission, ranking,
+redaction, and HTTP capability/authentication policy. This attachment cannot
+bypass its loopback transport gate or grant authentication.
+
+Daemon `memory_status` returns provider name/version, API version, schema
+version, the daemon's reported status, storage kind/writability, and an
+`attachment` object containing mode, profile, workspace, and read-only state.
+Storage writability describes the daemon, not adapter write permissions.
+It omits daemon-global profile/workspace inventories, storage paths, adjacent
+endpoints, and freeform job diagnostics. It does not establish scope existence
+or hosted connector readiness. Recall/search use the existing typed API
+contracts, preserve upstream memory policy metadata, and reject responses
+whose fact provenance or match workspace exceeds the configured scope.
+Checkpoint responses lack scope provenance fields; the daemon guarantees
+checkpoint isolation through `Store::recent_checkpoints` and its exact profile
+and workspace predicates. `RecallResponse` checkpoints and citations are
+preserved under that daemon authority. The synthetic test seeds checkpoints
+in another workspace and profile to verify this boundary.
+
+HTTP requests are limited to 1 MiB; response bodies to 2 MiB. Each request has
+a two-second total deadline including headers and slow body reads, with a
+one-second connection timeout. Transport failures, redirects, malformed or
+oversized responses, authentication and capability denials, and API failures
+produce MCP tool errors. Upstream error codes are retained when recognized;
+freeform upstream errors and warnings are not forwarded because they may
+contain paths, secrets, or memory contents. Failed reads never enable local
+fallback. The MCP wire lifecycle and message framing are shared with offline
+stdio mode.
+
+`mcp stdio` without `--daemon` remains the direct local/offline mode. Its default
+read tool tier and `--read-only` flag restrict tool exposure; startup still
+opens SQLite with write capability and initializes its schema.
+
+`cargo test --test mcp_daemon --test mcp_stdio` checks synthetic local attachment
+and the existing wire lifecycle. These are local tests, not a hosted
+ChatGPT/Work/Codex or Secure MCP Tunnel canary. Issue #247 still requires the
+external tunnel setup/profile workflow and a release-shaped hosted canary.
