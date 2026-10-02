@@ -1,9 +1,13 @@
 use std::path::PathBuf;
 
 use assert_cmd::Command;
+use rmcp::model::{CallToolRequestParams, ProtocolVersion};
+use rmcp::transport::TokioChildProcess;
+use rmcp::{serve_client_with_lifecycle, ClientLifecycleMode};
 use serde_json::json;
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::process::Command as TokioCommand;
 
 fn bin() -> Command {
     Command::cargo_bin("codex-memoryd").expect("binary built")
@@ -14,12 +18,28 @@ fn db_path(dir: &TempDir) -> PathBuf {
 }
 
 fn run_mcp(db: &PathBuf, extra_args: &[&str], requests: &[Value]) -> Vec<Value> {
-    let stdin = requests
-        .iter()
-        .map(Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut messages = Vec::new();
+    for request in requests {
+        messages.push(request.clone());
+        if request["method"] == "initialize" {
+            messages.push(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }));
+        }
+    }
+    run_mcp_raw(
+        db,
+        extra_args,
+        &messages
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
 
+fn run_mcp_raw(db: &PathBuf, extra_args: &[&str], stdin: &str) -> Vec<Value> {
     let output = bin()
         .arg("--db")
         .arg(db)
@@ -62,7 +82,7 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -91,7 +111,7 @@ fn mcp_stdio_initializes_lists_tools_and_status() {
         responses[0]["result"]["serverInfo"]["name"],
         "codex-memoryd"
     );
-    assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
 
     assert_eq!(
         tool_names(&responses[1]),
@@ -136,7 +156,7 @@ fn mcp_stdio_conclude_roundtrip_surfaces_in_recall() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -206,7 +226,7 @@ fn mcp_stdio_rejects_unknown_tool_args_field() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -246,7 +266,7 @@ fn mcp_stdio_accepts_tool_call_meta() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -285,7 +305,7 @@ fn mcp_stdio_defaults_to_read_only_tools_and_rejects_writes() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -353,7 +373,7 @@ fn mcp_stdio_write_tools_are_explicit_opt_in_and_policy_gated() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -450,7 +470,7 @@ fn mcp_stdio_import_preview_and_apply_use_existing_sync_policy() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -521,7 +541,7 @@ fn mcp_stdio_tool_schema_snapshot_matches_fixture() {
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "codex-memoryd-test", "version": "0.1.0" },
                     "capabilities": {}
                 }
@@ -539,4 +559,273 @@ fn mcp_stdio_tool_schema_snapshot_matches_fixture() {
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/mcp_tools.write.json")).unwrap();
     assert_eq!(actual, &expected);
+}
+
+#[test]
+fn mcp_stdio_legacy_lifecycle_and_notifications_are_protocol_correct() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let responses = run_mcp_raw(
+        &db,
+        &[],
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": "before",
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "clientInfo": { "name": "legacy-test", "version": "1.0" },
+                    "capabilities": {}
+                }
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/not-supported"
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string(),
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0]["id"], "before");
+    assert_eq!(responses[0]["error"]["code"], -32002);
+    assert_eq!(responses[1]["id"], "init");
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(responses[2]["id"], 3);
+    assert_eq!(responses[2]["error"]["code"], -32002);
+    assert_eq!(responses[3]["id"], 4);
+    assert_eq!(tool_names(&responses[3]).len(), 3);
+}
+
+#[test]
+fn mcp_stdio_legacy_version_negotiation_reports_the_supported_revision() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+
+    for requested in ["2024-11-05", "2026-08-01"] {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": requested,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": requested,
+                "clientInfo": { "name": "version-test", "version": "1.0" },
+                "capabilities": {}
+            }
+        });
+        let responses = run_mcp_raw(&db, &[], &request.to_string());
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], requested);
+        assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    let malformed = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 2025,
+            "clientInfo": { "name": "version-test", "version": "1.0" },
+            "capabilities": {}
+        }
+    });
+    let responses = run_mcp_raw(&db, &[], &malformed.to_string());
+    assert_eq!(responses[0]["id"], 7);
+    assert_eq!(responses[0]["error"]["code"], -32602);
+
+    let current_modern = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "clientInfo": { "name": "version-test", "version": "1.0" },
+            "capabilities": {}
+        }
+    });
+    let responses = run_mcp_raw(&db, &[], &current_modern.to_string());
+    assert_eq!(responses[0]["id"], 8);
+    assert_eq!(responses[0]["error"]["code"], -32601);
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("server/discover"));
+}
+
+#[test]
+fn mcp_stdio_modern_metadata_discovery_and_error_ids() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let metadata = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "modern-test", "version": "1.0" },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let mut discovery = json!({ "jsonrpc": "2.0", "id": "discovery", "method": "server/discover" });
+    discovery["params"] = json!({ "_meta": metadata });
+    let mut unsupported = json!({ "jsonrpc": "2.0", "id": 25, "method": "tools/list" });
+    unsupported["params"] = json!({
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-08-01",
+            "io.modelcontextprotocol/clientInfo": { "name": "modern-test", "version": "1.0" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    });
+    let missing_metadata =
+        json!({ "jsonrpc": "2.0", "id": 26, "method": "server/discover", "params": {} });
+    let mut unknown = json!({ "jsonrpc": "2.0", "id": "unknown", "method": "not/a/method" });
+    unknown["params"] = json!({ "_meta": metadata });
+    let notifications = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/not-supported",
+        "params": { "_meta": metadata }
+    });
+    let responses = run_mcp_raw(
+        &db,
+        &[],
+        &[
+            discovery,
+            unsupported,
+            missing_metadata,
+            unknown,
+            notifications,
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    );
+
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0]["id"], "discovery");
+    assert_eq!(responses[0]["result"]["resultType"], "complete");
+    assert_eq!(
+        responses[0]["result"]["supportedVersions"],
+        json!(["2026-07-28", "2025-11-25"])
+    );
+    assert_eq!(responses[1]["id"], 25);
+    assert_eq!(responses[1]["error"]["code"], -32022);
+    assert_eq!(responses[1]["error"]["data"]["requested"], "2026-08-01");
+    assert_eq!(
+        responses[1]["error"]["data"]["supported"],
+        json!(["2026-07-28", "2025-11-25"])
+    );
+    assert_eq!(responses[2]["id"], 26);
+    assert_eq!(responses[2]["error"]["code"], -32602);
+    assert_eq!(responses[3]["id"], "unknown");
+    assert_eq!(responses[3]["error"]["code"], -32601);
+}
+
+#[test]
+fn mcp_stdio_malformed_json_and_oversized_lines_are_bounded() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let oversized = " ".repeat(1024 * 1024 + 1);
+    let valid = json!({
+        "jsonrpc": "2.0",
+        "id": "after-oversized",
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { "name": "limit-test", "version": "1.0" },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    let responses = run_mcp_raw(
+        &db,
+        &[],
+        &format!(
+            "{{malformed\n{{\"jsonrpc\":\"1.0\",\"method\":\"broken\"}}\n{oversized}\n{}\n",
+            valid
+        ),
+    );
+
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert_eq!(responses[1]["error"]["code"], -32600);
+    assert_eq!(responses[1]["id"], Value::Null);
+    assert_eq!(responses[2]["error"]["code"], -32700);
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("1048576-byte"));
+    assert_eq!(responses[3]["id"], "after-oversized");
+    assert_eq!(responses[3]["result"]["resultType"], "complete");
+}
+
+#[test]
+fn mcp_stdio_exits_cleanly_on_eof_without_messages() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    assert!(run_mcp_raw(&db, &[], "").is_empty());
+}
+
+#[tokio::test]
+async fn mcp_stdio_interoperates_with_the_official_rmcp_client() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let mut command = TokioCommand::new(assert_cmd::cargo::cargo_bin!("codex-memoryd"));
+    command.args(["--db", db.to_str().unwrap(), "mcp", "stdio"]);
+    let transport = TokioChildProcess::new(command).expect("stdio child transport");
+    let client = serve_client_with_lifecycle(
+        (),
+        transport,
+        ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await
+    .expect("2026-07-28 rmcp discovery succeeds");
+
+    let tools = client
+        .peer()
+        .list_tools(None)
+        .await
+        .expect("rmcp discovers tools");
+    assert!(tools.tools.iter().any(|tool| tool.name == "memory_status"));
+
+    let arguments = json!({}).as_object().unwrap().clone();
+    let status = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("memory_status").with_arguments(arguments))
+        .await
+        .expect("rmcp calls memory_status");
+    assert_eq!(
+        status.structured_content.as_ref().unwrap()["provider_name"],
+        "codex-memoryd"
+    );
+
+    client.cancel().await.expect("client closes stdio cleanly");
 }

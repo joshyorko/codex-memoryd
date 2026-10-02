@@ -66,6 +66,7 @@ libc = "0.2"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process"] }
 
 [profile.release]
 strip = true
