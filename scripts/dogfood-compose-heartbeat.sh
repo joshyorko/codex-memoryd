@@ -230,7 +230,8 @@ sandbox_summary="$(db_check "$SANDBOX_DB" "sandbox")"
 
 log "Run direct MCP stdio read-only canary against sandbox DB"
 cat <<'JSON' > "$MCP_REQ"
-{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"codex-memoryd-dogfood-heartbeat","version":"1"}}}
+{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"codex-memoryd-dogfood-heartbeat","version":"1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":"tools","method":"tools/list","params":{}}
 {"jsonrpc":"2.0","id":"status","method":"tools/call","params":{"name":"memory_status","arguments":{}}}
 {"jsonrpc":"2.0","id":"recall-safe","method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"safe dogfood mode","profile":"personal","workspace":"josh-personal"}}}

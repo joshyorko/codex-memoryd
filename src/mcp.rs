@@ -20,7 +20,18 @@ use crate::PROVIDER_NAME;
 use crate::PROVIDER_VERSION;
 
 const JSONRPC_VERSION: &str = "2.0";
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
+const CODEX_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION,
+    LEGACY_PROTOCOL_VERSION,
+    CODEX_LEGACY_PROTOCOL_VERSION,
+];
+const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
+const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
 const TOOL_TEXT_TYPE: &str = "text";
 /// Read-only MCP tools, exposed by default. Public so diagnostics and contract
 /// tests reference the same source of truth as the dispatcher.
@@ -33,18 +44,6 @@ pub const WRITE_TOOL_NAMES: &[&str] = &[
     "memory_import_preview",
     "memory_import_apply",
 ];
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcRequest {
-    #[serde(default)]
-    jsonrpc: Option<String>,
-    #[serde(default)]
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Option<Value>,
-}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,12 +182,30 @@ struct ImportArgs {
 }
 
 struct ServerState {
-    initialized: bool,
+    connection_mode: ConnectionMode,
+    legacy_phase: LegacyPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionMode {
+    Undetermined,
+    Modern,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyPhase {
+    NotInitialized,
+    AwaitingInitialized,
+    Ready,
 }
 
 impl ServerState {
     fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            connection_mode: ConnectionMode::Undetermined,
+            legacy_phase: LegacyPhase::NotInitialized,
+        }
     }
 }
 
@@ -215,29 +232,103 @@ pub fn run_stdio(service: Service, write_tools: bool) -> Result<()> {
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
     let mut state = ServerState::new();
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let oversized = match read_bounded_line(&mut reader, &mut line)
+            .map_err(|err| error::Error::internal(format!("failed to read MCP stdin: {err}")))?
+        {
+            Some(oversized) => oversized,
+            None => break,
+        };
+        if oversized {
+            let text = serde_json::to_string(&parse_error(
+                Value::Null,
+                "MCP message exceeds the 1048576-byte stdio limit",
+            ))
+            .map_err(|err| error::Error::internal(format!("failed to encode MCP error: {err}")))?;
+            writeln!(writer, "{text}")
+                .and_then(|_| writer.flush())
+                .map_err(|err| {
+                    error::Error::internal(format!("failed to write MCP response: {err}"))
+                })?;
             continue;
         }
 
-        let response = handle_message(&service, &mut state, trimmed, write_tools);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let raw = match std::str::from_utf8(&line) {
+            Ok(raw) => raw,
+            Err(_) => {
+                let text = serde_json::to_string(&parse_error(
+                    Value::Null,
+                    "MCP messages must be valid UTF-8 JSON",
+                ))
+                .map_err(|err| {
+                    error::Error::internal(format!("failed to encode MCP error: {err}"))
+                })?;
+                writeln!(writer, "{text}")
+                    .and_then(|_| writer.flush())
+                    .map_err(|err| {
+                        error::Error::internal(format!("failed to write MCP response: {err}"))
+                    })?;
+                continue;
+            }
+        };
+
+        if raw.trim().is_empty() {
+            continue;
+        }
+
+        let response = handle_message(&service, &mut state, raw, write_tools);
         if let Some(response) = response {
-            let text = serde_json::to_string(&response)?;
-            writeln!(writer, "{text}")?;
-            writer.flush()?;
+            let text = serde_json::to_string(&response).map_err(|err| {
+                error::Error::internal(format!("failed to encode MCP response: {err}"))
+            })?;
+            writeln!(writer, "{text}")
+                .and_then(|_| writer.flush())
+                .map_err(|err| {
+                    error::Error::internal(format!("failed to write MCP response: {err}"))
+                })?;
         }
     }
 
     Ok(())
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    let mut oversized = false;
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if read_any { Some(oversized) } else { None });
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        read_any = true;
+        if !oversized {
+            if line.len().saturating_add(consumed) > MAX_MESSAGE_BYTES {
+                line.clear();
+                oversized = true;
+            } else {
+                line.extend_from_slice(&available[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(oversized));
+        }
+    }
 }
 
 fn handle_message(
@@ -246,68 +337,272 @@ fn handle_message(
     raw: &str,
     write_tools: bool,
 ) -> Option<RpcResponse> {
-    let parsed = match serde_json::from_str::<RpcRequest>(raw) {
-        Ok(request) => request,
+    let message = match serde_json::from_str::<Value>(raw) {
+        Ok(message) => message,
         Err(_) => return Some(parse_error(Value::Null, "invalid JSON request")),
     };
-    let id = parsed.id.unwrap_or(Value::Null);
-    if parsed
-        .jsonrpc
-        .as_deref()
-        .is_some_and(|version| version != JSONRPC_VERSION)
-    {
-        return Some(invalid_params(id, "unsupported JSON-RPC version"));
-    }
+    let Some(object) = message.as_object() else {
+        return Some(invalid_request(
+            Value::Null,
+            "JSON-RPC message must be an object",
+        ));
+    };
 
-    match parsed.method.as_str() {
-        "initialize" => {
-            state.initialized = true;
-            Some(ok(
-                id,
-                json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "serverInfo": {
-                        "name": PROVIDER_NAME,
-                        "version": PROVIDER_VERSION,
-                    },
-                    "capabilities": {
-                        "tools": {
-                            "listChanged": false,
-                        }
-                    }
-                }),
+    let id = object.get("id");
+    let response_id = id
+        .filter(|id| valid_request_id(id))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Some(invalid_request(response_id, "jsonrpc must be '2.0'"));
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Some(invalid_request(
+            response_id,
+            "request method must be a string",
+        ));
+    };
+    if id.is_some_and(|id| !valid_request_id(id)) {
+        return Some(invalid_request(
+            Value::Null,
+            "request id must be a string or integer",
+        ));
+    }
+    let is_notification = id.is_none();
+    let params = object.get("params").cloned();
+    if params.as_ref().is_some_and(|params| !params.is_object()) {
+        return if is_notification {
+            None
+        } else {
+            Some(invalid_params(
+                response_id,
+                "request params must be an object",
             ))
-        }
-        "initialized" => None,
-        "tools/list" => Some(match ensure_initialized(state, id.clone()) {
-            Some(error) => error,
-            None => ok(id, json!({ "tools": tool_definitions(write_tools) })),
-        }),
-        "tools/call" => Some(match ensure_initialized(state, id.clone()) {
-            Some(error) => error,
-            None => match parsed
-                .params
-                .and_then(|params| serde_json::from_value::<ToolCallParams>(params).ok())
-            {
-                Some(params) => handle_tool_call(service, id, params, write_tools),
-                None => invalid_params(id, "invalid tools/call params"),
-            },
-        }),
-        _ => Some(method_not_found(id, parsed.method)),
+        };
     }
-}
 
-fn ensure_initialized(state: &ServerState, id: Value) -> Option<RpcResponse> {
-    if state.initialized {
-        None
-    } else {
-        Some(server_error(
-            id,
+    if is_notification {
+        if method == "notifications/initialized"
+            && state.legacy_phase == LegacyPhase::AwaitingInitialized
+        {
+            state.legacy_phase = LegacyPhase::Ready;
+        }
+        return None;
+    }
+
+    if method == "initialize" {
+        return Some(initialize(state, response_id, params));
+    }
+
+    let request_meta = params
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object);
+    if let Some(version) = request_meta
+        .and_then(|meta| meta.get(PROTOCOL_VERSION_META))
+        .and_then(Value::as_str)
+    {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+            return Some(unsupported_protocol_version(response_id, version));
+        }
+        if version == MCP_PROTOCOL_VERSION {
+            let missing = [CLIENT_INFO_META, CLIENT_CAPABILITIES_META]
+                .into_iter()
+                .find(|key| {
+                    request_meta.is_none_or(|meta| !meta.get(*key).is_some_and(Value::is_object))
+                });
+            if let Some(missing) = missing {
+                return Some(invalid_params(
+                    response_id,
+                    format!("missing required MCP request metadata '{missing}'"),
+                ));
+            }
+            if let Some(client_info) = request_meta.and_then(|meta| meta.get(CLIENT_INFO_META)) {
+                if !valid_client_info(client_info) {
+                    return Some(invalid_params(
+                        response_id,
+                        format!("invalid MCP client identity metadata '{CLIENT_INFO_META}'"),
+                    ));
+                }
+            }
+            if state.connection_mode == ConnectionMode::Legacy {
+                return Some(invalid_request(
+                    response_id,
+                    "cannot mix modern and legacy MCP lifecycle on one stdio connection",
+                ));
+            }
+            state.connection_mode = ConnectionMode::Modern;
+            if method == "server/discover" {
+                return Some(ok_versioned(
+                    response_id,
+                    json!({
+                        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+                        "capabilities": { "tools": {} },
+                        "ttlMs": 0,
+                        "cacheScope": "private",
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {
+                                "name": PROVIDER_NAME,
+                                "version": PROVIDER_VERSION,
+                            }
+                        }
+                    }),
+                    true,
+                ));
+            }
+            return Some(handle_request(
+                service,
+                response_id,
+                method,
+                params,
+                write_tools,
+                true,
+            ));
+        }
+    }
+    if method == "server/discover" {
+        return Some(invalid_params(
+            response_id,
+            format!("server/discover requires '{PROTOCOL_VERSION_META}' metadata"),
+        ));
+    }
+
+    if state.connection_mode == ConnectionMode::Modern {
+        return Some(invalid_params(
+            response_id,
+            format!("modern MCP requests require '{PROTOCOL_VERSION_META}' metadata"),
+        ));
+    }
+    if state.legacy_phase != LegacyPhase::Ready {
+        return Some(server_error(
+            response_id,
             -32002,
             "MCP session is not initialized",
             Some(json!({ "code": "server_not_initialized" })),
-        ))
+        ));
     }
+    Some(handle_request(
+        service,
+        response_id,
+        method,
+        params,
+        write_tools,
+        false,
+    ))
+}
+
+fn initialize(state: &mut ServerState, id: Value, params: Option<Value>) -> RpcResponse {
+    if state.connection_mode == ConnectionMode::Modern {
+        return invalid_request(
+            id,
+            "cannot mix modern and legacy MCP lifecycle on one stdio connection",
+        );
+    }
+    if state.legacy_phase != LegacyPhase::NotInitialized {
+        return invalid_request(id, "MCP initialize may only be sent once");
+    }
+    let Some(params) = params.and_then(|params| params.as_object().cloned()) else {
+        return invalid_params(id, "initialize params must be an object");
+    };
+    let Some(requested) = params.get("protocolVersion").and_then(Value::as_str) else {
+        return invalid_params(id, "initialize requires a protocolVersion string");
+    };
+    if !params.get("clientInfo").is_some_and(valid_client_info)
+        || !params.get("capabilities").is_some_and(Value::is_object)
+    {
+        return invalid_params(
+            id,
+            "initialize requires clientInfo and capabilities objects",
+        );
+    }
+    if requested == MCP_PROTOCOL_VERSION {
+        return server_error(
+            id,
+            -32601,
+            "initialize is not part of MCP 2026-07-28; use server/discover and per-request metadata",
+            Some(json!({ "supported": SUPPORTED_PROTOCOL_VERSIONS })),
+        );
+    }
+    let negotiated = match requested {
+        LEGACY_PROTOCOL_VERSION | CODEX_LEGACY_PROTOCOL_VERSION => requested,
+        _ => LEGACY_PROTOCOL_VERSION,
+    };
+    state.connection_mode = ConnectionMode::Legacy;
+    state.legacy_phase = LegacyPhase::AwaitingInitialized;
+    ok(
+        id,
+        json!({
+            "protocolVersion": negotiated,
+            "serverInfo": {
+                "name": PROVIDER_NAME,
+                "version": PROVIDER_VERSION,
+            },
+            "capabilities": {
+                "tools": {
+                    "listChanged": false,
+                }
+            }
+        }),
+    )
+}
+
+fn valid_client_info(value: &Value) -> bool {
+    value.as_object().is_some_and(|info| {
+        info.get("name").is_some_and(Value::is_string)
+            && info.get("version").is_some_and(Value::is_string)
+    })
+}
+
+fn handle_request(
+    service: &Service,
+    id: Value,
+    method: &str,
+    params: Option<Value>,
+    write_tools: bool,
+    modern: bool,
+) -> RpcResponse {
+    match method {
+        "tools/list" => {
+            let mut result = json!({ "tools": tool_definitions(write_tools) });
+            if modern {
+                result["ttlMs"] = json!(0);
+                result["cacheScope"] = json!("private");
+            }
+            ok_versioned(id, result, modern)
+        }
+        "tools/call" => {
+            let params = params.and_then(|mut params| {
+                params.as_object_mut()?.remove("_meta");
+                serde_json::from_value::<ToolCallParams>(params).ok()
+            });
+            match params {
+                Some(params) => handle_tool_call(service, id, params, write_tools, modern),
+                None => invalid_params(id, "invalid tools/call params"),
+            }
+        }
+        _ => method_not_found(id, method),
+    }
+}
+
+fn valid_request_id(id: &Value) -> bool {
+    id.as_str().is_some() || id.as_i64().is_some() || id.as_u64().is_some()
+}
+
+fn unsupported_protocol_version(id: Value, requested: &str) -> RpcResponse {
+    server_error(
+        id,
+        -32022,
+        "Unsupported protocol version",
+        Some(json!({
+            "supported": SUPPORTED_PROTOCOL_VERSIONS,
+            "requested": requested,
+        })),
+    )
+}
+
+fn invalid_request(id: Value, message: impl Into<String>) -> RpcResponse {
+    server_error(id, -32600, message, None)
 }
 
 fn handle_tool_call(
@@ -315,6 +610,7 @@ fn handle_tool_call(
     id: Value,
     params: ToolCallParams,
     write_tools: bool,
+    modern: bool,
 ) -> RpcResponse {
     if !write_tools && !READ_ONLY_TOOL_NAMES.contains(&params.name.as_str()) {
         return read_only_tool_disabled(id, params.name);
@@ -328,11 +624,12 @@ fn handle_tool_call(
 
     match params.name.as_str() {
         "memory_status" => {
-            let args = parse_tool_args::<StatusArgs>(params.arguments).unwrap_or(StatusArgs {});
-            let _ = args;
+            if let Err(err) = parse_tool_args::<StatusArgs>(params.arguments) {
+                return invalid_params(id, err);
+            }
             match service.status() {
-                Ok(status) => ok_tool_result(id, json!(status)),
-                Err(err) => service_error(id, err),
+                Ok(status) => ok_tool_result(id, json!(status), modern),
+                Err(err) => service_error(id, err, modern),
             }
         }
         "memory_recall" => match parse_tool_args::<RecallArgs>(params.arguments) {
@@ -358,8 +655,8 @@ fn handle_tool_call(
                     metadata: None,
                 };
                 match service.recall(req) {
-                    Ok(resp) => ok_tool_result(id, json!(resp)),
-                    Err(err) => service_error(id, err),
+                    Ok(resp) => ok_tool_result(id, json!(resp), modern),
+                    Err(err) => service_error(id, err, modern),
                 }
             }
             Err(err) => invalid_params(id, err),
@@ -382,8 +679,8 @@ fn handle_tool_call(
                     cursor: None,
                 };
                 match service.search(req) {
-                    Ok(resp) => ok_tool_result(id, json!(resp)),
-                    Err(err) => service_error(id, err),
+                    Ok(resp) => ok_tool_result(id, json!(resp), modern),
+                    Err(err) => service_error(id, err, modern),
                 }
             }
             Err(err) => invalid_params(id, err),
@@ -405,8 +702,8 @@ fn handle_tool_call(
                         record_type: args.record_type,
                     };
                     match service.conclusions(req) {
-                        Ok(resp) => ok_tool_result(id, json!(resp)),
-                        Err(err) => service_error(id, err),
+                        Ok(resp) => ok_tool_result(id, json!(resp), modern),
+                        Err(err) => service_error(id, err, modern),
                     }
                 }
                 Err(err) => invalid_params(id, err),
@@ -442,14 +739,16 @@ fn handle_tool_call(
                     commit: args.commit,
                 };
                 match service.checkpoint(req) {
-                    Ok(resp) => ok_tool_result(id, json!(resp)),
-                    Err(err) => service_error(id, err),
+                    Ok(resp) => ok_tool_result(id, json!(resp), modern),
+                    Err(err) => service_error(id, err, modern),
                 }
             }
             Err(err) => invalid_params(id, err),
         },
-        "memory_import_preview" => handle_import_tool(service, id, params.arguments, "preview"),
-        "memory_import_apply" => handle_import_tool(service, id, params.arguments, "apply"),
+        "memory_import_preview" => {
+            handle_import_tool(service, id, params.arguments, "preview", modern)
+        }
+        "memory_import_apply" => handle_import_tool(service, id, params.arguments, "apply", modern),
         _ => method_not_found(id, params.name),
     }
 }
@@ -459,6 +758,7 @@ fn handle_import_tool(
     id: Value,
     arguments: Option<Value>,
     mode: &'static str,
+    modern: bool,
 ) -> RpcResponse {
     match parse_tool_args::<ImportArgs>(arguments) {
         Ok(args) => {
@@ -476,8 +776,8 @@ fn handle_import_tool(
                 metadata: None,
             };
             match service.sync_local(req) {
-                Ok(resp) => ok_tool_result(id, json!(resp)),
-                Err(err) => service_error(id, err),
+                Ok(resp) => ok_tool_result(id, json!(resp), modern),
+                Err(err) => service_error(id, err, modern),
             }
         }
         Err(err) => invalid_params(id, err),
@@ -673,9 +973,21 @@ fn ok(id: Value, result: Value) -> RpcResponse {
     }
 }
 
-fn ok_tool_result(id: Value, structured: Value) -> RpcResponse {
+fn ok_versioned(id: Value, mut result: Value, modern: bool) -> RpcResponse {
+    if modern {
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "resultType".to_string(),
+                Value::String("complete".to_string()),
+            );
+        }
+    }
+    ok(id, result)
+}
+
+fn ok_tool_result(id: Value, structured: Value, modern: bool) -> RpcResponse {
     let content = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".to_string());
-    ok(
+    ok_versioned(
         id,
         json!({
             "content": [
@@ -685,7 +997,9 @@ fn ok_tool_result(id: Value, structured: Value) -> RpcResponse {
                 }
             ],
             "structuredContent": structured,
+            "isError": false,
         }),
+        modern,
     )
 }
 
@@ -759,37 +1073,21 @@ fn server_error(
     }
 }
 
-fn service_error(id: Value, err: error::Error) -> RpcResponse {
-    let code = match err.code {
-        error::ErrorCode::InvalidRequest
-        | error::ErrorCode::MissingProfile
-        | error::ErrorCode::MissingWorkspace
-        | error::ErrorCode::UnknownProfile
-        | error::ErrorCode::UnknownWorkspace
-        | error::ErrorCode::NotFound
-        | error::ErrorCode::SecretDetected
-        | error::ErrorCode::PolicyDenied
-        | error::ErrorCode::ProfileBoundaryDenied
-        | error::ErrorCode::SyncSourceInvalid
-        | error::ErrorCode::UnsupportedVersion
-        | error::ErrorCode::BundleIntegrityFailed
-        | error::ErrorCode::BundleSchemaUnsupported
-        | error::ErrorCode::BundleRequiredFeatureUnsupported
-        | error::ErrorCode::BundleUnsafeMember
-        | error::ErrorCode::BundleDuplicateIdentity
-        | error::ErrorCode::BundleMissingDependency
-        | error::ErrorCode::BundleLimitExceeded
-        | error::ErrorCode::BundlePolicyDenied
-        | error::ErrorCode::BundlePlanStale
-        | error::ErrorCode::BundleLocalOnly => -32602,
-        error::ErrorCode::AuthMissing => -32001,
-        error::ErrorCode::StorageUnavailable | error::ErrorCode::InternalError => -32603,
-    };
-
-    server_error(
+fn service_error(id: Value, err: error::Error, modern: bool) -> RpcResponse {
+    let message = format!("[{}] {}", err.code, err.message);
+    let structured = json!({
+        "error": {
+            "code": err.code.as_str(),
+            "message": err.message,
+        }
+    });
+    ok_versioned(
         id,
-        code,
-        err.message,
-        Some(json!({ "code": err.code.as_str() })),
+        json!({
+            "content": [{ "type": TOOL_TEXT_TYPE, "text": message }],
+            "structuredContent": structured,
+            "isError": true,
+        }),
+        modern,
     )
 }
