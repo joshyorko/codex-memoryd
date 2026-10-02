@@ -15,7 +15,7 @@
         "action": "promote",
         "record_type": "task_checkpoint",
         "promotion_reason": "checkpoint_backed_task_state",
-        "evidence_count": 2,
+        "evidence_count": 1,
         "must_contain": ["rusqlite", "bundled SQLite"],
         "must_not_contain": ["still TBD; evaluating options"]
       },

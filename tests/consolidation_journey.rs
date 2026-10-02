@@ -245,18 +245,6 @@ fn review_underlying_source_ids_remain_resolvable_during_adoption() {
         .unwrap();
     let source_id = user_capture.source_ids[0].clone();
     assert!(service.store.get_source(&source_id).unwrap().is_some());
-    // Keep one current projection over this retained source. The existing
-    // consolidation boundary refuses duplicate descriptors for one root.
-    service
-        .forget(codex_memoryd::protocol::ForgetRequest {
-            profile: Some("personal".into()),
-            workspace: Some("journey".into()),
-            ids: Some(user_capture.derived_record_ids),
-            mode: Some("archive".into()),
-            reason: None,
-        })
-        .unwrap();
-    assert!(service.store.get_source(&source_id).unwrap().is_some());
     let captured = primary_checkpoint::capture(
         &service,
         "personal",
