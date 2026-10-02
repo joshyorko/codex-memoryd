@@ -60,6 +60,142 @@ fn failed_scheduled_command_does_not_advance_success_watermark() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail() {
+    let store = Store::open(":memory:").unwrap();
+    store.ensure_workspace("personal", "ws").unwrap();
+    store
+        .ensure_session(
+            "oversized-session",
+            "personal",
+            "ws",
+            None,
+            None,
+            "fixture",
+        )
+        .unwrap();
+    store
+        .insert_visible_turn(&VisibleTurn {
+            id: "oversized-turn".into(),
+            session_id: "oversized-session".into(),
+            actor: "user".into(),
+            content: format!("synthetic {}", "x".repeat(40_000)),
+            created_at: "2026-09-11T00:00:00Z".into(),
+            metadata: json!({}),
+        })
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("provider-called");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_scheduler.max_batch_size = 1;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "touch '{}'; cat >/dev/null; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"ws\",\"candidates\":[]}}'",
+            marker.display()
+        ),
+    ];
+    let service = Service::new(store.clone(), config);
+
+    let first = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap();
+    assert_eq!(first.status, "ok_with_limits");
+    assert!(first
+        .limits_hit
+        .iter()
+        .any(|limit| limit == "max_input_bytes"));
+    assert!(first.watermark_after.is_some());
+    assert!(!marker.exists(), "oversized evidence must not reach the provider");
+
+    let second = service
+        .scheduled_dream(Some("2030-01-02T00:00:00Z".into()))
+        .unwrap();
+    assert_ne!(second.watermark_before, first.watermark_before);
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_budget_reduces_a_window_then_processes_its_source_tail() {
+    let store = Store::open(":memory:").unwrap();
+    store.ensure_workspace("personal", "ws").unwrap();
+    store
+        .ensure_session(
+            "budget-window-session",
+            "personal",
+            "ws",
+            None,
+            None,
+            "fixture",
+        )
+        .unwrap();
+    for (id, minute) in [("turn-a", "00"), ("turn-b", "01")] {
+        store
+            .insert_visible_turn(&VisibleTurn {
+                id: id.into(),
+                session_id: "budget-window-session".into(),
+                actor: "user".into(),
+                content: format!("synthetic {id} {}", "x".repeat(18_000)),
+                created_at: format!("2026-09-11T00:{minute}:00Z"),
+                metadata: json!({}),
+            })
+            .unwrap();
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("provider-calls");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_scheduler.max_batch_size = 2;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "cat >/dev/null; echo call >> '{}'; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"ws\",\"candidates\":[]}}'",
+            calls.display()
+        ),
+    ];
+    let service = Service::new(store, config);
+
+    let first = service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .unwrap();
+    assert!(first
+        .limits_hit
+        .iter()
+        .any(|limit| limit == "max_input_tokens" || limit == "max_input_bytes"));
+    assert_eq!(first.run.as_ref().unwrap().evidence_window.visible_turns.count, 1);
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+    let second = service
+        .scheduled_dream(Some("2030-01-02T00:00:00Z".into()))
+        .unwrap();
+    assert_eq!(second.run.as_ref().unwrap().evidence_window.visible_turns.count, 1);
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scheduled_command_excludes_archived_sources_from_preview() {
     let store = Store::open(":memory:").unwrap();
     store.ensure_workspace("personal", "ws").unwrap();
