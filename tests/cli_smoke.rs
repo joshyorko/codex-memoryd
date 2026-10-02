@@ -5876,7 +5876,7 @@ fn cli_native_runtime_env_status_keeps_daemon_status_contract() {
 #[test]
 fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
     use codex_memoryd::protocol::ConclusionsRequest;
-    use codex_memoryd::store::DreamRunRecord;
+    use codex_memoryd::protocol::{DreamJobBudget, DreamJobRunRequest};
     use codex_memoryd::{config::Config, service::Service, store::Store};
 
     let dir = TempDir::new().unwrap();
@@ -5884,11 +5884,24 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
     let db = dir.path().join("synthetic.db");
     let bind = unused_loopback_addr();
     let url = format!("http://{bind}");
+    let provider_called = dir.path().join("provider-called");
+    fs::create_dir_all(&home).unwrap();
 
     let store = Store::open(&db).unwrap();
     let mut config = Config::default();
     config.default_profile = "personal".into();
     config.default_workspace = "synthetic-scope".into();
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "touch '{}'; cat >/dev/null; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"synthetic-scope\",\"candidates\":[]}}'",
+            provider_called.display()
+        ),
+    ];
     let service = Service::new(store.clone(), config);
     service
         .conclusions(ConclusionsRequest {
@@ -5904,25 +5917,98 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
         })
         .unwrap();
     store
-        .record_dream_run(&DreamRunRecord {
-            run_id: "dream_failed_preview_fixture".into(),
-            profile_id: "personal".into(),
-            workspace_id: "synthetic-scope".into(),
-            mode: "preview".into(),
-            kind: "dream_preview".into(),
-            status: "error".into(),
-            started_at: "2030-01-01T00:00:00Z".into(),
-            completed_at: Some("2030-01-01T00:00:01Z".into()),
-            error: Some("dream provider input byte budget exhausted".into()),
-            ..Default::default()
+        .ensure_session(
+            "startup-budget-session",
+            "personal",
+            "synthetic-scope",
+            None,
+            None,
+            "fixture",
+        )
+        .unwrap();
+    store
+        .insert_visible_turn(&codex_memoryd::domain::VisibleTurn {
+            id: "startup-oversized-turn".into(),
+            session_id: "startup-budget-session".into(),
+            actor: "user".into(),
+            content: format!("synthetic {}", "🦉".repeat(9_000)),
+            created_at: "2026-10-01T00:00:00Z".into(),
+            metadata: serde_json::json!({}),
         })
         .unwrap();
+
+    let request = |job_id: &str, mode: &str| DreamJobRunRequest {
+        job_id: Some(job_id.into()),
+        profile: Some("personal".into()),
+        workspace: Some("synthetic-scope".into()),
+        repo: None,
+        now: Some("2030-01-01T00:00:00Z".into()),
+        since: None,
+        since_explicit: false,
+        kind: "dream_preview".into(),
+        mode: Some(mode.into()),
+        budget: DreamJobBudget {
+            max_runtime_seconds: 10,
+            // The recall sentinel occupies one slot before visible evidence.
+            max_input_records: 2,
+            max_candidates: 5,
+            max_input_tokens: 8000,
+            max_input_bytes: 32000,
+            max_provider_calls: 1,
+            ..Default::default()
+        },
+        provider: None,
+    };
+    let selected = service
+        .run_dream_job(request("startup-budget-diagnostic", "deterministic"))
+        .unwrap();
+    assert_eq!(selected.preview.evidence_window.visible_turns.count, 1);
+    assert_eq!(
+        selected.preview.evidence_window.visible_turns.sources[0].id,
+        "startup-oversized-turn"
+    );
+    let preflight = service
+        .run_dream_job(request("startup-budget-failure", "command"))
+        .unwrap_err();
+    assert_eq!(
+        preflight.message,
+        "dream provider input byte budget exhausted"
+    );
+    assert!(
+        !provider_called.exists(),
+        "budget check must precede dispatch"
+    );
+    let status_before_up = service.status().unwrap();
+    assert_eq!(status_before_up.status, "degraded");
+    assert!(status_before_up.storage.writable);
+    assert_eq!(
+        status_before_up.storage_schema_version,
+        codex_memoryd::store::STORAGE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        status_before_up
+            .features
+            .get("exposure")
+            .and_then(Value::as_str),
+        Some("local_only")
+    );
+    assert!(status_before_up
+        .degraded_reasons
+        .iter()
+        .any(|reason| { reason.contains("dream provider input byte budget exhausted") }));
+    let persisted_failure = store.last_dream_run().unwrap().unwrap();
+    assert_eq!(persisted_failure.status, "error");
+    assert!(persisted_failure
+        .error_summary
+        .as_deref()
+        .is_some_and(|error| error.contains("dream provider input byte budget exhausted")));
     drop(service);
     drop(store);
 
     let mut up = bin();
     clear_runtime_env(&mut up);
     let up_output = up
+        .env("HOME", &home)
         .env("CODEX_MEMORYD_HOME", &home)
         .env("CODEX_MEMORYD_DB", &db)
         .env("CODEX_MEMORYD_HOST", "127.0.0.1")
@@ -5957,6 +6043,8 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
         let mut recall = bin();
         clear_runtime_env(&mut recall);
         let recall_output = recall
+            .env("HOME", &home)
+            .env("CODEX_MEMORYD_HOME", &home)
             .arg("--url")
             .arg(&url)
             .args([
@@ -5978,6 +6066,7 @@ fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
     let mut down = bin();
     clear_runtime_env(&mut down);
     let down_output = down
+        .env("HOME", &home)
         .env("CODEX_MEMORYD_HOME", &home)
         .env("CODEX_MEMORYD_DB", &db)
         .env("CODEX_MEMORYD_HOST", "127.0.0.1")
