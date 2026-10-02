@@ -65,8 +65,13 @@ including its tail. If one selected record still cannot fit, the
 command is not dispatched. A deterministic preview processes that one record,
 records the input limit, and advances only that source-kind cursor so later
 evidence remains eligible. Other provider failures do not advance the successful
-scheduled watermark. Process-group children are terminated; orphan reaping
-remains the operating system's job.
+scheduled watermark. A scheduled command's first scan has no prior cutoff;
+it does not inherit a manual apply watermark. Later scans use only their own
+persisted scheduled cursor, including after a restart or failed provider call.
+This empty first cutoff does not authorize archived-source replay. Manual jobs
+retain their existing omitted-cutoff default and explicit replay behavior.
+Process-group children are terminated; orphan reaping remains the operating
+system's job.
 
 Managed readiness accepts `local_only`, or `degraded` only when the reported
 store is writable SQLite at the current schema, the exact configured

@@ -1753,10 +1753,11 @@ impl Service {
             req.since_explicit || (req.since.is_some() && adapter != DreamProviderAdapter::Command);
         let source_window_start = match req.since.as_ref() {
             Some(since) => Some(since.clone()),
-            None if !req.since_explicit => {
-                self.store
-                    .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?
-            }
+            // The private scheduled invocation owns its empty cutoff. Only
+            // omitted manual cutoffs inherit the manual apply watermark.
+            None if !req.since_explicit && scheduler_deadline.is_none() => self
+                .store
+                .dream_watermark(profile.as_str(), &workspace, repo_id.as_deref())?,
             None => None,
         };
 
