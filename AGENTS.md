@@ -52,3 +52,34 @@ gate.
 - Before merge or handoff, report the reviewed head, a link to the completed
   connector review, unresolved findings, and required check status. Review
   completion does not itself authorize merging or replace other merge gates.
+
+## Isolated Linux lifecycle validation
+
+Native lifecycle checks start detached fixture daemons. Run them with a reaping
+PID 1 or the repository's child-subreaper launcher:
+
+```sh
+python3 scripts/run-with-child-reaper.py cargo test --test cli_smoke
+python3 scripts/run-with-child-reaper.py scripts/v0.1-release-gate.sh
+```
+
+Use the launcher only for isolated synthetic checks. When the command exits or
+is interrupted, it terminates and reaps the command's remaining descendants;
+do not wrap a real operator service or `--include-dogfood` with it.
+
+A non-reaping PID 1 can leave an exited daemon as a zombie. Linux `kill(pid, 0)`
+still reports that PID as present, so `src/native_runtime.rs::process_alive`
+cannot establish clean shutdown in that environment. Inspect `/proc/<pid>/status`
+and PID 1 before classifying such a fixture failure as a startup regression.
+Do not waive the shutdown assertion or change production lifecycle behavior to
+make the test environment pass.
+
+The agent that starts a release gate must keep ownership until it has the
+command's exit receipt. Shared log files do not transfer ownership of an
+agent-local execution session; do not hand off a still-running gate as verified.
+
+Validate the launcher with
+`python3 -m unittest discover -s tests -p test_child_reaper.py -v`.
+Its `run` function owns the main command's exit status separately from adopted
+child reaping and bounds signal cleanup. The canonical release gate includes
+these launcher checks.

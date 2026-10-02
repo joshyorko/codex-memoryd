@@ -1,9 +1,33 @@
 use codex_memoryd::domain::{Portability, RecordType, Scope, Sensitivity, VisibleTurn};
 use codex_memoryd::ids;
-use codex_memoryd::protocol::ConclusionsRequest;
+use codex_memoryd::protocol::{ConclusionsRequest, DreamJobBudget, DreamJobRunRequest};
 use codex_memoryd::store::NewRecord;
 use codex_memoryd::{config::Config, service::Service, store::Store};
 use serde_json::json;
+
+fn provider_job(job_id: &str, mode: &str, max_input_records: usize) -> DreamJobRunRequest {
+    DreamJobRunRequest {
+        job_id: Some(job_id.into()),
+        profile: Some("personal".into()),
+        workspace: Some("ws".into()),
+        repo: None,
+        now: Some("2030-01-01T00:00:00Z".into()),
+        since: None,
+        since_explicit: false,
+        kind: "dream_preview".into(),
+        mode: Some(mode.into()),
+        budget: DreamJobBudget {
+            max_runtime_seconds: 10,
+            max_input_records,
+            max_candidates: 5,
+            max_input_tokens: 8000,
+            max_input_bytes: 32000,
+            max_provider_calls: 1,
+            ..Default::default()
+        },
+        provider: None,
+    }
+}
 
 fn service(script: &str) -> (Service, Store) {
     let store = Store::open(":memory:").unwrap();
@@ -56,6 +80,247 @@ fn failed_scheduled_command_does_not_advance_success_watermark() {
         .scheduled_dream_watermark("personal", "ws", None)
         .unwrap()
         .is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_command_preview_records_a_limit_and_advances_without_skipping_tail() {
+    check_oversized_command_preview(format!("synthetic {}", "🦉".repeat(9_000)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_ascii_record_is_not_dispatched_with_a_missing_tail() {
+    check_oversized_command_preview(format!(
+        "# synthetic {} END-OF-WHOLE-RECORD",
+        "a".repeat(17_000)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+fn check_oversized_command_preview(content: String) {
+    let store = Store::open(":memory:").unwrap();
+    store.ensure_workspace("personal", "ws").unwrap();
+    store
+        .ensure_session("oversized-session", "personal", "ws", None, None, "fixture")
+        .unwrap();
+    store
+        .insert_visible_turn(&VisibleTurn {
+            id: "oversized-turn".into(),
+            session_id: "oversized-session".into(),
+            actor: "user".into(),
+            content,
+            created_at: "2026-10-01T00:00:00Z".into(),
+            metadata: json!({}),
+        })
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("provider-called");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_scheduler.max_batch_size = 1;
+    config.dream_scheduler.max_candidates = 5;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "touch '{}'; cat >/dev/null; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"ws\",\"candidates\":[]}}'",
+            marker.display()
+        ),
+    ];
+    let service = Service::new(store.clone(), config);
+
+    let selected = service
+        .run_dream_job(provider_job("oversized-diagnostic", "deterministic", 1))
+        .unwrap();
+    assert_eq!(selected.preview.evidence_window.visible_turns.count, 1);
+    assert_eq!(
+        selected.preview.evidence_window.visible_turns.sources[0].id,
+        "oversized-turn"
+    );
+    let preflight = service
+        .run_dream_job(provider_job("oversized-preflight", "command", 1))
+        .unwrap_err();
+    assert_eq!(
+        preflight.message,
+        "dream provider input byte budget exhausted"
+    );
+    assert!(
+        !marker.exists(),
+        "budget rejection must happen before dispatch"
+    );
+
+    let first = service.scheduled_dream(None).unwrap();
+    assert_eq!(first.status, "ok_with_limits");
+    assert!(first
+        .limits_hit
+        .iter()
+        .any(|limit| limit == "max_input_bytes"));
+    assert!(first.watermark_after.is_some());
+    assert!(
+        !marker.exists(),
+        "oversized evidence must not reach the provider"
+    );
+
+    let second = service.scheduled_dream(None).unwrap();
+    assert_ne!(second.watermark_before, first.watermark_before);
+    assert!(!marker.exists());
+    for _ in 0..4 {
+        let idle = service.scheduled_dream(None).unwrap();
+        assert_eq!(idle.status, "ok");
+        assert!(
+            !marker.exists(),
+            "unchanged ticks must not redispatch oversized evidence"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_budget_reduces_a_window_then_processes_its_source_tail() {
+    let store = Store::open(":memory:").unwrap();
+    store.ensure_workspace("personal", "ws").unwrap();
+    store
+        .ensure_session(
+            "budget-window-session",
+            "personal",
+            "ws",
+            None,
+            None,
+            "fixture",
+        )
+        .unwrap();
+    for (id, minute) in [("turn-a", "00"), ("turn-b", "01")] {
+        store
+            .insert_visible_turn(&VisibleTurn {
+                id: id.into(),
+                session_id: "budget-window-session".into(),
+                actor: "user".into(),
+                content: format!("synthetic {id} {}", "🦉".repeat(2_000)),
+                created_at: format!("2026-10-01T00:{minute}:00Z"),
+                metadata: json!({}),
+            })
+            .unwrap();
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("provider-calls");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "ws".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_scheduler.max_batch_size = 2;
+    config.dream_scheduler.max_candidates = 5;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "cat >/dev/null; echo call >> '{}'; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"ws\",\"candidates\":[]}}'",
+            calls.display()
+        ),
+    ];
+    let service = Service::new(store, config);
+
+    let selected = service
+        .run_dream_job(provider_job("window-diagnostic", "deterministic", 2))
+        .unwrap();
+    assert_eq!(selected.preview.evidence_window.visible_turns.count, 2);
+    assert_eq!(
+        selected
+            .preview
+            .evidence_window
+            .visible_turns
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["turn-a", "turn-b"].into_iter().collect()
+    );
+    let preflight = service
+        .run_dream_job(provider_job("window-preflight", "command", 2))
+        .unwrap_err();
+    assert_eq!(
+        preflight.message,
+        "dream provider input byte budget exhausted"
+    );
+    assert!(
+        !calls.exists(),
+        "budget rejection must happen before dispatch"
+    );
+
+    let first = service.scheduled_dream(None).unwrap();
+    assert!(first.limits_hit.iter().any(|limit| {
+        matches!(
+            limit.as_str(),
+            "max_input_records" | "max_input_tokens" | "max_input_bytes"
+        )
+    }));
+    assert_eq!(
+        first
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence_window
+            .visible_turns
+            .count,
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+    let second = service.scheduled_dream(None).unwrap();
+    let first_source = &first
+        .run
+        .as_ref()
+        .unwrap()
+        .evidence_window
+        .visible_turns
+        .sources[0]
+        .id;
+    let second_source = &second
+        .run
+        .as_ref()
+        .unwrap()
+        .evidence_window
+        .visible_turns
+        .sources[0]
+        .id;
+    assert_eq!(
+        second
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence_window
+            .visible_turns
+            .count,
+        1
+    );
+    assert_ne!(
+        first_source, second_source,
+        "the reduced window must leave its source tail for the next run"
+    );
+    assert_eq!(
+        [first_source.as_str(), second_source.as_str()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["turn-a", "turn-b"].into_iter().collect()
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
 }
 
 #[cfg(target_os = "linux")]

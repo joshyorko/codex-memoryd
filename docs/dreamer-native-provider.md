@@ -51,11 +51,34 @@ children in their process group. The native companion has no tool executor.
 ## Budgets and review
 
 Scheduled command mode uses the existing typed preview job: one provider call,
-zero provider retries, bounded input/output, and a deadline covering pipe I/O.
+zero provider retries, bounded input/output, and one absolute deadline covering
+evidence selection, every sizing retry, and pipe I/O. Retrying input selection
+does not replenish fractional seconds already consumed.
 The Linux runner uses nonblocking pipes, not detached reader/writer threads.
 An oversized response is stopped at the smaller job/configured byte limit.
-Failure does not advance the successful scheduled watermark. Process-group
-children are terminated; orphan reaping remains the operating system's job.
+Input byte/token checks include the complete serialized provider envelope and
+response schema. If pre-dispatch sizing exceeds an input budget, scheduled
+command mode reselects fewer whole evidence records before its single provider
+call, under the same byte, token, candidate, call, and runtime limits; it does
+not truncate evidence text. Safety screening still covers the entire source,
+including its tail. If one selected record still cannot fit, the
+command is not dispatched. A deterministic preview processes that one record,
+records the input limit, and advances only that source-kind cursor so later
+evidence remains eligible. Other provider failures do not advance the successful
+scheduled watermark. Process-group children are terminated; orphan reaping
+remains the operating system's job.
+
+Managed readiness accepts `local_only`, or `degraded` only when the reported
+store is writable SQLite at the current schema, the exact configured
+profile/workspace pair exists, exposure/auth fields are loopback-only, and
+the sole degradation reason matches a persisted failed preview Dreamer receipt.
+Native readiness checks the configured host database path; managed containers
+check `/data/memory.db`, the path passed to the daemon inside the container.
+`/v1/status` reports `features.configured_scope` using an exact workspace query,
+rather than combining global profile and workspace lists. A healthy empty store
+can start before its first workspace is created.
+Storage, schema, scope, authorization, exposure, malformed-status, and other
+degradation failures still block startup.
 
 The scheduled command path is **preview-only**. Candidates preserve scoped
 source references and remain subject to normal MemoryD validation and review.
@@ -67,17 +90,17 @@ accepted or useful.
 ## Verification
 
 ```sh
-python -m unittest discover -s tests -p test_dreamer_native_provider.py -v
+python3 -m unittest discover -s tests -p test_dreamer_native_provider.py -v
 cargo test --lib
 cargo test --test dream_command_scheduler --test command_no_http_fallback --test command_job_policy --test config_env
 ```
 
-The command tests are Linux-scoped. Use a disposable database for actual
+The command tests are Linux-scoped. Native lifecycle acceptance also needs a
+reaping PID 1 or `scripts/run-with-child-reaper.py`; see `AGENTS.md` for the
+isolated-check commands and the zombie-PID counterexample. The launcher cleans
+up only its owned test descendants and preserves the main command's exit code.
+Use a disposable database for actual
 subscription tests; `dream --scheduled` exercises the scheduler's configured
 provider, not a separate shell smoke test. Verify `command` provenance, the
 selected model, validated `dream_provider_` observations, and zero accepted
 memory writes. Keep raw receipts and profile paths private.
-
-Three `dream_jobs` fixture failures also reproduce on the unchanged base:
-HTTP fixtures used in HTTPS-only Provider mode, and a configured-credential
-endpoint mismatch. They are not waived security checks or a green full suite.
