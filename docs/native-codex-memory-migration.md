@@ -9,6 +9,9 @@ The migration is intentionally manual. There is no hidden memory injection, no
 automatic disabling of native Codex writes, and no tap-release provider
 requirement for this first cut.
 
+For a Codex instance sharing a host with an existing MemoryD, use the
+[Dakota isolated native instance runbook](dakota-native-codex-instance.md).
+
 ## Goals
 
 - Keep current Codex memory files usable as a fallback.
