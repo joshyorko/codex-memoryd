@@ -2603,6 +2603,14 @@ impl Service {
             && self.config.dream_provider.enabled
             && DreamProviderAdapter::parse(&self.config.dream_provider.adapter)
                 == Some(DreamProviderAdapter::Command);
+        let scan_start = if command_mode && watermark_before.is_none() {
+            self.store
+                .dream_watermark(profile.as_str(), &workspace, None)?
+        } else {
+            watermark_before.clone()
+        };
+        let scheduler_cursor =
+            dream::scheduler_cursor_for_run(&self.store, scan_start.as_deref(), &now)?;
         let mut input_window_limited = false;
         let mut input_budget_limit = None;
         let result = if command_mode {
@@ -2623,7 +2631,7 @@ impl Service {
                             workspace: Some(workspace.clone()),
                             repo: None,
                             now: Some(now.clone()),
-                            since: watermark_before.clone(),
+                            since: Some(scheduler_cursor.clone()),
                             since_explicit: false,
                             kind: "dream_preview".to_string(),
                             mode: Some("command".to_string()),
@@ -2679,7 +2687,7 @@ impl Service {
                                     mode: "preview",
                                     now: &now,
                                     source_window_end: Some(&now),
-                                    recency_cutoff: watermark_before.as_deref(),
+                                    recency_cutoff: Some(&scheduler_cursor),
                                     include_archived_sources: false,
                                     max_records: 1,
                                     max_candidates: Some(cfg.max_candidates),
@@ -2702,7 +2710,7 @@ impl Service {
                     mode: "preview",
                     now: &now,
                     source_window_end: (!simulated_now).then_some(now.as_str()),
-                    recency_cutoff: watermark_before.as_deref(),
+                    recency_cutoff: Some(&scheduler_cursor),
                     include_archived_sources: false,
                     max_records: cfg.max_batch_size,
                     max_candidates: (!cfg.automatic_apply).then_some(cfg.max_candidates),
@@ -2804,7 +2812,8 @@ impl Service {
                 });
                 let watermark_after = if input_only_limits {
                     dream::scheduler_watermark_after(
-                        watermark_before.as_deref(),
+                        &self.store,
+                        Some(&scheduler_cursor),
                         &run.evidence_window,
                         &now,
                         input_window_full,

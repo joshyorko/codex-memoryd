@@ -7,7 +7,7 @@ use codex_memoryd::domain::{
 use codex_memoryd::ids;
 use codex_memoryd::policy;
 use codex_memoryd::service::Service;
-use codex_memoryd::store::{NewRecord, Store, UpsertOutcome};
+use codex_memoryd::store::{DreamRunRecord, NewRecord, Store, UpsertOutcome};
 use serde_json::json;
 
 const PROFILE: &str = "personal";
@@ -398,7 +398,7 @@ fn scheduler_cursor_applies_fixed_frontier_to_checkpoint_queries() {
             tests_not_run: vec![],
             branch: None,
             commit: None,
-            created_at: "2030-01-01T00:00:01Z".into(),
+            created_at: RUN_NOW.into(),
         })
         .expect("late checkpoint");
 
@@ -454,6 +454,140 @@ fn scheduler_cursor_does_not_reselect_the_inclusive_frontier_boundary() {
         !next_evidence.contains("visible-at-original-frontier"),
         "the inclusive end of the prior band must be exclusive at the next band's start"
     );
+}
+
+#[test]
+fn scheduler_cursor_picks_up_late_row_before_frontier_keyset_position() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    service
+        .scheduled_dream(Some(BEFORE_FRONTIER.into()))
+        .expect("seed watermark");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    insert_chatgpt_turn(
+        &store,
+        "frontier-session",
+        "visible-z-frontier",
+        "generic evidence already at the saved upper frontier",
+        RUN_NOW,
+        None,
+    );
+    insert_chatgpt_turn(
+        &store,
+        "older-session",
+        "visible-old-frontier-band",
+        "generic evidence below the saved upper frontier",
+        "2029-12-31T00:00:00Z",
+        None,
+    );
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("scan first row at inclusive frontier");
+    assert!(evidence_ids(first.run.as_ref().expect("first run")).contains("visible-z-frontier"));
+
+    insert_chatgpt_turn(
+        &store,
+        "late-session",
+        "visible-a-late-frontier",
+        "generic evidence inserted late at the saved upper frontier",
+        RUN_NOW,
+        None,
+    );
+
+    let drain = service
+        .scheduled_dream(Some("2030-01-01T00:00:01Z".into()))
+        .expect("continue draining the saved band");
+    let old_band = evidence_ids(drain.run.as_ref().expect("drain run"));
+    assert!(
+        old_band.contains("visible-old-frontier-band"),
+        "the old bounded band must continue after its rowid position"
+    );
+    assert!(
+        !old_band.contains("visible-a-late-frontier"),
+        "a row inserted beyond the saved rowid frontier must wait for the next band"
+    );
+
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:02Z".into()))
+        .expect("finish the original bounded band");
+    let next_band = service
+        .scheduled_dream(Some("2030-01-01T00:00:03Z".into()))
+        .expect("scan the band after the saved frontier");
+    assert!(evidence_ids(next_band.run.as_ref().expect("next band run"))
+        .contains("visible-a-late-frontier"));
+}
+
+#[test]
+fn scheduler_cursor_rewinds_persisted_id_only_cursor_before_rowid_paging() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    store
+        .ensure_session(
+            "legacy-session",
+            PROFILE,
+            "workspace",
+            None,
+            None,
+            "fixture",
+        )
+        .expect("session");
+    for id in ["visible-z-legacy-position", "visible-a-legacy-unvisited"] {
+        store
+            .insert_visible_turn(&VisibleTurn {
+                id: id.into(),
+                session_id: "legacy-session".into(),
+                actor: "user".into(),
+                content: format!("generic evidence {id}"),
+                created_at: RUN_NOW.into(),
+                metadata: json!({}),
+            })
+            .expect("visible turn");
+    }
+
+    let legacy_cursor = format!(
+        "dream-cursor-v1:{}",
+        json!({
+            "lower_bound": BEFORE_FRONTIER,
+            "lower_bound_exclusive": false,
+            "upper_bound": RUN_NOW,
+            "visible_turns": {
+                "timestamp": RUN_NOW,
+                "id": "visible-z-legacy-position"
+            }
+        })
+    );
+    store
+        .record_dream_run(&DreamRunRecord {
+            run_id: "legacy-cursor-seed".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            mode: "preview".into(),
+            kind: "scheduled".into(),
+            status: "ok_with_limits".into(),
+            started_at: "2030-01-01T00:00:00Z".into(),
+            completed_at: Some("2030-01-01T00:00:00Z".into()),
+            watermark_after: Some(legacy_cursor),
+            ..Default::default()
+        })
+        .expect("persist legacy cursor");
+
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:01Z".into()))
+        .expect("migrate and rewind the legacy cursor");
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:02Z".into()))
+        .expect("restart the bounded scan with rowid ordering");
+    let resumed = service
+        .scheduled_dream(Some("2030-01-01T00:00:03Z".into()))
+        .expect("continue beyond the legacy ID keyset position");
+    assert!(evidence_ids(resumed.run.as_ref().expect("resumed run"))
+        .contains("visible-a-legacy-unvisited"));
 }
 
 #[test]

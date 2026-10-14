@@ -53,6 +53,17 @@ const SCHEDULER_CURSOR_PREFIX: &str = "dream-cursor-v1:";
 struct DreamSourceCursor {
     timestamp: String,
     id: String,
+    #[serde(default)]
+    rowid: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DreamRowidFrontier {
+    visible_turns: i64,
+    conclusions: i64,
+    checkpoints: i64,
+    imported_memories: i64,
+    active_memory_records: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,6 +74,10 @@ struct DreamSchedulerCursor {
     lower_bound_exclusive: bool,
     #[serde(default)]
     upper_bound: Option<String>,
+    #[serde(default)]
+    lower_rowids: Option<DreamRowidFrontier>,
+    #[serde(default)]
+    upper_rowids: Option<DreamRowidFrontier>,
     #[serde(default)]
     visible_turns: Option<DreamSourceCursor>,
     #[serde(default)]
@@ -90,6 +105,19 @@ impl DreamSchedulerCursor {
         self.checkpoints = None;
         self.imported_memories = None;
         self.active_memory_records = None;
+    }
+
+    fn has_legacy_position(&self) -> bool {
+        [
+            self.visible_turns.as_ref(),
+            self.conclusions.as_ref(),
+            self.checkpoints.as_ref(),
+            self.imported_memories.as_ref(),
+            self.active_memory_records.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|position| position.rowid.is_none())
     }
 }
 
@@ -311,6 +339,16 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         if cursor.has_source_position() && cursor.upper_bound.is_none() {
             cursor.clear_source_positions();
         }
+        // The old ID tie-break cannot be translated to SQLite insertion
+        // order. Rewind legacy pages before switching the keyset to rowid.
+        if cursor.has_legacy_position() {
+            cursor.clear_source_positions();
+            cursor.lower_bound_exclusive = false;
+            cursor.lower_rowids = cursor
+                .lower_bound
+                .as_ref()
+                .map(|_| DreamRowidFrontier::default());
+        }
     }
     let source_window_end = scheduler_cursor
         .as_ref()
@@ -341,6 +379,14 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             source_window_start,
             cursor.lower_bound_exclusive,
             Some(source_window_end),
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.active_memory_records),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.active_memory_records),
             cursor.active_memory_records.as_ref(),
             params.max_records,
             params.include_archived_sources,
@@ -463,7 +509,11 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         }
     }
 
-    if params.recency_cutoff.is_none() || params.include_archived_sources {
+    let has_recency_lower_bound = scheduler_cursor
+        .as_ref()
+        .map(|cursor| cursor.lower_bound.is_some())
+        .unwrap_or(params.recency_cutoff.is_some());
+    if !has_recency_lower_bound || params.include_archived_sources {
         push_threshold_candidates(params, &records, &mut candidates, &mut rejected)?;
     }
 
@@ -719,6 +769,14 @@ fn imported_chatgpt_candidate_records(
             source_window_start,
             cursor.lower_bound_exclusive,
             Some(source_window_end),
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.visible_turns),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.visible_turns),
             cursor.visible_turns.as_ref(),
             params.max_records,
         )?,
@@ -884,10 +942,30 @@ fn scheduler_cursor_from_watermark(previous: Option<&str>) -> DreamSchedulerCurs
         })
 }
 
+/// Pin a scheduled run's source bounds before selecting evidence. This keeps
+/// the first page and every resumed page on the same rowid ordering/frontier.
+pub fn scheduler_cursor_for_run(
+    store: &Store,
+    previous: Option<&str>,
+    now: &str,
+) -> Result<String> {
+    if let Some(previous) = previous.filter(|value| is_scheduler_cursor(value)) {
+        return Ok(previous.to_string());
+    }
+    let cursor = DreamSchedulerCursor {
+        lower_bound: previous.map(str::to_string),
+        upper_bound: Some(now.to_string()),
+        upper_rowids: Some(scheduler_rowid_frontier(store)?),
+        ..DreamSchedulerCursor::default()
+    };
+    encode_scheduler_cursor(&cursor)
+}
+
 /// Return a bounded scheduler cursor for a window that did not cover the
 /// entire input frontier. The cursor keeps one keyset position per source
 /// stream because the streams are budgeted in order and can advance unevenly.
 pub fn scheduler_watermark_after(
+    store: &Store,
     previous: Option<&str>,
     window: &DreamEvidenceWindow,
     now: &str,
@@ -900,45 +978,178 @@ pub fn scheduler_watermark_after(
         if cursor.upper_bound.is_none() {
             cursor.clear_source_positions();
             cursor.upper_bound = Some(window.end.clone());
+            cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            // The first bounded page used the ordinary ID ordering. Start the
+            // persisted cursor at the beginning so the remaining pages use
+            // the stable rowid ordering consistently.
+            return Ok(Some(encode_scheduler_cursor(&cursor)?));
         }
-        update_scheduler_cursor(&mut cursor, window);
-        let encoded = serde_json::to_string(&cursor)?;
-        return Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")));
+        if cursor.upper_rowids.is_none() || cursor.has_legacy_position() {
+            cursor.clear_source_positions();
+            cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            if cursor.lower_bound.is_some() {
+                cursor.lower_bound_exclusive = false;
+                cursor.lower_rowids = Some(DreamRowidFrontier::default());
+            }
+            return Ok(Some(encode_scheduler_cursor(&cursor)?));
+        }
+        update_scheduler_cursor(store, &mut cursor, window)?;
+        return Ok(Some(encode_scheduler_cursor(&cursor)?));
     }
 
     if let Some(mut previous_cursor) = previous.and_then(parse_scheduler_cursor) {
-        if previous_cursor.has_source_position() {
-            if let Some(frontier) = previous_cursor.upper_bound.take() {
-                let now_is_after_frontier = OffsetDateTime::parse(now, &Rfc3339)
-                    .ok()
-                    .zip(OffsetDateTime::parse(&frontier, &Rfc3339).ok())
-                    .is_some_and(|(now, frontier)| now > frontier);
-                if now_is_after_frontier {
-                    let next = DreamSchedulerCursor {
-                        lower_bound: Some(frontier),
-                        lower_bound_exclusive: true,
-                        upper_bound: Some(now.to_string()),
-                        ..DreamSchedulerCursor::default()
-                    };
-                    let encoded = serde_json::to_string(&next)?;
-                    return Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")));
-                }
-                return Ok(Some(frontier));
+        if previous_cursor.upper_bound.is_some()
+            && (previous_cursor.upper_rowids.is_none() || previous_cursor.has_legacy_position())
+        {
+            previous_cursor.clear_source_positions();
+            previous_cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            if previous_cursor.lower_bound.is_some() {
+                previous_cursor.lower_bound_exclusive = false;
+                previous_cursor.lower_rowids = Some(DreamRowidFrontier::default());
             }
+            return Ok(Some(encode_scheduler_cursor(&previous_cursor)?));
+        }
+        if let Some(frontier) = previous_cursor.upper_bound.take() {
+            let now_is_after_frontier = OffsetDateTime::parse(now, &Rfc3339)
+                .ok()
+                .zip(OffsetDateTime::parse(&frontier, &Rfc3339).ok())
+                .is_some_and(|(now, frontier)| now > frontier);
+            if now_is_after_frontier {
+                let next = DreamSchedulerCursor {
+                    lower_bound: Some(frontier),
+                    lower_bound_exclusive: false,
+                    lower_rowids: previous_cursor.upper_rowids,
+                    upper_bound: Some(now.to_string()),
+                    upper_rowids: Some(scheduler_rowid_frontier(store)?),
+                    ..DreamSchedulerCursor::default()
+                };
+                return Ok(Some(encode_scheduler_cursor(&next)?));
+            }
+            return Ok(Some(frontier));
         }
     }
 
     Ok(Some(now.to_string()))
 }
 
-fn update_scheduler_cursor(cursor: &mut DreamSchedulerCursor, window: &DreamEvidenceWindow) {
-    update_stream_cursor(&mut cursor.visible_turns, &window.visible_turns, false);
-    update_stream_cursor(&mut cursor.conclusions, &window.conclusions, false);
-    update_stream_cursor(&mut cursor.checkpoints, &window.checkpoints, false);
+fn encode_scheduler_cursor(cursor: &DreamSchedulerCursor) -> Result<String> {
+    Ok(format!(
+        "{SCHEDULER_CURSOR_PREFIX}{}",
+        serde_json::to_string(cursor)?
+    ))
+}
+
+fn scheduler_rowid_frontier(store: &Store) -> Result<DreamRowidFrontier> {
+    store.transaction(|tx| {
+        Ok(DreamRowidFrontier {
+            visible_turns: tx.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM visible_turns",
+                [],
+                |row| row.get(0),
+            )?,
+            conclusions: tx.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM conclusions",
+                [],
+                |row| row.get(0),
+            )?,
+            checkpoints: tx.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM checkpoints",
+                [],
+                |row| row.get(0),
+            )?,
+            imported_memories: tx.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM memory_sources",
+                [],
+                |row| row.get(0),
+            )?,
+            active_memory_records: tx.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM memory_records",
+                [],
+                |row| row.get(0),
+            )?,
+        })
+    })
+}
+
+fn update_scheduler_cursor(
+    store: &Store,
+    cursor: &mut DreamSchedulerCursor,
+    window: &DreamEvidenceWindow,
+) -> Result<()> {
+    let mut visible_turn_ids = window
+        .visible_turns
+        .sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<BTreeSet<_>>();
+    for source in &window.active_memory_records.sources {
+        if source.kind == "imported_chat_turn" {
+            visible_turn_ids.extend(source.root_ids.iter().cloned());
+        }
+    }
+    let visible_rowids = rowids_for_ids(store, "visible_turns", &visible_turn_ids)?;
+    let conclusion_rowids = rowids_for_ids(
+        store,
+        "conclusions",
+        &window
+            .conclusions
+            .sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect(),
+    )?;
+    let checkpoint_rowids = rowids_for_ids(
+        store,
+        "checkpoints",
+        &window
+            .checkpoints
+            .sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect(),
+    )?;
+    let source_rowids = rowids_for_ids(
+        store,
+        "memory_sources",
+        &window
+            .imported_memories
+            .sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect(),
+    )?;
+    let active_record_ids = window
+        .active_memory_records
+        .sources
+        .iter()
+        .filter(|source| source.kind != "imported_chat_turn")
+        .map(|source| source.id.clone())
+        .collect();
+    let record_rowids = rowids_for_ids(store, "memory_records", &active_record_ids)?;
+
+    update_stream_cursor(
+        &mut cursor.visible_turns,
+        &window.visible_turns,
+        false,
+        &visible_rowids,
+    );
+    update_stream_cursor(
+        &mut cursor.conclusions,
+        &window.conclusions,
+        false,
+        &conclusion_rowids,
+    );
+    update_stream_cursor(
+        &mut cursor.checkpoints,
+        &window.checkpoints,
+        false,
+        &checkpoint_rowids,
+    );
     update_stream_cursor(
         &mut cursor.imported_memories,
         &window.imported_memories,
         true,
+        &source_rowids,
     );
     for source in &window.active_memory_records.sources {
         if source.kind == "imported_chat_turn" && !source.root_ids.is_empty() {
@@ -947,6 +1158,7 @@ fn update_scheduler_cursor(cursor: &mut DreamSchedulerCursor, window: &DreamEvid
                     &mut cursor.visible_turns,
                     source.created_at.clone(),
                     root_id.clone(),
+                    visible_rowids.get(root_id).copied(),
                 );
             }
         } else {
@@ -957,15 +1169,18 @@ fn update_scheduler_cursor(cursor: &mut DreamSchedulerCursor, window: &DreamEvid
                     .clone()
                     .unwrap_or_else(|| source.created_at.clone()),
                 source.id.clone(),
+                record_rowids.get(&source.id).copied(),
             );
         }
     }
+    Ok(())
 }
 
 fn update_stream_cursor(
     slot: &mut Option<DreamSourceCursor>,
     stream: &DreamEvidenceStream,
     use_updated_at: bool,
+    rowids: &BTreeMap<String, i64>,
 ) {
     for source in &stream.sources {
         update_cursor_position(
@@ -979,18 +1194,63 @@ fn update_stream_cursor(
                 source.created_at.clone()
             },
             source.id.clone(),
+            rowids.get(&source.id).copied(),
         );
     }
 }
 
-fn update_cursor_position(slot: &mut Option<DreamSourceCursor>, timestamp: String, id: String) {
-    let candidate = DreamSourceCursor { timestamp, id };
+fn update_cursor_position(
+    slot: &mut Option<DreamSourceCursor>,
+    timestamp: String,
+    id: String,
+    rowid: Option<i64>,
+) {
+    let candidate = DreamSourceCursor {
+        timestamp,
+        id,
+        rowid,
+    };
     if slot.as_ref().is_none_or(|current| {
         candidate.timestamp < current.timestamp
-            || (candidate.timestamp == current.timestamp && candidate.id > current.id)
+            || (candidate.timestamp == current.timestamp
+                && match (candidate.rowid, current.rowid) {
+                    (Some(candidate), Some(current)) => candidate > current,
+                    _ => candidate.id > current.id,
+                })
     }) {
         *slot = Some(candidate);
     }
+}
+
+fn rowids_for_ids(
+    store: &Store,
+    table: &str,
+    ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, i64>> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    store.transaction(|tx| {
+        let mut rowids = BTreeMap::new();
+        for chunk in ids.iter().collect::<Vec<_>>().chunks(900) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("SELECT id, rowid FROM {table} WHERE id IN ({placeholders})");
+            let args: Vec<Box<dyn ToSql>> = chunk
+                .iter()
+                .map(|id| Box::new((*id).clone()) as Box<dyn ToSql>)
+                .collect();
+            let args_ref = args.iter().map(|arg| arg.as_ref()).collect::<Vec<_>>();
+            let mut statement = tx.prepare(&sql)?;
+            let rows = statement.query_map(args_ref.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, rowid) = row?;
+                rowids.insert(id, rowid);
+            }
+        }
+        Ok(rowids)
+    })
 }
 
 fn query_dream_rows<T, F>(
@@ -999,9 +1259,12 @@ fn query_dream_rows<T, F>(
     mut args: Vec<Box<dyn ToSql>>,
     timestamp_column: &str,
     id_column: &str,
+    rowid_column: &str,
     start: Option<&str>,
     start_exclusive: bool,
+    lower_rowid: Option<i64>,
     end: Option<&str>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
     mapper: F,
@@ -1013,25 +1276,52 @@ where
         return Ok(Vec::new());
     }
     if let Some(start) = start {
-        let operator = if start_exclusive { ">" } else { ">=" };
-        sql.push_str(&format!(" AND {timestamp_column} {operator} ?"));
-        args.push(Box::new(start.to_string()));
+        if let Some(lower_rowid) = lower_rowid {
+            sql.push_str(&format!(
+                " AND ({timestamp_column} > ? OR ({timestamp_column} = ? AND {rowid_column} > ?))"
+            ));
+            args.push(Box::new(start.to_string()));
+            args.push(Box::new(start.to_string()));
+            args.push(Box::new(lower_rowid));
+        } else {
+            let operator = if start_exclusive { ">" } else { ">=" };
+            sql.push_str(&format!(" AND {timestamp_column} {operator} ?"));
+            args.push(Box::new(start.to_string()));
+        }
     }
     if let Some(position) = position {
-        sql.push_str(&format!(
-            " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {id_column} > ?))"
-        ));
-        args.push(Box::new(position.timestamp.clone()));
-        args.push(Box::new(position.timestamp.clone()));
-        args.push(Box::new(position.id.clone()));
+        if let Some(rowid) = position.rowid {
+            sql.push_str(&format!(
+                " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {rowid_column} > ?))"
+            ));
+            args.push(Box::new(position.timestamp.clone()));
+            args.push(Box::new(position.timestamp.clone()));
+            args.push(Box::new(rowid));
+        } else {
+            sql.push_str(&format!(
+                " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {id_column} > ?))"
+            ));
+            args.push(Box::new(position.timestamp.clone()));
+            args.push(Box::new(position.timestamp.clone()));
+            args.push(Box::new(position.id.clone()));
+        }
     }
     if let Some(end) = end {
-        sql.push_str(&format!(" AND {timestamp_column} <= ?"));
-        args.push(Box::new(end.to_string()));
+        if let Some(upper_rowid) = upper_rowid {
+            sql.push_str(&format!(
+                " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {rowid_column} <= ?))"
+            ));
+            args.push(Box::new(end.to_string()));
+            args.push(Box::new(end.to_string()));
+            args.push(Box::new(upper_rowid));
+        } else {
+            sql.push_str(&format!(" AND {timestamp_column} <= ?"));
+            args.push(Box::new(end.to_string()));
+        }
     }
     let params_ref: Vec<&dyn ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
     sql.push_str(&format!(
-        " ORDER BY {timestamp_column} DESC, {id_column} ASC LIMIT {limit}"
+        " ORDER BY {timestamp_column} DESC, {rowid_column} ASC LIMIT {limit}"
     ));
     store.transaction(|tx| {
         let mut statement = tx.prepare(&sql)?;
@@ -1050,6 +1340,8 @@ fn query_visible_turns_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
 ) -> Result<Vec<VisibleTurn>> {
@@ -1072,9 +1364,12 @@ fn query_visible_turns_with_frontier(
         args,
         "t.created_at",
         "t.id",
+        "t.rowid",
         start,
         start_exclusive,
+        lower_rowid,
         end,
+        upper_rowid,
         position,
         limit,
         |row| {
@@ -1098,6 +1393,8 @@ fn query_conclusions_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
 ) -> Result<Vec<Conclusion>> {
@@ -1120,9 +1417,12 @@ fn query_conclusions_with_frontier(
         args,
         "created_at",
         "id",
+        "rowid",
         start,
         start_exclusive,
+        lower_rowid,
         end,
+        upper_rowid,
         position,
         limit,
         |row| {
@@ -1149,6 +1449,8 @@ fn query_checkpoints_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
 ) -> Result<Vec<Checkpoint>> {
@@ -1172,9 +1474,12 @@ fn query_checkpoints_with_frontier(
         args,
         "created_at",
         "id",
+        "rowid",
         start,
         start_exclusive,
+        lower_rowid,
         end,
+        upper_rowid,
         position,
         limit,
         |row| {
@@ -1206,6 +1511,8 @@ fn query_memory_sources_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
 ) -> Result<Vec<MemorySource>> {
@@ -1224,9 +1531,12 @@ fn query_memory_sources_with_frontier(
         args,
         "ingested_at",
         "id",
+        "rowid",
         start,
         start_exclusive,
+        lower_rowid,
         end,
+        upper_rowid,
         position,
         limit,
         |row| {
@@ -1253,6 +1563,8 @@ fn query_memory_records_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
     include_archived: bool,
@@ -1278,9 +1590,12 @@ fn query_memory_records_with_frontier(
         args,
         "updated_at",
         "id",
+        "rowid",
         start,
         start_exclusive,
+        lower_rowid,
         end,
+        upper_rowid,
         position,
         limit,
         |row| row.get::<_, String>(0),
@@ -1327,6 +1642,14 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_end,
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.visible_turns),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.visible_turns),
             cursor.visible_turns.as_ref(),
             remaining,
         )?;
@@ -1355,6 +1678,14 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_end,
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.conclusions),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.conclusions),
             cursor.conclusions.as_ref(),
             remaining,
         )?;
@@ -1383,6 +1714,14 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_end,
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.checkpoints),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.checkpoints),
             cursor.checkpoints.as_ref(),
             remaining,
         )?;
@@ -1410,6 +1749,14 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_end,
+            cursor
+                .lower_rowids
+                .as_ref()
+                .map(|rowids| rowids.imported_memories),
+            cursor
+                .upper_rowids
+                .as_ref()
+                .map(|rowids| rowids.imported_memories),
             cursor.imported_memories.as_ref(),
             remaining,
         )?

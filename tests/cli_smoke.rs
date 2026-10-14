@@ -6914,6 +6914,73 @@ fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_determinist
 
 #[cfg(unix)]
 #[test]
+fn cli_mcp_codex_container_mounts_the_resolved_symlink_database_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let alias_dir = dir.path().join("database-alias");
+    let target_dir = dir.path().join("database-target");
+    fs::create_dir_all(&alias_dir).unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    let target_db = target_dir.join("memory.db");
+    fs::write(&target_db, b"synthetic disposable database fixture").unwrap();
+    let alias_db = alias_dir.join("configured.db");
+    symlink(&target_db, &alias_db).unwrap();
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_IMAGE", "codex-memoryd:local")
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&alias_db)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        preview["resolved"]["args"],
+        serde_json::json!([
+            "run",
+            "--rm",
+            "-i",
+            "--pull=missing",
+            "--user",
+            "1001:1002",
+            "--volume",
+            format!("{}:/data", target_dir.canonicalize().unwrap().display()),
+            "--env",
+            "CODEX_MEMORYD_PROFILE=personal",
+            "--env",
+            "CODEX_MEMORYD_WORKSPACE=default",
+            "--env",
+            "CODEX_MEMORYD_LOG=info",
+            "codex-memoryd:local",
+            "--db",
+            "/data/memory.db",
+            "mcp",
+            "stdio",
+            "--read-only"
+        ])
+    );
+    assert!(
+        !codex_home.exists(),
+        "previewing a symlinked database path must not write Codex configuration"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_mcp_codex_each_action_accepts_both_global_runtime_placements() {
     let dir = TempDir::new().unwrap();
     let memoryd_home = dir.path().join("memoryd-home");
