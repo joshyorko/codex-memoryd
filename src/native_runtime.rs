@@ -604,6 +604,13 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     if !opts.codex_memories_dir.exists() {
         fs::create_dir_all(&opts.codex_memories_dir).map_err(Error::from)?;
     }
+    let database_parent = opts
+        .db
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(database_parent).map_err(Error::from)?;
+    let (database_parent, container_db_path) = container_database_mount(opts)?;
 
     if container_exists(&runtime, &opts.container_name)? {
         if !container_running(&runtime, &opts.container_name)? {
@@ -628,7 +635,7 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             "--publish".to_string(),
             format!("{}:{}:8787", opts.host, opts.port),
             "--volume".to_string(),
-            format!("{}:/data", opts.home.display()),
+            format!("{}:/data", database_parent.display()),
             "--volume".to_string(),
             format!(
                 "{}:/host-codex-memories:ro",
@@ -639,7 +646,7 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             "--env".to_string(),
             "CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH=1".to_string(),
             "--env".to_string(),
-            "CODEX_MEMORYD_DB=/data/memory.db".to_string(),
+            format!("CODEX_MEMORYD_DB={container_db_path}"),
             "--env".to_string(),
             format!("CODEX_MEMORYD_PROFILE={}", opts.profile),
             "--env".to_string(),
@@ -674,8 +681,137 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         )?;
     }
 
-    wait_for_ready(opts, "/data/memory.db")?;
+    wait_for_ready(opts, &container_db_path)?;
     Ok(status_container(opts))
+}
+
+fn container_database_mount(opts: &RuntimeOptions) -> Result<(PathBuf, String)> {
+    let database = if opts.db.is_absolute() {
+        opts.db.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                Error::invalid_request(format!(
+                    "cannot resolve relative container database path {}: {err}",
+                    opts.db.display()
+                ))
+            })?
+            .join(&opts.db)
+    };
+    let filename = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| {
+            Error::invalid_request(format!(
+                "container database path must name a UTF-8 file: {}",
+                database.display()
+            ))
+        })?;
+    if filename
+        .chars()
+        .any(|character| character.is_control() || character == ':')
+    {
+        return Err(Error::invalid_request(
+            "container database filename contains characters that cannot be represented safely in a Docker/Podman mount",
+        ));
+    }
+    let configured_parent = database.parent().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "container database path has no usable parent directory: {}",
+            database.display()
+        ))
+    })?;
+    let configured_metadata = fs::metadata(configured_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent directory is not usable: {} ({err})",
+            configured_parent.display()
+        ))
+    })?;
+    if !configured_metadata.is_dir() {
+        return Err(Error::invalid_request(format!(
+            "container database parent is not a directory: {}",
+            configured_parent.display()
+        )));
+    }
+    let configured_parent = fs::canonicalize(configured_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent cannot be resolved safely: {} ({err})",
+            database
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .display()
+        ))
+    })?;
+    let resolved_database = match fs::symlink_metadata(&database) {
+        Ok(_) => {
+            let resolved = fs::canonicalize(&database).map_err(|err| {
+                Error::invalid_request(format!(
+                    "container database cannot be resolved safely: {} ({err})",
+                    database.display()
+                ))
+            })?;
+            if !fs::metadata(&resolved).map_err(Error::from)?.is_file() {
+                return Err(Error::invalid_request(format!(
+                    "container database path is not a file: {}",
+                    database.display()
+                )));
+            }
+            resolved
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => configured_parent.join(filename),
+        Err(err) => {
+            return Err(Error::invalid_request(format!(
+                "container database path is not usable: {} ({err})",
+                database.display()
+            )))
+        }
+    };
+    let database_parent = resolved_database.parent().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "container database path has no usable parent directory: {}",
+            resolved_database.display()
+        ))
+    })?;
+    let database_parent = fs::canonicalize(database_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent cannot be resolved safely: {} ({err})",
+            database_parent.display()
+        ))
+    })?;
+    if database_parent == Path::new("/") {
+        return Err(Error::invalid_request(
+            "container runtime refuses to mount the host root as the database parent; set CODEX_MEMORYD_DB inside a dedicated data directory",
+        ));
+    }
+    let database_parent_text = database_parent.to_str().ok_or_else(|| {
+        Error::invalid_request(
+            "container database parent is not valid UTF-8 and cannot be represented safely",
+        )
+    })?;
+    if database_parent_text.contains(':') || database_parent_text.chars().any(char::is_control) {
+        return Err(Error::invalid_request(format!(
+            "container database parent cannot be represented safely in a Docker/Podman volume mount: {database_parent_text}"
+        )));
+    }
+    let filename = resolved_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::invalid_request(format!(
+                "container database filename is not valid UTF-8: {}",
+                resolved_database.display()
+            ))
+        })?;
+    if filename
+        .chars()
+        .any(|character| character.is_control() || character == ':')
+    {
+        return Err(Error::invalid_request(
+            "resolved container database filename contains characters that cannot be represented safely in a Docker/Podman mount",
+        ));
+    }
+    Ok((database_parent, format!("/data/{filename}")))
 }
 
 fn down_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -860,7 +996,9 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
         pid: None,
         url: opts.url.clone(),
         bind: format!("{}:{} -> container:8787", opts.host, opts.port),
-        db: format!("{}:/data/memory.db", opts.home.display()),
+        db: container_database_mount(opts)
+            .map(|(parent, path)| format!("{}:{path}", parent.display()))
+            .unwrap_or_else(|_| opts.db.display().to_string()),
         log_file: format!(
             "{} logs {}",
             container_runtime_name(opts),
@@ -1583,10 +1721,19 @@ mod container_readiness_regressions {
         (format!("http://{address}"), stop, server)
     }
 
-    fn fake_container_runtime(path: &std::path::Path) {
+    fn fake_container_runtime(
+        path: &std::path::Path,
+        invocation_log: &std::path::Path,
+        state_file: &std::path::Path,
+    ) {
         fs::write(
             path,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ \"$3\" = \"--format\" ]; then printf true; fi; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ -f '{}' ]; then if [ \"$3\" = \"--format\" ]; then printf true; fi; exit 0; fi; exit 1; fi\nif [ \"$1\" = \"run\" ]; then printf '%s\\n' \"$*\" >> '{}'; touch '{}'; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
+                state_file.display(),
+                invocation_log.display(),
+                state_file.display()
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -1596,13 +1743,21 @@ mod container_readiness_regressions {
 
     fn run_managed_container_up(
         status_path: &str,
-    ) -> crate::error::Result<super::RuntimeStatusReport> {
+        db_relative_path: &str,
+    ) -> (
+        crate::error::Result<super::RuntimeStatusReport>,
+        String,
+        String,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("fake-container-runtime");
-        fake_container_runtime(&runtime);
+        let invocation_log = temp.path().join("container-runtime.log");
+        let state_file = temp.path().join("container-created");
+        fake_container_runtime(&runtime, &invocation_log, &state_file);
         let (url, stop, server) = status_server(container_status(status_path));
-        let address = url.strip_prefix("http://").unwrap();
-        let port = address.rsplit_once(':').unwrap().1.parse().unwrap();
+        let port = 0;
+        let db = temp.path().join(db_relative_path);
+        let database_parent = db.parent().unwrap().to_string_lossy().into_owned();
         let options = RuntimeOptions {
             runtime: RuntimeKind::Container,
             home: temp.path().join("runtime-home"),
@@ -1610,7 +1765,7 @@ mod container_readiness_regressions {
             host: "127.0.0.1".into(),
             port,
             bind: format!("127.0.0.1:{port}"),
-            db: PathBuf::from("/tmp/host-memory.db"),
+            db,
             pid_file: temp.path().join("unused.pid"),
             log_file: temp.path().join("unused.log"),
             profile: "personal".into(),
@@ -1630,25 +1785,41 @@ mod container_readiness_regressions {
         let result = up(&options);
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
-        result
+        let invocations = fs::read_to_string(invocation_log).unwrap_or_default();
+        (result, invocations, database_parent)
     }
 
     #[test]
     fn up_accepts_healthy_container_status_at_container_database_path() {
-        let result = run_managed_container_up("/data/memory.db");
+        let (result, invocations, database_parent) =
+            run_managed_container_up("/data/memory.db", "runtime-home/memory.db");
         assert!(
             result.is_ok(),
             "managed container startup failed: {result:?}"
         );
         assert_eq!(result.unwrap().health, "ok");
+        assert!(invocations.contains(&format!("--volume {database_parent}:/data")));
+        assert!(invocations.contains("CODEX_MEMORYD_DB=/data/memory.db"));
     }
 
     #[test]
     fn up_rejects_container_status_for_wrong_database_path() {
-        let result = run_managed_container_up("/data/wrong.db");
+        let (result, _, _) = run_managed_container_up("/data/wrong.db", "runtime-home/memory.db");
         let error = result.expect_err("wrong managed-container storage path must fail readiness");
         assert!(error
             .message
             .contains("core readiness requirements are not met"));
+    }
+
+    #[test]
+    fn up_mounts_and_verifies_the_configured_custom_database() {
+        let (result, invocations, database_parent) =
+            run_managed_container_up("/data/custom.sqlite", "custom-store/custom.sqlite");
+        assert!(
+            result.is_ok(),
+            "managed container startup failed for configured database: {result:?}"
+        );
+        assert!(invocations.contains(&format!("--volume {database_parent}:/data")));
+        assert!(invocations.contains("CODEX_MEMORYD_DB=/data/custom.sqlite"));
     }
 }

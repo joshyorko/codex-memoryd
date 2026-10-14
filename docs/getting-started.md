@@ -108,6 +108,11 @@ directory of the persistent SQLite database at `/data`, preserving SQLite
 sidecar files such as WAL and shared-memory files. Docker or Podman must be
 installed and available to the CLI.
 
+When `--db` or `CODEX_MEMORYD_DB` selects a custom database, managed container
+startup mounts that database's parent directory and configures the matching
+`/data/<filename>` path inside the container. The host root cannot be used as
+the database parent; choose a dedicated data directory instead.
+
 To connect Codex to the container-backed read-only MCP server:
 
 ```zsh
