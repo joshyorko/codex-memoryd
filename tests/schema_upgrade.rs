@@ -16,10 +16,10 @@
 
 use std::path::Path;
 
-use codex_memoryd::store::Store;
-use codex_memoryd::store::STORAGE_SCHEMA_VERSION;
+use codex_memoryd::store::{DreamRunRecord, Store, STORAGE_SCHEMA_VERSION};
 use rusqlite::params;
 use rusqlite::Connection;
+use serde_json::json;
 use tempfile::TempDir;
 
 /// Historical `memory_records` shape as it existed at schema v1 — before the
@@ -451,6 +451,90 @@ fn upgrades_v7_database_preserves_legacy_records_and_creates_semantic_tables() {
         .expect("relations table exists after migration")
         .rows;
     assert_eq!(relation_rows, 0, "relations should exist at v8");
+}
+
+#[test]
+fn scheduler_rowid_upgrade_preserves_saved_cursor_highwater() {
+    let temp = TempDir::new().expect("temporary directory");
+    let db_path = temp.path().join("scheduler-rowid-upgrade.db");
+    let store = Store::open(&db_path).expect("initial store");
+    store
+        .record_dream_run(&DreamRunRecord {
+            run_id: "legacy-scheduler-cursor".into(),
+            profile_id: "personal".into(),
+            workspace_id: "workspace".into(),
+            mode: "preview".into(),
+            kind: "scheduled".into(),
+            status: "ok".into(),
+            started_at: "2030-01-01T00:00:00Z".into(),
+            watermark_after: Some(format!(
+                "dream-cursor-v1:{}",
+                json!({
+                    "upper_rowids": {
+                        "visible_turns": 80,
+                        "conclusions": 81,
+                        "checkpoints": 82,
+                        "imported_memories": 83,
+                        "active_memory_records": 84,
+                        "active_memory_mutation_sequence": 9000
+                    },
+                    "active_memory_records": {
+                        "timestamp": "2029-12-31T23:59:59Z",
+                        "id": "old-position",
+                        "rowid": 97
+                    }
+                })
+            )),
+            ..DreamRunRecord::default()
+        })
+        .expect("store legacy rowid cursor");
+    store
+        .transaction(|tx| {
+            tx.execute_batch(
+                "DROP TRIGGER visible_turns_scheduler_rowid_insert;
+                 DROP TRIGGER visible_turns_scheduler_rowid_delete;
+                 DROP TRIGGER conclusions_scheduler_rowid_insert;
+                 DROP TRIGGER conclusions_scheduler_rowid_delete;
+                 DROP TRIGGER checkpoints_scheduler_rowid_insert;
+                 DROP TRIGGER checkpoints_scheduler_rowid_delete;
+                 DROP TRIGGER memory_sources_scheduler_rowid_insert;
+                 DROP TRIGGER memory_sources_scheduler_rowid_delete;
+                 DROP TRIGGER memory_records_scheduler_rowid_insert;
+                 DROP TRIGGER memory_records_scheduler_rowid_delete;
+                 DROP TABLE scheduler_source_rowids;
+                 DROP TABLE scheduler_source_rowid_counter;",
+            )?;
+            Ok(())
+        })
+        .expect("simulate a pre-rowid-frontier schema");
+    drop(store);
+
+    let upgraded = Store::open(&db_path).expect("reopen through scheduler rowid migration");
+    upgraded
+        .transaction(|tx| {
+            tx.execute(
+                "INSERT INTO visible_turns(id, session_id, actor, content, created_at)
+                 VALUES ('new-after-upgrade', 'synthetic-session', 'user', 'synthetic', ?1)",
+                params!["2029-12-31T23:59:30Z"],
+            )?;
+            Ok(())
+        })
+        .expect("insert synthetic row after migration");
+    let scheduler_rowid = upgraded
+        .transaction(|tx| {
+            tx.query_row(
+                "SELECT scheduler_rowid FROM scheduler_source_rowids
+                 WHERE stream = 'visible_turns' AND source_key = 'new-after-upgrade'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .expect("read upgraded scheduler rowid");
+    assert!(
+        scheduler_rowid > 97,
+        "new rows must sort after every rowid saved in a pre-migration cursor"
+    );
 }
 
 #[test]

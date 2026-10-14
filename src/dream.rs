@@ -37,11 +37,13 @@ use crate::protocol::DreamRejection;
 use crate::protocol::DreamResponse;
 use crate::protocol::DreamStaleRecord;
 use crate::store::ledger_safe_summary;
+use crate::store::row_to_record;
 use crate::store::EvidenceLedgerEntry;
 use crate::store::NewRecord;
 use crate::store::RecordQuery;
 use crate::store::Store;
 use crate::store::UpsertOutcome;
+use crate::store::RECORD_COLS;
 
 pub const DREAM_IMPLEMENTATION_VERSION: &str = "heuristic-v1";
 pub const DREAM_RULESET_VERSION: &str = "dreamer-heuristics-v1";
@@ -1351,27 +1353,32 @@ fn scheduler_rowid_frontier(store: &Store) -> Result<DreamRowidFrontier> {
     store.transaction(|tx| {
         Ok(DreamRowidFrontier {
             visible_turns: tx.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM visible_turns",
+                "SELECT COALESCE(MAX(scheduler_rowid), 0)
+                 FROM scheduler_source_rowids WHERE stream = 'visible_turns'",
                 [],
                 |row| row.get(0),
             )?,
             conclusions: tx.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM conclusions",
+                "SELECT COALESCE(MAX(scheduler_rowid), 0)
+                 FROM scheduler_source_rowids WHERE stream = 'conclusions'",
                 [],
                 |row| row.get(0),
             )?,
             checkpoints: tx.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM checkpoints",
+                "SELECT COALESCE(MAX(scheduler_rowid), 0)
+                 FROM scheduler_source_rowids WHERE stream = 'checkpoints'",
                 [],
                 |row| row.get(0),
             )?,
             imported_memories: tx.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM memory_sources",
+                "SELECT COALESCE(MAX(scheduler_rowid), 0)
+                 FROM scheduler_source_rowids WHERE stream = 'memory_sources'",
                 [],
                 |row| row.get(0),
             )?,
             active_memory_records: tx.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM memory_records",
+                "SELECT COALESCE(MAX(scheduler_rowid), 0)
+                 FROM scheduler_source_rowids WHERE stream = 'memory_records'",
                 [],
                 |row| row.get(0),
             )?,
@@ -1547,11 +1554,17 @@ fn rowids_for_ids(
         let mut rowids = BTreeMap::new();
         for chunk in ids.iter().collect::<Vec<_>>().chunks(900) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
-            let sql = format!("SELECT id, rowid FROM {table} WHERE id IN ({placeholders})");
-            let args: Vec<Box<dyn ToSql>> = chunk
-                .iter()
-                .map(|id| Box::new((*id).clone()) as Box<dyn ToSql>)
-                .collect();
+            let sql = format!(
+                "SELECT source_key, scheduler_rowid
+                 FROM scheduler_source_rowids
+                 WHERE stream = ? AND source_key IN ({placeholders})"
+            );
+            let mut args = vec![Box::new(table.to_string()) as Box<dyn ToSql>];
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|id| Box::new((*id).clone()) as Box<dyn ToSql>),
+            );
             let args_ref = args.iter().map(|arg| arg.as_ref()).collect::<Vec<_>>();
             let mut statement = tx.prepare(&sql)?;
             let rows = statement.query_map(args_ref.as_slice(), |row| {
@@ -1727,6 +1740,8 @@ fn query_visible_turns_with_frontier(
     let mut sql = "SELECT t.id, t.session_id, t.actor, t.content, t.created_at, t.metadata
          FROM visible_turns t
          JOIN sessions s ON s.id = t.session_id
+         JOIN scheduler_source_rowids sr
+           ON sr.stream = 'visible_turns' AND sr.source_key = t.id
          WHERE s.profile_id = ? AND s.workspace_id = ?"
         .to_string();
     let mut args: Vec<Box<dyn ToSql>> = vec![
@@ -1743,7 +1758,7 @@ fn query_visible_turns_with_frontier(
         args,
         "t.created_at",
         "t.id",
-        "t.rowid",
+        "sr.scheduler_rowid",
         start,
         start_exclusive,
         lower_rowid_strict,
@@ -1785,6 +1800,8 @@ fn query_conclusions_with_frontier(
     let mut sql = "SELECT id, profile_id, workspace_id, repo_id, target, content, source_id,
             created_at, metadata
          FROM conclusions
+         JOIN scheduler_source_rowids sr
+           ON sr.stream = 'conclusions' AND sr.source_key = conclusions.id
          WHERE profile_id = ? AND workspace_id = ?"
         .to_string();
     let mut args: Vec<Box<dyn ToSql>> = vec![
@@ -1801,7 +1818,7 @@ fn query_conclusions_with_frontier(
         args,
         "created_at",
         "id",
-        "rowid",
+        "sr.scheduler_rowid",
         start,
         start_exclusive,
         lower_rowid_strict,
@@ -1847,6 +1864,8 @@ fn query_checkpoints_with_frontier(
             changed_files, decisions, blockers, next_steps, tests_run, tests_not_run,
             branch, commit_sha, created_at
          FROM checkpoints
+         JOIN scheduler_source_rowids sr
+           ON sr.stream = 'checkpoints' AND sr.source_key = checkpoints.id
          WHERE profile_id = ? AND workspace_id = ?"
         .to_string();
     let mut args: Vec<Box<dyn ToSql>> = vec![
@@ -1863,7 +1882,7 @@ fn query_checkpoints_with_frontier(
         args,
         "created_at",
         "id",
-        "rowid",
+        "sr.scheduler_rowid",
         start,
         start_exclusive,
         lower_rowid_strict,
@@ -1913,6 +1932,8 @@ fn query_memory_sources_with_frontier(
     let sql = "SELECT id, profile_id, workspace_id, kind, source_path, source_hash,
             created_at, ingested_at, metadata
          FROM memory_sources
+         JOIN scheduler_source_rowids sr
+           ON sr.stream = 'memory_sources' AND sr.source_key = memory_sources.id
          WHERE profile_id = ? AND workspace_id = ?"
         .to_string();
     let args: Vec<Box<dyn ToSql>> = vec![
@@ -1925,7 +1946,7 @@ fn query_memory_sources_with_frontier(
         args,
         "ingested_at",
         "id",
-        "rowid",
+        "sr.scheduler_rowid",
         start,
         start_exclusive,
         lower_rowid_strict,
@@ -1969,9 +1990,53 @@ fn query_memory_records_with_frontier(
     include_archived: bool,
     mutation_scan: Option<(&str, i64, i64)>,
 ) -> Result<Vec<MemoryRecord>> {
-    let mut sql = "SELECT id FROM memory_records
+    query_memory_records_with_frontier_after_materialization(
+        store,
+        profile_id,
+        workspace_id,
+        repo_id,
+        start,
+        start_exclusive,
+        lower_rowid_strict,
+        include_post_frontier_rowids,
+        end,
+        lower_rowid,
+        upper_rowid,
+        position,
+        limit,
+        include_archived,
+        mutation_scan,
+        || {},
+    )
+}
+
+fn query_memory_records_with_frontier_after_materialization<F>(
+    store: &Store,
+    profile_id: &str,
+    workspace_id: &str,
+    repo_id: Option<&str>,
+    start: Option<&str>,
+    start_exclusive: bool,
+    lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
+    end: Option<&str>,
+    lower_rowid: Option<i64>,
+    upper_rowid: Option<i64>,
+    position: Option<&DreamSourceCursor>,
+    limit: usize,
+    include_archived: bool,
+    mutation_scan: Option<(&str, i64, i64)>,
+    after_materialization: F,
+) -> Result<Vec<MemoryRecord>>
+where
+    F: FnOnce(),
+{
+    let mut sql = format!(
+        "SELECT {RECORD_COLS} FROM memory_records
+         JOIN scheduler_source_rowids sr
+           ON sr.stream = 'memory_records' AND sr.source_key = memory_records.id
          WHERE profile_id = ? AND workspace_id = ?"
-        .to_string();
+    );
     let mut args: Vec<Box<dyn ToSql>> = vec![
         Box::new(profile_id.to_string()),
         Box::new(workspace_id.to_string()),
@@ -1991,13 +2056,13 @@ fn query_memory_records_with_frontier(
         sql.push_str(" AND archived = 0");
     }
     sql.push_str(" AND sensitivity != 'secret_blocked' AND trust_state != 'quarantined'");
-    let ids = query_dream_rows(
+    let records = query_dream_rows(
         store,
         sql,
         args,
         "updated_at",
         "id",
-        "rowid",
+        "sr.scheduler_rowid",
         start,
         start_exclusive,
         lower_rowid_strict,
@@ -2008,14 +2073,9 @@ fn query_memory_records_with_frontier(
         position,
         mutation_scan,
         limit,
-        |row| row.get::<_, String>(0),
+        row_to_record,
     )?;
-    let mut records = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(record) = store.get_record(&id)? {
-            records.push(record);
-        }
-    }
+    after_materialization();
     Ok(records)
 }
 
@@ -3798,5 +3858,85 @@ mod tests {
             .expect_err("expired post-processing deadline should return an error");
 
         assert_eq!(error.message, "dream job exceeded max_runtime_seconds");
+    }
+
+    #[test]
+    fn scheduler_memory_record_frontier_hydration_uses_filtered_snapshot() {
+        let temp = tempfile::tempdir().expect("temporary database directory");
+        let db_path = temp.path().join("memory-record-frontier-snapshot.db");
+        let store = Store::open(&db_path).expect("store");
+        let writer = Store::open(&db_path).expect("independent writer pool");
+        let content = "Preference: content from the captured scheduler snapshot";
+        let classification = policy::classify(content, Profile::Personal, false);
+        let content_hash = ids::exact_content_hash(
+            Profile::Personal.as_str(),
+            "workspace",
+            None,
+            classification.record_type.as_str(),
+            classification.scope.as_str(),
+            content,
+        );
+        let id = match store
+            .upsert_record(&NewRecord {
+                profile_id: Profile::Personal.as_str().into(),
+                workspace_id: "workspace".into(),
+                repo_id: None,
+                subject_id: None,
+                episode_id: None,
+                scope: classification.scope,
+                record_type: classification.record_type,
+                content: content.into(),
+                related_files: classification.related_files,
+                tags: classification.tags,
+                sensitivity: classification.sensitivity,
+                portability: classification.portability,
+                confidence: classification.confidence,
+                source_ids: vec![],
+                content_hash,
+                supersedes: vec![],
+                metadata: json!({"origin": "fixture"}),
+            })
+            .expect("insert synthetic record")
+        {
+            UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+        };
+
+        let records = query_memory_records_with_frontier_after_materialization(
+            &store,
+            Profile::Personal.as_str(),
+            "workspace",
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            10,
+            false,
+            None,
+            || {
+                writer
+                    .transaction_immediate(|tx| {
+                        tx.execute(
+                            "UPDATE memory_records SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                            rusqlite::params![
+                                "Preference: content updated after frontier selection",
+                                "2030-01-01T00:00:00Z",
+                                id,
+                            ],
+                        )?;
+                        Ok(())
+                    })
+                    .expect("concurrent synthetic record update");
+            },
+        )
+        .expect("read memory records at the scheduler frontier");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, id);
+        assert_eq!(records[0].content, content);
     }
 }

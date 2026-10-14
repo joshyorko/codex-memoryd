@@ -925,6 +925,282 @@ fn scheduler_unbounded_completion_catches_backdated_rows_in_next_fixed_band() {
 }
 
 #[test]
+fn scheduler_catches_reinserted_sources_after_max_rowid_is_deleted() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+
+    insert_chatgpt_turn(
+        &store,
+        "rowid-reuse-session",
+        "visible-before-reuse",
+        "generic old visible row before rowid reuse",
+        "2029-12-31T23:59:00Z",
+        None,
+    );
+    store
+        .insert_conclusion(&Conclusion {
+            id: "conclusion-before-reuse".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Conclusion: old conclusion before rowid reuse".into(),
+            source_id: None,
+            created_at: "2029-12-31T23:59:00Z".into(),
+            metadata: json!({}),
+        })
+        .expect("old conclusion");
+    store
+        .insert_checkpoint(&Checkpoint {
+            id: "checkpoint-before-reuse".into(),
+            session_id: Some("rowid-reuse-session".into()),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            summary: "generic old checkpoint before rowid reuse".into(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2029-12-31T23:59:00Z".into(),
+        })
+        .expect("old checkpoint");
+    let (old_source, _) = store
+        .upsert_source(
+            PROFILE,
+            "workspace",
+            "fixture",
+            Some("rowid-reuse-old-source"),
+            "rowid-reuse-old-hash",
+            &json!({}),
+        )
+        .expect("old memory source");
+    let old_record = insert_memory_record(
+        &store,
+        "Preference: old active record before rowid reuse",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_sources SET ingested_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2029-12-31T23:59:00Z", old_source.id],
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2029-12-31T23:59:00Z", old_record],
+            )?;
+            Ok(())
+        })
+        .expect("backdate old synthetic rows");
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, RUN_NOW, true)
+            .expect("capture initial rowid frontier");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, RUN_NOW);
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        RUN_NOW,
+        false,
+    )
+    .expect("complete initial scan")
+    .expect("completed initial cursor");
+
+    let original_rowids = store
+        .transaction(|tx| {
+            Ok((
+                tx.query_row(
+                    "SELECT rowid FROM visible_turns WHERE id = 'visible-before-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM conclusions WHERE id = 'conclusion-before-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM checkpoints WHERE id = 'checkpoint-before-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM memory_sources WHERE id = ?1",
+                    rusqlite::params![old_source.id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM memory_records WHERE id = ?1",
+                    rusqlite::params![old_record],
+                    |row| row.get::<_, i64>(0),
+                )?,
+            ))
+        })
+        .expect("read original rowids");
+
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "DELETE FROM visible_turns WHERE id = 'visible-before-reuse'",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM conclusions WHERE id = 'conclusion-before-reuse'",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM checkpoints WHERE id = 'checkpoint-before-reuse'",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_sources WHERE id = ?1",
+                rusqlite::params![old_source.id],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_records WHERE id = ?1",
+                rusqlite::params![old_record],
+            )?;
+            Ok(())
+        })
+        .expect("hard-delete each synthetic maximum row");
+
+    insert_chatgpt_turn(
+        &store,
+        "rowid-reuse-session",
+        "visible-after-reuse",
+        "generic backdated visible row after rowid reuse",
+        "2029-12-31T23:59:30Z",
+        None,
+    );
+    store
+        .insert_conclusion(&Conclusion {
+            id: "conclusion-after-reuse".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Conclusion: backdated conclusion after rowid reuse".into(),
+            source_id: None,
+            created_at: "2029-12-31T23:59:30Z".into(),
+            metadata: json!({}),
+        })
+        .expect("new conclusion");
+    store
+        .insert_checkpoint(&Checkpoint {
+            id: "checkpoint-after-reuse".into(),
+            session_id: Some("rowid-reuse-session".into()),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            summary: "generic backdated checkpoint after rowid reuse".into(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2029-12-31T23:59:30Z".into(),
+        })
+        .expect("new checkpoint");
+    let (new_source, _) = store
+        .upsert_source(
+            PROFILE,
+            "workspace",
+            "fixture",
+            Some("rowid-reuse-new-source"),
+            "rowid-reuse-new-hash",
+            &json!({}),
+        )
+        .expect("new memory source");
+    let new_record = insert_memory_record(
+        &store,
+        "Preference: backdated active record after rowid reuse",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_sources SET ingested_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2029-12-31T23:59:30Z", new_source.id],
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2029-12-31T23:59:30Z", new_record],
+            )?;
+            Ok(())
+        })
+        .expect("backdate new synthetic rows");
+
+    let reused_rowids = store
+        .transaction(|tx| {
+            Ok((
+                tx.query_row(
+                    "SELECT rowid FROM visible_turns WHERE id = 'visible-after-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM conclusions WHERE id = 'conclusion-after-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM checkpoints WHERE id = 'checkpoint-after-reuse'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM memory_sources WHERE id = ?1",
+                    rusqlite::params![new_source.id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                tx.query_row(
+                    "SELECT rowid FROM memory_records WHERE id = ?1",
+                    rusqlite::params![new_record],
+                    |row| row.get::<_, i64>(0),
+                )?,
+            ))
+        })
+        .expect("read reused rowids");
+    assert_eq!(
+        reused_rowids, original_rowids,
+        "fixture must reuse max rowids"
+    );
+
+    let next_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        "2030-01-01T00:00:01Z",
+        false,
+    )
+    .expect("open fixed band after deleted maximum rowids");
+    let next_run = run_scheduler_cursor(&store, &next_cursor, "2030-01-01T00:00:01Z");
+    let selected = evidence_ids(&next_run);
+    for id in [
+        "visible-after-reuse",
+        "conclusion-after-reuse",
+        "checkpoint-after-reuse",
+        new_source.id.as_str(),
+        new_record.as_str(),
+    ] {
+        assert!(
+            selected.contains(id),
+            "new rows whose physical rowids were reused must remain eligible after the frontier; missing={id}, selected={selected:?}"
+        );
+    }
+}
+
+#[test]
 fn scheduler_observes_exact_hash_consolidation_reactivation_after_rowid_frontier() {
     let store = Store::open(":memory:").expect("store");
     store

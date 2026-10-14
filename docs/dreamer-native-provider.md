@@ -68,11 +68,18 @@ evidence remains eligible. Other provider failures do not advance the successful
 scheduled watermark. A recovered deterministic fallback also records a later
 status-visible `ok_with_limits` receipt while retaining the provider budget
 rejection in audit history. Completed unbounded simulated-clock scans retain
-their rowid frontier even when the simulated clock does not advance. Each
-bounded band caps every source stream at its captured rowid frontier. The next
-band also checks rows inserted after that cap, including rows whose source
-timestamp was backdated below the prior band's end. The first bounded band
-after an unbounded scan uses the same post-frontier catch-up, so arrivals
+their rowid frontier even when the simulated clock does not advance. Scheduler
+frontiers use persisted logical rowids for visible turns, conclusions,
+checkpoints, imported sources, and memory records. Existing rows retain their
+SQLite rowid during migration, while later inserts receive a logical rowid
+above every saved cursor frontier; hard-deleting a physical maximum can no
+longer make a replacement insert invisible. Each bounded band caps every
+source stream at its captured logical rowid frontier. Memory record contents
+are materialized by the same filtered query that checks the frontier, so a
+later pooled read cannot substitute a post-frontier update into the evidence
+window. The next band also checks rows inserted after that cap, including rows
+whose source timestamp was backdated below the prior band's end. The first
+bounded band after an unbounded scan uses the same post-frontier catch-up, so arrivals
 between that snapshot and the next band are not lost below the timestamp
 watermark. Existing-row updates that affect scheduler-visible evidence and
 eligibility changes allocate a per-record mutation sequence in the same SQLite

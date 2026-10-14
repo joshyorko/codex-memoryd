@@ -49,7 +49,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 14;
+pub const STORAGE_SCHEMA_VERSION: i64 = 15;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -69,6 +69,8 @@ const MIGRATION_CONSOLIDATION_PROPOSALS: &str =
     include_str!("../migrations/0013_consolidation_proposals.sql");
 const MIGRATION_SCHEDULER_MUTATION_FRONTIER: &str =
     include_str!("../migrations/0014_scheduler_mutation_frontier.sql");
+const MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS: &str =
+    include_str!("../migrations/0015_scheduler_nonreusable_source_rowids.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -1661,6 +1663,14 @@ impl Store {
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
         conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
         conn.execute_batch(MIGRATION_SCHEDULER_MUTATION_FRONTIER)?;
+        conn.execute_batch(MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS)?;
+        let saved_scheduler_frontier = saved_scheduler_rowid_highwater(&conn)?;
+        conn.execute(
+            "UPDATE scheduler_source_rowid_counter
+             SET sequence = MAX(sequence, ?1)
+             WHERE singleton = 1",
+            params![saved_scheduler_frontier],
+        )?;
         ensure_column(
             &conn,
             "memory_records",
@@ -5046,6 +5056,57 @@ fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn saved_scheduler_rowid_highwater(conn: &rusqlite::Connection) -> Result<i64> {
+    fn visit(value: &Value, key: Option<&str>, highwater: &mut i64) {
+        match value {
+            Value::Number(number)
+                if matches!(
+                    key,
+                    Some(
+                        "rowid"
+                            | "visible_turns"
+                            | "conclusions"
+                            | "checkpoints"
+                            | "imported_memories"
+                            | "active_memory_records"
+                    )
+                ) =>
+            {
+                if let Some(value) = number.as_i64() {
+                    *highwater = (*highwater).max(value);
+                }
+            }
+            Value::Number(_) => {}
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, None, highwater);
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    visit(value, Some(key), highwater);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::String(_) => {}
+        }
+    }
+
+    let mut highwater = 0;
+    let mut statement =
+        conn.prepare("SELECT watermark_after FROM dream_runs WHERE watermark_after IS NOT NULL")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let watermark = row?;
+        let Some(json_start) = watermark.find('{') else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(&watermark[json_start..]) {
+            visit(&value, None, &mut highwater);
+        }
+    }
+    Ok(highwater)
+}
+
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
     ids::sha256_hex(
         format!(
@@ -5324,7 +5385,7 @@ fn ensure_column(
 // Row mappers and SQL helpers
 // ----------------------------------------------------------------------
 
-const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until, observed_at, invalidated_at, superseded_by, historical_reason, temporal_state, metadata";
+pub(crate) const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until, observed_at, invalidated_at, superseded_by, historical_reason, temporal_state, metadata";
 const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
 const SUBJECT_COLS_S: &str =
@@ -5586,7 +5647,7 @@ fn validate_relation(relation: &Relation) -> Result<()> {
     Ok(())
 }
 
-fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
+pub(crate) fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
     Ok(MemoryRecord {
         id: row.get(0)?,
         profile_id: row.get(1)?,
