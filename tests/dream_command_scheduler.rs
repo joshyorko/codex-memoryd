@@ -443,9 +443,15 @@ fn scheduled_command_excludes_archived_sources_from_preview() {
         })
         .unwrap();
 
-    service
+    let _second = service
         .scheduled_dream(Some("2040-01-01T00:00:00Z".into()))
         .unwrap();
+    // This invocation drains the first fixed-frontier band. The late row is
+    // eligible in the next band, which is opened by the following invocation.
+    let third = service
+        .scheduled_dream(Some("2050-01-01T00:00:00Z".into()))
+        .unwrap();
+    assert_eq!(third.status, "ok_with_limits");
     let body = std::fs::read_to_string(capture_path).unwrap();
     assert!(body.contains("Post-watermark source"), "body={body}");
     assert!(!body.contains("Pre-watermark source"), "body={body}");

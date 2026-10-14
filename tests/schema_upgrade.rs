@@ -225,6 +225,27 @@ fn upgrades_v1_database_and_backfills_columns() {
     // Records preserved.
     assert_eq!(store.count_records().unwrap(), 2, "v1 records preserved");
 
+    let mutation_state = store
+        .transaction(|tx| {
+            let record_sequence: i64 = tx.query_row(
+                "SELECT active_memory_mutation_sequence FROM memory_records WHERE id = 'mem_1'",
+                [],
+                |row| row.get(0),
+            )?;
+            let sequence: i64 = tx.query_row(
+                "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((record_sequence, sequence))
+        })
+        .expect("scheduler mutation frontier migration");
+    assert_eq!(
+        mutation_state,
+        (0, 0),
+        "legacy memory rows are baseline data"
+    );
+
     // The read path needs the back-filled columns (subject_id, episode_id,
     // trust_state, ...). If `ensure_*` did not run, this query errors.
     let rec = store

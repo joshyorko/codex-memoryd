@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -145,6 +146,32 @@ fn evidence_ids(run: &codex_memoryd::protocol::DreamResponse) -> BTreeSet<String
         .chain(run.evidence_window.active_memory_records.sources.iter())
         .map(|source| source.id.clone())
         .collect()
+}
+
+fn run_scheduler_cursor(
+    store: &Store,
+    cursor: &str,
+    now: &str,
+) -> codex_memoryd::protocol::DreamResponse {
+    codex_memoryd::dream::run(
+        store,
+        &codex_memoryd::dream::DreamParams {
+            profile: Profile::Personal,
+            workspace: "workspace",
+            repo_id: None,
+            mode: "preview",
+            now,
+            source_window_end: Some(now),
+            recency_cutoff: Some(cursor),
+            include_archived_sources: false,
+            max_records: 10,
+            max_candidates: Some(10),
+            patch_run_id: None,
+            deadline: None,
+        },
+    )
+    .expect("run scheduler cursor")
+    .0
 }
 
 fn insert_chatgpt_turn(
@@ -360,7 +387,7 @@ fn scheduler_cursor_keeps_lower_bound_across_all_streams_and_ties() {
     ] {
         assert!(
             !seen.contains(old_id),
-            "selected below-bound source {old_id}"
+            "selected below-bound source {old_id}; seen={seen:?}"
         );
     }
     for current_id in [
@@ -625,6 +652,68 @@ fn scheduler_cursor_picks_up_late_row_before_frontier_keyset_position() {
 }
 
 #[test]
+fn scheduler_bounded_band_catches_backdated_rows_after_its_rowid_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    service
+        .scheduled_dream(Some(BEFORE_FRONTIER.into()))
+        .expect("seed watermark");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    insert_chatgpt_turn(
+        &store,
+        "backdated-frontier-session",
+        "visible-position-before-backdate",
+        "generic evidence at the current bounded position",
+        "2029-12-31T23:59:00Z",
+        None,
+    );
+    insert_chatgpt_turn(
+        &store,
+        "backdated-tail-session",
+        "visible-tail-before-backdate",
+        "generic older evidence that drains the bounded band",
+        "2029-12-31T23:58:00Z",
+        None,
+    );
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("scan first bounded page");
+    assert!(evidence_ids(first.run.as_ref().expect("first run"))
+        .contains("visible-position-before-backdate"));
+
+    insert_chatgpt_turn(
+        &store,
+        "late-backdated-session",
+        "visible-backdated-after-frontier",
+        "generic late row with a backdated timestamp",
+        "2029-12-31T23:59:30Z",
+        None,
+    );
+
+    let drain = service
+        .scheduled_dream(Some("2030-01-01T00:00:01Z".into()))
+        .expect("drain original fixed band");
+    let drained = evidence_ids(drain.run.as_ref().expect("drain run"));
+    assert!(drained.contains("visible-tail-before-backdate"));
+    assert!(
+        !drained.contains("visible-backdated-after-frontier"),
+        "rows inserted after the fixed upper rowid frontier must stay out of the old band"
+    );
+
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:02Z".into()))
+        .expect("complete original bounded band");
+    let next_band = service
+        .scheduled_dream(Some("2030-01-01T00:00:03Z".into()))
+        .expect("scan post-frontier rows in the next band");
+    assert!(evidence_ids(next_band.run.as_ref().expect("next-band run"))
+        .contains("visible-backdated-after-frontier"));
+}
+
+#[test]
 fn scheduler_cursor_rewinds_persisted_id_only_cursor_before_rowid_paging() {
     let store = Store::open(":memory:").expect("store");
     let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
@@ -690,8 +779,12 @@ fn scheduler_cursor_rewinds_persisted_id_only_cursor_before_rowid_paging() {
     let resumed = service
         .scheduled_dream(Some("2030-01-01T00:00:03Z".into()))
         .expect("continue beyond the legacy ID keyset position");
-    assert!(evidence_ids(resumed.run.as_ref().expect("resumed run"))
-        .contains("visible-a-legacy-unvisited"));
+    assert!(
+        evidence_ids(resumed.run.as_ref().expect("resumed run"))
+            .contains("visible-a-legacy-unvisited"),
+        "resumed run={:?}",
+        resumed.run
+    );
 }
 
 #[test]
@@ -912,6 +1005,25 @@ fn scheduler_scan_emits_restored_and_promoted_memory_versions() {
             .0,
         vec![promoted_id.clone()]
     );
+    let mutation_sequences = store
+        .transaction(|tx| {
+            let restored_sequence: i64 = tx.query_row(
+                "SELECT active_memory_mutation_sequence FROM memory_records WHERE id = ?1",
+                rusqlite::params![restored_id],
+                |row| row.get(0),
+            )?;
+            let promoted_sequence: i64 = tx.query_row(
+                "SELECT active_memory_mutation_sequence FROM memory_records WHERE id = ?1",
+                rusqlite::params![promoted_id],
+                |row| row.get(0),
+            )?;
+            Ok((restored_sequence, promoted_sequence))
+        })
+        .expect("read active-memory mutation sequences");
+    assert!(
+        mutation_sequences.0 > 0 && mutation_sequences.1 > mutation_sequences.0,
+        "restore and promotion must receive increasing commit-ordered sequences: {mutation_sequences:?}"
+    );
 
     let first_changed_page = service
         .scheduled_dream(Some(RUN_NOW.into()))
@@ -953,6 +1065,262 @@ fn scheduler_scan_emits_restored_and_promoted_memory_versions() {
         .contains("Synthetic restored record reaches the scheduled provider."));
     assert!(changed_provider_input
         .contains("Synthetic promoted record reaches the scheduled provider."));
+}
+
+#[test]
+fn scheduler_scan_catches_a_restore_committed_after_its_snapshot() {
+    let temp = tempfile::tempdir().expect("temporary database directory");
+    let db_path = temp.path().join("scheduler-race.db");
+    let store = Store::open(&db_path).expect("store");
+    let writer_store = Store::open(&db_path).expect("independent writer pool");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    let archived_id = insert_memory_record(
+        &store,
+        "Synthetic record is restored after the scheduler snapshot.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .archive_records_with_metadata(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&archived_id),
+            "historical",
+            "synthetic race fixture",
+            Some("race-fixture-run"),
+        )
+        .expect("archive synthetic record");
+    let quarantined_id = insert_memory_record(
+        &store,
+        "Synthetic record is promoted after the scheduler snapshot.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .quarantine_records(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&quarantined_id),
+            "synthetic race fixture",
+        )
+        .expect("quarantine synthetic record");
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, "2000-01-01T00:00:00Z", true)
+            .expect("capture initial frontier");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, "2000-01-01T00:00:00Z");
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        "2000-01-01T00:00:00Z",
+        false,
+    )
+    .expect("complete initial scan")
+    .expect("completed cursor");
+
+    let (staged_tx, staged_rx) = mpsc::channel();
+    let (commit_tx, commit_rx) = mpsc::channel();
+    let writer_record_id = archived_id.clone();
+    let writer_quarantined_id = quarantined_id.clone();
+    let writer = thread::spawn(move || {
+        writer_store
+            .transaction(|tx| {
+                // This deliberately old timestamp models restore code that
+                // computes updated_at before waiting to commit its transaction.
+                tx.execute(
+                    "UPDATE active_memory_mutation_counter
+                     SET sequence = sequence + 1
+                     WHERE singleton = 1",
+                    [],
+                )?;
+                let mutation_sequence: i64 = tx.query_row(
+                    "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE memory_records
+                     SET archived = 0, updated_at = ?1,
+                         active_memory_mutation_sequence = ?2
+                     WHERE id = ?3",
+                    rusqlite::params!["1990-01-01T00:00:00Z", mutation_sequence, writer_record_id],
+                )?;
+                tx.execute(
+                    "UPDATE memory_records
+                     SET trust_state = 'trusted', updated_at = ?1,
+                         active_memory_mutation_sequence = ?2
+                     WHERE id = ?3",
+                    rusqlite::params![
+                        "1990-01-01T00:00:00Z",
+                        mutation_sequence,
+                        writer_quarantined_id
+                    ],
+                )?;
+                staged_tx.send(()).expect("signal staged restore");
+                commit_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("wait for scheduler snapshot");
+                Ok(())
+            })
+            .expect("commit staged restore");
+    });
+    staged_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("restore remains uncommitted");
+
+    let in_flight_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        RUN_NOW,
+        false,
+    )
+    .expect("capture frontier while restore is uncommitted");
+    let in_flight = run_scheduler_cursor(&store, &in_flight_cursor, RUN_NOW);
+    assert!(!evidence_ids(&in_flight).contains(&archived_id));
+    let completed_in_flight = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&in_flight_cursor),
+        &in_flight.evidence_window,
+        RUN_NOW,
+        false,
+    )
+    .expect("complete scan before restore commit")
+    .expect("completed in-flight cursor");
+
+    commit_tx.send(()).expect("allow restore commit");
+    writer.join().expect("restore writer thread");
+
+    let after_restore_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_in_flight),
+        "2030-01-01T00:00:01Z",
+        false,
+    )
+    .expect("capture next frontier after restore commit");
+    let after_restore = run_scheduler_cursor(&store, &after_restore_cursor, "2030-01-01T00:00:01Z");
+    assert_eq!(
+        evidence_ids(&after_restore),
+        BTreeSet::from([archived_id, quarantined_id]),
+        "restores and promotions committed after a read snapshot must be selected even when updated_at predates that snapshot"
+    );
+}
+
+#[test]
+fn scheduler_frontier_excludes_mutations_committed_after_capture_until_next_scan() {
+    let temp = tempfile::tempdir().expect("temporary database directory");
+    let db_path = temp.path().join("scheduler-frontier-race.db");
+    let store = Store::open(&db_path).expect("store");
+    let writer_store = Store::open(&db_path).expect("independent writer pool");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, "2000-01-01T00:00:00Z", true)
+            .expect("capture empty initial frontier");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, "2000-01-01T00:00:00Z");
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        "2000-01-01T00:00:00Z",
+        false,
+    )
+    .expect("complete initial scan")
+    .expect("completed cursor");
+
+    let archived_id = insert_memory_record(
+        &store,
+        "Synthetic archived row becomes active after frontier capture.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .archive_records_with_metadata(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&archived_id),
+            "historical",
+            "synthetic post-frontier fixture",
+            Some("post-frontier-fixture-run"),
+        )
+        .expect("archive synthetic record");
+    let quarantined_id = insert_memory_record(
+        &store,
+        "Synthetic quarantined row becomes active after frontier capture.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .quarantine_records(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&quarantined_id),
+            "synthetic post-frontier fixture",
+        )
+        .expect("quarantine synthetic record");
+
+    let in_flight_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        RUN_NOW,
+        false,
+    )
+    .expect("capture bounded frontier before eligibility changes");
+    let writer_archived_id = archived_id.clone();
+    let writer_quarantined_id = quarantined_id.clone();
+    writer_store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE active_memory_mutation_counter
+                 SET sequence = sequence + 1 WHERE singleton = 1",
+                [],
+            )?;
+            let sequence: i64 = tx.query_row(
+                "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET archived = 0, updated_at = ?1,
+                     active_memory_mutation_sequence = ?2 WHERE id = ?3",
+                rusqlite::params![RUN_NOW, sequence, writer_archived_id],
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET trust_state = 'trusted', updated_at = ?1,
+                     active_memory_mutation_sequence = ?2 WHERE id = ?3",
+                rusqlite::params![RUN_NOW, sequence, writer_quarantined_id],
+            )?;
+            Ok(())
+        })
+        .expect("commit post-frontier restore and promotion");
+
+    let current_scan = run_scheduler_cursor(&store, &in_flight_cursor, RUN_NOW);
+    assert!(
+        evidence_ids(&current_scan).is_empty(),
+        "a commit after the captured sequence frontier must not leak into the current band"
+    );
+    let completed_band = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&in_flight_cursor),
+        &current_scan.evidence_window,
+        RUN_NOW,
+        false,
+    )
+    .expect("complete bounded scan")
+    .expect("completed bounded cursor");
+    let next_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_band),
+        "2030-01-01T00:00:01Z",
+        false,
+    )
+    .expect("capture next mutation frontier");
+    let next_scan = run_scheduler_cursor(&store, &next_cursor, "2030-01-01T00:00:01Z");
+    assert_eq!(
+        evidence_ids(&next_scan),
+        BTreeSet::from([archived_id, quarantined_id]),
+        "the next scan must select both committed eligibility changes"
+    );
 }
 
 #[test]

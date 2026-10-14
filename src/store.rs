@@ -49,7 +49,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 13;
+pub const STORAGE_SCHEMA_VERSION: i64 = 14;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -67,6 +67,8 @@ const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.s
 const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
 const MIGRATION_CONSOLIDATION_PROPOSALS: &str =
     include_str!("../migrations/0013_consolidation_proposals.sql");
+const MIGRATION_SCHEDULER_MUTATION_FRONTIER: &str =
+    include_str!("../migrations/0014_scheduler_mutation_frontier.sql");
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -1638,6 +1640,17 @@ impl Store {
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
         conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
+        conn.execute_batch(MIGRATION_SCHEDULER_MUTATION_FRONTIER)?;
+        ensure_column(
+            &conn,
+            "memory_records",
+            "active_memory_mutation_sequence",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_active_mutation_sequence
+             ON memory_records(active_memory_mutation_sequence);",
+        )?;
         ensure_column(
             &conn,
             "consolidation_proposals",
@@ -3145,24 +3158,47 @@ impl Store {
         workspace_id: Option<&str>,
         ids_to_promote: &[String],
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let now = ids::now_rfc3339();
         let mut promoted = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        // Serialize mutations before reading state so this transaction cannot
+        // keep a stale WAL snapshot while waiting for the mutation counter.
+        tx.execute(
+            "UPDATE active_memory_mutation_counter
+             SET sequence = sequence
+             WHERE singleton = 1",
+            [],
+        )?;
+        let mut mutation_sequence = None;
+        let mut now = None;
         {
             let mut stmt = tx.prepare(
                 "UPDATE memory_records
                  SET trust_state = 'trusted', trust_score = 1.0,
-                     quarantine_reason = NULL, promoted_at = ?1, updated_at = ?1
-                 WHERE id = ?2 AND trust_state = 'quarantined'",
+                     quarantine_reason = NULL, promoted_at = ?1, updated_at = ?1,
+                     active_memory_mutation_sequence = ?2
+                 WHERE id = ?3 AND trust_state = 'quarantined'",
             )?;
             for id in ids_to_promote {
                 if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
                     not_found.push(id.clone());
                     continue;
                 }
-                if stmt.execute(params![now, id])? > 0 {
+                if mutation_sequence.is_none() {
+                    // The sequence is invisible to scheduler snapshots until
+                    // this transaction commits, so it orders the eligibility
+                    // change after snapshots that cannot yet observe it.
+                    let sequence = next_active_memory_mutation_sequence(&tx)?;
+                    mutation_sequence = Some(sequence);
+                    now = Some(ids::now_rfc3339());
+                }
+                let changed = stmt.execute(params![
+                    now.as_deref().expect("timestamp initialized with sequence"),
+                    mutation_sequence.expect("sequence initialized before update"),
+                    id
+                ])?;
+                if changed > 0 {
                     promoted.push(id.clone());
                 } else {
                     not_found.push(id.clone());
@@ -3276,16 +3312,27 @@ impl Store {
         patch_run_id: &str,
         reason: &str,
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let now = ids::now_rfc3339();
         let mut restored = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        // Serialize mutations before reading state so this transaction cannot
+        // keep a stale WAL snapshot while waiting for the mutation counter.
+        tx.execute(
+            "UPDATE active_memory_mutation_counter
+             SET sequence = sequence
+             WHERE singleton = 1",
+            [],
+        )?;
+        let mut mutation_sequence = None;
+        let mut now = None;
         {
             let mut select =
                 tx.prepare("SELECT metadata, archived FROM memory_records WHERE id = ?1")?;
             let mut update = tx.prepare(
-                "UPDATE memory_records SET archived = 0, updated_at = ?1, metadata = ?2 WHERE id = ?3 AND archived = 1",
+                "UPDATE memory_records SET archived = 0, updated_at = ?1, metadata = ?2,
+                    active_memory_mutation_sequence = ?3
+                 WHERE id = ?4 AND archived = 1",
             )?;
             for id in ids_to_restore {
                 if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
@@ -3312,13 +3359,24 @@ impl Store {
                     not_found.push(id.clone());
                     continue;
                 }
+                if mutation_sequence.is_none() {
+                    // Acquire the writer lock and allocate a commit-ordered
+                    // sequence before taking the mutation timestamp.
+                    let sequence = next_active_memory_mutation_sequence(&tx)?;
+                    mutation_sequence = Some(sequence);
+                    now = Some(ids::now_rfc3339());
+                }
+                let updated_at = now.as_deref().expect("timestamp initialized with sequence");
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("state".to_string(), Value::String("restored".to_string()));
                     obj.insert(
                         "policy_outcome".to_string(),
                         Value::String("restored".to_string()),
                     );
-                    obj.insert("restored_at".to_string(), Value::String(now.clone()));
+                    obj.insert(
+                        "restored_at".to_string(),
+                        Value::String(updated_at.to_string()),
+                    );
                     obj.insert(
                         "restored_by_patch_run_id".to_string(),
                         Value::String(patch_run_id.to_string()),
@@ -3328,7 +3386,13 @@ impl Store {
                         Value::String(reason.to_string()),
                     );
                 }
-                if update.execute(params![now, metadata.to_string(), id])? > 0 {
+                if update.execute(params![
+                    updated_at,
+                    metadata.to_string(),
+                    mutation_sequence.expect("sequence initialized before update"),
+                    id
+                ])? > 0
+                {
                     restored.push(id.clone());
                 }
             }
@@ -5154,6 +5218,20 @@ fn metadata_number(metadata: &Value, key: &str) -> Option<f64> {
 
 fn normalized_trust_value(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn next_active_memory_mutation_sequence(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
+    tx.execute(
+        "UPDATE active_memory_mutation_counter
+         SET sequence = sequence + 1
+         WHERE singleton = 1",
+        [],
+    )?;
+    Ok(tx.query_row(
+        "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn ensure_column(

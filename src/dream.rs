@@ -64,6 +64,8 @@ struct DreamRowidFrontier {
     checkpoints: i64,
     imported_memories: i64,
     active_memory_records: i64,
+    #[serde(default)]
+    active_memory_mutation_sequence: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -75,6 +77,8 @@ struct DreamSchedulerCursor {
     #[serde(default)]
     lower_rowid_strict: bool,
     #[serde(default)]
+    include_post_frontier_rowids: bool,
+    #[serde(default)]
     upper_bound: Option<String>,
     #[serde(default)]
     upper_unbounded: bool,
@@ -83,9 +87,9 @@ struct DreamSchedulerCursor {
     #[serde(default)]
     upper_rowids: Option<DreamRowidFrontier>,
     #[serde(default)]
-    active_memory_version_lower: Option<String>,
+    active_memory_mutation_lower: Option<i64>,
     #[serde(default)]
-    active_memory_version_upper: Option<String>,
+    active_memory_mutation_upper: Option<i64>,
     #[serde(default)]
     visible_turns: Option<DreamSourceCursor>,
     #[serde(default)]
@@ -384,13 +388,9 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         offset: 0,
     };
     let active_memory_mutation_scan = scheduler_cursor.as_ref().and_then(|cursor| {
-        if !cursor.lower_rowid_strict {
-            return None;
-        }
-        let lower = cursor.active_memory_version_lower.as_deref()?;
-        let upper = cursor.active_memory_version_upper.as_deref()?;
-        let upper_rowid = cursor.upper_rowids.as_ref()?.active_memory_records;
-        Some((lower, upper, upper_rowid))
+        let lower = cursor.active_memory_mutation_lower.unwrap_or(0);
+        let upper = cursor.active_memory_mutation_upper?;
+        Some(("active_memory_mutation_sequence", lower, upper))
     });
     let mut records = match scheduler_cursor.as_ref() {
         Some(cursor) => query_memory_records_with_frontier(
@@ -401,6 +401,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             source_window_start,
             cursor.lower_bound_exclusive,
             cursor.lower_rowid_strict,
+            cursor.include_post_frontier_rowids,
             cursor_end,
             cursor
                 .lower_rowids
@@ -449,6 +450,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
                 params.workspace,
                 params.repo_id,
                 None,
+                false,
                 false,
                 false,
                 cursor_end,
@@ -853,6 +855,7 @@ fn imported_chatgpt_candidate_records(
             source_window_start,
             cursor.lower_bound_exclusive,
             cursor.lower_rowid_strict,
+            cursor.include_post_frontier_rowids,
             source_window_end,
             cursor
                 .lower_rowids
@@ -1073,18 +1076,28 @@ pub fn scheduler_cursor_for_run(
                 .unwrap_or(now);
             cursor.upper_unbounded = false;
             cursor.upper_bound = Some(next_start.to_string());
-            begin_active_memory_version_scan(&mut cursor);
-            cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            let frontiers = scheduler_rowid_frontier(store)?;
+            begin_active_memory_mutation_scan(
+                &mut cursor,
+                frontiers.active_memory_mutation_sequence,
+            );
+            cursor.upper_rowids = Some(frontiers);
             return encode_scheduler_cursor(&cursor);
         }
-        if cursor.active_memory_version_upper.is_none() {
-            // Older persisted cursors have no mutation frontier. Establish a
-            // baseline when they are next resumed so later restores and
-            // promotions can be detected without replaying every old row.
-            if cursor.active_memory_version_lower.is_none() {
-                cursor.active_memory_version_lower = Some(ids::now_rfc3339());
-            }
-            cursor.active_memory_version_upper = Some(ids::now_rfc3339());
+        if cursor.active_memory_mutation_upper.is_none() {
+            // Rewind pre-sequence cursors to a single captured source snapshot.
+            // Their historical rows have sequence zero; changes committed
+            // after this baseline receive a greater sequence and stay eligible.
+            let frontiers = scheduler_rowid_frontier(store)?;
+            cursor.active_memory_mutation_lower = Some(
+                cursor
+                    .upper_rowids
+                    .as_ref()
+                    .map(|saved| saved.active_memory_mutation_sequence)
+                    .unwrap_or(0),
+            );
+            cursor.active_memory_mutation_upper = Some(frontiers.active_memory_mutation_sequence);
+            cursor.upper_rowids = Some(frontiers);
             return encode_scheduler_cursor(&cursor);
         }
         return Ok(previous.to_string());
@@ -1095,34 +1108,44 @@ pub fn scheduler_cursor_for_run(
         upper_unbounded,
         ..DreamSchedulerCursor::default()
     };
-    cursor.active_memory_version_upper = Some(ids::now_rfc3339());
-    cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+    let frontiers = scheduler_rowid_frontier(store)?;
+    let mutation_baseline = if previous.is_some() {
+        frontiers.active_memory_mutation_sequence
+    } else {
+        0
+    };
+    cursor.active_memory_mutation_lower = Some(mutation_baseline);
+    cursor.active_memory_mutation_upper = Some(frontiers.active_memory_mutation_sequence);
+    cursor.upper_rowids = Some(frontiers);
     encode_scheduler_cursor(&cursor)
 }
 
-fn begin_active_memory_version_scan(cursor: &mut DreamSchedulerCursor) {
-    if cursor.active_memory_version_lower.is_none() {
-        cursor.active_memory_version_lower = Some(ids::now_rfc3339());
+fn begin_active_memory_mutation_scan(cursor: &mut DreamSchedulerCursor, upper: i64) {
+    if cursor.active_memory_mutation_lower.is_none() {
+        cursor.active_memory_mutation_lower =
+            Some(cursor.active_memory_mutation_upper.unwrap_or(0));
     }
-    cursor.active_memory_version_upper = Some(ids::now_rfc3339());
+    cursor.active_memory_mutation_upper = Some(upper);
 }
 
-fn complete_active_memory_version_scan(cursor: &mut DreamSchedulerCursor) {
-    if let Some(upper) = cursor.active_memory_version_upper.take() {
-        cursor.active_memory_version_lower = Some(upper);
+fn complete_active_memory_mutation_scan(cursor: &mut DreamSchedulerCursor) {
+    if let Some(upper) = cursor.active_memory_mutation_upper.take() {
+        cursor.active_memory_mutation_lower = Some(upper);
     }
 }
 
-fn next_active_memory_version_scan(
+fn next_active_memory_mutation_scan(
     cursor: &mut DreamSchedulerCursor,
     previous: &DreamSchedulerCursor,
+    upper: i64,
 ) {
-    cursor.active_memory_version_lower = previous
-        .active_memory_version_upper
-        .clone()
-        .or_else(|| previous.active_memory_version_lower.clone())
-        .or_else(|| Some(ids::now_rfc3339()));
-    cursor.active_memory_version_upper = Some(ids::now_rfc3339());
+    cursor.active_memory_mutation_lower = Some(
+        previous
+            .active_memory_mutation_upper
+            .or(previous.active_memory_mutation_lower)
+            .unwrap_or(0),
+    );
+    cursor.active_memory_mutation_upper = Some(upper);
 }
 
 /// Return a bounded scheduler cursor for a window that did not cover the
@@ -1142,7 +1165,12 @@ pub fn scheduler_watermark_after(
         if cursor.upper_unbounded {
             if cursor.upper_rowids.is_none() || cursor.has_legacy_position() {
                 cursor.clear_source_positions();
-                cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                let frontiers = scheduler_rowid_frontier(store)?;
+                begin_active_memory_mutation_scan(
+                    &mut cursor,
+                    frontiers.active_memory_mutation_sequence,
+                );
+                cursor.upper_rowids = Some(frontiers);
                 if cursor.lower_bound.is_some() {
                     cursor.lower_bound_exclusive = false;
                     if !cursor.lower_rowid_strict {
@@ -1157,10 +1185,12 @@ pub fn scheduler_watermark_after(
         if cursor.upper_bound.is_none() {
             cursor.clear_source_positions();
             cursor.upper_bound = Some(window.end.clone());
-            cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
-            if cursor.active_memory_version_upper.is_none() {
-                begin_active_memory_version_scan(&mut cursor);
-            }
+            let frontiers = scheduler_rowid_frontier(store)?;
+            begin_active_memory_mutation_scan(
+                &mut cursor,
+                frontiers.active_memory_mutation_sequence,
+            );
+            cursor.upper_rowids = Some(frontiers);
             // The first bounded page used the ordinary ID ordering. Start the
             // persisted cursor at the beginning so the remaining pages use
             // the stable rowid ordering consistently.
@@ -1168,15 +1198,17 @@ pub fn scheduler_watermark_after(
         }
         if cursor.upper_rowids.is_none() || cursor.has_legacy_position() {
             cursor.clear_source_positions();
-            cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            let frontiers = scheduler_rowid_frontier(store)?;
+            begin_active_memory_mutation_scan(
+                &mut cursor,
+                frontiers.active_memory_mutation_sequence,
+            );
+            cursor.upper_rowids = Some(frontiers);
             if cursor.lower_bound.is_some() {
                 cursor.lower_bound_exclusive = false;
                 if !cursor.lower_rowid_strict {
                     cursor.lower_rowids = Some(DreamRowidFrontier::default());
                 }
-            }
-            if cursor.active_memory_version_upper.is_none() {
-                begin_active_memory_version_scan(&mut cursor);
             }
             return Ok(Some(encode_scheduler_cursor(&cursor)?));
         }
@@ -1188,7 +1220,12 @@ pub fn scheduler_watermark_after(
         if previous_cursor.upper_unbounded {
             if previous_cursor.upper_rowids.is_none() || previous_cursor.has_legacy_position() {
                 previous_cursor.clear_source_positions();
-                previous_cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                let frontiers = scheduler_rowid_frontier(store)?;
+                begin_active_memory_mutation_scan(
+                    &mut previous_cursor,
+                    frontiers.active_memory_mutation_sequence,
+                );
+                previous_cursor.upper_rowids = Some(frontiers);
                 if previous_cursor.lower_bound.is_some() {
                     previous_cursor.lower_bound_exclusive = false;
                     if !previous_cursor.lower_rowid_strict {
@@ -1205,14 +1242,20 @@ pub fn scheduler_watermark_after(
             previous_cursor.upper_unbounded = false;
             previous_cursor.upper_rowids = None;
             previous_cursor.clear_source_positions();
-            complete_active_memory_version_scan(&mut previous_cursor);
+            complete_active_memory_mutation_scan(&mut previous_cursor);
+            previous_cursor.include_post_frontier_rowids = false;
             return Ok(Some(encode_scheduler_cursor(&previous_cursor)?));
         }
         if previous_cursor.upper_bound.is_some()
             && (previous_cursor.upper_rowids.is_none() || previous_cursor.has_legacy_position())
         {
             previous_cursor.clear_source_positions();
-            previous_cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+            let frontiers = scheduler_rowid_frontier(store)?;
+            begin_active_memory_mutation_scan(
+                &mut previous_cursor,
+                frontiers.active_memory_mutation_sequence,
+            );
+            previous_cursor.upper_rowids = Some(frontiers);
             if previous_cursor.lower_bound.is_some() {
                 previous_cursor.lower_bound_exclusive = false;
                 if !previous_cursor.lower_rowid_strict {
@@ -1232,11 +1275,17 @@ pub fn scheduler_watermark_after(
                         lower_bound: Some(frontier),
                         lower_rowids: previous_cursor.upper_rowids.clone(),
                         lower_rowid_strict: true,
+                        include_post_frontier_rowids: true,
                         upper_bound: Some(now.to_string()),
                         ..DreamSchedulerCursor::default()
                     };
-                    next_active_memory_version_scan(&mut next, &previous_cursor);
-                    next.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                    let frontiers = scheduler_rowid_frontier(store)?;
+                    next_active_memory_mutation_scan(
+                        &mut next,
+                        &previous_cursor,
+                        frontiers.active_memory_mutation_sequence,
+                    );
+                    next.upper_rowids = Some(frontiers);
                     return Ok(Some(encode_scheduler_cursor(&next)?));
                 }
                 previous_cursor.lower_bound = Some(frontier);
@@ -1245,7 +1294,8 @@ pub fn scheduler_watermark_after(
                 previous_cursor.upper_bound = None;
                 previous_cursor.upper_unbounded = false;
                 previous_cursor.clear_source_positions();
-                complete_active_memory_version_scan(&mut previous_cursor);
+                complete_active_memory_mutation_scan(&mut previous_cursor);
+                previous_cursor.include_post_frontier_rowids = true;
                 return Ok(Some(encode_scheduler_cursor(&previous_cursor)?));
             }
         }
@@ -1260,11 +1310,17 @@ pub fn scheduler_watermark_after(
                     lower_bound_exclusive: false,
                     lower_rowids: previous_cursor.upper_rowids.clone(),
                     lower_rowid_strict: true,
+                    include_post_frontier_rowids: true,
                     upper_bound: Some(now.to_string()),
                     ..DreamSchedulerCursor::default()
                 };
-                next_active_memory_version_scan(&mut next, &previous_cursor);
-                next.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                let frontiers = scheduler_rowid_frontier(store)?;
+                next_active_memory_mutation_scan(
+                    &mut next,
+                    &previous_cursor,
+                    frontiers.active_memory_mutation_sequence,
+                );
+                next.upper_rowids = Some(frontiers);
                 return Ok(Some(encode_scheduler_cursor(&next)?));
             }
             previous_cursor.lower_bound = Some(frontier);
@@ -1274,7 +1330,8 @@ pub fn scheduler_watermark_after(
             previous_cursor.upper_bound = None;
             previous_cursor.upper_unbounded = false;
             previous_cursor.clear_source_positions();
-            complete_active_memory_version_scan(&mut previous_cursor);
+            complete_active_memory_mutation_scan(&mut previous_cursor);
+            previous_cursor.include_post_frontier_rowids = true;
             return Ok(Some(encode_scheduler_cursor(&previous_cursor)?));
         }
     }
@@ -1314,6 +1371,11 @@ fn scheduler_rowid_frontier(store: &Store) -> Result<DreamRowidFrontier> {
             )?,
             active_memory_records: tx.query_row(
                 "SELECT COALESCE(MAX(rowid), 0) FROM memory_records",
+                [],
+                |row| row.get(0),
+            )?,
+            active_memory_mutation_sequence: tx.query_row(
+                "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )?,
@@ -1513,11 +1575,12 @@ fn query_dream_rows<T, F>(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     lower_rowid: Option<i64>,
     end: Option<&str>,
     upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
-    mutation_scan: Option<(&str, &str, i64)>,
+    mutation_scan: Option<(&str, i64, i64)>,
     limit: usize,
     mapper: F,
 ) -> Result<Vec<T>>
@@ -1559,10 +1622,7 @@ where
     let mut end_args: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(end) = end {
         if let Some(upper_rowid) = upper_rowid {
-            end_filter = format!(
-                " AND ({timestamp_column} < ? OR ({timestamp_column} = ? AND {rowid_column} <= ?))"
-            );
-            end_args.push(Box::new(end.to_string()));
+            end_filter = format!(" AND {timestamp_column} <= ? AND {rowid_column} <= ?");
             end_args.push(Box::new(end.to_string()));
             end_args.push(Box::new(upper_rowid));
         } else {
@@ -1574,7 +1634,12 @@ where
         end_args.push(Box::new(upper_rowid));
     }
 
-    if let Some((version_lower, version_upper, version_upper_rowid)) = mutation_scan {
+    let post_frontier_rowids = if include_post_frontier_rowids {
+        lower_rowid.zip(upper_rowid)
+    } else {
+        None
+    };
+    if mutation_scan.is_some() || post_frontier_rowids.is_some() {
         sql.push_str(" AND ((");
         if start_filter.is_empty() {
             sql.push_str("1 = 1");
@@ -1582,14 +1647,27 @@ where
             sql.push_str(&start_filter);
         }
         sql.push_str(&end_filter);
-        sql.push_str(&format!(
-            ") OR ({timestamp_column} > ? AND {timestamp_column} <= ? AND {rowid_column} <= ?))"
-        ));
+        sql.push(')');
         args.extend(start_args);
         args.extend(end_args);
-        args.push(Box::new(version_lower.to_string()));
-        args.push(Box::new(version_upper.to_string()));
-        args.push(Box::new(version_upper_rowid));
+        if let Some((lower_rowid, upper_rowid)) = post_frontier_rowids {
+            sql.push_str(&format!(" OR ({rowid_column} > ? AND {rowid_column} <= ?"));
+            args.push(Box::new(lower_rowid));
+            args.push(Box::new(upper_rowid));
+            if let Some(end) = end {
+                sql.push_str(&format!(" AND {timestamp_column} <= ?"));
+                args.push(Box::new(end.to_string()));
+            }
+            sql.push(')');
+        }
+        if let Some((mutation_column, lower, upper)) = mutation_scan {
+            sql.push_str(&format!(
+                " OR ({mutation_column} > ? AND {mutation_column} <= ?)"
+            ));
+            args.push(Box::new(lower));
+            args.push(Box::new(upper));
+        }
+        sql.push(')');
     } else {
         if !start_filter.is_empty() {
             sql.push_str(" AND ");
@@ -1638,6 +1716,7 @@ fn query_visible_turns_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     end: Option<&str>,
     lower_rowid: Option<i64>,
     upper_rowid: Option<i64>,
@@ -1667,6 +1746,7 @@ fn query_visible_turns_with_frontier(
         start,
         start_exclusive,
         lower_rowid_strict,
+        include_post_frontier_rowids,
         lower_rowid,
         end,
         upper_rowid,
@@ -1694,6 +1774,7 @@ fn query_conclusions_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     end: Option<&str>,
     lower_rowid: Option<i64>,
     upper_rowid: Option<i64>,
@@ -1723,6 +1804,7 @@ fn query_conclusions_with_frontier(
         start,
         start_exclusive,
         lower_rowid_strict,
+        include_post_frontier_rowids,
         lower_rowid,
         end,
         upper_rowid,
@@ -1753,6 +1835,7 @@ fn query_checkpoints_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     end: Option<&str>,
     lower_rowid: Option<i64>,
     upper_rowid: Option<i64>,
@@ -1783,6 +1866,7 @@ fn query_checkpoints_with_frontier(
         start,
         start_exclusive,
         lower_rowid_strict,
+        include_post_frontier_rowids,
         lower_rowid,
         end,
         upper_rowid,
@@ -1818,6 +1902,7 @@ fn query_memory_sources_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     end: Option<&str>,
     lower_rowid: Option<i64>,
     upper_rowid: Option<i64>,
@@ -1843,6 +1928,7 @@ fn query_memory_sources_with_frontier(
         start,
         start_exclusive,
         lower_rowid_strict,
+        include_post_frontier_rowids,
         lower_rowid,
         end,
         upper_rowid,
@@ -1873,13 +1959,14 @@ fn query_memory_records_with_frontier(
     start: Option<&str>,
     start_exclusive: bool,
     lower_rowid_strict: bool,
+    include_post_frontier_rowids: bool,
     end: Option<&str>,
     lower_rowid: Option<i64>,
     upper_rowid: Option<i64>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
     include_archived: bool,
-    mutation_scan: Option<(&str, &str, i64)>,
+    mutation_scan: Option<(&str, i64, i64)>,
 ) -> Result<Vec<MemoryRecord>> {
     let mut sql = "SELECT id FROM memory_records
          WHERE profile_id = ? AND workspace_id = ?"
@@ -1891,6 +1978,13 @@ fn query_memory_records_with_frontier(
     if let Some(repo_id) = repo_id {
         sql.push_str(" AND repo_id = ?");
         args.push(Box::new(repo_id.to_string()));
+    }
+    if let Some((mutation_column, _, upper)) = mutation_scan {
+        // Query the active-memory state as it existed at the captured
+        // mutation frontier; a restore or promotion committed later must wait
+        // for the next scan even if its updated_at falls inside this band.
+        sql.push_str(&format!(" AND {mutation_column} <= ?"));
+        args.push(Box::new(upper));
     }
     if !include_archived {
         sql.push_str(" AND archived = 0");
@@ -1906,6 +2000,7 @@ fn query_memory_records_with_frontier(
         start,
         start_exclusive,
         lower_rowid_strict,
+        include_post_frontier_rowids,
         lower_rowid,
         end,
         upper_rowid,
@@ -1949,6 +2044,8 @@ fn build_evidence_window(
         scheduler_cursor.is_some_and(|cursor| cursor.lower_bound_exclusive);
     let cursor_lower_rowid_strict =
         scheduler_cursor.is_some_and(|cursor| cursor.lower_rowid_strict);
+    let cursor_post_frontier_rowids =
+        scheduler_cursor.is_some_and(|cursor| cursor.include_post_frontier_rowids);
     let visible_turns = if remaining == 0 {
         Vec::new()
     } else if let Some(cursor) = scheduler_cursor {
@@ -1960,6 +2057,7 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_lower_rowid_strict,
+            cursor_post_frontier_rowids,
             cursor_end,
             cursor
                 .lower_rowids
@@ -1997,6 +2095,7 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_lower_rowid_strict,
+            cursor_post_frontier_rowids,
             cursor_end,
             cursor
                 .lower_rowids
@@ -2034,6 +2133,7 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_lower_rowid_strict,
+            cursor_post_frontier_rowids,
             cursor_end,
             cursor
                 .lower_rowids
@@ -2070,6 +2170,7 @@ fn build_evidence_window(
             start,
             cursor_start_exclusive,
             cursor_lower_rowid_strict,
+            cursor_post_frontier_rowids,
             cursor_end,
             cursor
                 .lower_rowids
