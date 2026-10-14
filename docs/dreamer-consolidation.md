@@ -49,7 +49,10 @@ rejects the transaction as stale.
 
 A scheduled run that fills its bounded input window persists a per-stream
 continuation cursor, including timestamp ties, rather than skipping to the run's
-end. Later ticks consume the remaining pages before advancing the time watermark.
+end. Every source stream uses that cursor's fixed upper frontier. Later ticks
+consume the remaining pages before advancing the time watermark; a new time band
+starts strictly after the prior frontier so boundary evidence is not selected
+twice.
 Runtime or candidate limits retain the previous cursor. A scheduled command's
 watermark does not authorize replay of archived or withdrawn evidence.
 

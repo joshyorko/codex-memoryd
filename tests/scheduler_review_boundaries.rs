@@ -353,6 +353,110 @@ fn scheduler_cursor_keeps_new_evidence_eligible_while_draining() {
 }
 
 #[test]
+fn scheduler_cursor_applies_fixed_frontier_to_checkpoint_queries() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    service
+        .scheduled_dream(Some(BEFORE_FRONTIER.into()))
+        .expect("seed watermark");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    insert_chatgpt_turn(
+        &store,
+        "checkpoint-frontier-session",
+        "visible-before-frontier",
+        "generic evidence before the checkpoint frontier",
+        "2026-09-10T00:00:00Z",
+        None,
+    );
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("first bounded page");
+    assert!(
+        first.limits_hit.contains(&"max_input_records".to_string()),
+        "first page should retain a bounded cursor"
+    );
+    assert!(
+        evidence_ids(first.run.as_ref().expect("first run")).contains("visible-before-frontier")
+    );
+
+    store
+        .insert_checkpoint(&Checkpoint {
+            id: "checkpoint-arrived-after-frontier".into(),
+            session_id: None,
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            summary: "Synthetic checkpoint beyond the saved scan frontier".into(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: "2030-01-01T00:00:01Z".into(),
+        })
+        .expect("late checkpoint");
+
+    let drain = service
+        .scheduled_dream(Some("2030-01-01T00:00:02Z".into()))
+        .expect("drain the original bounded window");
+    let drain_evidence = drain.run.as_ref().map(evidence_ids).unwrap_or_default();
+    assert!(
+        !drain_evidence.contains("checkpoint-arrived-after-frontier"),
+        "a checkpoint after the saved upper frontier must not enter the old scan"
+    );
+
+    let next_band = service
+        .scheduled_dream(Some("2030-01-01T00:00:03Z".into()))
+        .expect("scan the later bounded interval");
+    let next_evidence = evidence_ids(next_band.run.as_ref().expect("next band run"));
+    assert!(next_evidence.contains("checkpoint-arrived-after-frontier"));
+}
+
+#[test]
+fn scheduler_cursor_does_not_reselect_the_inclusive_frontier_boundary() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    service
+        .scheduled_dream(Some(BEFORE_FRONTIER.into()))
+        .expect("seed watermark");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    insert_chatgpt_turn(
+        &store,
+        "boundary-session",
+        "visible-at-original-frontier",
+        "generic evidence exactly at the original upper frontier",
+        RUN_NOW,
+        None,
+    );
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("scan inclusive upper frontier");
+    assert!(evidence_ids(first.run.as_ref().expect("first run"))
+        .contains("visible-at-original-frontier"));
+
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:01Z".into()))
+        .expect("finish the original band");
+    let next_band = service
+        .scheduled_dream(Some("2030-01-01T00:00:02Z".into()))
+        .expect("scan the next band");
+    let next_evidence = next_band.run.as_ref().map(evidence_ids).unwrap_or_default();
+    assert!(
+        !next_evidence.contains("visible-at-original-frontier"),
+        "the inclusive end of the prior band must be exclusive at the next band's start"
+    );
+}
+
+#[test]
 fn synthetic_repository_evidence_resolves_trusted_session_boundary() {
     let store = Store::open(":memory:").expect("store");
     let service = Service::new(store.clone(), scheduler_config("workspace", 10, true));

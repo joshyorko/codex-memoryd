@@ -37,8 +37,8 @@ def adopted_children(main_pid):
             continue
         try:
             status = (process / "status").read_text()
-        except (FileNotFoundError, ProcessLookupError):
-            # The process exited while procfs was being enumerated.
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            # The process exited or its status record is unreadable.
             continue
         parent_pid = next(
             (

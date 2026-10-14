@@ -73,7 +73,9 @@ store is writable SQLite at the current schema, the exact configured
 profile/workspace pair exists, exposure/auth fields are loopback-only, and
 the sole degradation reason matches a persisted failed preview Dreamer receipt.
 Native readiness checks the configured host database path; managed containers
-check `/data/memory.db`, the path passed to the daemon inside the container.
+check both the host directory mounted at `/data` and the exact configured
+`/data/<filename>` path passed to the daemon inside the container. Reusing a
+container with a stale database filename is refused before it is started.
 `/v1/status` reports `features.configured_scope` using an exact workspace query,
 rather than combining global profile and workspace lists. A healthy empty store
 can start before its first workspace is created.

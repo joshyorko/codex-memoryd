@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-with-child-reaper.py"
 SPEC = importlib.util.spec_from_file_location("memoryd_child_reaper", LAUNCHER)
@@ -47,6 +48,34 @@ class ChildReaperTests(unittest.TestCase):
             CHILD_REAPER._CHILDREN_PATH_USABLE = previous
             process.terminate()
             process.wait(timeout=5)
+
+    def test_proc_status_fallback_skips_unreadable_status_entries(self):
+        previous = CHILD_REAPER._CHILDREN_PATH_USABLE
+        CHILD_REAPER._CHILDREN_PATH_USABLE = False
+        denied_status = Path("/proc/41001/status")
+        child_status = Path("/proc/41002/status")
+        original_iterdir = Path.iterdir
+        original_read_text = Path.read_text
+
+        def fake_iterdir(path):
+            if path == Path("/proc"):
+                return iter((Path("/proc/41001"), Path("/proc/41002")))
+            return original_iterdir(path)
+
+        def fake_read_text(path, *args, **kwargs):
+            if path == denied_status:
+                raise PermissionError("synthetic restricted procfs entry")
+            if path == child_status:
+                return f"Name:\towned-child\nPPid:\t{os.getpid()}\n"
+            return original_read_text(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(Path, "iterdir", fake_iterdir), mock.patch.object(
+                Path, "read_text", fake_read_text
+            ):
+                self.assertEqual(CHILD_REAPER.adopted_children(-1), [41002])
+        finally:
+            CHILD_REAPER._CHILDREN_PATH_USABLE = previous
 
     def test_success_preserves_output_and_exit(self):
         with tempfile.TemporaryDirectory() as name:

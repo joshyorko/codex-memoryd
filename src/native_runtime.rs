@@ -344,6 +344,17 @@ pub fn init(opts: &RuntimeOptions, mode: InitMode) -> Result<RuntimeInitReport> 
         ensure_dir(&dir, &mut created, &mut reused)?;
     }
 
+    // Persist one stable database identity so a later `up` from another
+    // working directory cannot silently select a different relative path.
+    fs::create_dir_all(
+        opts.db
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(Error::from)?;
+    opts.db = resolve_database_path(&opts.db)?;
+
     let config_path = opts.home.join("config.toml");
     write_or_update(
         &config_path,
@@ -563,12 +574,14 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String> {
 
 fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     require_safe_bind(opts)?;
+    let mut opts = opts.clone();
     fs::create_dir_all(opts.log_file.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(Error::from)?;
     fs::create_dir_all(opts.db.parent().unwrap_or_else(|| Path::new("."))).map_err(Error::from)?;
+    opts.db = resolve_database_path(&opts.db)?;
 
     if running_pid(&opts.pid_file).is_none() {
-        ensure_bind_available(opts)?;
+        ensure_bind_available(&opts)?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -594,8 +607,8 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         fs::write(&opts.pid_file, child.id().to_string()).map_err(Error::from)?;
     }
 
-    wait_for_ready(opts, &opts.db.to_string_lossy())?;
-    Ok(status(opts))
+    wait_for_ready(&opts, &opts.db.to_string_lossy())?;
+    Ok(status(&opts))
 }
 
 fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -613,7 +626,12 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     let (database_parent, container_db_path) = container_database_mount(opts)?;
 
     if container_exists(&runtime, &opts.container_name)? {
-        ensure_container_database_mount(&runtime, &opts.container_name, &database_parent)?;
+        ensure_container_database_mount(
+            &runtime,
+            &opts.container_name,
+            &database_parent,
+            &container_db_path,
+        )?;
         if !container_running(&runtime, &opts.container_name)? {
             ensure_bind_available(opts)?;
         }
@@ -819,6 +837,7 @@ fn ensure_container_database_mount(
     runtime: &str,
     name: &str,
     expected_parent: &Path,
+    expected_database_path: &str,
 ) -> Result<()> {
     let template = r#"{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}"#;
     let output = Command::new(runtime)
@@ -850,7 +869,76 @@ fn ensure_container_database_mount(
             expected_parent.display()
         )));
     }
+
+    let template = r#"{{range .Config.Env}}{{println .}}{{end}}"#;
+    let output = Command::new(runtime)
+        .args(["container", "inspect", "--format", template, name])
+        .output()
+        .map_err(Error::from)?;
+    if !output.status.success() {
+        return Err(Error::storage(format!(
+            "could not verify CODEX_MEMORYD_DB for managed container {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let inspected_environment = String::from_utf8_lossy(&output.stdout);
+    let configured_databases = inspected_environment
+        .lines()
+        .filter_map(|line| line.strip_prefix("CODEX_MEMORYD_DB="))
+        .collect::<Vec<_>>();
+    if configured_databases.as_slice() != [expected_database_path] {
+        let actual = match configured_databases.as_slice() {
+            [] => "missing".to_string(),
+            [only] => (*only).to_string(),
+            _ => "multiple values".to_string(),
+        };
+        return Err(Error::storage(format!(
+            "managed container {name} has CODEX_MEMORYD_DB={actual}, but the configured database requires {expected_database_path}; refusing to start it because it would use the wrong database"
+        )));
+    }
     Ok(())
+}
+
+fn resolve_database_path(database: &Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(Error::from)?;
+    resolve_database_path_from(database, &cwd)
+}
+
+fn resolve_database_path_from(database: &Path, cwd: &Path) -> Result<PathBuf> {
+    if database == Path::new(":memory:") {
+        return Ok(database.to_path_buf());
+    }
+    let database = if database.is_absolute() {
+        database.to_path_buf()
+    } else {
+        cwd.join(database)
+    };
+    let filename = database.file_name().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "native database path has no filename: {}",
+            database.display()
+        ))
+    })?;
+    let parent = database
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "native database parent cannot be resolved safely: {} ({err})",
+            parent.display()
+        ))
+    })?;
+    match fs::canonicalize(&database) {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(canonical_parent.join(filename))
+        }
+        Err(err) => Err(Error::invalid_request(format!(
+            "native database path is not usable: {} ({err})",
+            database.display()
+        ))),
+    }
 }
 
 fn down_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -1482,9 +1570,11 @@ fn parse_loopback_url(url: &str) -> Result<ParsedUrl> {
 
 #[cfg(test)]
 mod managed_readiness_tests {
-    use super::managed_status_ready;
+    use super::{managed_status_ready, resolve_database_path_from};
     use crate::store::STORAGE_SCHEMA_VERSION;
     use serde_json::json;
+    use std::fs;
+    use std::path::Path;
 
     fn local_status() -> serde_json::Value {
         json!({"data": {
@@ -1687,6 +1777,37 @@ mod managed_readiness_tests {
         assert!(!ready(&local_status(), "other-profile", "synthetic-scope"));
         assert!(!ready(&local_status(), "personal", "other-workspace"));
     }
+
+    #[test]
+    fn relative_database_identity_is_bound_to_the_starting_working_directory() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        fs::create_dir_all(first_cwd.join("data")).expect("first database directory");
+        fs::create_dir_all(second_cwd.join("data")).expect("second database directory");
+
+        let configured = Path::new("data/memory.db");
+        let first_path = resolve_database_path_from(configured, &first_cwd)
+            .expect("resolve first database identity");
+        let second_path = resolve_database_path_from(configured, &second_cwd)
+            .expect("resolve second database identity");
+        assert_ne!(first_path, second_path);
+
+        let mut status = local_status();
+        status["data"]["storage"]["path"] = json!(first_path.display().to_string());
+        assert!(managed_status_ready(
+            &status,
+            "personal",
+            "synthetic-scope",
+            &first_path.display().to_string()
+        ));
+        assert!(!managed_status_ready(
+            &status,
+            "personal",
+            "synthetic-scope",
+            &second_path.display().to_string()
+        ));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1765,18 +1886,24 @@ mod container_readiness_regressions {
         invocation_log: &std::path::Path,
         state_file: &std::path::Path,
         mounted_data_source: &std::path::Path,
+        container_database_path: &str,
+        existing_database_path: Option<&str>,
         initial_existing_container: bool,
     ) {
         let mount_source_file = path.with_extension("mount-source");
+        let database_env_file = path.with_extension("database-env");
         fs::write(
             path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}';\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ -f '{}' ]; then if [ \"$3\" = \"--format\" ]; then case \"$4\" in *State.Running*) printf true ;; *Mounts*) cat '{}' ;; esac; fi; exit 0; fi; exit 1; fi\nif [ \"$1\" = \"run\" ]; then printf '%s' '{}' > '{}'; touch '{}'; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}';\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ -f '{}' ]; then if [ \"$3\" = \"--format\" ]; then case \"$4\" in *State.Running*) printf true ;; *Mounts*) cat '{}' ;; *Config.Env*) cat '{}' ;; esac; fi; exit 0; fi; exit 1; fi\nif [ \"$1\" = \"run\" ]; then printf '%s' '{}' > '{}'; printf 'CODEX_MEMORYD_DB=%s\\n' '{}' > '{}'; touch '{}'; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
                 invocation_log.display(),
                 state_file.display(),
                 mount_source_file.display(),
+                database_env_file.display(),
                 mounted_data_source.display(),
                 mount_source_file.display(),
+                container_database_path,
+                database_env_file.display(),
                 state_file.display()
             ),
         )
@@ -1785,6 +1912,14 @@ mod container_readiness_regressions {
             fs::write(
                 &mount_source_file,
                 mounted_data_source.as_os_str().to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            fs::write(
+                &database_env_file,
+                format!(
+                    "CODEX_MEMORYD_DB={}\n",
+                    existing_database_path.unwrap_or(container_database_path)
+                ),
             )
             .unwrap();
             fs::write(state_file, "existing").unwrap();
@@ -1798,6 +1933,7 @@ mod container_readiness_regressions {
         status_path: &str,
         db_relative_path: &str,
         existing_mount_relative_path: Option<&str>,
+        existing_database_path: Option<&str>,
     ) -> (
         crate::error::Result<super::RuntimeStatusReport>,
         String,
@@ -1809,6 +1945,8 @@ mod container_readiness_regressions {
         let state_file = temp.path().join("container-created");
         let db = temp.path().join(db_relative_path);
         let database_parent = db.parent().unwrap().to_string_lossy().into_owned();
+        let container_database_path =
+            format!("/data/{}", db.file_name().unwrap().to_string_lossy());
         let mounted_source = existing_mount_relative_path
             .map(|path| temp.path().join(path))
             .unwrap_or_else(|| PathBuf::from(&database_parent));
@@ -1820,6 +1958,8 @@ mod container_readiness_regressions {
             &invocation_log,
             &state_file,
             &mounted_source,
+            &container_database_path,
+            existing_database_path,
             existing_mount_relative_path.is_some(),
         );
         let (url, stop, server) = status_server(container_status(status_path));
@@ -1858,7 +1998,7 @@ mod container_readiness_regressions {
     #[test]
     fn up_accepts_healthy_container_status_at_container_database_path() {
         let (result, invocations, database_parent) =
-            run_managed_container_up("/data/memory.db", "runtime-home/memory.db", None);
+            run_managed_container_up("/data/memory.db", "runtime-home/memory.db", None, None);
         assert!(
             result.is_ok(),
             "managed container startup failed: {result:?}"
@@ -1871,7 +2011,7 @@ mod container_readiness_regressions {
     #[test]
     fn up_rejects_container_status_for_wrong_database_path() {
         let (result, _, _) =
-            run_managed_container_up("/data/wrong.db", "runtime-home/memory.db", None);
+            run_managed_container_up("/data/wrong.db", "runtime-home/memory.db", None, None);
         let error = result.expect_err("wrong managed-container storage path must fail readiness");
         assert!(error
             .message
@@ -1880,8 +2020,12 @@ mod container_readiness_regressions {
 
     #[test]
     fn up_mounts_and_verifies_the_configured_custom_database() {
-        let (result, invocations, database_parent) =
-            run_managed_container_up("/data/custom.sqlite", "custom-store/custom.sqlite", None);
+        let (result, invocations, database_parent) = run_managed_container_up(
+            "/data/custom.sqlite",
+            "custom-store/custom.sqlite",
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "managed container startup failed for configured database: {result:?}"
@@ -1892,8 +2036,12 @@ mod container_readiness_regressions {
 
     #[test]
     fn up_rejects_an_existing_container_with_a_stale_database_mount() {
-        let (result, invocations, database_parent) =
-            run_managed_container_up("/data/memory.db", "new-store/memory.db", Some("old-store"));
+        let (result, invocations, database_parent) = run_managed_container_up(
+            "/data/memory.db",
+            "new-store/memory.db",
+            Some("old-store"),
+            None,
+        );
         let error = result.expect_err("old container must not start with a different DB mount");
         assert!(error.message.contains("mounted from"), "{error:?}");
         assert!(error.message.contains(&database_parent), "{error:?}");
@@ -1907,6 +2055,7 @@ mod container_readiness_regressions {
             "/data/memory.db",
             "runtime-home/memory.db",
             Some("runtime-home"),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -1914,6 +2063,22 @@ mod container_readiness_regressions {
         );
         assert!(invocations.contains("container inspect --format"));
         assert!(invocations.contains("start synthetic-memoryd"));
+        assert!(!invocations.contains("run -d"));
+    }
+
+    #[test]
+    fn up_rejects_an_existing_container_with_a_stale_database_filename() {
+        let (result, invocations, _) = run_managed_container_up(
+            "/data/old.db",
+            "runtime-home/new.db",
+            Some("runtime-home"),
+            Some("/data/old.db"),
+        );
+        let error = result.expect_err("existing container must not start with a stale DB filename");
+        assert!(error.message.contains("CODEX_MEMORYD_DB"), "{error:?}");
+        assert!(error.message.contains("/data/new.db"), "{error:?}");
+        assert!(error.message.contains("/data/old.db"), "{error:?}");
+        assert!(!invocations.contains("start synthetic-memoryd"));
         assert!(!invocations.contains("run -d"));
     }
 }

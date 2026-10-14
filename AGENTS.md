@@ -67,6 +67,11 @@ Use the launcher only for isolated synthetic checks. When the command exits or
 is interrupted, it terminates and reaps the command's remaining descendants;
 do not wrap a real operator service or `--include-dogfood` with it.
 
+On restricted procfs mounts, the launcher falls back to scanning
+`/proc/<pid>/status` for direct children. Process records that disappear or
+cannot be read due to permissions are skipped; the focused test
+`test_proc_status_fallback_skips_unreadable_status_entries` covers that case.
+
 A non-reaping PID 1 can leave an exited daemon as a zombie. Linux `kill(pid, 0)`
 still reports that PID as present, so `src/native_runtime.rs::process_alive`
 cannot establish clean shutdown in that environment. Inspect `/proc/<pid>/status`

@@ -60,6 +60,8 @@ struct DreamSchedulerCursor {
     #[serde(default)]
     lower_bound: Option<String>,
     #[serde(default)]
+    lower_bound_exclusive: bool,
+    #[serde(default)]
     upper_bound: Option<String>,
     #[serde(default)]
     visible_turns: Option<DreamSourceCursor>,
@@ -337,6 +339,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             params.workspace,
             params.repo_id,
             source_window_start,
+            cursor.lower_bound_exclusive,
             Some(source_window_end),
             cursor.active_memory_records.as_ref(),
             params.max_records,
@@ -714,6 +717,7 @@ fn imported_chatgpt_candidate_records(
             params.workspace,
             params.repo_id,
             source_window_start,
+            cursor.lower_bound_exclusive,
             Some(source_window_end),
             cursor.visible_turns.as_ref(),
             params.max_records,
@@ -912,6 +916,7 @@ pub fn scheduler_watermark_after(
                 if now_is_after_frontier {
                     let next = DreamSchedulerCursor {
                         lower_bound: Some(frontier),
+                        lower_bound_exclusive: true,
                         upper_bound: Some(now.to_string()),
                         ..DreamSchedulerCursor::default()
                     };
@@ -995,6 +1000,7 @@ fn query_dream_rows<T, F>(
     timestamp_column: &str,
     id_column: &str,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1007,7 +1013,8 @@ where
         return Ok(Vec::new());
     }
     if let Some(start) = start {
-        sql.push_str(&format!(" AND {timestamp_column} >= ?"));
+        let operator = if start_exclusive { ">" } else { ">=" };
+        sql.push_str(&format!(" AND {timestamp_column} {operator} ?"));
         args.push(Box::new(start.to_string()));
     }
     if let Some(position) = position {
@@ -1041,6 +1048,7 @@ fn query_visible_turns_with_frontier(
     workspace_id: &str,
     repo_id: Option<&str>,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1065,6 +1073,7 @@ fn query_visible_turns_with_frontier(
         "t.created_at",
         "t.id",
         start,
+        start_exclusive,
         end,
         position,
         limit,
@@ -1087,6 +1096,7 @@ fn query_conclusions_with_frontier(
     workspace_id: &str,
     repo_id: Option<&str>,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1111,6 +1121,7 @@ fn query_conclusions_with_frontier(
         "created_at",
         "id",
         start,
+        start_exclusive,
         end,
         position,
         limit,
@@ -1136,6 +1147,7 @@ fn query_checkpoints_with_frontier(
     workspace_id: &str,
     repo_id: Option<&str>,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1161,6 +1173,7 @@ fn query_checkpoints_with_frontier(
         "created_at",
         "id",
         start,
+        start_exclusive,
         end,
         position,
         limit,
@@ -1191,6 +1204,7 @@ fn query_memory_sources_with_frontier(
     profile_id: &str,
     workspace_id: &str,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1211,6 +1225,7 @@ fn query_memory_sources_with_frontier(
         "ingested_at",
         "id",
         start,
+        start_exclusive,
         end,
         position,
         limit,
@@ -1236,6 +1251,7 @@ fn query_memory_records_with_frontier(
     workspace_id: &str,
     repo_id: Option<&str>,
     start: Option<&str>,
+    start_exclusive: bool,
     end: Option<&str>,
     position: Option<&DreamSourceCursor>,
     limit: usize,
@@ -1263,6 +1279,7 @@ fn query_memory_records_with_frontier(
         "updated_at",
         "id",
         start,
+        start_exclusive,
         end,
         position,
         limit,
@@ -1297,6 +1314,8 @@ fn build_evidence_window(
     let cursor_end = scheduler_cursor
         .map(|_| Some(end))
         .unwrap_or(params.source_window_end);
+    let cursor_start_exclusive =
+        scheduler_cursor.is_some_and(|cursor| cursor.lower_bound_exclusive);
     let visible_turns = if remaining == 0 {
         Vec::new()
     } else if let Some(cursor) = scheduler_cursor {
@@ -1306,6 +1325,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
+            cursor_start_exclusive,
             cursor_end,
             cursor.visible_turns.as_ref(),
             remaining,
@@ -1333,6 +1353,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
+            cursor_start_exclusive,
             cursor_end,
             cursor.conclusions.as_ref(),
             remaining,
@@ -1345,7 +1366,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            params.source_window_end,
+            cursor_end,
             remaining,
         )?;
         remaining = remaining.saturating_sub(records.len());
@@ -1360,7 +1381,8 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            params.source_window_end,
+            cursor_start_exclusive,
+            cursor_end,
             cursor.checkpoints.as_ref(),
             remaining,
         )?;
@@ -1386,6 +1408,7 @@ fn build_evidence_window(
             params.profile.as_str(),
             params.workspace,
             start,
+            cursor_start_exclusive,
             cursor_end,
             cursor.imported_memories.as_ref(),
             remaining,
