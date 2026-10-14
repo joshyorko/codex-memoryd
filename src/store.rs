@@ -4269,7 +4269,7 @@ impl Store {
                 "SELECT run_id, status, completed_at, watermark_after, error
                  FROM dream_runs
                  WHERE kind = 'scheduled'
-                 ORDER BY started_at DESC, run_id DESC
+                 ORDER BY started_at DESC, rowid DESC
                  LIMIT 1",
                 [],
                 |row| {
@@ -4318,7 +4318,7 @@ impl Store {
                  WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id = ?3
-                 ORDER BY completed_at DESC, run_id DESC
+                 ORDER BY completed_at DESC, rowid DESC
                  LIMIT 1",
                 params![profile_id, workspace_id, repo_id],
                 |row| row.get(0),
@@ -4331,7 +4331,7 @@ impl Store {
                  WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id IS NULL
-                 ORDER BY completed_at DESC, run_id DESC
+                 ORDER BY completed_at DESC, rowid DESC
                  LIMIT 1",
                 params![profile_id, workspace_id],
                 |row| row.get(0),

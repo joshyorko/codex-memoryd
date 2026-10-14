@@ -68,9 +68,12 @@ evidence remains eligible. Other provider failures do not advance the successful
 scheduled watermark. A recovered deterministic fallback also records a later
 status-visible `ok_with_limits` receipt while retaining the provider budget
 rejection in audit history. Completed unbounded simulated-clock scans retain
-their rowid frontier, so a later clock does not redispatch prior evidence and
-new rows remain eligible when they meet the timestamp watermark, even when
-they predate future-dated rows from the earlier scan. Process-group
+their rowid frontier even when the simulated clock does not advance. The
+scheduler also pins the active-memory `updated_at` version frontier across
+bounded pages, so restore and promotion operations on an existing row remain
+eligible after the insertion frontier advances. Previously selected active
+records may provide comparison context, but only a record selected in the
+current evidence window can emit stale or supersession candidates. Process-group
 children are terminated; orphan reaping remains the operating system's job.
 
 Managed readiness accepts `local_only`, or `degraded` only when the reported

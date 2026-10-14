@@ -1,4 +1,8 @@
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use codex_memoryd::config::Config;
 use codex_memoryd::domain::{
@@ -28,6 +32,106 @@ fn scheduler_config(workspace: &str, max_batch_size: usize, automatic_apply: boo
     config.dream_scheduler.max_batch_size = max_batch_size;
     config.dream_scheduler.max_candidates = 10;
     config
+}
+
+fn insert_memory_record(store: &Store, content: &str, metadata: serde_json::Value) -> String {
+    let class = policy::classify(content, Profile::Personal, false);
+    match store
+        .upsert_record(&NewRecord {
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            subject_id: None,
+            episode_id: None,
+            scope: class.scope,
+            record_type: class.record_type,
+            content: content.into(),
+            related_files: vec![],
+            tags: vec![],
+            sensitivity: Sensitivity::Personal,
+            portability: Portability::ProfileOnly,
+            confidence: class.confidence,
+            source_ids: vec![],
+            content_hash: ids::exact_content_hash(
+                PROFILE,
+                "workspace",
+                None,
+                class.record_type.as_str(),
+                class.scope.as_str(),
+                content,
+            ),
+            supersedes: vec![],
+            metadata,
+        })
+        .expect("synthetic memory record")
+    {
+        UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+    }
+}
+
+fn capture_provider_requests(expected: usize) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking provider listener");
+    let address = listener.local_addr().expect("provider address");
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut bodies = Vec::new();
+        while bodies.len() < expected && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .expect("provider read timeout");
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 8192];
+                    loop {
+                        let read = stream.read(&mut chunk).expect("read provider request");
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(str::to_string)
+                                })
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + content_length {
+                                bodies.push(
+                                    String::from_utf8_lossy(
+                                        &request[header_end + 4..header_end + 4 + content_length],
+                                    )
+                                    .into_owned(),
+                                );
+                                stream
+                                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                                    .expect("write provider response");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept provider request: {error}"),
+            }
+        }
+        bodies
+    });
+    (format!("http://{address}/v1"), server)
 }
 
 fn evidence_ids(run: &codex_memoryd::protocol::DreamResponse) -> BTreeSet<String> {
@@ -708,5 +812,270 @@ fn archived_exact_hash_does_not_suppress_new_synthetic_evidence() {
     assert!(
         !readopted.source_ids.is_empty(),
         "re-adoption must retain fresh provenance"
+    );
+}
+
+#[test]
+fn scheduler_scan_emits_restored_and_promoted_memory_versions() {
+    let (endpoint, server) = capture_provider_requests(3);
+    let store = Store::open(":memory:").expect("store");
+    let mut config = scheduler_config("workspace", 1, false);
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_provider = codex_memoryd::config::DreamProviderConfig {
+        enabled: true,
+        endpoint,
+        model: "fixture-model".into(),
+        ..Default::default()
+    };
+    let service = Service::new(store.clone(), config);
+
+    let restored_id = insert_memory_record(
+        &store,
+        "Synthetic restored record reaches the scheduled provider.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .archive_records_with_metadata(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&restored_id),
+            "historical",
+            "synthetic restore fixture",
+            Some("restore-fixture-run"),
+        )
+        .expect("archive restore fixture");
+    let promoted_id = insert_memory_record(
+        &store,
+        "Synthetic promoted record reaches the scheduled provider.",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .quarantine_records(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&promoted_id),
+            "synthetic promotion fixture",
+        )
+        .expect("quarantine promotion fixture");
+    store
+        .insert_conclusion(&Conclusion {
+            id: "scheduler-version-seed".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Conclusion: seed the simulated scheduler version scan.".into(),
+            source_id: None,
+            created_at: FRONTIER.into(),
+            metadata: json!({}),
+        })
+        .expect("seed conclusion");
+
+    let first = service
+        .scheduled_dream(Some("2000-01-01T00:00:00Z".into()))
+        .expect("initial simulated scan");
+    assert!(evidence_ids(first.run.as_ref().expect("seed run")).contains("scheduler-version-seed"));
+    service
+        .scheduled_dream(Some("2000-01-01T00:00:01Z".into()))
+        .expect("complete initial unbounded scan");
+    assert_eq!(
+        store
+            .scheduled_dream_cursor(PROFILE, "workspace", None)
+            .expect("completed cursor")
+            .as_deref()
+            .and_then(codex_memoryd::dream::scheduler_cursor_completed_watermark),
+        Some("2000-01-01T00:00:01Z".into()),
+        "the no-input drain should persist a completed rowid cursor"
+    );
+
+    assert_eq!(
+        store
+            .restore_records_with_metadata(
+                PROFILE,
+                Some("workspace"),
+                std::slice::from_ref(&restored_id),
+                "restore-fixture-run",
+                "synthetic restore fixture",
+            )
+            .expect("restore synthetic record")
+            .0,
+        vec![restored_id.clone()]
+    );
+    assert_eq!(
+        store
+            .promote_quarantined_records(
+                PROFILE,
+                Some("workspace"),
+                std::slice::from_ref(&promoted_id),
+            )
+            .expect("promote synthetic record")
+            .0,
+        vec![promoted_id.clone()]
+    );
+
+    let first_changed_page = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("scan restored or promoted record");
+    let first_changed_ids = evidence_ids(first_changed_page.run.as_ref().expect("changed run"));
+    let second_changed_page = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("continue scanning changed records");
+    let second_changed_ids = evidence_ids(second_changed_page.run.as_ref().expect("changed run"));
+    assert_eq!(
+        first_changed_ids.union(&second_changed_ids).cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([restored_id.clone(), promoted_id.clone()]),
+        "existing rowids made eligible by restore or promotion must enter the current evidence window"
+    );
+    service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("finish changed-record scan");
+    let next_tick = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("verify changed records are not redispatched");
+    assert!(
+        next_tick
+            .run
+            .as_ref()
+            .map(evidence_ids)
+            .unwrap_or_default()
+            .is_disjoint(&BTreeSet::from([restored_id.clone(), promoted_id.clone()])),
+        "a completed version scan must not redispatch its restored or promoted records"
+    );
+
+    let provider_bodies = server.join().expect("provider capture");
+    assert_eq!(
+        provider_bodies.len(),
+        3,
+        "seed and both changed pages dispatch"
+    );
+    let changed_provider_input = provider_bodies.iter().skip(1).cloned().collect::<String>();
+    assert!(changed_provider_input
+        .contains("Synthetic restored record reaches the scheduled provider."));
+    assert!(changed_provider_input
+        .contains("Synthetic promoted record reaches the scheduled provider."));
+}
+
+#[test]
+fn scheduler_idle_preview_does_not_emit_candidates_from_comparison_context() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 2, false));
+    let old_id = insert_memory_record(
+        &store,
+        "I plan to deploy the widget tomorrow.",
+        json!({"state": "planned", "subject_key": "widget-deployment"}),
+    );
+    let new_id = insert_memory_record(
+        &store,
+        "Widget deployment is fixed.",
+        json!({"state": "completed", "subject_key": "widget-deployment"}),
+    );
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_records SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2020-01-01T00:00:00Z", old_id],
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2021-01-01T00:00:00Z", new_id],
+            )?;
+            Ok(())
+        })
+        .expect("age synthetic comparison fixtures");
+
+    let first = service
+        .scheduled_dream(Some("2100-01-01T00:00:00Z".into()))
+        .expect("scan current records");
+    let first_run = first.run.expect("initial run");
+    assert!(first_run
+        .candidates
+        .iter()
+        .any(|candidate| candidate.action == "rewrite_historical"
+            && candidate.supersedes.contains(&old_id)));
+    assert!(
+        first_run
+            .candidates
+            .iter()
+            .any(|candidate| candidate.action == "supersede"
+                && candidate.supersedes.contains(&old_id))
+    );
+
+    let idle = service
+        .scheduled_dream(Some("2100-01-01T00:00:01Z".into()))
+        .expect("complete current-record scan");
+    assert!(idle.limits_hit.is_empty());
+    let idle = service
+        .scheduled_dream(Some("2100-01-01T00:00:02Z".into()))
+        .expect("idle comparison-only preview");
+    let idle_run = idle.run.expect("idle run");
+    assert!(idle_run
+        .evidence_window
+        .active_memory_records
+        .sources
+        .is_empty());
+    assert!(
+        idle_run.candidates.is_empty(),
+        "prior active rows should provide comparison context only when current evidence is absent; candidates={:?}",
+        idle_run.candidates
+    );
+    assert!(
+        idle_run.stale.is_empty(),
+        "comparison-only expired rows must not be re-reported as current stale evidence"
+    );
+}
+
+#[test]
+fn scheduler_same_clock_completion_retains_its_rowid_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 1, false));
+    store
+        .record_dream_run(&DreamRunRecord {
+            // This key sorts after generated `dream_...` run ids. Equal
+            // simulated timestamps must still read the newest inserted run.
+            run_id: "zzzz-scheduler-seed-watermark".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            mode: "preview".into(),
+            kind: "scheduled".into(),
+            status: "ok".into(),
+            started_at: RUN_NOW.into(),
+            completed_at: Some(RUN_NOW.into()),
+            watermark_after: Some(BEFORE_FRONTIER.into()),
+            ..Default::default()
+        })
+        .expect("seed bounded cursor watermark");
+    for id in ["same-clock-frontier-a", "same-clock-frontier-b"] {
+        insert_chatgpt_turn(
+            &store,
+            "same-clock-session",
+            id,
+            &format!("generic same-clock scheduler evidence {id}"),
+            RUN_NOW,
+            None,
+        );
+    }
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("first bounded page");
+    let first_ids = evidence_ids(first.run.as_ref().expect("first run"));
+    assert_eq!(first_ids.len(), 1);
+    let second = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("second bounded page at unchanged clock");
+    let second_ids = evidence_ids(second.run.as_ref().expect("second run"));
+    assert_eq!(second_ids.len(), 1);
+    assert!(first_ids.is_disjoint(&second_ids));
+
+    service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("complete bounded cursor without advancing the clock");
+    let next_tick = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("start next same-clock scan");
+    let next_ids = next_tick.run.as_ref().map(evidence_ids).unwrap_or_default();
+    assert!(
+        next_ids.is_empty(),
+        "a completed bounded scan must not redispatch rows at its saved upper timestamp; got {next_ids:?}"
     );
 }
