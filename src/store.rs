@@ -71,6 +71,7 @@ const MIGRATION_SCHEDULER_MUTATION_FRONTIER: &str =
     include_str!("../migrations/0014_scheduler_mutation_frontier.sql");
 const MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS: &str =
     include_str!("../migrations/0015_scheduler_nonreusable_source_rowids.sql");
+const SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY: &str = "scheduler_source_rowids_migrated";
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -1635,7 +1636,7 @@ impl Store {
 
     /// Run migrations and probe FTS5. Idempotent.
     fn migrate(&mut self) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         conn.execute_batch(MIGRATION_INIT)?;
         ensure_memory_record_ref_columns(&conn)?;
 
@@ -1663,14 +1664,7 @@ impl Store {
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
         conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
         conn.execute_batch(MIGRATION_SCHEDULER_MUTATION_FRONTIER)?;
-        conn.execute_batch(MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS)?;
-        let saved_scheduler_frontier = saved_scheduler_rowid_highwater(&conn)?;
-        conn.execute(
-            "UPDATE scheduler_source_rowid_counter
-             SET sequence = MAX(sequence, ?1)
-             WHERE singleton = 1",
-            params![saved_scheduler_frontier],
-        )?;
+        migrate_scheduler_source_rowids(&mut conn)?;
         ensure_column(
             &conn,
             "memory_records",
@@ -5107,6 +5101,48 @@ fn saved_scheduler_rowid_highwater(conn: &rusqlite::Connection) -> Result<i64> {
     Ok(highwater)
 }
 
+/// Installs stable scheduler row IDs once, while holding SQLite's write lock.
+/// The saved-cursor scan and high-water seed share the transaction with the
+/// backfill and triggers so concurrent inserts cannot receive IDs below an
+/// already-persisted cursor. The marker avoids rescanning dream history on
+/// ordinary store opens.
+fn migrate_scheduler_source_rowids(conn: &mut rusqlite::Connection) -> Result<()> {
+    migrate_scheduler_source_rowids_with_hook(conn, || {})
+}
+
+fn migrate_scheduler_source_rowids_with_hook(
+    conn: &mut rusqlite::Connection,
+    after_install: impl FnOnce(),
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already_migrated: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM schema_meta WHERE key = ?1
+        )",
+        params![SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY],
+        |row| row.get(0),
+    )?;
+
+    if !already_migrated {
+        tx.execute_batch(MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS)?;
+        after_install();
+        let saved_scheduler_frontier = saved_scheduler_rowid_highwater(&tx)?;
+        tx.execute(
+            "UPDATE scheduler_source_rowid_counter
+             SET sequence = MAX(sequence, ?1)
+             WHERE singleton = 1",
+            params![saved_scheduler_frontier],
+        )?;
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, '1')",
+            params![SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
     ids::sha256_hex(
         format!(
@@ -5871,6 +5907,97 @@ mod tests {
 
     fn mem_store() -> Store {
         Store::open(":memory:").expect("open in-memory store")
+    }
+
+    #[test]
+    fn scheduler_rowid_migration_blocks_writes_until_cursor_highwater_is_seeded() {
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let db_path = temp.path().join("scheduler-rowid-atomic.db");
+        let store = Store::open(&db_path).expect("initial store");
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO dream_runs(
+                        run_id, profile_id, workspace_id, mode, kind, status,
+                        started_at, watermark_after
+                    ) VALUES ('synthetic-cursor', 'personal', 'workspace', 'preview', 'scheduled',
+                              'ok', '2030-01-01T00:00:00Z',
+                              'dream-cursor-v1:{\"upper_rowids\":{\"visible_turns\":500}}')",
+                    [],
+                )?;
+                tx.execute_batch(
+                    "DROP TRIGGER visible_turns_scheduler_rowid_insert;
+                     DROP TRIGGER visible_turns_scheduler_rowid_delete;
+                     DROP TRIGGER conclusions_scheduler_rowid_insert;
+                     DROP TRIGGER conclusions_scheduler_rowid_delete;
+                     DROP TRIGGER checkpoints_scheduler_rowid_insert;
+                     DROP TRIGGER checkpoints_scheduler_rowid_delete;
+                     DROP TRIGGER memory_sources_scheduler_rowid_insert;
+                     DROP TRIGGER memory_sources_scheduler_rowid_delete;
+                     DROP TRIGGER memory_records_scheduler_rowid_insert;
+                     DROP TRIGGER memory_records_scheduler_rowid_delete;
+                     DROP TABLE scheduler_source_rowids;
+                     DROP TABLE scheduler_source_rowid_counter;
+                     DELETE FROM schema_meta
+                     WHERE key = 'scheduler_source_rowids_migrated';",
+                )?;
+                Ok(())
+            })
+            .expect("prepare a synthetic pre-migration database");
+        drop(store);
+
+        let mut migration_conn = rusqlite::Connection::open(&db_path).expect("migration db");
+        let concurrent_writer = rusqlite::Connection::open(&db_path).expect("writer db");
+        concurrent_writer
+            .execute_batch("PRAGMA busy_timeout = 0;")
+            .expect("make the competing write fail immediately");
+        let mut concurrent_insert = None;
+
+        migrate_scheduler_source_rowids_with_hook(&mut migration_conn, || {
+            concurrent_insert = Some(concurrent_writer.execute(
+                "INSERT INTO visible_turns(id, session_id, actor, content, created_at)
+                 VALUES ('concurrent-synthetic', 'synthetic-session', 'user', 'synthetic',
+                         '2029-12-31T23:59:30Z')",
+                [],
+            ));
+        })
+        .expect("atomically migrate scheduler row IDs");
+
+        let blocked = concurrent_insert
+            .expect("migration hook attempted the concurrent insert")
+            .expect_err("the migration's immediate transaction must hold the write lock");
+        assert!(
+            matches!(
+                blocked,
+                rusqlite::Error::SqliteFailure(ref error, _)
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            ),
+            "expected a SQLite busy/locked error, got {blocked}"
+        );
+
+        concurrent_writer
+            .execute(
+                "INSERT INTO visible_turns(id, session_id, actor, content, created_at)
+                 VALUES ('concurrent-synthetic', 'synthetic-session', 'user', 'synthetic',
+                         '2029-12-31T23:59:30Z')",
+                [],
+            )
+            .expect("write succeeds after migration commits");
+        let scheduler_rowid = concurrent_writer
+            .query_row(
+                "SELECT scheduler_rowid FROM scheduler_source_rowids
+                 WHERE stream = 'visible_turns' AND source_key = 'concurrent-synthetic'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read concurrent row's stable scheduler ID");
+        assert!(
+            scheduler_rowid > 500,
+            "post-migration writes must sort after the saved cursor high-water"
+        );
     }
 
     #[test]

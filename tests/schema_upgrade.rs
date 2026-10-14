@@ -502,7 +502,8 @@ fn scheduler_rowid_upgrade_preserves_saved_cursor_highwater() {
                  DROP TRIGGER memory_records_scheduler_rowid_insert;
                  DROP TRIGGER memory_records_scheduler_rowid_delete;
                  DROP TABLE scheduler_source_rowids;
-                 DROP TABLE scheduler_source_rowid_counter;",
+                 DROP TABLE scheduler_source_rowid_counter;
+                 DELETE FROM schema_meta WHERE key = 'scheduler_source_rowids_migrated';",
             )?;
             Ok(())
         })
@@ -534,6 +535,49 @@ fn scheduler_rowid_upgrade_preserves_saved_cursor_highwater() {
     assert!(
         scheduler_rowid > 97,
         "new rows must sort after every rowid saved in a pre-migration cursor"
+    );
+
+    let counter_before_reopen = upgraded
+        .transaction(|tx| {
+            tx.query_row(
+                "SELECT sequence FROM scheduler_source_rowid_counter WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .expect("read scheduler rowid counter before reopen");
+    upgraded
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE dream_runs SET watermark_after = ?1 WHERE run_id = ?2",
+                params![
+                    format!(
+                        "dream-cursor-v1:{}",
+                        json!({"upper_rowids": {"visible_turns": 100_000}})
+                    ),
+                    "legacy-scheduler-cursor"
+                ],
+            )?;
+            Ok(())
+        })
+        .expect("seed a later synthetic cursor");
+    drop(upgraded);
+
+    let reopened = Store::open(&db_path).expect("reopen migrated database");
+    let counter_after_reopen = reopened
+        .transaction(|tx| {
+            tx.query_row(
+                "SELECT sequence FROM scheduler_source_rowid_counter WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .expect("read scheduler rowid counter after reopen");
+    assert_eq!(
+        counter_after_reopen, counter_before_reopen,
+        "an ordinary reopen must not rescan and reseed historical scheduler cursors"
     );
 }
 
