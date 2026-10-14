@@ -304,6 +304,140 @@ fn scheduled_provider_receives_conclusion_only_evidence() {
 }
 
 #[test]
+fn simulated_unbounded_scan_does_not_dispatch_frontier_evidence_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("provider listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let address = listener.local_addr().expect("provider address");
+    let (body_tx, body_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 8192];
+                    loop {
+                        let read = stream.read(&mut chunk).expect("read provider request");
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(str::to_string)
+                                })
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + content_length {
+                                let body = String::from_utf8_lossy(
+                                    &request[header_end + 4..header_end + 4 + content_length],
+                                )
+                                .into_owned();
+                                body_tx.send(body).expect("send provider body");
+                                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                                stream
+                                    .write_all(response.as_bytes())
+                                    .expect("write provider response");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept provider request: {error}"),
+            }
+        }
+    });
+
+    let store = Store::open(":memory:").expect("store");
+    store
+        .insert_conclusion(&Conclusion {
+            id: "future-frontier-conclusion".into(),
+            profile_id: "personal".into(),
+            workspace_id: "simulated-frontier".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Decision: simulated frontier evidence is processed once.".into(),
+            source_id: None,
+            created_at: "2030-01-01T00:00:00Z".into(),
+            metadata: json!({}),
+        })
+        .expect("future-dated conclusion");
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "simulated-frontier".into();
+    config.dream_scheduler.enabled = true;
+    config.dream_scheduler.idle_window_seconds = 0;
+    config.dream_scheduler.min_session_age_seconds = 0;
+    config.dream_scheduler.min_turn_count = 0;
+    config.dream_scheduler.scheduled_provider_enabled = true;
+    config.dream_provider = DreamProviderConfig {
+        enabled: true,
+        endpoint: format!("http://{address}/v1"),
+        model: "fixture-model".into(),
+        ..DreamProviderConfig::default()
+    };
+    let service = Service::new(store, config);
+
+    let first = service
+        .scheduled_dream(Some("2000-01-01T00:00:00Z".into()))
+        .expect("initial unbounded simulated scan");
+    assert_eq!(
+        first.watermark_after.as_deref(),
+        Some("2000-01-01T00:00:00Z"),
+        "the response keeps the public timestamp watermark"
+    );
+    assert!(service
+        .store
+        .scheduled_dream_cursor("personal", "simulated-frontier", None)
+        .expect("persisted scheduler cursor")
+        .as_deref()
+        .is_some_and(codex_memoryd::dream::is_scheduler_cursor));
+    service
+        .store
+        .insert_conclusion(&Conclusion {
+            id: "late-old-timestamp-conclusion".into(),
+            profile_id: "personal".into(),
+            workspace_id: "simulated-frontier".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Decision: late evidence with an older timestamp stays eligible.".into(),
+            source_id: None,
+            created_at: "2001-01-01T00:00:00Z".into(),
+            metadata: json!({}),
+        })
+        .expect("late conclusion");
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("later simulated scan");
+    service
+        .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))
+        .expect("repeat at the consumed source timestamp");
+
+    server.join().expect("provider server");
+    let calls = body_rx.try_iter().collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the later scan should dispatch only evidence added after the prior frontier"
+    );
+    assert!(calls[0].contains("simulated frontier evidence is processed once"));
+    assert!(calls[1].contains("late evidence with an older timestamp stays eligible"));
+    assert!(!calls[1].contains("simulated frontier evidence is processed once"));
+}
+
+#[test]
 fn capped_scheduled_run_preserves_and_continues_unprocessed_tail() {
     let store = Store::open(":memory:").expect("store");
     let mut config = Config::default();

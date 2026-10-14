@@ -65,8 +65,13 @@ including its tail. If one selected record still cannot fit, the
 command is not dispatched. A deterministic preview processes that one record,
 records the input limit, and advances only that source-kind cursor so later
 evidence remains eligible. Other provider failures do not advance the successful
-scheduled watermark. Process-group children are terminated; orphan reaping
-remains the operating system's job.
+scheduled watermark. A recovered deterministic fallback also records a later
+status-visible `ok_with_limits` receipt while retaining the provider budget
+rejection in audit history. Completed unbounded simulated-clock scans retain
+their rowid frontier, so a later clock does not redispatch prior evidence and
+new rows remain eligible when they meet the timestamp watermark, even when
+they predate future-dated rows from the earlier scan. Process-group
+children are terminated; orphan reaping remains the operating system's job.
 
 Managed readiness accepts `local_only`, or `degraded` only when the reported
 store is writable SQLite at the current schema, the exact configured

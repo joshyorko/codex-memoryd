@@ -171,6 +171,18 @@ fn check_oversized_command_preview(content: String) {
         !marker.exists(),
         "oversized evidence must not reach the provider"
     );
+    let status = service.status().expect("status after recovered fallback");
+    assert!(
+        !status
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("last Dreamer run failed")),
+        "a successful scheduled fallback must replace the failed preflight in status"
+    );
+    assert!(status
+        .last_dream
+        .as_ref()
+        .is_some_and(|run| run.status == "ok_with_limits"));
 
     let second = service.scheduled_dream(None).unwrap();
     assert_ne!(second.watermark_before, first.watermark_before);

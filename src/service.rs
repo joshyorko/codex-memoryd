@@ -2528,9 +2528,12 @@ impl Service {
             });
         }
 
-        let watermark_before =
+        let scheduler_before =
             self.store
-                .scheduled_dream_watermark(profile.as_str(), &workspace, None)?;
+                .scheduled_dream_cursor(profile.as_str(), &workspace, None)?;
+        let watermark_before = scheduler_before.as_ref().map(|state| {
+            dream::scheduler_cursor_completed_watermark(state).unwrap_or_else(|| state.clone())
+        });
         if cfg.max_runtime_seconds == 0 {
             let limits_hit = vec!["max_runtime_seconds".to_string()];
             self.store.record_dream_run(&DreamRunRecord {
@@ -2603,11 +2606,11 @@ impl Service {
             && self.config.dream_provider.enabled
             && DreamProviderAdapter::parse(&self.config.dream_provider.adapter)
                 == Some(DreamProviderAdapter::Command);
-        let scan_start = if command_mode && watermark_before.is_none() {
+        let scan_start = if command_mode && scheduler_before.is_none() {
             self.store
                 .dream_watermark(profile.as_str(), &workspace, None)?
         } else {
-            watermark_before.clone()
+            scheduler_before.clone()
         };
         let scheduler_cursor = Some(dream::scheduler_cursor_for_run(
             &self.store,
@@ -2808,6 +2811,36 @@ impl Service {
                 } else {
                     "ok_with_limits"
                 };
+                if input_budget_limit.is_some() {
+                    // The failed command sizing receipt is useful audit data,
+                    // but this deterministic fallback completed the run. Add
+                    // a later status-visible success receipt without replacing
+                    // the provider's original budget audit.
+                    let completed_at = ids::now_rfc3339();
+                    self.store.insert_dream_run(&DreamRunAudit {
+                        id: ids::new_id("dream"),
+                        profile_id: run.profile.clone(),
+                        workspace_id: run.workspace.clone(),
+                        repo_id: run.repo_id.clone(),
+                        mode: run.mode.clone(),
+                        status: status.to_string(),
+                        started_at: completed_at.clone(),
+                        completed_at: Some(completed_at),
+                        implementation_version: dream::DREAM_IMPLEMENTATION_VERSION.to_string(),
+                        config_hash: dream::config_hash(),
+                        ruleset_version: dream::DREAM_RULESET_VERSION.to_string(),
+                        fixture_schema_version: dream::DREAM_FIXTURE_SCHEMA_VERSION
+                            .map(str::to_string),
+                        source_window_start: run.evidence_window.start.clone(),
+                        source_window_end: Some(run.evidence_window.end.clone()),
+                        source_counts: dream_audit_source_counts(&run, None, None),
+                        candidate_counts: dream_audit_candidate_counts(&run, None, None),
+                        created_count: run.created.len() as i64,
+                        archived_count: run.archived.len() as i64,
+                        rejected_count: run.rejected.len() as i64,
+                        error_summary: None,
+                    })?;
+                }
                 // A limited run has not durably covered the source frontier.
                 // Preserve a bounded source cursor for input-only limits; keep
                 // the previous cursor for runtime, provider, or candidate limits.
@@ -2828,6 +2861,10 @@ impl Service {
                 } else {
                     None
                 };
+                let public_watermark_after = watermark_after.as_ref().map(|state| {
+                    dream::scheduler_cursor_completed_watermark(state)
+                        .unwrap_or_else(|| state.clone())
+                });
                 self.store.record_dream_run(&DreamRunRecord {
                     run_id: run.run_id.clone(),
                     profile_id: run.profile.clone(),
@@ -2851,7 +2888,7 @@ impl Service {
                     reason: (!limits_hit.is_empty()).then(|| limits_hit.join(",")),
                     run: Some(run),
                     watermark_before,
-                    watermark_after,
+                    watermark_after: public_watermark_after,
                     limits_hit,
                 })
             }

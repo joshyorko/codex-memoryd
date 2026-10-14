@@ -4273,11 +4273,14 @@ impl Store {
                  LIMIT 1",
                 [],
                 |row| {
+                    let watermark_after = row.get::<_, Option<String>>(3)?.map(|state| {
+                        crate::dream::scheduler_cursor_completed_watermark(&state).unwrap_or(state)
+                    });
                     Ok(ScheduledDreamRunSummary {
                         run_id: row.get(0)?,
                         status: row.get(1)?,
                         completed_at: row.get(2)?,
-                        watermark_after: row.get(3)?,
+                        watermark_after,
                         error: row.get(4)?,
                     })
                 },
@@ -4287,6 +4290,21 @@ impl Store {
     }
 
     pub fn scheduled_dream_watermark(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .scheduled_dream_cursor(profile_id, workspace_id, repo_id)?
+            .map(|cursor| {
+                crate::dream::scheduler_cursor_completed_watermark(&cursor).unwrap_or(cursor)
+            }))
+    }
+
+    /// Return the persisted scheduler state, including any private keyset
+    /// cursor used to resume or deduplicate a completed scan.
+    pub fn scheduled_dream_cursor(
         &self,
         profile_id: &str,
         workspace_id: &str,
