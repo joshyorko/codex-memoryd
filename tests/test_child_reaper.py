@@ -1,4 +1,5 @@
 """Exercise the Linux isolated-test launcher against real owned processes."""
+import importlib.util
 import os
 from pathlib import Path
 import signal
@@ -9,6 +10,9 @@ import time
 import unittest
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-with-child-reaper.py"
+SPEC = importlib.util.spec_from_file_location("memoryd_child_reaper", LAUNCHER)
+CHILD_REAPER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CHILD_REAPER)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux child-subreaper contract")
@@ -32,6 +36,17 @@ class ChildReaperTests(unittest.TestCase):
             except (FileNotFoundError, ProcessLookupError):
                 pass
         process.communicate(timeout=5)
+
+    def test_proc_status_fallback_finds_direct_child(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        previous = CHILD_REAPER._CHILDREN_PATH_USABLE
+        CHILD_REAPER._CHILDREN_PATH_USABLE = False
+        try:
+            self.assertIn(process.pid, CHILD_REAPER.adopted_children(-1))
+        finally:
+            CHILD_REAPER._CHILDREN_PATH_USABLE = previous
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_success_preserves_output_and_exit(self):
         with tempfile.TemporaryDirectory() as name:

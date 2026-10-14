@@ -11,11 +11,45 @@ import time
 
 CLEANUP_GRACE_SECONDS = 2.0
 KILL_WAIT_SECONDS = 1.0
+_CHILDREN_PATH_USABLE = True
 
 
 def adopted_children(main_pid):
-    """Only direct children of this launcher, excluding the Popen owner."""
-    children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+    """Only direct children of this launcher, excluding the Popen owner.
+
+    Some restricted Linux procfs mounts omit the task ``children`` file. In
+    that case, recover the same direct-child list from process status records.
+    """
+    global _CHILDREN_PATH_USABLE
+    if _CHILDREN_PATH_USABLE:
+        children_path = Path(f"/proc/self/task/{os.getpid()}/children")
+        try:
+            children = children_path.read_text().split()
+        except (FileNotFoundError, PermissionError):
+            _CHILDREN_PATH_USABLE = False
+        else:
+            return [int(pid) for pid in children if int(pid) != main_pid]
+
+    children = []
+    launcher_pid = os.getpid()
+    for process in Path("/proc").iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            status = (process / "status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            # The process exited while procfs was being enumerated.
+            continue
+        parent_pid = next(
+            (
+                int(line.split()[1])
+                for line in status.splitlines()
+                if line.startswith("PPid:")
+            ),
+            None,
+        )
+        if parent_pid == launcher_pid and int(process.name) != main_pid:
+            children.append(int(process.name))
     return [int(pid) for pid in children if int(pid) != main_pid]
 
 
