@@ -157,6 +157,7 @@ impl RuntimeOptions {
         let runtime_env = read_runtime_env(&home.join("runtime.env"));
         let endpoint_overridden =
             host_override.is_some() || port_override.is_some() || bind_override.is_some();
+        let endpoint_address_overridden = host_override.is_some() || port_override.is_some();
         let (runtime, runtime_source) = resolve_runtime(runtime, &runtime_env);
         let process_bind = env_value("CODEX_MEMORYD_BIND");
         let runtime_env_bind = runtime_env_value(&runtime_env, "CODEX_MEMORYD_BIND");
@@ -169,10 +170,13 @@ impl RuntimeOptions {
         let runtime_env_url = runtime_env_value(&runtime_env, "CODEX_MEMORYD_URL")
             .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BASE_URL"));
 
-        let bind_candidate = bind_override
-            .clone()
-            .or_else(|| process_bind.clone())
-            .or_else(|| runtime_env_bind.clone());
+        let bind_candidate = bind_override.clone().or_else(|| {
+            if endpoint_address_overridden {
+                None
+            } else {
+                process_bind.clone().or_else(|| runtime_env_bind.clone())
+            }
+        });
         let parsed_bind = bind_candidate.as_deref().and_then(parse_bind_host_port);
 
         let host = host_override

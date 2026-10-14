@@ -9,7 +9,11 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,6 +25,8 @@ const PROFILE: &str = "personal";
 const WORKSPACE: &str = "dakota";
 const FRIDAY_MARKER: &str = "amber-lantern";
 const CODEX_MARKER: &str = "violet-otter";
+#[cfg(target_os = "linux")]
+static SUBREAPER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Instance {
     name: &'static str,
@@ -30,7 +36,14 @@ struct Instance {
     profile: &'static str,
     workspace: &'static str,
     #[cfg(target_os = "linux")]
-    reapers: Mutex<Vec<JoinHandle<()>>>,
+    reapers: Mutex<Vec<ReaperHandle>>,
+}
+
+#[cfg(target_os = "linux")]
+struct ReaperHandle {
+    pid: u32,
+    stopping: Arc<AtomicBool>,
+    join: JoinHandle<Result<(), String>>,
 }
 
 impl Instance {
@@ -58,6 +71,7 @@ impl Instance {
             .env("CODEX_MEMORYD_WORKSPACE", self.workspace)
             .args(["init", "--host", "127.0.0.1", "--port"])
             .arg(self.port.to_string())
+            .args(["--bind", &format!("127.0.0.1:{}", self.port)])
             .output()
             .expect("run init");
         let report = success_json(output, &format!("{} init", self.name));
@@ -156,6 +170,10 @@ impl Instance {
     }
 
     fn restart(&self) -> Value {
+        let old_pid = self.read_pid();
+        if let Some(pid) = old_pid {
+            self.request_reap(pid);
+        }
         let output = self.command().arg("restart").output().expect("run restart");
         if let Ok(pid) = fs::read_to_string(self.pid_file()) {
             if let Ok(pid) = pid.trim().parse::<u32>() {
@@ -166,6 +184,10 @@ impl Instance {
         assert_eq!(report["process"], "running");
         assert_eq!(report["health"], "ok");
         assert_eq!(report["db"], self.database().display().to_string());
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = old_pid {
+            self.finish_reaper(pid);
+        }
         report
     }
 
@@ -331,28 +353,77 @@ impl Instance {
     }
 
     fn stop(&self) -> Value {
+        let pid = self.read_pid();
+        if let Some(pid) = pid {
+            self.request_reap(pid);
+        }
         let output = self.command().arg("down").output().expect("run down");
         let report = success_json(output, &format!("{} down", self.name));
         assert_eq!(report["process"], "stopped");
         assert!(!self.pid_file().exists());
-        self.join_reapers();
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = pid {
+            self.finish_reaper(pid);
+        }
         report
+    }
+
+    fn read_pid(&self) -> Option<u32> {
+        fs::read_to_string(self.pid_file())
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
     }
 
     fn track_child(&self, pid: u32) {
         #[cfg(target_os = "linux")]
-        self.reapers
-            .lock()
-            .expect("reaper lock")
-            .push(reap_adopted_process(pid));
+        {
+            let mut reapers = self.reapers.lock().expect("reaper lock");
+            if reapers.iter().any(|reaper| reaper.pid == pid) {
+                return;
+            }
+            let stopping = Arc::new(AtomicBool::new(false));
+            reapers.push(ReaperHandle {
+                pid,
+                join: reap_adopted_process(pid, stopping.clone()),
+                stopping,
+            });
+        }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
     }
 
-    fn join_reapers(&self) {
+    fn request_reap(&self, pid: u32) {
         #[cfg(target_os = "linux")]
-        for reaper in self.reapers.lock().expect("reaper lock").drain(..) {
-            reaper.join().expect("reap detached daemon");
+        if let Some(reaper) = self
+            .reapers
+            .lock()
+            .expect("reaper lock")
+            .iter()
+            .find(|reaper| reaper.pid == pid)
+        {
+            reaper.stopping.store(true, Ordering::Release);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_reaper(&self, pid: u32) {
+        let reaper = {
+            let mut reapers = self.reapers.lock().expect("reaper lock");
+            reapers
+                .iter()
+                .position(|reaper| reaper.pid == pid)
+                .map(|index| reapers.remove(index))
+        };
+        if let Some(reaper) = reaper {
+            reaper
+                .join
+                .join()
+                .expect("reaper thread panicked")
+                .unwrap_or_else(|error| panic!("{error}"));
         }
     }
 }
@@ -360,9 +431,16 @@ impl Instance {
 impl Drop for Instance {
     fn drop(&mut self) {
         if self.pid_file().exists() {
+            if let Some(pid) = self.read_pid() {
+                self.request_reap(pid);
+            }
             let _ = self.command().arg("down").output();
         }
-        self.join_reapers();
+        #[cfg(target_os = "linux")]
+        for reaper in self.reapers.get_mut().expect("reaper lock").drain(..) {
+            reaper.stopping.store(true, Ordering::Release);
+            let _ = reaper.join.join();
+        }
     }
 }
 
@@ -386,22 +464,48 @@ impl Drop for Subreaper {
 }
 
 #[cfg(target_os = "linux")]
-fn reap_adopted_process(pid: u32) -> JoinHandle<()> {
+fn reap_adopted_process(pid: u32, stopping: Arc<AtomicBool>) -> JoinHandle<Result<(), String>> {
     std::thread::spawn(move || {
-        let started = Instant::now();
+        let mut stopping_since = None;
         let mut status = 0;
         loop {
-            let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
             if result == pid as libc::pid_t {
-                return;
+                return Ok(());
+            }
+            let is_stopping = stopping.load(Ordering::Acquire);
+            if is_stopping && stopping_since.is_none() {
+                stopping_since = Some(Instant::now());
+            }
+            let timeout = || {
+                stopping_since.is_some_and(|started| started.elapsed() > Duration::from_secs(10))
+            };
+            if result == 0 {
+                if timeout() {
+                    return Err(format!("timed out reaping detached daemon pid {pid}"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             }
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ECHILD)
-                || started.elapsed() > Duration::from_secs(10)
-            {
-                return;
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                let process_exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                if !process_exists {
+                    return Ok(());
+                }
+                if timeout() {
+                    return Err(format!(
+                        "timed out waiting for detached daemon pid {pid} to become reapable"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("waitpid failed for daemon pid {pid}: {error}"));
         }
     })
 }
@@ -430,6 +534,61 @@ fn data(value: &Value) -> &Value {
     value.get("data").unwrap_or(value)
 }
 
+fn database_snapshot(database: &Path, selected_tables: Option<&[&str]>) -> Value {
+    use rusqlite::types::ValueRef;
+
+    let connection = rusqlite::Connection::open(database).expect("open SQLite snapshot");
+    let mut table_statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("list SQLite tables");
+    let table_names = table_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query SQLite tables")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect SQLite table names");
+    let mut tables = serde_json::Map::new();
+    for table in table_names {
+        if selected_tables.is_some_and(|selected| !selected.contains(&table.as_str())) {
+            continue;
+        }
+        let escaped_name = table.replace('"', "\"\"");
+        let sql = format!("SELECT * FROM \"{escaped_name}\"");
+        let mut statement = connection.prepare(&sql).expect("prepare table snapshot");
+        let column_count = statement.column_count();
+        let mut rows = statement.query([]).expect("query table snapshot rows");
+        let mut snapshot_rows = Vec::new();
+        while let Some(row) = rows.next().expect("read table snapshot row") {
+            let mut values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                let value = match row.get_ref(index).expect("read snapshot value") {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(value) => json!(value),
+                    ValueRef::Real(value) => json!(value),
+                    ValueRef::Text(value) => {
+                        Value::String(String::from_utf8_lossy(value).into_owned())
+                    }
+                    ValueRef::Blob(value) => json!(value),
+                };
+                values.push(value);
+            }
+            snapshot_rows.push(Value::Array(values));
+        }
+        snapshot_rows.sort_by_key(Value::to_string);
+        tables.insert(table, Value::Array(snapshot_rows));
+    }
+    Value::Object(tables)
+}
+
+fn documented_md_wrapper() -> &'static str {
+    const RUNBOOK: &str = include_str!("../docs/dakota-native-codex-instance.md");
+    let start = RUNBOOK.find("md() {\n").expect("runbook md wrapper start");
+    let end = RUNBOOK[start..]
+        .find("\n}\n```")
+        .map(|offset| start + offset + 2)
+        .expect("runbook md wrapper end");
+    &RUNBOOK[start..end]
+}
+
 fn reserve_loopback_ports(count: usize) -> (Vec<u16>, Vec<TcpListener>) {
     let listeners = (0..count)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("allocate loopback port"))
@@ -450,6 +609,8 @@ fn returned_by_id<'a>(responses: &'a [Value], id: u64) -> &'a Value {
 
 #[test]
 fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
+    #[cfg(target_os = "linux")]
+    let _subreaper_test_lock = SUBREAPER_TEST_LOCK.lock().expect("subreaper test lock");
     #[cfg(target_os = "linux")]
     let _subreaper = Subreaper::install();
 
@@ -492,16 +653,34 @@ fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
     )
     .expect("write synthetic Codex memory");
 
+    let store_before_preview = database_snapshot(&codex.database(), None);
     let preview = codex.sync_local("--preview", &synthetic_memories);
     assert_eq!(preview["mode"], "preview");
     assert_eq!(preview["created"], 0);
     assert_eq!(preview["rejected"], 0);
+    assert_eq!(
+        database_snapshot(&codex.database(), None),
+        store_before_preview,
+        "preview must leave records and provenance unchanged"
+    );
     let applied = codex.sync_local("--apply", &synthetic_memories);
     assert_eq!(applied["mode"], "apply");
     assert!(applied["created"].as_u64().unwrap_or_default() > 0);
+    let store_after_apply = database_snapshot(
+        &codex.database(),
+        Some(&["memory_records", "memory_sources", "evidence_ledger"]),
+    );
     let applied_again = codex.sync_local("--apply", &synthetic_memories);
     assert_eq!(applied_again["created"], 0);
     assert_eq!(applied_again["updated"], 0);
+    assert_eq!(
+        database_snapshot(
+            &codex.database(),
+            Some(&["memory_records", "memory_sources", "evidence_ledger"]),
+        ),
+        store_after_apply,
+        "repeating apply must not change records or duplicate provenance"
+    );
 
     let friday_recall = friday.recall(FRIDAY_MARKER);
     let codex_recall = codex.recall(CODEX_MARKER);
@@ -509,6 +688,10 @@ fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
     assert!(!friday_recall.to_string().contains(CODEX_MARKER));
     assert!(codex_recall.to_string().contains(CODEX_MARKER));
     assert!(!codex_recall.to_string().contains(FRIDAY_MARKER));
+    let friday_cross_recall = friday.recall(CODEX_MARKER);
+    let codex_cross_recall = codex.recall(FRIDAY_MARKER);
+    assert!(!friday_cross_recall.to_string().contains(CODEX_MARKER));
+    assert!(!codex_cross_recall.to_string().contains(FRIDAY_MARKER));
 
     for (instance, status) in [(&friday, friday.status()), (&codex, codex.status())] {
         assert_eq!(
@@ -565,6 +748,11 @@ fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
                 .expect("evidence refs")
                 .is_empty());
         }
+    }
+    for (instance, foreign_marker) in [(&friday, CODEX_MARKER), (&codex, FRIDAY_MARKER)] {
+        let responses = instance.mcp_read(foreign_marker);
+        let recall = &returned_by_id(&responses, 4)["result"]["structuredContent"];
+        assert!(!recall.to_string().contains(foreign_marker));
     }
 
     // Restart Friday while Codex remains live; the independent daemon and DB
@@ -649,25 +837,44 @@ fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
         .to_string()
         .contains(FRIDAY_MARKER));
 
-    // Reinitializing the same selected home with a free port reuses its DB;
-    // startup and MCP recall then recover the imported fact after restart.
-    let reinitialized = codex.initialize();
+    // Reinitializing the same selected home with a new port reuses its DB;
+    // the previous port remains occupied while the new endpoint starts.
+    let original_port_reservation =
+        TcpListener::bind(("127.0.0.1", codex.port)).expect("reserve stopped Codex port");
+    let (new_ports, new_port_reservations) = reserve_loopback_ports(1);
+    let new_port = new_ports[0];
+    // Exercise CLI endpoint override precedence against the stale bind in the
+    // existing runtime.env. The runbook smoke test separately verifies its
+    // explicit matching --bind command.
+    let reinitialize_without_bind = command_for_home(&codex.home)
+        .args(["init", "--host", "127.0.0.1", "--port"])
+        .arg(new_port.to_string())
+        .output()
+        .expect("reinitialize selected home on a new port");
+    let reinitialized = success_json(reinitialize_without_bind, "Codex changed-port init");
+    let recovered_codex = Instance::new("synthetic-Codex-recovered", codex.home.clone(), new_port);
+    let paths = recovered_codex.inspect_paths();
+    assert_ne!(recovered_codex.port, codex.port);
+    assert!(TcpListener::bind(("127.0.0.1", codex.port)).is_err());
+    assert_eq!(paths["bind"]["value"], format!("127.0.0.1:{new_port}"));
+    assert_eq!(paths["url"]["value"], recovered_codex.url);
     let database_path = codex.database().to_string_lossy().into_owned();
     assert!(reinitialized["reused"]
         .as_array()
         .unwrap()
         .iter()
         .any(|path| path.as_str() == Some(&database_path)));
-    codex.start();
-    assert!(codex
+    drop(new_port_reservations);
+    recovered_codex.start();
+    assert!(recovered_codex
         .recall(CODEX_MARKER)
         .to_string()
         .contains(CODEX_MARKER));
-    let responses = codex.mcp_read(CODEX_MARKER);
+    let responses = recovered_codex.mcp_read(CODEX_MARKER);
     let status = &returned_by_id(&responses, 3)["result"]["structuredContent"];
     assert_eq!(
         status["storage"]["path"],
-        codex.database().display().to_string()
+        recovered_codex.database().display().to_string()
     );
     let recall = &returned_by_id(&responses, 4)["result"]["structuredContent"];
     assert!(recall.to_string().contains(CODEX_MARKER));
@@ -675,10 +882,220 @@ fn native_instances_have_independent_paths_lifecycle_import_and_mcp() {
         friday.status()["data"]["storage"]["path"],
         friday.database().display().to_string()
     );
-    codex.stop();
+    recovered_codex.stop();
     assert!(friday
         .recall(FRIDAY_MARKER)
         .to_string()
         .contains(FRIDAY_MARKER));
     friday.stop();
+    drop(original_port_reservation);
+}
+
+#[test]
+fn documented_dakota_commands_isolate_hostile_inherited_environment() {
+    #[cfg(target_os = "linux")]
+    let _subreaper_test_lock = SUBREAPER_TEST_LOCK.lock().expect("subreaper test lock");
+    #[cfg(target_os = "linux")]
+    let _subreaper = Subreaper::install();
+
+    let sandbox = TempDir::new().expect("temporary runbook sandbox");
+    let operator_home = sandbox.path().join("operator-home");
+    let memory_home = operator_home.join(".codex-memoryd-codex");
+    let memories = operator_home.join(".codex/memories");
+    fs::create_dir_all(&memories).expect("create synthetic runbook memories");
+    fs::write(
+        memories.join("memory_summary.md"),
+        format!("# Synthetic Dakota memory\n- Runbook fixture marker: {CODEX_MARKER}.\n"),
+    )
+    .expect("write synthetic runbook memory");
+
+    let (ports, reservations) = reserve_loopback_ports(1);
+    let port = ports[0];
+    drop(reservations);
+
+    let binary = assert_cmd::cargo::cargo_bin("codex-memoryd");
+    let binary_dir = binary.parent().expect("binary parent");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!(
+        "{}:{}",
+        binary_dir.display(),
+        inherited_path.to_string_lossy()
+    );
+    let script = format!(
+        r#"set -euo pipefail
+MEMORYD_CODEX_HOME="$HOME/.codex-memoryd-codex"
+{}
+trap 'md down >/dev/null 2>&1 || true' EXIT
+MEMORYD_CODEX_PORT={port}
+md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT" \
+  --bind "127.0.0.1:$MEMORYD_CODEX_PORT"
+md paths --format json > "$MEMORYD_CODEX_HOME/paths.json"
+md config show --resolved > "$MEMORYD_CODEX_HOME/config-resolved.json"
+md up > "$MEMORYD_CODEX_HOME/up.json"
+md status | jq -e --arg db "$MEMORYD_CODEX_HOME/memory.db" \
+  '{{status: .data.status, storage_path: .data.storage.path}} | select(.status == "local_only" and .storage_path == $db)' \
+  > "$MEMORYD_CODEX_HOME/status.json"
+md sync-local --preview --profile personal --workspace dakota "$HOME/.codex/memories" \
+  | tee "$MEMORYD_CODEX_HOME/sync-local-preview.json"
+md sync-local --apply --profile personal --workspace dakota "$HOME/.codex/memories" \
+  | tee "$MEMORYD_CODEX_HOME/sync-local-apply.json"
+md sync-local --apply --profile personal --workspace dakota "$HOME/.codex/memories" \
+  | tee "$MEMORYD_CODEX_HOME/sync-local-apply-second.json"
+md recall --profile personal --workspace dakota \
+  --query "What do my native Codex memories say about this project? {CODEX_MARKER}" \
+  --max-tokens 1200 \
+  | jq '.data // . | {{authority, facts: .facts[0:3], citations}}' \
+  > "$MEMORYD_CODEX_HOME/recall.json"
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","clientInfo":{{"name":"dakota-check","version":"1"}},"capabilities":{{}}}}}}' \
+  '{{"jsonrpc":"2.0","method":"notifications/initialized"}}' \
+  '{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}' \
+  '{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_status","arguments":{{}}}}}}' \
+  '{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"profile":"personal","workspace":"dakota","query":"{CODEX_MARKER}","maxTokens":1200}}}}}}' \
+  | md mcp stdio --read-only \
+  | jq -c 'select(.id == 2 or .id == 3 or .id == 4)' \
+  > "$MEMORYD_CODEX_HOME/mcp.jsonl"
+md restart > "$MEMORYD_CODEX_HOME/restart.json"
+md status > "$MEMORYD_CODEX_HOME/status-after-restart.json"
+md down > "$MEMORYD_CODEX_HOME/down.json"
+"#,
+        documented_md_wrapper()
+    );
+
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("HOME", &operator_home)
+        .env("PATH", path)
+        .env("TMPDIR", sandbox.path())
+        .env(
+            "CODEX_MEMORYD_HOME",
+            sandbox.path().join("Friday-hostile-env"),
+        )
+        .env(
+            "CODEX_MEMORYD_DB",
+            sandbox.path().join("Friday-hostile-env/friday.db"),
+        )
+        .env("CODEX_MEMORYD_URL", "http://127.0.0.1:1")
+        .env("CODEX_MEMORYD_BIND", "127.0.0.1:1")
+        .env("CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED", "true")
+        .env("CODEX_MEMORYD_DREAM_SCHEDULED_PROVIDER_ENABLED", "true")
+        .env("CODEX_MEMORYD_PROVIDER_ENABLED", "true")
+        .env("CODEX_MEMORYD_PROVIDER_ADAPTER", "not-a-real-adapter")
+        .env(
+            "CODEX_MEMORYD_PROVIDER_ENDPOINT",
+            "https://provider.invalid/v1",
+        )
+        .env("CODEX_MEMORYD_PROVIDER_API_KEY", "synthetic-not-a-secret")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run literal Dakota commands with hostile inherited environment");
+    #[cfg(target_os = "linux")]
+    let pid_file = memory_home.join("codex-memoryd.pid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    #[cfg(target_os = "linux")]
+    let mut reapers = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut tracked_pids = Vec::new();
+    loop {
+        #[cfg(target_os = "linux")]
+        if pid_file.exists() {
+            let pid = fs::read_to_string(&pid_file)
+                .expect("read runbook daemon pid")
+                .trim()
+                .parse::<u32>()
+                .expect("parse runbook daemon pid");
+            if !tracked_pids.contains(&pid) {
+                tracked_pids.push(pid);
+                let stopping = Arc::new(AtomicBool::new(false));
+                let join = reap_adopted_process(pid, stopping.clone());
+                reapers.push((stopping, join));
+            }
+        }
+        if child
+            .try_wait()
+            .expect("check runbook command status")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runbook command did not start daemon"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("wait for literal runbook commands");
+    #[cfg(target_os = "linux")]
+    for (stopping, reaper) in reapers {
+        stopping.store(true, Ordering::Release);
+        reaper
+            .join()
+            .expect("runbook reaper thread panicked")
+            .expect("reap runbook daemon");
+    }
+    assert!(
+        output.status.success(),
+        "documented wrapper commands failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config: Value = serde_json::from_slice(
+        &fs::read(memory_home.join("config-resolved.json")).expect("resolved runbook config"),
+    )
+    .expect("resolved runbook config JSON");
+    assert_eq!(config["runtime"]["home"], memory_home.display().to_string());
+    assert_eq!(
+        config["daemon"]["storage_path"],
+        memory_home.join("memory.db").display().to_string()
+    );
+    assert_eq!(config["dream"]["scheduler_enabled"], false);
+    let scheduler = config["registry"]
+        .as_array()
+        .expect("config registry")
+        .iter()
+        .find(|entry| entry["key"] == "CODEX_MEMORYD_DREAM_SCHEDULER_ENABLED")
+        .expect("scheduler registry entry");
+    assert_eq!(scheduler["value"], false);
+
+    let preview: Value = serde_json::from_slice(
+        &fs::read(memory_home.join("sync-local-preview.json")).expect("preview output"),
+    )
+    .expect("preview JSON");
+    let applied: Value = serde_json::from_slice(
+        &fs::read(memory_home.join("sync-local-apply.json")).expect("apply output"),
+    )
+    .expect("apply JSON");
+    let applied_again: Value = serde_json::from_slice(
+        &fs::read(memory_home.join("sync-local-apply-second.json")).expect("repeat apply output"),
+    )
+    .expect("repeat apply JSON");
+    assert_eq!(data(&preview)["created"], 0);
+    assert!(data(&applied)["created"].as_u64().unwrap_or_default() > 0);
+    assert_eq!(data(&applied_again)["created"], 0);
+    assert_eq!(data(&applied_again)["updated"], 0);
+
+    let recall: Value = serde_json::from_slice(
+        &fs::read(memory_home.join("recall.json")).expect("runbook recall output"),
+    )
+    .expect("runbook jq recall projection");
+    assert_eq!(recall["authority"], "recall_not_authority");
+    assert!(recall.to_string().contains(CODEX_MARKER));
+    let mcp = fs::read_to_string(memory_home.join("mcp.jsonl")).expect("runbook MCP output");
+    assert!(mcp.contains("memory_status"));
+    assert!(mcp.contains("memory_recall"));
+    assert!(mcp.contains(&memory_home.join("memory.db").display().to_string()));
+    let imported_ledger = Store::open(&memory_home.join("memory.db"))
+        .expect("inspect runbook store")
+        .list_evidence_ledger(PROFILE, WORKSPACE)
+        .expect("inspect runbook provenance");
+    assert!(imported_ledger.iter().any(|row| {
+        row.source_path.as_deref() == Some("memory_summary.md")
+            && row.source_kind == "sync_local"
+            && row.policy_state == "accepted"
+    }));
 }

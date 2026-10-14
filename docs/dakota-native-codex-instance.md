@@ -14,30 +14,20 @@ memory.
 
 ## Select the Codex home
 
-Use a clean command wrapper so a process-level `CODEX_MEMORYD_DB` or URL cannot
-override the selected home. The wrapper preserves normal shell variables and
-lets the selected home resolve its own database, runtime environment, PID file,
-log, and endpoint.
+Use a clean command wrapper so inherited provider, scheduler, database, or URL
+settings cannot override the selected home or enable provider access. The
+wrapper keeps only the basic shell environment and the selected MemoryD home;
+the home resolves its own database, runtime environment, PID file, log, and
+endpoint.
 
 ```bash
 MEMORYD_CODEX_HOME="$HOME/.codex-memoryd-codex"
 
 md() {
-  env \
-    -u CODEX_MEMORYD_RUNTIME \
-    -u CODEX_MEMORYD_RUNTIME_DIR \
-    -u CODEX_MEMORYD_ALLOW_NON_LOOPBACK \
-    -u CODEX_MEMORYD_DB \
-    -u CODEX_MEMORYD_URL \
-    -u CODEX_MEMORYD_BASE_URL \
-    -u CODEX_MEMORYD_BIND \
-    -u CODEX_MEMORYD_HOST \
-    -u CODEX_MEMORYD_PORT \
-    -u CODEX_MEMORYD_PID_FILE \
-    -u CODEX_MEMORYD_LOG_FILE \
-    -u CODEX_MEMORYD_BIN \
-    -u CODEX_MEMORYD_PROFILE \
-    -u CODEX_MEMORYD_WORKSPACE \
+  env -i \
+    HOME="$HOME" \
+    PATH="$PATH" \
+    TMPDIR="${TMPDIR:-/tmp}" \
     CODEX_MEMORYD_HOME="$MEMORYD_CODEX_HOME" \
     codex-memoryd "$@"
 }
@@ -55,7 +45,8 @@ python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 8990)); s.clo
 ## Initialize and inspect resolved paths
 
 ```bash
-md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT"
+md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT" \
+  --bind "127.0.0.1:$MEMORYD_CODEX_PORT"
 
 md paths --format json | jq '{home: .entries.runtime_home.path, database: .entries.database.path, config: .entries.config_file.path, pid: .entries.pid_file.path, log: .entries.log_file.path, bind: .bind.value, url: .url.value}'
 
@@ -111,7 +102,7 @@ Use a topic present in the imported files for the recall query.
 md recall --profile personal --workspace dakota \
   --query "What do my native Codex memories say about this project?" \
   --max-tokens 1200 \
-  | jq '{authority, facts: .facts[0:3], citations: .citations}'
+  | jq '.data // . | {authority, facts: .facts[0:3], citations}'
 ```
 
 This protocol check verifies MCP discovery, the selected database path,
@@ -167,7 +158,8 @@ the resolved path before proceeding.
 ```bash
 MEMORYD_CODEX_PORT=8991
 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 8991)); s.close(); print("127.0.0.1:8991 is available at check time")'
-md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT"
+md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT" \
+  --bind "127.0.0.1:$MEMORYD_CODEX_PORT"
 md paths --format json | jq '{home: .entries.runtime_home.path, database: .entries.database.path, bind: .bind.value}'
 md up
 md status | jq --arg db "$MEMORYD_CODEX_HOME/memory.db" -e '.data.status == "local_only" and .data.storage.path == $db'
