@@ -75,6 +75,8 @@ struct DreamSchedulerCursor {
     #[serde(default)]
     upper_bound: Option<String>,
     #[serde(default)]
+    upper_unbounded: bool,
+    #[serde(default)]
     lower_rowids: Option<DreamRowidFrontier>,
     #[serde(default)]
     upper_rowids: Option<DreamRowidFrontier>,
@@ -336,7 +338,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
     if let Some(cursor) = scheduler_cursor.as_mut() {
         // Cursors written before the fixed upper frontier was introduced can
         // only be resumed safely by rescanning their current bounded window.
-        if cursor.has_source_position() && cursor.upper_bound.is_none() {
+        if cursor.has_source_position() && cursor.upper_bound.is_none() && !cursor.upper_unbounded {
             cursor.clear_source_positions();
         }
         // The old ID tie-break cannot be translated to SQLite insertion
@@ -355,6 +357,11 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
         .and_then(|cursor| cursor.upper_bound.as_deref())
         .or(params.source_window_end)
         .unwrap_or(params.now);
+    let cursor_end = match scheduler_cursor.as_ref() {
+        Some(cursor) if cursor.upper_unbounded => None,
+        Some(_) => Some(source_window_end),
+        None => params.source_window_end,
+    };
     let source_window_start = match scheduler_cursor.as_ref() {
         Some(cursor) => cursor.lower_bound.as_deref(),
         None => params.recency_cutoff,
@@ -378,7 +385,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             params.repo_id,
             source_window_start,
             cursor.lower_bound_exclusive,
-            Some(source_window_end),
+            cursor_end,
             cursor
                 .lower_rowids
                 .as_ref()
@@ -404,7 +411,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             params,
             imported_limit,
             source_window_start,
-            source_window_end,
+            cursor_end,
             scheduler_cursor.as_ref(),
         )?);
     }
@@ -757,7 +764,7 @@ fn imported_chatgpt_candidate_records(
     params: &DreamParams,
     limit: usize,
     source_window_start: Option<&str>,
-    source_window_end: &str,
+    source_window_end: Option<&str>,
     scheduler_cursor: Option<&DreamSchedulerCursor>,
 ) -> Result<Vec<MemoryRecord>> {
     let turns = match scheduler_cursor {
@@ -768,7 +775,7 @@ fn imported_chatgpt_candidate_records(
             params.repo_id,
             source_window_start,
             cursor.lower_bound_exclusive,
-            Some(source_window_end),
+            source_window_end,
             cursor
                 .lower_rowids
                 .as_ref()
@@ -948,13 +955,15 @@ pub fn scheduler_cursor_for_run(
     store: &Store,
     previous: Option<&str>,
     now: &str,
+    upper_unbounded: bool,
 ) -> Result<String> {
     if let Some(previous) = previous.filter(|value| is_scheduler_cursor(value)) {
         return Ok(previous.to_string());
     }
     let cursor = DreamSchedulerCursor {
         lower_bound: previous.map(str::to_string),
-        upper_bound: Some(now.to_string()),
+        upper_bound: (!upper_unbounded).then(|| now.to_string()),
+        upper_unbounded,
         upper_rowids: Some(scheduler_rowid_frontier(store)?),
         ..DreamSchedulerCursor::default()
     };
@@ -975,6 +984,19 @@ pub fn scheduler_watermark_after(
     if window_full {
         // Keep the original scan frontier stable while each source stream is
         // drained. Rows arriving after it are scanned in a new bounded band.
+        if cursor.upper_unbounded {
+            if cursor.upper_rowids.is_none() || cursor.has_legacy_position() {
+                cursor.clear_source_positions();
+                cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                if cursor.lower_bound.is_some() {
+                    cursor.lower_bound_exclusive = false;
+                    cursor.lower_rowids = Some(DreamRowidFrontier::default());
+                }
+            } else {
+                update_scheduler_cursor(store, &mut cursor, window)?;
+            }
+            return Ok(Some(encode_scheduler_cursor(&cursor)?));
+        }
         if cursor.upper_bound.is_none() {
             cursor.clear_source_positions();
             cursor.upper_bound = Some(window.end.clone());
@@ -998,6 +1020,18 @@ pub fn scheduler_watermark_after(
     }
 
     if let Some(mut previous_cursor) = previous.and_then(parse_scheduler_cursor) {
+        if previous_cursor.upper_unbounded {
+            if previous_cursor.upper_rowids.is_none() || previous_cursor.has_legacy_position() {
+                previous_cursor.clear_source_positions();
+                previous_cursor.upper_rowids = Some(scheduler_rowid_frontier(store)?);
+                if previous_cursor.lower_bound.is_some() {
+                    previous_cursor.lower_bound_exclusive = false;
+                    previous_cursor.lower_rowids = Some(DreamRowidFrontier::default());
+                }
+                return Ok(Some(encode_scheduler_cursor(&previous_cursor)?));
+            }
+            return Ok(Some(now.to_string()));
+        }
         if previous_cursor.upper_bound.is_some()
             && (previous_cursor.upper_rowids.is_none() || previous_cursor.has_legacy_position())
         {
@@ -1318,6 +1352,9 @@ where
             sql.push_str(&format!(" AND {timestamp_column} <= ?"));
             args.push(Box::new(end.to_string()));
         }
+    } else if let Some(upper_rowid) = upper_rowid {
+        sql.push_str(&format!(" AND {rowid_column} <= ?"));
+        args.push(Box::new(upper_rowid));
     }
     let params_ref: Vec<&dyn ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
     sql.push_str(&format!(
@@ -1626,9 +1663,11 @@ fn build_evidence_window(
     active_records: &[MemoryRecord],
 ) -> Result<DreamEvidenceWindow> {
     let mut remaining = params.max_records.saturating_sub(active_records.len());
-    let cursor_end = scheduler_cursor
-        .map(|_| Some(end))
-        .unwrap_or(params.source_window_end);
+    let cursor_end = match scheduler_cursor {
+        Some(cursor) if cursor.upper_unbounded => None,
+        Some(_) => Some(end),
+        None => params.source_window_end,
+    };
     let cursor_start_exclusive =
         scheduler_cursor.is_some_and(|cursor| cursor.lower_bound_exclusive);
     let visible_turns = if remaining == 0 {
