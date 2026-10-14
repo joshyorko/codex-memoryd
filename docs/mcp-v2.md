@@ -118,10 +118,11 @@ MCP recall and search preserve the normal MemoryD contract:
 output, and test results override recalled memory. Results retain the
 structured content, evidence, and provenance provided by the service.
 
-The stdio CLI currently opens its configured local store; it does **not**
-attach to an already-running daemon's store owner. Protocol conformance does
-not implement or claim daemon-backed attachment. That is separate work tracked
-by [issue #247](https://github.com/joshyorko/codex-memoryd/issues/247).
+Direct stdio mode opens its configured local store. The explicit `--daemon`
+mode described below instead attaches to an already-running daemon's store
+owner without opening local storage. Protocol conformance alone does not
+provide daemon-backed attachment; this CLI mode is the bounded first slice
+tracked by [issue #247](https://github.com/joshyorko/codex-memoryd/issues/247).
 
 ## Compatibility and live evidence
 

@@ -258,12 +258,16 @@ fn existing_daemon_reads_scope_without_local_store_and_survives_adapter_restart(
         assert!(denied["error"].is_object(), "{denied}");
         adapter.stop();
         normal_client.join().unwrap();
-        assert!(
-            reqwest::blocking::get(format!("{}/v1/status", daemon.endpoint))
-                .unwrap()
-                .status()
-                .is_success()
-        );
+        let status_client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        assert!(status_client
+            .get(format!("{}/v1/status", daemon.endpoint))
+            .send()
+            .unwrap()
+            .status()
+            .is_success());
     }
 }
 
