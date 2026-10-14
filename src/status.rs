@@ -101,6 +101,11 @@ pub fn build_status(store: &Store, config: &Config, metrics: &Metrics) -> Result
         "max_recall_tokens": config.max_recall_tokens,
         "exposure": if loopback_only { "local_only" } else { "auth_missing" },
         "auth": "none",
+        "configured_scope": {
+            "profile": config.default_profile,
+            "workspace": config.default_workspace,
+            "available": store.workspace_exists(&config.default_profile, &config.default_workspace)?,
+        },
     });
 
     Ok(StatusResponse {

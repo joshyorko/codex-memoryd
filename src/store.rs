@@ -49,7 +49,7 @@ use crate::ids;
 use crate::protocol::DreamJobBudget;
 use crate::protocol::DreamJobProvider;
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 13;
+pub const STORAGE_SCHEMA_VERSION: i64 = 15;
 
 const MIGRATION_INIT: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_FTS: &str = include_str!("../migrations/0002_fts.sql");
@@ -67,6 +67,11 @@ const MIGRATION_DREAM_JOBS: &str = include_str!("../migrations/0011_dream_jobs.s
 const MIGRATION_PORTABLE_BUNDLES: &str = include_str!("../migrations/0012_portable_bundles.sql");
 const MIGRATION_CONSOLIDATION_PROPOSALS: &str =
     include_str!("../migrations/0013_consolidation_proposals.sql");
+const MIGRATION_SCHEDULER_MUTATION_FRONTIER: &str =
+    include_str!("../migrations/0014_scheduler_mutation_frontier.sql");
+const MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS: &str =
+    include_str!("../migrations/0015_scheduler_nonreusable_source_rowids.sql");
+const SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY: &str = "scheduler_source_rowids_migrated";
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 
@@ -961,6 +966,7 @@ impl Store {
                 .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
             enforce_consolidation_budget(&batch, policy)?;
             let mut applied = Vec::new();
+            let mut active_memory_mutation_sequence = None;
             for decision in decisions {
                 let Some(candidate) = batch.candidates.iter().find(|item| item.candidate_id == decision.candidate_id) else {
                     return Err(Error::invalid_request("consolidation decision references unknown candidate"));
@@ -1105,6 +1111,10 @@ impl Store {
                     (id, false)
                 };
                 if reused_existing {
+                    if active_memory_mutation_sequence.is_none() {
+                        active_memory_mutation_sequence =
+                            Some(next_active_memory_mutation_sequence(tx)?);
+                    }
                     let (raw_source_ids, raw_metadata): (String, String) = tx.query_row(
                         "SELECT source_ids, metadata FROM memory_records WHERE id = ?1",
                         rusqlite::params![&record_id],
@@ -1128,8 +1138,9 @@ impl Store {
                              temporal_state = COALESCE(?2, temporal_state),
                              valid_until = COALESCE(?3, valid_until),
                              historical_reason = COALESCE(?4, historical_reason),
-                             metadata = ?5, updated_at = ?6, archived = 0
-                         WHERE id = ?7 AND (archived = 0 OR ?8 = 1)
+                             metadata = ?5, updated_at = ?6, archived = 0,
+                             active_memory_mutation_sequence = ?7
+                         WHERE id = ?8 AND (archived = 0 OR ?9 = 1)
                            AND COALESCE(temporal_state, 'current') = 'current'",
                         rusqlite::params![
                             serde_json::to_string(&source_ids)?,
@@ -1138,6 +1149,8 @@ impl Store {
                             candidate.historical_reason.as_deref(),
                             metadata.to_string(),
                             ids::now_rfc3339(),
+                            active_memory_mutation_sequence
+                                .expect("sequence initialized before reused-record update"),
                             &record_id,
                             decision.supersedes.is_empty(),
                         ],
@@ -1202,6 +1215,7 @@ impl Store {
                 .collect::<std::result::Result<Vec<String>, _>>()?;
             drop(stmt);
             let mut reverted = Vec::new();
+            let mut reactivation_sequence = None;
             for replacement_id in &ids {
                 let old_records = tx
                     .prepare(
@@ -1252,11 +1266,21 @@ impl Store {
                     let previous_historical_reason = previous
                         .get("historical_reason")
                         .and_then(Value::as_str);
+                    let mutation_sequence = if previous_archived == 0 {
+                        if reactivation_sequence.is_none() {
+                            reactivation_sequence =
+                                Some(next_active_memory_mutation_sequence(tx)?);
+                        }
+                        reactivation_sequence
+                    } else {
+                        None
+                    };
                     tx.execute(
                         "UPDATE memory_records
                          SET archived = ?1, temporal_state = ?2, superseded_by = ?3,
                              valid_until = ?4, historical_reason = ?5,
-                             updated_at = ?6, metadata = ?7
+                             updated_at = ?6, metadata = ?7,
+                             active_memory_mutation_sequence = COALESCE(?9, active_memory_mutation_sequence)
                          WHERE id = ?8",
                         rusqlite::params![
                             previous_archived,
@@ -1267,6 +1291,7 @@ impl Store {
                             ids::now_rfc3339(),
                             previous_metadata.to_string(),
                             old_id,
+                            mutation_sequence,
                         ],
                     )?;
                 }
@@ -1611,7 +1636,7 @@ impl Store {
 
     /// Run migrations and probe FTS5. Idempotent.
     fn migrate(&mut self) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         conn.execute_batch(MIGRATION_INIT)?;
         ensure_memory_record_ref_columns(&conn)?;
 
@@ -1638,6 +1663,18 @@ impl Store {
         conn.execute_batch(MIGRATION_DREAM_JOBS)?;
         conn.execute_batch(MIGRATION_PORTABLE_BUNDLES)?;
         conn.execute_batch(MIGRATION_CONSOLIDATION_PROPOSALS)?;
+        conn.execute_batch(MIGRATION_SCHEDULER_MUTATION_FRONTIER)?;
+        migrate_scheduler_source_rowids(&mut conn)?;
+        ensure_column(
+            &conn,
+            "memory_records",
+            "active_memory_mutation_sequence",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_active_mutation_sequence
+             ON memory_records(active_memory_mutation_sequence);",
+        )?;
         ensure_column(
             &conn,
             "consolidation_proposals",
@@ -1810,6 +1847,17 @@ impl Store {
             params![workspace_id, profile_id, now],
         )?;
         Ok(())
+    }
+
+    /// Check the exact scope without creating it or combining global lists.
+    pub fn workspace_exists(&self, profile_id: &str, workspace_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE profile_id = ?1 AND id = ?2)",
+            params![profile_id, workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
     }
 
     pub fn active_profiles(&self) -> Result<Vec<String>> {
@@ -3021,12 +3069,45 @@ impl Store {
                         merged.push(sid.clone());
                     }
                 }
-                let now = ids::now_rfc3339();
-                let conn = self.conn()?;
-                conn.execute(
-                    "UPDATE memory_records SET source_ids = ?1, metadata = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![serde_json::to_string(&merged)?, merged_metadata.to_string(), if new.source_ids.is_empty() { existing.updated_at.clone() } else { now }, existing.id],
-                )?;
+                let existing_id = existing.id.clone();
+                let merged_source_ids = serde_json::to_string(&merged)?;
+                let merged_metadata = merged_metadata.to_string();
+                self.transaction_immediate(|tx| {
+                    let is_scheduler_eligible: bool = tx.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM memory_records
+                             WHERE id = ?1 AND archived = 0
+                               AND sensitivity != 'secret_blocked'
+                               AND trust_state != 'quarantined'
+                         )",
+                        params![existing_id],
+                        |row| row.get(0),
+                    )?;
+                    let mutation_sequence = if is_scheduler_eligible {
+                        Some(next_active_memory_mutation_sequence(tx)?)
+                    } else {
+                        None
+                    };
+                    let updated_at = if new.source_ids.is_empty() {
+                        existing.updated_at.clone()
+                    } else {
+                        ids::now_rfc3339()
+                    };
+                    tx.execute(
+                        "UPDATE memory_records
+                         SET source_ids = ?1, metadata = ?2, updated_at = ?3,
+                             active_memory_mutation_sequence = COALESCE(?4, active_memory_mutation_sequence)
+                         WHERE id = ?5",
+                        params![
+                            merged_source_ids,
+                            merged_metadata,
+                            updated_at,
+                            mutation_sequence,
+                            existing_id
+                        ],
+                    )?;
+                    Ok(())
+                })?;
             }
             return Ok(UpsertOutcome::Skipped(existing.id));
         }
@@ -3134,24 +3215,47 @@ impl Store {
         workspace_id: Option<&str>,
         ids_to_promote: &[String],
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let now = ids::now_rfc3339();
         let mut promoted = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        // Serialize mutations before reading state so this transaction cannot
+        // keep a stale WAL snapshot while waiting for the mutation counter.
+        tx.execute(
+            "UPDATE active_memory_mutation_counter
+             SET sequence = sequence
+             WHERE singleton = 1",
+            [],
+        )?;
+        let mut mutation_sequence = None;
+        let mut now = None;
         {
             let mut stmt = tx.prepare(
                 "UPDATE memory_records
                  SET trust_state = 'trusted', trust_score = 1.0,
-                     quarantine_reason = NULL, promoted_at = ?1, updated_at = ?1
-                 WHERE id = ?2 AND trust_state = 'quarantined'",
+                     quarantine_reason = NULL, promoted_at = ?1, updated_at = ?1,
+                     active_memory_mutation_sequence = ?2
+                 WHERE id = ?3 AND trust_state = 'quarantined'",
             )?;
             for id in ids_to_promote {
                 if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
                     not_found.push(id.clone());
                     continue;
                 }
-                if stmt.execute(params![now, id])? > 0 {
+                if mutation_sequence.is_none() {
+                    // The sequence is invisible to scheduler snapshots until
+                    // this transaction commits, so it orders the eligibility
+                    // change after snapshots that cannot yet observe it.
+                    let sequence = next_active_memory_mutation_sequence(&tx)?;
+                    mutation_sequence = Some(sequence);
+                    now = Some(ids::now_rfc3339());
+                }
+                let changed = stmt.execute(params![
+                    now.as_deref().expect("timestamp initialized with sequence"),
+                    mutation_sequence.expect("sequence initialized before update"),
+                    id
+                ])?;
+                if changed > 0 {
                     promoted.push(id.clone());
                 } else {
                     not_found.push(id.clone());
@@ -3265,16 +3369,27 @@ impl Store {
         patch_run_id: &str,
         reason: &str,
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let now = ids::now_rfc3339();
         let mut restored = Vec::new();
         let mut not_found = Vec::new();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        // Serialize mutations before reading state so this transaction cannot
+        // keep a stale WAL snapshot while waiting for the mutation counter.
+        tx.execute(
+            "UPDATE active_memory_mutation_counter
+             SET sequence = sequence
+             WHERE singleton = 1",
+            [],
+        )?;
+        let mut mutation_sequence = None;
+        let mut now = None;
         {
             let mut select =
                 tx.prepare("SELECT metadata, archived FROM memory_records WHERE id = ?1")?;
             let mut update = tx.prepare(
-                "UPDATE memory_records SET archived = 0, updated_at = ?1, metadata = ?2 WHERE id = ?3 AND archived = 1",
+                "UPDATE memory_records SET archived = 0, updated_at = ?1, metadata = ?2,
+                    active_memory_mutation_sequence = ?3
+                 WHERE id = ?4 AND archived = 1",
             )?;
             for id in ids_to_restore {
                 if !self.scoped_record_exists(&tx, id, profile_id, workspace_id)? {
@@ -3301,13 +3416,24 @@ impl Store {
                     not_found.push(id.clone());
                     continue;
                 }
+                if mutation_sequence.is_none() {
+                    // Acquire the writer lock and allocate a commit-ordered
+                    // sequence before taking the mutation timestamp.
+                    let sequence = next_active_memory_mutation_sequence(&tx)?;
+                    mutation_sequence = Some(sequence);
+                    now = Some(ids::now_rfc3339());
+                }
+                let updated_at = now.as_deref().expect("timestamp initialized with sequence");
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("state".to_string(), Value::String("restored".to_string()));
                     obj.insert(
                         "policy_outcome".to_string(),
                         Value::String("restored".to_string()),
                     );
-                    obj.insert("restored_at".to_string(), Value::String(now.clone()));
+                    obj.insert(
+                        "restored_at".to_string(),
+                        Value::String(updated_at.to_string()),
+                    );
                     obj.insert(
                         "restored_by_patch_run_id".to_string(),
                         Value::String(patch_run_id.to_string()),
@@ -3317,7 +3443,13 @@ impl Store {
                         Value::String(reason.to_string()),
                     );
                 }
-                if update.execute(params![now, metadata.to_string(), id])? > 0 {
+                if update.execute(params![
+                    updated_at,
+                    metadata.to_string(),
+                    mutation_sequence.expect("sequence initialized before update"),
+                    id
+                ])? > 0
+                {
                     restored.push(id.clone());
                 }
             }
@@ -3393,13 +3525,14 @@ impl Store {
         now: &str,
     ) -> Result<Option<MemoryRecord>> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if !self.scoped_record_exists(&tx, old_id, profile_id, Some(workspace_id))?
             || !self.scoped_record_exists(&tx, new_id, profile_id, Some(workspace_id))?
         {
             tx.commit()?;
             return Ok(None);
         }
+        let mutation_sequence = next_active_memory_mutation_sequence(&tx)?;
 
         tx.execute(
             "UPDATE memory_records
@@ -3407,9 +3540,18 @@ impl Store {
                  superseded_by = ?4,
                  valid_until = COALESCE(valid_until, ?5),
                  historical_reason = ?6,
-                 updated_at = ?5
+                 updated_at = ?5,
+                 active_memory_mutation_sequence = ?7
              WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
-            params![profile_id, workspace_id, old_id, new_id, now, reason],
+            params![
+                profile_id,
+                workspace_id,
+                old_id,
+                new_id,
+                now,
+                reason,
+                mutation_sequence
+            ],
         )?;
 
         let raw: String = tx.query_row(
@@ -3423,7 +3565,8 @@ impl Store {
             supersedes.push(old_id.to_string());
             tx.execute(
                 "UPDATE memory_records
-                 SET supersedes = ?4, updated_at = ?5
+                 SET supersedes = ?4, updated_at = ?5,
+                     active_memory_mutation_sequence = ?6
                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
                 params![
                     profile_id,
@@ -3431,6 +3574,7 @@ impl Store {
                     new_id,
                     serde_json::to_string(&supersedes)?,
                     now,
+                    mutation_sequence,
                 ],
             )?;
         }
@@ -3449,20 +3593,22 @@ impl Store {
         now: &str,
     ) -> Result<Option<MemoryRecord>> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if !self.scoped_record_exists(&tx, id, profile_id, Some(workspace_id))? {
             tx.commit()?;
             return Ok(None);
         }
+        let mutation_sequence = next_active_memory_mutation_sequence(&tx)?;
         tx.execute(
             "UPDATE memory_records
              SET temporal_state = 'invalidated',
                  invalidated_at = ?4,
                  valid_until = COALESCE(valid_until, ?4),
                  historical_reason = ?5,
-                 updated_at = ?4
+                 updated_at = ?4,
+                 active_memory_mutation_sequence = ?6
              WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
-            params![profile_id, workspace_id, id, now, reason],
+            params![profile_id, workspace_id, id, now, reason, mutation_sequence],
         )?;
         tx.commit()?;
         drop(conn);
@@ -4258,15 +4404,18 @@ impl Store {
                 "SELECT run_id, status, completed_at, watermark_after, error
                  FROM dream_runs
                  WHERE kind = 'scheduled'
-                 ORDER BY started_at DESC, run_id DESC
+                 ORDER BY started_at DESC, rowid DESC
                  LIMIT 1",
                 [],
                 |row| {
+                    let watermark_after = row.get::<_, Option<String>>(3)?.map(|state| {
+                        crate::dream::scheduler_cursor_completed_watermark(&state).unwrap_or(state)
+                    });
                     Ok(ScheduledDreamRunSummary {
                         run_id: row.get(0)?,
                         status: row.get(1)?,
                         completed_at: row.get(2)?,
-                        watermark_after: row.get(3)?,
+                        watermark_after,
                         error: row.get(4)?,
                     })
                 },
@@ -4281,6 +4430,21 @@ impl Store {
         workspace_id: &str,
         repo_id: Option<&str>,
     ) -> Result<Option<String>> {
+        Ok(self
+            .scheduled_dream_cursor(profile_id, workspace_id, repo_id)?
+            .map(|cursor| {
+                crate::dream::scheduler_cursor_completed_watermark(&cursor).unwrap_or(cursor)
+            }))
+    }
+
+    /// Return the persisted scheduler state, including any private keyset
+    /// cursor used to resume or deduplicate a completed scan.
+    pub fn scheduled_dream_cursor(
+        &self,
+        profile_id: &str,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<Option<String>> {
         let conn = self.conn()?;
         let result = if let Some(repo_id) = repo_id {
             conn.query_row(
@@ -4289,7 +4453,7 @@ impl Store {
                  WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id = ?3
-                 ORDER BY completed_at DESC, run_id DESC
+                 ORDER BY completed_at DESC, rowid DESC
                  LIMIT 1",
                 params![profile_id, workspace_id, repo_id],
                 |row| row.get(0),
@@ -4302,7 +4466,7 @@ impl Store {
                  WHERE kind = 'scheduled' AND status IN ('ok', 'ok_with_limits')
                    AND watermark_after IS NOT NULL
                    AND profile_id = ?1 AND workspace_id = ?2 AND repo_id IS NULL
-                 ORDER BY completed_at DESC, run_id DESC
+                 ORDER BY completed_at DESC, rowid DESC
                  LIMIT 1",
                 params![profile_id, workspace_id],
                 |row| row.get(0),
@@ -4886,6 +5050,99 @@ fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn saved_scheduler_rowid_highwater(conn: &rusqlite::Connection) -> Result<i64> {
+    fn visit(value: &Value, key: Option<&str>, highwater: &mut i64) {
+        match value {
+            Value::Number(number)
+                if matches!(
+                    key,
+                    Some(
+                        "rowid"
+                            | "visible_turns"
+                            | "conclusions"
+                            | "checkpoints"
+                            | "imported_memories"
+                            | "active_memory_records"
+                    )
+                ) =>
+            {
+                if let Some(value) = number.as_i64() {
+                    *highwater = (*highwater).max(value);
+                }
+            }
+            Value::Number(_) => {}
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, None, highwater);
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    visit(value, Some(key), highwater);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::String(_) => {}
+        }
+    }
+
+    let mut highwater = 0;
+    let mut statement =
+        conn.prepare("SELECT watermark_after FROM dream_runs WHERE watermark_after IS NOT NULL")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let watermark = row?;
+        let Some(json_start) = watermark.find('{') else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(&watermark[json_start..]) {
+            visit(&value, None, &mut highwater);
+        }
+    }
+    Ok(highwater)
+}
+
+/// Installs stable scheduler row IDs once, while holding SQLite's write lock.
+/// The saved-cursor scan and high-water seed share the transaction with the
+/// backfill and triggers so concurrent inserts cannot receive IDs below an
+/// already-persisted cursor. The marker avoids rescanning dream history on
+/// ordinary store opens.
+fn migrate_scheduler_source_rowids(conn: &mut rusqlite::Connection) -> Result<()> {
+    migrate_scheduler_source_rowids_with_hook(conn, || {})
+}
+
+fn migrate_scheduler_source_rowids_with_hook(
+    conn: &mut rusqlite::Connection,
+    after_install: impl FnOnce(),
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already_migrated: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM schema_meta WHERE key = ?1
+        )",
+        params![SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY],
+        |row| row.get(0),
+    )?;
+
+    if !already_migrated {
+        tx.execute_batch(MIGRATION_SCHEDULER_NONREUSABLE_SOURCE_ROWIDS)?;
+        after_install();
+        let saved_scheduler_frontier = saved_scheduler_rowid_highwater(&tx)?;
+        tx.execute(
+            "UPDATE scheduler_source_rowid_counter
+             SET sequence = MAX(sequence, ?1)
+             WHERE singleton = 1",
+            params![saved_scheduler_frontier],
+        )?;
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, '1')",
+            params![SCHEDULER_SOURCE_ROWIDS_MIGRATION_KEY],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
 fn evidence_ledger_event_key(entry: &EvidenceLedgerEntry) -> String {
     ids::sha256_hex(
         format!(
@@ -5127,6 +5384,20 @@ fn normalized_trust_value(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
+fn next_active_memory_mutation_sequence(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
+    tx.execute(
+        "UPDATE active_memory_mutation_counter
+         SET sequence = sequence + 1
+         WHERE singleton = 1",
+        [],
+    )?;
+    Ok(tx.query_row(
+        "SELECT sequence FROM active_memory_mutation_counter WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn ensure_column(
     conn: &rusqlite::Connection,
     table: &str,
@@ -5150,7 +5421,7 @@ fn ensure_column(
 // Row mappers and SQL helpers
 // ----------------------------------------------------------------------
 
-const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until, observed_at, invalidated_at, superseded_by, historical_reason, temporal_state, metadata";
+pub(crate) const RECORD_COLS: &str = "id, profile_id, workspace_id, repo_id, subject_id, episode_id, scope, type, content, related_files, tags, sensitivity, portability, confidence, source_ids, content_hash, supersedes, created_at, updated_at, last_used_at, archived, trust_state, trust_score, quarantine_reason, quarantined_at, promoted_at, valid_from, valid_until, observed_at, invalidated_at, superseded_by, historical_reason, temporal_state, metadata";
 const SUBJECT_COLS: &str =
     "id, profile_id, workspace_id, subject_key, kind, display_name, created_at, updated_at, metadata";
 const SUBJECT_COLS_S: &str =
@@ -5412,7 +5683,7 @@ fn validate_relation(relation: &Relation) -> Result<()> {
     Ok(())
 }
 
-fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
+pub(crate) fn row_to_record(row: &Row) -> rusqlite::Result<MemoryRecord> {
     Ok(MemoryRecord {
         id: row.get(0)?,
         profile_id: row.get(1)?,
@@ -5636,6 +5907,97 @@ mod tests {
 
     fn mem_store() -> Store {
         Store::open(":memory:").expect("open in-memory store")
+    }
+
+    #[test]
+    fn scheduler_rowid_migration_blocks_writes_until_cursor_highwater_is_seeded() {
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let db_path = temp.path().join("scheduler-rowid-atomic.db");
+        let store = Store::open(&db_path).expect("initial store");
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO dream_runs(
+                        run_id, profile_id, workspace_id, mode, kind, status,
+                        started_at, watermark_after
+                    ) VALUES ('synthetic-cursor', 'personal', 'workspace', 'preview', 'scheduled',
+                              'ok', '2030-01-01T00:00:00Z',
+                              'dream-cursor-v1:{\"upper_rowids\":{\"visible_turns\":500}}')",
+                    [],
+                )?;
+                tx.execute_batch(
+                    "DROP TRIGGER visible_turns_scheduler_rowid_insert;
+                     DROP TRIGGER visible_turns_scheduler_rowid_delete;
+                     DROP TRIGGER conclusions_scheduler_rowid_insert;
+                     DROP TRIGGER conclusions_scheduler_rowid_delete;
+                     DROP TRIGGER checkpoints_scheduler_rowid_insert;
+                     DROP TRIGGER checkpoints_scheduler_rowid_delete;
+                     DROP TRIGGER memory_sources_scheduler_rowid_insert;
+                     DROP TRIGGER memory_sources_scheduler_rowid_delete;
+                     DROP TRIGGER memory_records_scheduler_rowid_insert;
+                     DROP TRIGGER memory_records_scheduler_rowid_delete;
+                     DROP TABLE scheduler_source_rowids;
+                     DROP TABLE scheduler_source_rowid_counter;
+                     DELETE FROM schema_meta
+                     WHERE key = 'scheduler_source_rowids_migrated';",
+                )?;
+                Ok(())
+            })
+            .expect("prepare a synthetic pre-migration database");
+        drop(store);
+
+        let mut migration_conn = rusqlite::Connection::open(&db_path).expect("migration db");
+        let concurrent_writer = rusqlite::Connection::open(&db_path).expect("writer db");
+        concurrent_writer
+            .execute_batch("PRAGMA busy_timeout = 0;")
+            .expect("make the competing write fail immediately");
+        let mut concurrent_insert = None;
+
+        migrate_scheduler_source_rowids_with_hook(&mut migration_conn, || {
+            concurrent_insert = Some(concurrent_writer.execute(
+                "INSERT INTO visible_turns(id, session_id, actor, content, created_at)
+                 VALUES ('concurrent-synthetic', 'synthetic-session', 'user', 'synthetic',
+                         '2029-12-31T23:59:30Z')",
+                [],
+            ));
+        })
+        .expect("atomically migrate scheduler row IDs");
+
+        let blocked = concurrent_insert
+            .expect("migration hook attempted the concurrent insert")
+            .expect_err("the migration's immediate transaction must hold the write lock");
+        assert!(
+            matches!(
+                blocked,
+                rusqlite::Error::SqliteFailure(ref error, _)
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            ),
+            "expected a SQLite busy/locked error, got {blocked}"
+        );
+
+        concurrent_writer
+            .execute(
+                "INSERT INTO visible_turns(id, session_id, actor, content, created_at)
+                 VALUES ('concurrent-synthetic', 'synthetic-session', 'user', 'synthetic',
+                         '2029-12-31T23:59:30Z')",
+                [],
+            )
+            .expect("write succeeds after migration commits");
+        let scheduler_rowid = concurrent_writer
+            .query_row(
+                "SELECT scheduler_rowid FROM scheduler_source_rowids
+                 WHERE stream = 'visible_turns' AND source_key = 'concurrent-synthetic'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read concurrent row's stable scheduler ID");
+        assert!(
+            scheduler_rowid > 500,
+            "post-migration writes must sort after the saved cursor high-water"
+        );
     }
 
     #[test]

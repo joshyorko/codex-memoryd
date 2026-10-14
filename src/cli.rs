@@ -2750,37 +2750,76 @@ fn container_mcp_database(runtime: &RuntimeOptions) -> Result<(String, String)> 
         ));
     }
 
-    let parent = database.parent().ok_or_else(|| {
+    let configured_parent = database.parent().ok_or_else(|| {
         error::Error::invalid_request(format!(
             "container MCP database path has no usable parent directory: {}; set CODEX_MEMORYD_DB=/path/to/memory.db",
             database.display()
         ))
     })?;
-    let metadata = std::fs::metadata(parent).map_err(|err| {
+    let metadata = std::fs::metadata(configured_parent).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             error::Error::invalid_request(format!(
                 "container MCP database parent directory does not exist: {}; create it with mkdir -p {} or set CODEX_MEMORYD_DB to an existing directory",
-                parent.display(),
-                parent.display()
+                configured_parent.display(),
+                configured_parent.display()
             ))
         } else {
             error::Error::invalid_request(format!(
                 "container MCP database parent directory is not usable: {} ({err}); check permissions or set CODEX_MEMORYD_DB to an accessible directory",
-                parent.display()
+                configured_parent.display()
             ))
         }
     })?;
     if !metadata.is_dir() {
         return Err(error::Error::invalid_request(format!(
             "container MCP database parent is not a directory: {}; set CODEX_MEMORYD_DB to a file inside an existing directory",
-            parent.display()
+            configured_parent.display()
         )));
     }
 
-    let parent = std::fs::canonicalize(parent).map_err(|err| {
+    let configured_parent = std::fs::canonicalize(configured_parent).map_err(|err| {
         error::Error::invalid_request(format!(
             "container MCP database parent cannot be resolved safely: {} ({err}); set CODEX_MEMORYD_DB to an accessible absolute path",
-            parent.display()
+            configured_parent.display()
+        ))
+    })?;
+    let resolved_database = match std::fs::symlink_metadata(&database) {
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(&database).map_err(|err| {
+                error::Error::invalid_request(format!(
+                    "container MCP database cannot be resolved safely: {} ({err})",
+                    database.display()
+                ))
+            })?;
+            if !std::fs::metadata(&resolved)
+                .map_err(error::Error::from)?
+                .is_file()
+            {
+                return Err(error::Error::invalid_request(format!(
+                    "container MCP database path is not a file: {}",
+                    database.display()
+                )));
+            }
+            resolved
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => configured_parent.join(filename),
+        Err(err) => {
+            return Err(error::Error::invalid_request(format!(
+                "container MCP database path is not usable: {} ({err})",
+                database.display()
+            )))
+        }
+    };
+    let resolved_parent = resolved_database.parent().ok_or_else(|| {
+        error::Error::invalid_request(format!(
+            "container MCP database path has no usable parent directory: {}",
+            resolved_database.display()
+        ))
+    })?;
+    let parent = std::fs::canonicalize(resolved_parent).map_err(|err| {
+        error::Error::invalid_request(format!(
+            "container MCP database parent cannot be resolved safely: {} ({err}); set CODEX_MEMORYD_DB to an accessible absolute path",
+            resolved_parent.display()
         ))
     })?;
     if parent == Path::new("/") {
@@ -2798,7 +2837,25 @@ fn container_mcp_database(runtime: &RuntimeOptions) -> Result<(String, String)> 
             "container MCP database parent cannot be represented safely in a Docker/Podman --volume mount: {parent}; use a path without ':' or control characters, or set CODEX_MEMORYD_DB to a safe directory"
         )));
     }
-    Ok((parent.to_string(), filename.to_string()))
+    let resolved_filename = resolved_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| {
+            error::Error::invalid_request(format!(
+                "container MCP database path must name a UTF-8 file: {}; set CODEX_MEMORYD_DB=/path/to/memory.db",
+                resolved_database.display()
+            ))
+        })?;
+    if resolved_filename
+        .chars()
+        .any(|character| character.is_control() || character == ':')
+    {
+        return Err(error::Error::invalid_request(
+            "resolved container MCP database filename contains characters that cannot be represented safely; set CODEX_MEMORYD_DB to a normal filename",
+        ));
+    }
+    Ok((parent.to_string(), resolved_filename.to_string()))
 }
 
 fn toml_basic_string(value: &str, label: &str) -> Result<String> {

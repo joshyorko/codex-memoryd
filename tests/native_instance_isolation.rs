@@ -1057,6 +1057,7 @@ md down > "$MEMORYD_CODEX_HOME/down.json"
     )
     .expect("resolved runbook config JSON");
     assert_eq!(config["runtime"]["home"], memory_home.display().to_string());
+    assert_eq!(config["runtime"]["workspace"], "dakota");
     assert_eq!(
         config["daemon"]["storage_path"],
         memory_home.join("memory.db").display().to_string()

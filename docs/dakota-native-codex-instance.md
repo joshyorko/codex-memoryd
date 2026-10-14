@@ -29,6 +29,8 @@ md() {
     PATH="$PATH" \
     TMPDIR="${TMPDIR:-/tmp}" \
     CODEX_MEMORYD_HOME="$MEMORYD_CODEX_HOME" \
+    CODEX_MEMORYD_PROFILE=personal \
+    CODEX_MEMORYD_WORKSPACE=dakota \
     codex-memoryd "$@"
 }
 ```

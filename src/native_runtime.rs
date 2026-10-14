@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::config;
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Store, STORAGE_SCHEMA_VERSION};
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8787";
 
@@ -344,6 +344,17 @@ pub fn init(opts: &RuntimeOptions, mode: InitMode) -> Result<RuntimeInitReport> 
         ensure_dir(&dir, &mut created, &mut reused)?;
     }
 
+    // Persist one stable database identity so a later `up` from another
+    // working directory cannot silently select a different relative path.
+    fs::create_dir_all(
+        opts.db
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(Error::from)?;
+    opts.db = resolve_database_path(&opts.db)?;
+
     let config_path = opts.home.join("config.toml");
     write_or_update(
         &config_path,
@@ -563,12 +574,14 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String> {
 
 fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     require_safe_bind(opts)?;
+    let mut opts = opts.clone();
     fs::create_dir_all(opts.log_file.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(Error::from)?;
     fs::create_dir_all(opts.db.parent().unwrap_or_else(|| Path::new("."))).map_err(Error::from)?;
+    opts.db = resolve_database_path(&opts.db)?;
 
     if running_pid(&opts.pid_file).is_none() {
-        ensure_bind_available(opts)?;
+        ensure_bind_available(&opts)?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -594,8 +607,8 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         fs::write(&opts.pid_file, child.id().to_string()).map_err(Error::from)?;
     }
 
-    wait_for_ready(opts)?;
-    Ok(status(opts))
+    wait_for_ready(&opts, &opts.db.to_string_lossy())?;
+    Ok(status(&opts))
 }
 
 fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -604,8 +617,21 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
     if !opts.codex_memories_dir.exists() {
         fs::create_dir_all(&opts.codex_memories_dir).map_err(Error::from)?;
     }
+    let database_parent = opts
+        .db
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(database_parent).map_err(Error::from)?;
+    let (database_parent, container_db_path) = container_database_mount(opts)?;
 
     if container_exists(&runtime, &opts.container_name)? {
+        ensure_container_database_mount(
+            &runtime,
+            &opts.container_name,
+            &database_parent,
+            &container_db_path,
+        )?;
         if !container_running(&runtime, &opts.container_name)? {
             ensure_bind_available(opts)?;
         }
@@ -628,7 +654,7 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             "--publish".to_string(),
             format!("{}:{}:8787", opts.host, opts.port),
             "--volume".to_string(),
-            format!("{}:/data", opts.home.display()),
+            format!("{}:/data", database_parent.display()),
             "--volume".to_string(),
             format!(
                 "{}:/host-codex-memories:ro",
@@ -639,7 +665,7 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             "--env".to_string(),
             "CODEX_MEMORYD_DECLARE_LOOPBACK_PUBLISH=1".to_string(),
             "--env".to_string(),
-            "CODEX_MEMORYD_DB=/data/memory.db".to_string(),
+            format!("CODEX_MEMORYD_DB={container_db_path}"),
             "--env".to_string(),
             format!("CODEX_MEMORYD_PROFILE={}", opts.profile),
             "--env".to_string(),
@@ -674,8 +700,245 @@ fn up_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         )?;
     }
 
-    wait_for_ready(opts)?;
+    wait_for_ready(opts, &container_db_path)?;
     Ok(status_container(opts))
+}
+
+fn container_database_mount(opts: &RuntimeOptions) -> Result<(PathBuf, String)> {
+    let database = if opts.db.is_absolute() {
+        opts.db.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                Error::invalid_request(format!(
+                    "cannot resolve relative container database path {}: {err}",
+                    opts.db.display()
+                ))
+            })?
+            .join(&opts.db)
+    };
+    let filename = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| {
+            Error::invalid_request(format!(
+                "container database path must name a UTF-8 file: {}",
+                database.display()
+            ))
+        })?;
+    if filename
+        .chars()
+        .any(|character| character.is_control() || character == ':')
+    {
+        return Err(Error::invalid_request(
+            "container database filename contains characters that cannot be represented safely in a Docker/Podman mount",
+        ));
+    }
+    let configured_parent = database.parent().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "container database path has no usable parent directory: {}",
+            database.display()
+        ))
+    })?;
+    let configured_metadata = fs::metadata(configured_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent directory is not usable: {} ({err})",
+            configured_parent.display()
+        ))
+    })?;
+    if !configured_metadata.is_dir() {
+        return Err(Error::invalid_request(format!(
+            "container database parent is not a directory: {}",
+            configured_parent.display()
+        )));
+    }
+    let configured_parent = fs::canonicalize(configured_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent cannot be resolved safely: {} ({err})",
+            database
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .display()
+        ))
+    })?;
+    let resolved_database = match fs::symlink_metadata(&database) {
+        Ok(_) => {
+            let resolved = fs::canonicalize(&database).map_err(|err| {
+                Error::invalid_request(format!(
+                    "container database cannot be resolved safely: {} ({err})",
+                    database.display()
+                ))
+            })?;
+            if !fs::metadata(&resolved).map_err(Error::from)?.is_file() {
+                return Err(Error::invalid_request(format!(
+                    "container database path is not a file: {}",
+                    database.display()
+                )));
+            }
+            resolved
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => configured_parent.join(filename),
+        Err(err) => {
+            return Err(Error::invalid_request(format!(
+                "container database path is not usable: {} ({err})",
+                database.display()
+            )))
+        }
+    };
+    let database_parent = resolved_database.parent().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "container database path has no usable parent directory: {}",
+            resolved_database.display()
+        ))
+    })?;
+    let database_parent = fs::canonicalize(database_parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "container database parent cannot be resolved safely: {} ({err})",
+            database_parent.display()
+        ))
+    })?;
+    if database_parent == Path::new("/") {
+        return Err(Error::invalid_request(
+            "container runtime refuses to mount the host root as the database parent; set CODEX_MEMORYD_DB inside a dedicated data directory",
+        ));
+    }
+    let database_parent_text = database_parent.to_str().ok_or_else(|| {
+        Error::invalid_request(
+            "container database parent is not valid UTF-8 and cannot be represented safely",
+        )
+    })?;
+    if database_parent_text.contains(':') || database_parent_text.chars().any(char::is_control) {
+        return Err(Error::invalid_request(format!(
+            "container database parent cannot be represented safely in a Docker/Podman volume mount: {database_parent_text}"
+        )));
+    }
+    let filename = resolved_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::invalid_request(format!(
+                "container database filename is not valid UTF-8: {}",
+                resolved_database.display()
+            ))
+        })?;
+    if filename
+        .chars()
+        .any(|character| character.is_control() || character == ':')
+    {
+        return Err(Error::invalid_request(
+            "resolved container database filename contains characters that cannot be represented safely in a Docker/Podman mount",
+        ));
+    }
+    Ok((database_parent, format!("/data/{filename}")))
+}
+
+fn ensure_container_database_mount(
+    runtime: &str,
+    name: &str,
+    expected_parent: &Path,
+    expected_database_path: &str,
+) -> Result<()> {
+    let template = r#"{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}"#;
+    let output = Command::new(runtime)
+        .args(["container", "inspect", "--format", template, name])
+        .output()
+        .map_err(Error::from)?;
+    if !output.status.success() {
+        return Err(Error::storage(format!(
+            "could not verify the /data database mount for managed container {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let actual_source = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if actual_source.is_empty() {
+        return Err(Error::storage(format!(
+            "managed container {name} has no verifiable /data bind mount; refusing to start it"
+        )));
+    }
+    let actual_parent = fs::canonicalize(&actual_source).map_err(|err| {
+        Error::storage(format!(
+            "managed container {name} /data mount source cannot be resolved safely: {} ({err})",
+            actual_source
+        ))
+    })?;
+    if actual_parent != expected_parent {
+        return Err(Error::storage(format!(
+            "managed container {name} is mounted from {} at /data, but the configured database requires {}; refusing to start it because it would use the wrong database",
+            actual_parent.display(),
+            expected_parent.display()
+        )));
+    }
+
+    let template = r#"{{range .Config.Env}}{{println .}}{{end}}"#;
+    let output = Command::new(runtime)
+        .args(["container", "inspect", "--format", template, name])
+        .output()
+        .map_err(Error::from)?;
+    if !output.status.success() {
+        return Err(Error::storage(format!(
+            "could not verify CODEX_MEMORYD_DB for managed container {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let inspected_environment = String::from_utf8_lossy(&output.stdout);
+    let configured_databases = inspected_environment
+        .lines()
+        .filter_map(|line| line.strip_prefix("CODEX_MEMORYD_DB="))
+        .collect::<Vec<_>>();
+    if configured_databases.as_slice() != [expected_database_path] {
+        let actual = match configured_databases.as_slice() {
+            [] => "missing".to_string(),
+            [only] => (*only).to_string(),
+            _ => "multiple values".to_string(),
+        };
+        return Err(Error::storage(format!(
+            "managed container {name} has CODEX_MEMORYD_DB={actual}, but the configured database requires {expected_database_path}; refusing to start it because it would use the wrong database"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_database_path(database: &Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(Error::from)?;
+    resolve_database_path_from(database, &cwd)
+}
+
+fn resolve_database_path_from(database: &Path, cwd: &Path) -> Result<PathBuf> {
+    if database == Path::new(":memory:") {
+        return Ok(database.to_path_buf());
+    }
+    let database = if database.is_absolute() {
+        database.to_path_buf()
+    } else {
+        cwd.join(database)
+    };
+    let filename = database.file_name().ok_or_else(|| {
+        Error::invalid_request(format!(
+            "native database path has no filename: {}",
+            database.display()
+        ))
+    })?;
+    let parent = database
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).map_err(|err| {
+        Error::invalid_request(format!(
+            "native database parent cannot be resolved safely: {} ({err})",
+            parent.display()
+        ))
+    })?;
+    match fs::canonicalize(&database) {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(canonical_parent.join(filename))
+        }
+        Err(err) => Err(Error::invalid_request(format!(
+            "native database path is not usable: {} ({err})",
+            database.display()
+        ))),
+    }
 }
 
 fn down_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -716,22 +979,18 @@ fn wait_for_health(opts: &RuntimeOptions) -> Result<()> {
     Err(Error::storage(format!("timed out waiting for {url}")))
 }
 
-fn wait_for_ready(opts: &RuntimeOptions) -> Result<()> {
+fn wait_for_ready(opts: &RuntimeOptions, db_path: &str) -> Result<()> {
     wait_for_health(opts)?;
     let status_url = format!("{}/v1/status", opts.url.trim_end_matches('/'));
     for _ in 0..30 {
         if let Ok(body) = http_get(&status_url) {
             let parsed: serde_json::Value = serde_json::from_str(&body)?;
-            if parsed
-                .pointer("/data/status")
-                .and_then(|v| v.as_str())
-                .is_some_and(|status| status == "local_only")
-            {
+            if managed_status_ready(&parsed, &opts.profile, &opts.workspace, db_path) {
                 return Ok(());
             }
             if let Some(status) = parsed.pointer("/data/status").and_then(|v| v.as_str()) {
                 return Err(Error::storage(format!(
-                    "daemon status is '{status}', expected local_only"
+                    "daemon status is '{status}', core readiness requirements are not met"
                 )));
             }
         }
@@ -740,6 +999,107 @@ fn wait_for_ready(opts: &RuntimeOptions) -> Result<()> {
     Err(Error::storage(format!(
         "timed out waiting for {status_url}"
     )))
+}
+
+fn managed_status_ready(
+    body: &serde_json::Value,
+    profile: &str,
+    workspace: &str,
+    db_path: &str,
+) -> bool {
+    let Some(data) = body.get("data") else {
+        return false;
+    };
+    let status = data.get("status").and_then(|value| value.as_str());
+    let Some(storage) = data.get("storage") else {
+        return false;
+    };
+    let Some(features) = data.get("features") else {
+        return false;
+    };
+    if storage.get("kind").and_then(|value| value.as_str()) != Some("sqlite")
+        || storage.get("path").and_then(|value| value.as_str()) != Some(db_path)
+        || storage.get("writable").and_then(|value| value.as_bool()) != Some(true)
+        || data
+            .get("storage_schema_version")
+            .and_then(|value| value.as_i64())
+            != Some(STORAGE_SCHEMA_VERSION)
+        || features.get("exposure").and_then(|value| value.as_str()) != Some("local_only")
+        || features.get("auth").and_then(|value| value.as_str()) != Some("none")
+        || !managed_scope_available(data, status, profile, workspace)
+    {
+        return false;
+    }
+
+    let Some(reasons) = data
+        .get("degraded_reasons")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    match status {
+        Some("local_only") => reasons.is_empty(),
+        Some("degraded") => degraded_only_by_dreamer(data, reasons),
+        _ => false,
+    }
+}
+
+fn managed_scope_available(
+    data: &serde_json::Value,
+    status: Option<&str>,
+    profile: &str,
+    workspace: &str,
+) -> bool {
+    let Some(profiles) = data
+        .get("active_profiles")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    let Some(workspaces) = data
+        .get("active_workspaces")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    let Some(scope) = data.pointer("/features/configured_scope") else {
+        return false;
+    };
+    if scope.get("profile").and_then(|value| value.as_str()) != Some(profile)
+        || scope.get("workspace").and_then(|value| value.as_str()) != Some(workspace)
+    {
+        return false;
+    }
+    if profiles.is_empty() && workspaces.is_empty() {
+        return status == Some("local_only")
+            && scope.get("available").and_then(|value| value.as_bool()) == Some(false);
+    }
+    profiles.iter().any(|value| value.as_str() == Some(profile))
+        && workspaces
+            .iter()
+            .any(|value| value.as_str() == Some(workspace))
+        && scope.get("available").and_then(|value| value.as_bool()) == Some(true)
+}
+
+fn degraded_only_by_dreamer(data: &serde_json::Value, reasons: &[serde_json::Value]) -> bool {
+    let Some(last_dream) = data.get("last_dream") else {
+        return false;
+    };
+    if last_dream.get("status").and_then(|value| value.as_str()) != Some("error")
+        || last_dream.get("mode").and_then(|value| value.as_str()) != Some("preview")
+        || reasons.len() != 1
+    {
+        return false;
+    }
+    let error = last_dream
+        .get("error_summary")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let expected = error.map_or_else(
+        || "last Dreamer run failed".to_string(),
+        |error| format!("last Dreamer run failed: {error}"),
+    );
+    reasons[0].as_str() == Some(expected.as_str())
 }
 
 fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
@@ -763,7 +1123,9 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
         pid: None,
         url: opts.url.clone(),
         bind: format!("{}:{} -> container:8787", opts.host, opts.port),
-        db: format!("{}:/data/memory.db", opts.home.display()),
+        db: container_database_mount(opts)
+            .map(|(parent, path)| format!("{}:{path}", parent.display()))
+            .unwrap_or_else(|_| opts.db.display().to_string()),
         log_file: format!(
             "{} logs {}",
             container_runtime_name(opts),
@@ -1204,4 +1566,519 @@ fn parse_loopback_url(url: &str) -> Result<ParsedUrl> {
         host_header: host_port.to_string(),
         path: format!("/{}", path),
     })
+}
+
+#[cfg(test)]
+mod managed_readiness_tests {
+    use super::{managed_status_ready, resolve_database_path_from};
+    use crate::store::STORAGE_SCHEMA_VERSION;
+    use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+
+    fn local_status() -> serde_json::Value {
+        json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/synthetic.db", "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
+        }})
+    }
+
+    fn dreamer_degraded_status() -> serde_json::Value {
+        json!({"data": {
+            "status": "degraded",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/synthetic.db", "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": {
+                "mode": "preview",
+                "status": "error",
+                "error_summary": "dream provider input byte budget exhausted"
+            },
+            "degraded_reasons": ["last Dreamer run failed: dream provider input byte budget exhausted"],
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
+        }})
+    }
+
+    fn ready(body: &serde_json::Value, profile: &str, workspace: &str) -> bool {
+        managed_status_ready(body, profile, workspace, "/tmp/synthetic.db")
+    }
+
+    #[test]
+    fn accepts_core_ready_and_dreamer_only_degraded_statuses() {
+        assert!(ready(&local_status(), "personal", "synthetic-scope"));
+        assert!(ready(
+            &dreamer_degraded_status(),
+            "personal",
+            "synthetic-scope"
+        ));
+
+        let empty_store = json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": "/tmp/empty.db", "writable": true},
+            "active_profiles": [],
+            "active_workspaces": [],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "default", "available": false}}
+        }});
+        assert!(managed_status_ready(
+            &empty_store,
+            "personal",
+            "default",
+            "/tmp/empty.db"
+        ));
+
+        let mut missing_degraded_scope = dreamer_degraded_status();
+        missing_degraded_scope["data"]["active_profiles"] = json!([]);
+        missing_degraded_scope["data"]["active_workspaces"] = json!([]);
+        assert!(!ready(
+            &missing_degraded_scope,
+            "personal",
+            "synthetic-scope"
+        ));
+    }
+
+    #[test]
+    fn rejects_profile_workspace_cross_product_from_real_status() {
+        let store = crate::store::Store::open(":memory:").unwrap();
+        store
+            .ensure_workspace("personal", "other-workspace")
+            .unwrap();
+        store.ensure_workspace("work", "synthetic-scope").unwrap();
+        let mut config = crate::config::Config::default();
+        config.default_profile = "personal".into();
+        config.default_workspace = "synthetic-scope".into();
+        let service = crate::service::Service::new(store.clone(), config);
+        let status = serde_json::to_value(service.status().unwrap()).unwrap();
+        let path = status["storage"]["path"].as_str().unwrap().to_string();
+        assert!(
+            !managed_status_ready(
+                &json!({"data": status}),
+                "personal",
+                "synthetic-scope",
+                &path
+            ),
+            "unrelated profile and workspace must not establish a ready scope"
+        );
+
+        store
+            .ensure_workspace("personal", "synthetic-scope")
+            .unwrap();
+        let status = serde_json::to_value(service.status().unwrap()).unwrap();
+        assert!(managed_status_ready(
+            &json!({"data": status}),
+            "personal",
+            "synthetic-scope",
+            &path
+        ));
+    }
+
+    #[test]
+    fn rejects_inconsistent_empty_scope_claims() {
+        let mut status = local_status();
+        status["data"]["active_profiles"] = json!([]);
+        status["data"]["active_workspaces"] = json!([]);
+        assert!(!ready(&status, "personal", "synthetic-scope"));
+        status["data"]["features"]["configured_scope"]["available"] = json!(false);
+        assert!(ready(&status, "personal", "synthetic-scope"));
+        assert!(!ready(&status, "work", "synthetic-scope"));
+        assert!(!ready(&status, "personal", "other-workspace"));
+        status["data"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("configured_scope");
+        assert!(!ready(&status, "personal", "synthetic-scope"));
+    }
+
+    #[test]
+    fn rejects_non_dreamer_and_unverifiable_degradation() {
+        let mut mixed_reason = dreamer_degraded_status();
+        mixed_reason["data"]["degraded_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("storage is not writable"));
+        assert!(!ready(&mixed_reason, "personal", "synthetic-scope"));
+
+        let mut no_receipt = dreamer_degraded_status();
+        no_receipt["data"]["last_dream"] = json!(null);
+        assert!(!ready(&no_receipt, "personal", "synthetic-scope"));
+
+        let mut failed_apply = dreamer_degraded_status();
+        failed_apply["data"]["last_dream"]["mode"] = json!("apply");
+        assert!(!ready(&failed_apply, "personal", "synthetic-scope"));
+
+        let mut no_reason = dreamer_degraded_status();
+        no_reason["data"]["degraded_reasons"] = json!([]);
+        assert!(!ready(&no_reason, "personal", "synthetic-scope"));
+
+        let caller_boolean = json!({"ready": true, "data": {"status": "degraded"}});
+        assert!(!ready(&caller_boolean, "personal", "synthetic-scope"));
+    }
+
+    #[test]
+    fn rejects_storage_schema_authorization_exposure_and_scope_failures() {
+        let mut unreadable = local_status();
+        unreadable["data"]["storage"]["writable"] = json!(false);
+        assert!(!ready(&unreadable, "personal", "synthetic-scope"));
+
+        let mut malformed_storage = local_status();
+        malformed_storage["data"]["storage"] = json!(null);
+        assert!(!ready(&malformed_storage, "personal", "synthetic-scope"));
+
+        let mut wrong_schema = local_status();
+        wrong_schema["data"]["storage_schema_version"] = json!(STORAGE_SCHEMA_VERSION - 1);
+        assert!(!ready(&wrong_schema, "personal", "synthetic-scope"));
+
+        let mut missing_schema = local_status();
+        missing_schema["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("storage_schema_version");
+        assert!(!ready(&missing_schema, "personal", "synthetic-scope"));
+
+        let mut remote_exposure = local_status();
+        remote_exposure["data"]["features"]["exposure"] = json!("auth_missing");
+        assert!(!ready(&remote_exposure, "personal", "synthetic-scope"));
+
+        let mut missing_exposure = local_status();
+        missing_exposure["data"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exposure");
+        assert!(!ready(&missing_exposure, "personal", "synthetic-scope"));
+
+        let mut other_database = local_status();
+        other_database["data"]["storage"]["path"] = json!("/tmp/other.db");
+        assert!(!ready(&other_database, "personal", "synthetic-scope"));
+
+        let mut authorization_failure = local_status();
+        authorization_failure["data"]["features"]["auth"] = json!("required");
+        assert!(!ready(
+            &authorization_failure,
+            "personal",
+            "synthetic-scope"
+        ));
+
+        let mut inconsistent_status = local_status();
+        inconsistent_status["data"]["degraded_reasons"] = json!(["storage is not writable"]);
+        assert!(!ready(&inconsistent_status, "personal", "synthetic-scope"));
+
+        assert!(!ready(&local_status(), "other-profile", "synthetic-scope"));
+        assert!(!ready(&local_status(), "personal", "other-workspace"));
+    }
+
+    #[test]
+    fn relative_database_identity_is_bound_to_the_starting_working_directory() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        fs::create_dir_all(first_cwd.join("data")).expect("first database directory");
+        fs::create_dir_all(second_cwd.join("data")).expect("second database directory");
+
+        let configured = Path::new("data/memory.db");
+        let first_path = resolve_database_path_from(configured, &first_cwd)
+            .expect("resolve first database identity");
+        let second_path = resolve_database_path_from(configured, &second_cwd)
+            .expect("resolve second database identity");
+        assert_ne!(first_path, second_path);
+
+        let mut status = local_status();
+        status["data"]["storage"]["path"] = json!(first_path.display().to_string());
+        assert!(managed_status_ready(
+            &status,
+            "personal",
+            "synthetic-scope",
+            &first_path.display().to_string()
+        ));
+        assert!(!managed_status_ready(
+            &status,
+            "personal",
+            "synthetic-scope",
+            &second_path.display().to_string()
+        ));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod container_readiness_regressions {
+    use super::{up, RuntimeKind, RuntimeOptions};
+    use crate::store::STORAGE_SCHEMA_VERSION;
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    fn container_status(path: &str) -> Value {
+        json!({"data": {
+            "status": "local_only",
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "storage": {"kind": "sqlite", "path": path, "writable": true},
+            "active_profiles": ["personal"],
+            "active_workspaces": ["synthetic-scope"],
+            "last_dream": null,
+            "degraded_reasons": [],
+            "features": {"exposure": "local_only", "auth": "none",
+                "configured_scope": {"profile": "personal", "workspace": "synthetic-scope", "available": true}}
+        }})
+    }
+
+    fn status_server(status: Value) -> (String, Arc<AtomicBool>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let status_body = status.to_string();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop_server.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let read = stream.read(&mut request).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&request[..read]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body = if path == "/healthz" {
+                            "{}"
+                        } else {
+                            status_body.as_str()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}"), stop, server)
+    }
+
+    fn fake_container_runtime(
+        path: &std::path::Path,
+        invocation_log: &std::path::Path,
+        state_file: &std::path::Path,
+        mounted_data_source: &std::path::Path,
+        container_database_path: &str,
+        existing_database_path: Option<&str>,
+        initial_existing_container: bool,
+    ) {
+        let mount_source_file = path.with_extension("mount-source");
+        let database_env_file = path.with_extension("database-env");
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}';\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then if [ -f '{}' ]; then if [ \"$3\" = \"--format\" ]; then case \"$4\" in *State.Running*) printf true ;; *Mounts*) cat '{}' ;; *Config.Env*) cat '{}' ;; esac; fi; exit 0; fi; exit 1; fi\nif [ \"$1\" = \"run\" ]; then printf '%s' '{}' > '{}'; printf 'CODEX_MEMORYD_DB=%s\\n' '{}' > '{}'; touch '{}'; exit 0; fi\nif [ \"$1\" = \"start\" ]; then exit 0; fi\nexit 1\n",
+                invocation_log.display(),
+                state_file.display(),
+                mount_source_file.display(),
+                database_env_file.display(),
+                mounted_data_source.display(),
+                mount_source_file.display(),
+                container_database_path,
+                database_env_file.display(),
+                state_file.display()
+            ),
+        )
+        .unwrap();
+        if initial_existing_container {
+            fs::write(
+                &mount_source_file,
+                mounted_data_source.as_os_str().to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            fs::write(
+                &database_env_file,
+                format!(
+                    "CODEX_MEMORYD_DB={}\n",
+                    existing_database_path.unwrap_or(container_database_path)
+                ),
+            )
+            .unwrap();
+            fs::write(state_file, "existing").unwrap();
+        }
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn run_managed_container_up(
+        status_path: &str,
+        db_relative_path: &str,
+        existing_mount_relative_path: Option<&str>,
+        existing_database_path: Option<&str>,
+    ) -> (
+        crate::error::Result<super::RuntimeStatusReport>,
+        String,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("fake-container-runtime");
+        let invocation_log = temp.path().join("container-runtime.log");
+        let state_file = temp.path().join("container-created");
+        let db = temp.path().join(db_relative_path);
+        let database_parent = db.parent().unwrap().to_string_lossy().into_owned();
+        let container_database_path =
+            format!("/data/{}", db.file_name().unwrap().to_string_lossy());
+        let mounted_source = existing_mount_relative_path
+            .map(|path| temp.path().join(path))
+            .unwrap_or_else(|| PathBuf::from(&database_parent));
+        if existing_mount_relative_path.is_some() {
+            fs::create_dir_all(&mounted_source).unwrap();
+        }
+        fake_container_runtime(
+            &runtime,
+            &invocation_log,
+            &state_file,
+            &mounted_source,
+            &container_database_path,
+            existing_database_path,
+            existing_mount_relative_path.is_some(),
+        );
+        let (url, stop, server) = status_server(container_status(status_path));
+        let port = 0;
+        let options = RuntimeOptions {
+            runtime: RuntimeKind::Container,
+            home: temp.path().join("runtime-home"),
+            url,
+            host: "127.0.0.1".into(),
+            port,
+            bind: format!("127.0.0.1:{port}"),
+            db,
+            pid_file: temp.path().join("unused.pid"),
+            log_file: temp.path().join("unused.log"),
+            profile: "personal".into(),
+            workspace: "synthetic-scope".into(),
+            log_level: "info".into(),
+            binary: PathBuf::from("unused-binary"),
+            allow_non_loopback: false,
+            image: "synthetic-image".into(),
+            container_name: "synthetic-memoryd".into(),
+            container_runtime: Some(runtime.to_string_lossy().into_owned()),
+            codex_memories_dir: temp.path().join("synthetic-memories"),
+            uid: None,
+            gid: None,
+            endpoint_configured: true,
+        };
+
+        let result = up(&options);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let invocations = fs::read_to_string(invocation_log).unwrap_or_default();
+        (result, invocations, database_parent)
+    }
+
+    #[test]
+    fn up_accepts_healthy_container_status_at_container_database_path() {
+        let (result, invocations, database_parent) =
+            run_managed_container_up("/data/memory.db", "runtime-home/memory.db", None, None);
+        assert!(
+            result.is_ok(),
+            "managed container startup failed: {result:?}"
+        );
+        assert_eq!(result.unwrap().health, "ok");
+        assert!(invocations.contains(&format!("--volume {database_parent}:/data")));
+        assert!(invocations.contains("CODEX_MEMORYD_DB=/data/memory.db"));
+    }
+
+    #[test]
+    fn up_rejects_container_status_for_wrong_database_path() {
+        let (result, _, _) =
+            run_managed_container_up("/data/wrong.db", "runtime-home/memory.db", None, None);
+        let error = result.expect_err("wrong managed-container storage path must fail readiness");
+        assert!(error
+            .message
+            .contains("core readiness requirements are not met"));
+    }
+
+    #[test]
+    fn up_mounts_and_verifies_the_configured_custom_database() {
+        let (result, invocations, database_parent) = run_managed_container_up(
+            "/data/custom.sqlite",
+            "custom-store/custom.sqlite",
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "managed container startup failed for configured database: {result:?}"
+        );
+        assert!(invocations.contains(&format!("--volume {database_parent}:/data")));
+        assert!(invocations.contains("CODEX_MEMORYD_DB=/data/custom.sqlite"));
+    }
+
+    #[test]
+    fn up_rejects_an_existing_container_with_a_stale_database_mount() {
+        let (result, invocations, database_parent) = run_managed_container_up(
+            "/data/memory.db",
+            "new-store/memory.db",
+            Some("old-store"),
+            None,
+        );
+        let error = result.expect_err("old container must not start with a different DB mount");
+        assert!(error.message.contains("mounted from"), "{error:?}");
+        assert!(error.message.contains(&database_parent), "{error:?}");
+        assert!(!invocations.contains("start synthetic-memoryd"));
+        assert!(!invocations.contains("run -d"));
+    }
+
+    #[test]
+    fn up_reuses_an_existing_container_with_the_configured_database_mount() {
+        let (result, invocations, _database_parent) = run_managed_container_up(
+            "/data/memory.db",
+            "runtime-home/memory.db",
+            Some("runtime-home"),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "matching managed container should be reusable: {result:?}"
+        );
+        assert!(invocations.contains("container inspect --format"));
+        assert!(invocations.contains("start synthetic-memoryd"));
+        assert!(!invocations.contains("run -d"));
+    }
+
+    #[test]
+    fn up_rejects_an_existing_container_with_a_stale_database_filename() {
+        let (result, invocations, _) = run_managed_container_up(
+            "/data/old.db",
+            "runtime-home/new.db",
+            Some("runtime-home"),
+            Some("/data/old.db"),
+        );
+        let error = result.expect_err("existing container must not start with a stale DB filename");
+        assert!(error.message.contains("CODEX_MEMORYD_DB"), "{error:?}");
+        assert!(error.message.contains("/data/new.db"), "{error:?}");
+        assert!(error.message.contains("/data/old.db"), "{error:?}");
+        assert!(!invocations.contains("start synthetic-memoryd"));
+        assert!(!invocations.contains("run -d"));
+    }
 }

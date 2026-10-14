@@ -5872,6 +5872,235 @@ fn cli_native_runtime_env_status_keeps_daemon_status_contract() {
     assert!(body.contains("\"dream_worker\""));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_native_up_keeps_dreamer_degraded_daemon_live_and_recallable() {
+    use codex_memoryd::protocol::ConclusionsRequest;
+    use codex_memoryd::protocol::{DreamJobBudget, DreamJobRunRequest};
+    use codex_memoryd::{config::Config, service::Service, store::Store};
+
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("managed-home");
+    let db = dir.path().join("synthetic.db");
+    let bind = unused_loopback_addr();
+    let url = format!("http://{bind}");
+    let provider_called = dir.path().join("provider-called");
+    fs::create_dir_all(&home).unwrap();
+
+    let store = Store::open(&db).unwrap();
+    let mut config = Config::default();
+    config.default_profile = "personal".into();
+    config.default_workspace = "synthetic-scope".into();
+    config.dream_provider.enabled = true;
+    config.dream_provider.adapter = "command".into();
+    config.dream_provider.model = "synthetic-model".into();
+    config.dream_provider.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "touch '{}'; cat >/dev/null; printf '{{\"schema_version\":\"dream-preview-v1\",\"profile\":\"personal\",\"workspace\":\"synthetic-scope\",\"candidates\":[]}}'",
+            provider_called.display()
+        ),
+    ];
+    let service = Service::new(store.clone(), config);
+    service
+        .conclusions(ConclusionsRequest {
+            profile: Some("personal".into()),
+            workspace: Some("synthetic-scope".into()),
+            repo: None,
+            target: Some("user".into()),
+            conclusions: Some(vec![
+                "Decision: synthetic lifecycle sentinel remains recallable".into(),
+            ]),
+            metadata: None,
+            record_type: Some("decision".into()),
+        })
+        .unwrap();
+    store
+        .ensure_session(
+            "startup-budget-session",
+            "personal",
+            "synthetic-scope",
+            None,
+            None,
+            "fixture",
+        )
+        .unwrap();
+    store
+        .insert_visible_turn(&codex_memoryd::domain::VisibleTurn {
+            id: "startup-oversized-turn".into(),
+            session_id: "startup-budget-session".into(),
+            actor: "user".into(),
+            content: format!("synthetic {}", "🦉".repeat(9_000)),
+            created_at: "2026-10-01T00:00:00Z".into(),
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+
+    let request = |job_id: &str, mode: &str| DreamJobRunRequest {
+        job_id: Some(job_id.into()),
+        profile: Some("personal".into()),
+        workspace: Some("synthetic-scope".into()),
+        repo: None,
+        now: Some("2030-01-01T00:00:00Z".into()),
+        since: None,
+        since_explicit: false,
+        kind: "dream_preview".into(),
+        mode: Some(mode.into()),
+        budget: DreamJobBudget {
+            max_runtime_seconds: 10,
+            // The recall sentinel occupies one slot before visible evidence.
+            max_input_records: 2,
+            max_candidates: 5,
+            max_input_tokens: 8000,
+            max_input_bytes: 32000,
+            max_provider_calls: 1,
+            ..Default::default()
+        },
+        provider: None,
+    };
+    let selected = service
+        .run_dream_job(request("startup-budget-diagnostic", "deterministic"))
+        .unwrap();
+    assert_eq!(selected.preview.evidence_window.visible_turns.count, 1);
+    assert_eq!(
+        selected.preview.evidence_window.visible_turns.sources[0].id,
+        "startup-oversized-turn"
+    );
+    let preflight = service
+        .run_dream_job(request("startup-budget-failure", "command"))
+        .unwrap_err();
+    assert_eq!(
+        preflight.message,
+        "dream provider input byte budget exhausted"
+    );
+    assert!(
+        !provider_called.exists(),
+        "budget check must precede dispatch"
+    );
+    let status_before_up = service.status().unwrap();
+    assert_eq!(status_before_up.status, "degraded");
+    assert!(status_before_up.storage.writable);
+    assert_eq!(
+        status_before_up.storage_schema_version,
+        codex_memoryd::store::STORAGE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        status_before_up
+            .features
+            .get("exposure")
+            .and_then(Value::as_str),
+        Some("local_only")
+    );
+    assert!(status_before_up
+        .degraded_reasons
+        .iter()
+        .any(|reason| { reason.contains("dream provider input byte budget exhausted") }));
+    let persisted_failure = store.last_dream_run().unwrap().unwrap();
+    assert_eq!(persisted_failure.status, "error");
+    assert!(persisted_failure
+        .error_summary
+        .as_deref()
+        .is_some_and(|error| error.contains("dream provider input byte budget exhausted")));
+    drop(service);
+    drop(store);
+
+    for _ in 0..3 {
+        let mut up = bin();
+        clear_runtime_env(&mut up);
+        let up_output = up
+            .env("HOME", &home)
+            .env("CODEX_MEMORYD_HOME", &home)
+            .env("CODEX_MEMORYD_DB", &db)
+            .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+            .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
+            .env("CODEX_MEMORYD_PROFILE", "personal")
+            .env("CODEX_MEMORYD_WORKSPACE", "synthetic-scope")
+            .args(["--runtime", "native", "up"])
+            .output()
+            .unwrap();
+
+        let mut status_ok = false;
+        let mut recall_ok = false;
+        if up_output.status.success() {
+            let http = reqwest::blocking::Client::new();
+            let response = http.get(format!("{url}/v1/status")).send().unwrap();
+            let body: serde_json::Value = response.json().unwrap();
+            status_ok = body.pointer("/data/status").and_then(Value::as_str) == Some("degraded")
+                && body
+                    .pointer("/data/storage/writable")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && body
+                    .pointer("/data/degraded_reasons")
+                    .and_then(Value::as_array)
+                    .is_some_and(|reasons| {
+                        reasons.iter().any(|reason| {
+                            reason.as_str().is_some_and(|text| {
+                                text.contains("dream provider input byte budget exhausted")
+                            })
+                        })
+                    });
+            let mut recall = bin();
+            clear_runtime_env(&mut recall);
+            let recall_output = recall
+                .env("HOME", &home)
+                .env("CODEX_MEMORYD_HOME", &home)
+                .arg("--url")
+                .arg(&url)
+                .args([
+                    "recall",
+                    "--profile",
+                    "personal",
+                    "--workspace",
+                    "synthetic-scope",
+                    "--query",
+                    "lifecycle sentinel",
+                ])
+                .output()
+                .unwrap();
+            recall_ok = recall_output.status.success()
+                && String::from_utf8_lossy(&recall_output.stdout)
+                    .contains("synthetic lifecycle sentinel remains recallable");
+        }
+
+        let mut down = bin();
+        clear_runtime_env(&mut down);
+        let down_output = down
+            .env("HOME", &home)
+            .env("CODEX_MEMORYD_HOME", &home)
+            .env("CODEX_MEMORYD_DB", &db)
+            .env("CODEX_MEMORYD_HOST", "127.0.0.1")
+            .env("CODEX_MEMORYD_PORT", bind.rsplit_once(':').unwrap().1)
+            .args(["--runtime", "native", "down"])
+            .output()
+            .unwrap();
+
+        assert!(
+            up_output.status.success(),
+            "native up failed: {}",
+            String::from_utf8_lossy(&up_output.stderr)
+        );
+        assert!(
+            status_ok,
+            "degraded Dreamer receipt was not preserved in live status"
+        );
+        assert!(
+            recall_ok,
+            "configured-scope recall failed after native startup"
+        );
+        assert!(
+            down_output.status.success(),
+            "native down failed: {}",
+            String::from_utf8_lossy(&down_output.stderr)
+        );
+    }
+    assert!(
+        !provider_called.exists(),
+        "restart cycles must not dispatch the failed oversized job"
+    );
+}
+
 #[test]
 fn cli_rejects_invalid_runtime_environment_for_status_and_lifecycle() {
     let dir = TempDir::new().unwrap();
@@ -6681,6 +6910,73 @@ fn cli_mcp_codex_container_global_runtime_placements_and_engines_are_determinist
             podman.to_string_lossy().to_string()
         )));
     let _: toml::Value = toml::from_str(podman_output["snippet"].as_str().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mcp_codex_container_mounts_the_resolved_symlink_database_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let memoryd_home = dir.path().join("memoryd-home");
+    let codex_home = codex_home_path(&dir);
+    let alias_dir = dir.path().join("database-alias");
+    let target_dir = dir.path().join("database-target");
+    fs::create_dir_all(&alias_dir).unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    let target_db = target_dir.join("memory.db");
+    fs::write(&target_db, b"synthetic disposable database fixture").unwrap();
+    let alias_db = alias_dir.join("configured.db");
+    symlink(&target_db, &alias_db).unwrap();
+    let runtime = fake_container_runtime_named(dir.path(), "docker");
+
+    let mut command = bin();
+    clear_runtime_env(&mut command);
+    let output = command
+        .env("CODEX_MEMORYD_HOME", &memoryd_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_MEMORYD_CONTAINER_RUNTIME", &runtime)
+        .env("CODEX_MEMORYD_IMAGE", "codex-memoryd:local")
+        .env("CODEX_MEMORYD_UID", "1001")
+        .env("CODEX_MEMORYD_GID", "1002")
+        .arg("--db")
+        .arg(&alias_db)
+        .args(["mcp", "codex", "preview", "--runtime", "container"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        preview["resolved"]["args"],
+        serde_json::json!([
+            "run",
+            "--rm",
+            "-i",
+            "--pull=missing",
+            "--user",
+            "1001:1002",
+            "--volume",
+            format!("{}:/data", target_dir.canonicalize().unwrap().display()),
+            "--env",
+            "CODEX_MEMORYD_PROFILE=personal",
+            "--env",
+            "CODEX_MEMORYD_WORKSPACE=default",
+            "--env",
+            "CODEX_MEMORYD_LOG=info",
+            "codex-memoryd:local",
+            "--db",
+            "/data/memory.db",
+            "mcp",
+            "stdio",
+            "--read-only"
+        ])
+    );
+    assert!(
+        !codex_home.exists(),
+        "previewing a symlinked database path must not write Codex configuration"
+    );
 }
 
 #[cfg(unix)]
