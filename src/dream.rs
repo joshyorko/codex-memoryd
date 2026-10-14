@@ -60,6 +60,8 @@ struct DreamSchedulerCursor {
     #[serde(default)]
     lower_bound: Option<String>,
     #[serde(default)]
+    upper_bound: Option<String>,
+    #[serde(default)]
     visible_turns: Option<DreamSourceCursor>,
     #[serde(default)]
     conclusions: Option<DreamSourceCursor>,
@@ -69,6 +71,24 @@ struct DreamSchedulerCursor {
     imported_memories: Option<DreamSourceCursor>,
     #[serde(default)]
     active_memory_records: Option<DreamSourceCursor>,
+}
+
+impl DreamSchedulerCursor {
+    fn has_source_position(&self) -> bool {
+        self.visible_turns.is_some()
+            || self.conclusions.is_some()
+            || self.checkpoints.is_some()
+            || self.imported_memories.is_some()
+            || self.active_memory_records.is_some()
+    }
+
+    fn clear_source_positions(&mut self) {
+        self.visible_turns = None;
+        self.conclusions = None;
+        self.checkpoints = None;
+        self.imported_memories = None;
+        self.active_memory_records = None;
+    }
 }
 
 static RELATIVE_TIME: Lazy<Regex> = Lazy::new(|| {
@@ -282,7 +302,19 @@ pub struct DreamParams<'a> {
 
 pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)> {
     check_deadline(params)?;
-    let scheduler_cursor = params.recency_cutoff.and_then(parse_scheduler_cursor);
+    let mut scheduler_cursor = params.recency_cutoff.and_then(parse_scheduler_cursor);
+    if let Some(cursor) = scheduler_cursor.as_mut() {
+        // Cursors written before the fixed upper frontier was introduced can
+        // only be resumed safely by rescanning their current bounded window.
+        if cursor.has_source_position() && cursor.upper_bound.is_none() {
+            cursor.clear_source_positions();
+        }
+    }
+    let source_window_end = scheduler_cursor
+        .as_ref()
+        .and_then(|cursor| cursor.upper_bound.as_deref())
+        .or(params.source_window_end)
+        .unwrap_or(params.now);
     let source_window_start = match scheduler_cursor.as_ref() {
         Some(cursor) => cursor.lower_bound.as_deref(),
         None => params.recency_cutoff,
@@ -305,7 +337,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             params.workspace,
             params.repo_id,
             source_window_start,
-            params.source_window_end,
+            Some(source_window_end),
             cursor.active_memory_records.as_ref(),
             params.max_records,
             params.include_archived_sources,
@@ -315,7 +347,6 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             None => store.query_records(&query)?,
         },
     };
-    let source_window_end = params.source_window_end.unwrap_or(params.now);
     check_deadline(params)?;
     let imported_limit = params.max_records.saturating_sub(records.len());
     if imported_limit > 0 {
@@ -324,6 +355,7 @@ pub fn run(store: &Store, params: &DreamParams) -> Result<(DreamResponse, bool)>
             params,
             imported_limit,
             source_window_start,
+            source_window_end,
             scheduler_cursor.as_ref(),
         )?);
     }
@@ -672,6 +704,7 @@ fn imported_chatgpt_candidate_records(
     params: &DreamParams,
     limit: usize,
     source_window_start: Option<&str>,
+    source_window_end: &str,
     scheduler_cursor: Option<&DreamSchedulerCursor>,
 ) -> Result<Vec<MemoryRecord>> {
     let turns = match scheduler_cursor {
@@ -681,7 +714,7 @@ fn imported_chatgpt_candidate_records(
             params.workspace,
             params.repo_id,
             source_window_start,
-            params.source_window_end,
+            Some(source_window_end),
             cursor.visible_turns.as_ref(),
             params.max_records,
         )?,
@@ -853,8 +886,47 @@ fn scheduler_cursor_from_watermark(previous: Option<&str>) -> DreamSchedulerCurs
 pub fn scheduler_watermark_after(
     previous: Option<&str>,
     window: &DreamEvidenceWindow,
+    now: &str,
+    window_full: bool,
 ) -> Result<Option<String>> {
     let mut cursor = scheduler_cursor_from_watermark(previous);
+    if window_full {
+        // Keep the original scan frontier stable while each source stream is
+        // drained. Rows arriving after it are scanned in a new bounded band.
+        if cursor.upper_bound.is_none() {
+            cursor.clear_source_positions();
+            cursor.upper_bound = Some(window.end.clone());
+        }
+        update_scheduler_cursor(&mut cursor, window);
+        let encoded = serde_json::to_string(&cursor)?;
+        return Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")));
+    }
+
+    if let Some(mut previous_cursor) = previous.and_then(parse_scheduler_cursor) {
+        if previous_cursor.has_source_position() {
+            if let Some(frontier) = previous_cursor.upper_bound.take() {
+                let now_is_after_frontier = OffsetDateTime::parse(now, &Rfc3339)
+                    .ok()
+                    .zip(OffsetDateTime::parse(&frontier, &Rfc3339).ok())
+                    .is_some_and(|(now, frontier)| now > frontier);
+                if now_is_after_frontier {
+                    let next = DreamSchedulerCursor {
+                        lower_bound: Some(frontier),
+                        upper_bound: Some(now.to_string()),
+                        ..DreamSchedulerCursor::default()
+                    };
+                    let encoded = serde_json::to_string(&next)?;
+                    return Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")));
+                }
+                return Ok(Some(frontier));
+            }
+        }
+    }
+
+    Ok(Some(now.to_string()))
+}
+
+fn update_scheduler_cursor(cursor: &mut DreamSchedulerCursor, window: &DreamEvidenceWindow) {
     update_stream_cursor(&mut cursor.visible_turns, &window.visible_turns, false);
     update_stream_cursor(&mut cursor.conclusions, &window.conclusions, false);
     update_stream_cursor(&mut cursor.checkpoints, &window.checkpoints, false);
@@ -883,9 +955,6 @@ pub fn scheduler_watermark_after(
             );
         }
     }
-
-    let encoded = serde_json::to_string(&cursor)?;
-    Ok(Some(format!("{SCHEDULER_CURSOR_PREFIX}{encoded}")))
 }
 
 fn update_stream_cursor(
@@ -1225,6 +1294,9 @@ fn build_evidence_window(
     active_records: &[MemoryRecord],
 ) -> Result<DreamEvidenceWindow> {
     let mut remaining = params.max_records.saturating_sub(active_records.len());
+    let cursor_end = scheduler_cursor
+        .map(|_| Some(end))
+        .unwrap_or(params.source_window_end);
     let visible_turns = if remaining == 0 {
         Vec::new()
     } else if let Some(cursor) = scheduler_cursor {
@@ -1234,7 +1306,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            params.source_window_end,
+            cursor_end,
             cursor.visible_turns.as_ref(),
             remaining,
         )?;
@@ -1246,7 +1318,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            params.source_window_end,
+            cursor_end,
             remaining,
         )?;
         remaining = remaining.saturating_sub(records.len());
@@ -1261,7 +1333,7 @@ fn build_evidence_window(
             params.workspace,
             params.repo_id,
             start,
-            params.source_window_end,
+            cursor_end,
             cursor.conclusions.as_ref(),
             remaining,
         )?;
@@ -1314,7 +1386,7 @@ fn build_evidence_window(
             params.profile.as_str(),
             params.workspace,
             start,
-            params.source_window_end,
+            cursor_end,
             cursor.imported_memories.as_ref(),
             remaining,
         )?

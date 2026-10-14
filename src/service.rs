@@ -2796,19 +2796,18 @@ impl Service {
                 // A limited run has not durably covered the source frontier.
                 // Preserve a bounded source cursor for input-only limits; keep
                 // the previous cursor for runtime, provider, or candidate limits.
-                let watermark_after = if limits_hit.is_empty() {
-                    Some(now.clone())
-                } else if input_window_full
-                    && limits_hit.iter().all(|limit| {
-                        matches!(
-                            limit.as_str(),
-                            "max_input_records" | "max_input_bytes" | "max_input_tokens"
-                        )
-                    })
-                {
+                let input_only_limits = limits_hit.iter().all(|limit| {
+                    matches!(
+                        limit.as_str(),
+                        "max_input_records" | "max_input_bytes" | "max_input_tokens"
+                    )
+                });
+                let watermark_after = if input_only_limits {
                     dream::scheduler_watermark_after(
                         watermark_before.as_deref(),
                         &run.evidence_window,
+                        &now,
+                        input_window_full,
                     )?
                 } else {
                     None

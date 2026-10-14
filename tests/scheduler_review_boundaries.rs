@@ -280,6 +280,79 @@ fn scheduler_cursor_keeps_lower_bound_across_all_streams_and_ties() {
 }
 
 #[test]
+fn scheduler_cursor_keeps_new_evidence_eligible_while_draining() {
+    let store = Store::open(":memory:").expect("store");
+    let service = Service::new(store.clone(), scheduler_config("workspace", 2, false));
+    service
+        .scheduled_dream(Some(BEFORE_FRONTIER.into()))
+        .expect("seed watermark");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+
+    for (id, created_at) in [
+        ("visible-newest-before-drain", "2026-09-10T00:00:00Z"),
+        ("visible-middle-before-drain", "2026-09-09T00:00:00Z"),
+        ("visible-oldest-before-drain", "2026-09-08T00:00:00Z"),
+    ] {
+        insert_chatgpt_turn(
+            &store,
+            "cursor-session",
+            id,
+            &format!("generic evidence {id}"),
+            created_at,
+            None,
+        );
+    }
+
+    let first = service
+        .scheduled_dream(Some(RUN_NOW.into()))
+        .expect("first bounded scheduler page");
+    assert!(first.limits_hit.contains(&"max_input_records".to_string()));
+    assert_eq!(
+        evidence_ids(first.run.as_ref().expect("first run")).len(),
+        2,
+        "first page should be bounded to two sources"
+    );
+
+    insert_chatgpt_turn(
+        &store,
+        "cursor-session",
+        "visible-arrived-during-drain",
+        "generic evidence arrived during the bounded scan",
+        "2030-01-01T00:00:01Z",
+        None,
+    );
+
+    let mut drained = false;
+    for tick in 2..=10 {
+        let now = format!("2030-01-01T00:00:{tick:02}Z");
+        let page = service
+            .scheduled_dream(Some(now.into()))
+            .expect("drain bounded scheduler page");
+        let input_limited = page.limits_hit.contains(&"max_input_records".to_string());
+        if !input_limited {
+            drained = true;
+            break;
+        }
+    }
+    assert!(
+        drained,
+        "the original bounded window should eventually drain"
+    );
+
+    let arrived = service
+        .scheduled_dream(Some("2030-01-01T00:00:11Z".into()))
+        .expect("scan evidence that arrived during the drain");
+    let seen = evidence_ids(arrived.run.as_ref().expect("arrival scan"));
+    assert!(
+        seen.contains("visible-arrived-during-drain"),
+        "newer evidence must remain eligible until the cursor reaches its frontier; evidence={seen:?}; limits={:?}",
+        arrived.limits_hit
+    );
+}
+
+#[test]
 fn synthetic_repository_evidence_resolves_trusted_session_boundary() {
     let store = Store::open(":memory:").expect("store");
     let service = Service::new(store.clone(), scheduler_config("workspace", 10, true));

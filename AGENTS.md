@@ -79,7 +79,7 @@ command's exit receipt. Shared log files do not transfer ownership of an
 agent-local execution session; do not hand off a still-running gate as verified.
 
 Validate the launcher with
-`python3 -m unittest discover -s tests -p test_child_reaper.py -v`.
+`python3 -B -m unittest discover -s tests -p test_child_reaper.py -v`.
 Its `run` function owns the main command's exit status separately from adopted
 child reaping and bounds signal cleanup. The canonical release gate includes
 these launcher checks.

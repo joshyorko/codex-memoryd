@@ -224,7 +224,7 @@ PY
 
 : >"$ARTIFACT_DIR/steps.jsonl"
 
-run "child-reaper-tests" python3 -m unittest discover -s tests -p test_child_reaper.py -v
+run "child-reaper-tests" python3 -B -m unittest discover -s tests -p test_child_reaper.py -v
 run "cargo-fmt" cargo fmt --all --check
 run "git-diff-check" git diff --check
 
