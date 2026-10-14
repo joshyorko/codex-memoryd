@@ -963,6 +963,7 @@ impl Store {
                 .ok_or_else(|| Error::invalid_request("consolidation batch profile is invalid"))?;
             enforce_consolidation_budget(&batch, policy)?;
             let mut applied = Vec::new();
+            let mut active_memory_mutation_sequence = None;
             for decision in decisions {
                 let Some(candidate) = batch.candidates.iter().find(|item| item.candidate_id == decision.candidate_id) else {
                     return Err(Error::invalid_request("consolidation decision references unknown candidate"));
@@ -1107,6 +1108,10 @@ impl Store {
                     (id, false)
                 };
                 if reused_existing {
+                    if active_memory_mutation_sequence.is_none() {
+                        active_memory_mutation_sequence =
+                            Some(next_active_memory_mutation_sequence(tx)?);
+                    }
                     let (raw_source_ids, raw_metadata): (String, String) = tx.query_row(
                         "SELECT source_ids, metadata FROM memory_records WHERE id = ?1",
                         rusqlite::params![&record_id],
@@ -1130,8 +1135,9 @@ impl Store {
                              temporal_state = COALESCE(?2, temporal_state),
                              valid_until = COALESCE(?3, valid_until),
                              historical_reason = COALESCE(?4, historical_reason),
-                             metadata = ?5, updated_at = ?6, archived = 0
-                         WHERE id = ?7 AND (archived = 0 OR ?8 = 1)
+                             metadata = ?5, updated_at = ?6, archived = 0,
+                             active_memory_mutation_sequence = ?7
+                         WHERE id = ?8 AND (archived = 0 OR ?9 = 1)
                            AND COALESCE(temporal_state, 'current') = 'current'",
                         rusqlite::params![
                             serde_json::to_string(&source_ids)?,
@@ -1140,6 +1146,8 @@ impl Store {
                             candidate.historical_reason.as_deref(),
                             metadata.to_string(),
                             ids::now_rfc3339(),
+                            active_memory_mutation_sequence
+                                .expect("sequence initialized before reused-record update"),
                             &record_id,
                             decision.supersedes.is_empty(),
                         ],
@@ -1204,6 +1212,7 @@ impl Store {
                 .collect::<std::result::Result<Vec<String>, _>>()?;
             drop(stmt);
             let mut reverted = Vec::new();
+            let mut reactivation_sequence = None;
             for replacement_id in &ids {
                 let old_records = tx
                     .prepare(
@@ -1254,11 +1263,21 @@ impl Store {
                     let previous_historical_reason = previous
                         .get("historical_reason")
                         .and_then(Value::as_str);
+                    let mutation_sequence = if previous_archived == 0 {
+                        if reactivation_sequence.is_none() {
+                            reactivation_sequence =
+                                Some(next_active_memory_mutation_sequence(tx)?);
+                        }
+                        reactivation_sequence
+                    } else {
+                        None
+                    };
                     tx.execute(
                         "UPDATE memory_records
                          SET archived = ?1, temporal_state = ?2, superseded_by = ?3,
                              valid_until = ?4, historical_reason = ?5,
-                             updated_at = ?6, metadata = ?7
+                             updated_at = ?6, metadata = ?7,
+                             active_memory_mutation_sequence = COALESCE(?9, active_memory_mutation_sequence)
                          WHERE id = ?8",
                         rusqlite::params![
                             previous_archived,
@@ -1269,6 +1288,7 @@ impl Store {
                             ids::now_rfc3339(),
                             previous_metadata.to_string(),
                             old_id,
+                            mutation_sequence,
                         ],
                     )?;
                 }
@@ -3045,12 +3065,45 @@ impl Store {
                         merged.push(sid.clone());
                     }
                 }
-                let now = ids::now_rfc3339();
-                let conn = self.conn()?;
-                conn.execute(
-                    "UPDATE memory_records SET source_ids = ?1, metadata = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![serde_json::to_string(&merged)?, merged_metadata.to_string(), if new.source_ids.is_empty() { existing.updated_at.clone() } else { now }, existing.id],
-                )?;
+                let existing_id = existing.id.clone();
+                let merged_source_ids = serde_json::to_string(&merged)?;
+                let merged_metadata = merged_metadata.to_string();
+                self.transaction_immediate(|tx| {
+                    let is_scheduler_eligible: bool = tx.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM memory_records
+                             WHERE id = ?1 AND archived = 0
+                               AND sensitivity != 'secret_blocked'
+                               AND trust_state != 'quarantined'
+                         )",
+                        params![existing_id],
+                        |row| row.get(0),
+                    )?;
+                    let mutation_sequence = if is_scheduler_eligible {
+                        Some(next_active_memory_mutation_sequence(tx)?)
+                    } else {
+                        None
+                    };
+                    let updated_at = if new.source_ids.is_empty() {
+                        existing.updated_at.clone()
+                    } else {
+                        ids::now_rfc3339()
+                    };
+                    tx.execute(
+                        "UPDATE memory_records
+                         SET source_ids = ?1, metadata = ?2, updated_at = ?3,
+                             active_memory_mutation_sequence = COALESCE(?4, active_memory_mutation_sequence)
+                         WHERE id = ?5",
+                        params![
+                            merged_source_ids,
+                            merged_metadata,
+                            updated_at,
+                            mutation_sequence,
+                            existing_id
+                        ],
+                    )?;
+                    Ok(())
+                })?;
             }
             return Ok(UpsertOutcome::Skipped(existing.id));
         }
@@ -3468,13 +3521,14 @@ impl Store {
         now: &str,
     ) -> Result<Option<MemoryRecord>> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if !self.scoped_record_exists(&tx, old_id, profile_id, Some(workspace_id))?
             || !self.scoped_record_exists(&tx, new_id, profile_id, Some(workspace_id))?
         {
             tx.commit()?;
             return Ok(None);
         }
+        let mutation_sequence = next_active_memory_mutation_sequence(&tx)?;
 
         tx.execute(
             "UPDATE memory_records
@@ -3482,9 +3536,18 @@ impl Store {
                  superseded_by = ?4,
                  valid_until = COALESCE(valid_until, ?5),
                  historical_reason = ?6,
-                 updated_at = ?5
+                 updated_at = ?5,
+                 active_memory_mutation_sequence = ?7
              WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
-            params![profile_id, workspace_id, old_id, new_id, now, reason],
+            params![
+                profile_id,
+                workspace_id,
+                old_id,
+                new_id,
+                now,
+                reason,
+                mutation_sequence
+            ],
         )?;
 
         let raw: String = tx.query_row(
@@ -3498,7 +3561,8 @@ impl Store {
             supersedes.push(old_id.to_string());
             tx.execute(
                 "UPDATE memory_records
-                 SET supersedes = ?4, updated_at = ?5
+                 SET supersedes = ?4, updated_at = ?5,
+                     active_memory_mutation_sequence = ?6
                  WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
                 params![
                     profile_id,
@@ -3506,6 +3570,7 @@ impl Store {
                     new_id,
                     serde_json::to_string(&supersedes)?,
                     now,
+                    mutation_sequence,
                 ],
             )?;
         }
@@ -3524,20 +3589,22 @@ impl Store {
         now: &str,
     ) -> Result<Option<MemoryRecord>> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if !self.scoped_record_exists(&tx, id, profile_id, Some(workspace_id))? {
             tx.commit()?;
             return Ok(None);
         }
+        let mutation_sequence = next_active_memory_mutation_sequence(&tx)?;
         tx.execute(
             "UPDATE memory_records
              SET temporal_state = 'invalidated',
                  invalidated_at = ?4,
                  valid_until = COALESCE(valid_until, ?4),
                  historical_reason = ?5,
-                 updated_at = ?4
+                 updated_at = ?4,
+                 active_memory_mutation_sequence = ?6
              WHERE profile_id = ?1 AND workspace_id = ?2 AND id = ?3",
-            params![profile_id, workspace_id, id, now, reason],
+            params![profile_id, workspace_id, id, now, reason, mutation_sequence],
         )?;
         tx.commit()?;
         drop(conn);

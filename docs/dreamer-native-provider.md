@@ -71,14 +71,20 @@ rejection in audit history. Completed unbounded simulated-clock scans retain
 their rowid frontier even when the simulated clock does not advance. Each
 bounded band caps every source stream at its captured rowid frontier. The next
 band also checks rows inserted after that cap, including rows whose source
-timestamp was backdated below the prior band's end. Restore and promotion
-operations allocate a per-record mutation sequence in the same SQLite
-transaction as the eligibility change; the scheduler captures that sequence
-with the rowid frontier so an uncommitted mutation cannot be skipped because
-its wall-clock timestamp predates a scan. Previously selected active records
-may provide comparison context, but only a record selected in the current
-evidence window can emit stale or supersession candidates. Process-group
-children are terminated; orphan reaping remains the operating system's job.
+timestamp was backdated below the prior band's end. The first bounded band
+after an unbounded scan uses the same post-frontier catch-up, so arrivals
+between that snapshot and the next band are not lost below the timestamp
+watermark. Existing-row updates that affect scheduler-visible evidence and
+eligibility changes allocate a per-record mutation sequence in the same SQLite
+transaction: provenance upserts, supersession and invalidation, consolidation
+reuse and undo, restore, and promotion. The scheduler captures that sequence
+with the rowid frontier so an uncommitted update cannot be skipped because its
+wall-clock timestamp predates a scan. Archiving and quarantine remove rows from
+eligible selection; a later reactivation advances the sequence. Previously
+selected active records may provide comparison context, but only a record
+selected in the current evidence window can emit stale or supersession
+candidates. Process-group children are terminated; orphan reaping remains the
+operating system's job.
 
 Managed readiness accepts `local_only`, or `degraded` only when the reported
 store is writable SQLite at the current schema, the exact configured

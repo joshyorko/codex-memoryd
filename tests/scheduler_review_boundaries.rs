@@ -6,6 +6,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use codex_memoryd::config::Config;
+use codex_memoryd::consolidation::{
+    ConsolidationBatch, ConsolidationBudget, ConsolidationCandidate, ConsolidationDecision,
+    ConsolidationMode, ConsolidationOperation, ConsolidationPolicy, ConsolidationSourceCursor,
+    CONSOLIDATION_CONTRACT_VERSION,
+};
 use codex_memoryd::domain::{
     Checkpoint, Conclusion, Portability, Profile, Sensitivity, VisibleTurn,
 };
@@ -36,37 +41,45 @@ fn scheduler_config(workspace: &str, max_batch_size: usize, automatic_apply: boo
 }
 
 fn insert_memory_record(store: &Store, content: &str, metadata: serde_json::Value) -> String {
-    let class = policy::classify(content, Profile::Personal, false);
     match store
-        .upsert_record(&NewRecord {
-            profile_id: PROFILE.into(),
-            workspace_id: "workspace".into(),
-            repo_id: None,
-            subject_id: None,
-            episode_id: None,
-            scope: class.scope,
-            record_type: class.record_type,
-            content: content.into(),
-            related_files: vec![],
-            tags: vec![],
-            sensitivity: Sensitivity::Personal,
-            portability: Portability::ProfileOnly,
-            confidence: class.confidence,
-            source_ids: vec![],
-            content_hash: ids::exact_content_hash(
-                PROFILE,
-                "workspace",
-                None,
-                class.record_type.as_str(),
-                class.scope.as_str(),
-                content,
-            ),
-            supersedes: vec![],
-            metadata,
-        })
+        .upsert_record(&new_memory_record(content, metadata, vec![]))
         .expect("synthetic memory record")
     {
         UpsertOutcome::Created(id) | UpsertOutcome::Skipped(id) => id,
+    }
+}
+
+fn new_memory_record(
+    content: &str,
+    metadata: serde_json::Value,
+    source_ids: Vec<String>,
+) -> NewRecord {
+    let class = policy::classify(content, Profile::Personal, false);
+    NewRecord {
+        profile_id: PROFILE.into(),
+        workspace_id: "workspace".into(),
+        repo_id: None,
+        subject_id: None,
+        episode_id: None,
+        scope: class.scope,
+        record_type: class.record_type,
+        content: content.into(),
+        related_files: vec![],
+        tags: vec![],
+        sensitivity: Sensitivity::Personal,
+        portability: Portability::ProfileOnly,
+        confidence: class.confidence,
+        source_ids,
+        content_hash: ids::exact_content_hash(
+            PROFILE,
+            "workspace",
+            None,
+            class.record_type.as_str(),
+            class.scope.as_str(),
+            content,
+        ),
+        supersedes: vec![],
+        metadata,
     }
 }
 
@@ -174,6 +187,77 @@ fn run_scheduler_cursor(
     .0
 }
 
+fn apply_synthetic_consolidation(
+    store: &Store,
+    batch_id: &str,
+    content: &str,
+    supersedes: &[String],
+) -> Vec<String> {
+    let policy = ConsolidationPolicy {
+        contract_version: CONSOLIDATION_CONTRACT_VERSION.into(),
+        mode: ConsolidationMode::Automatic,
+        scopes: vec!["personal".into()],
+        claim_classes: vec!["preference".into()],
+        source_classes: vec!["user_statement".into()],
+        operations: vec![ConsolidationOperation::AdoptStatement],
+        budget: ConsolidationBudget {
+            max_candidates: 10,
+            max_source_records: 10,
+            max_provider_calls: 1,
+            max_input_bytes: 4096,
+            max_output_bytes: 4096,
+        },
+        retention_days: 30,
+        semantic_validation: false,
+        legacy_metadata: None,
+    };
+    let candidate = ConsolidationCandidate {
+        candidate_id: format!("{batch_id}-candidate"),
+        output_digest: format!("{batch_id}-output"),
+        claim: content.into(),
+        claim_class: "preference".into(),
+        subject: "user".into(),
+        inferred: false,
+        source_ids: vec![format!("{batch_id}-synthetic-source")],
+        supporting_spans: vec![content.into()],
+        supersedes: supersedes.to_vec(),
+        temporal_state: None,
+        valid_until: None,
+        historical_reason: None,
+    };
+    let batch = ConsolidationBatch {
+        contract_version: CONSOLIDATION_CONTRACT_VERSION.into(),
+        batch_id: batch_id.into(),
+        policy_digest: policy.digest(),
+        profile: PROFILE.into(),
+        workspace: "workspace".into(),
+        repo_id: None,
+        scope: "personal".into(),
+        source_cursor: ConsolidationSourceCursor {
+            since: None,
+            until: Some(RUN_NOW.into()),
+            explicit_since: false,
+        },
+        snapshot_digest: format!("{batch_id}-snapshot"),
+        candidates: vec![candidate.clone()],
+    };
+    let decisions = vec![ConsolidationDecision {
+        candidate_id: candidate.candidate_id.clone(),
+        output_digest: candidate.output_digest.clone(),
+        operation: ConsolidationOperation::AdoptStatement,
+        reason: "synthetic consolidation scheduler regression".into(),
+        distinct_evidence_roots: candidate.source_ids.clone(),
+        supersedes: supersedes.to_vec(),
+        validator: None,
+    }];
+    store
+        .persist_consolidation_batch(&batch, Some(&decisions), "validated")
+        .expect("persist synthetic consolidation batch");
+    store
+        .apply_consolidation_proposal(&batch.batch_id, &policy, &decisions)
+        .expect("apply synthetic consolidation batch")
+}
+
 fn insert_chatgpt_turn(
     store: &Store,
     session_id: &str,
@@ -214,10 +298,6 @@ fn insert_chatgpt_turn(
 fn scheduler_cursor_keeps_lower_bound_across_all_streams_and_ties() {
     let store = Store::open(":memory:").expect("store");
     let service = Service::new(store.clone(), scheduler_config("workspace", 3, false));
-
-    service
-        .scheduled_dream(Some(FRONTIER.into()))
-        .expect("seed watermark");
     store
         .ensure_workspace(PROFILE, "workspace")
         .expect("workspace");
@@ -358,6 +438,21 @@ fn scheduler_cursor_keeps_lower_bound_across_all_streams_and_ties() {
             Ok(())
         })
         .expect("source timestamps");
+
+    store
+        .record_dream_run(&DreamRunRecord {
+            run_id: "zzzz-scheduler-seed-watermark".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            mode: "preview".into(),
+            kind: "scheduled".into(),
+            status: "ok".into(),
+            started_at: FRONTIER.into(),
+            completed_at: Some(FRONTIER.into()),
+            watermark_after: Some(FRONTIER.into()),
+            ..Default::default()
+        })
+        .expect("seed timestamp watermark without a rowid frontier");
 
     let mut seen = BTreeSet::new();
     for now in [
@@ -711,6 +806,341 @@ fn scheduler_bounded_band_catches_backdated_rows_after_its_rowid_frontier() {
         .expect("scan post-frontier rows in the next band");
     assert!(evidence_ids(next_band.run.as_ref().expect("next-band run"))
         .contains("visible-backdated-after-frontier"));
+}
+
+#[test]
+fn scheduler_unbounded_completion_catches_backdated_rows_in_next_fixed_band() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    let unbounded = codex_memoryd::dream::scheduler_cursor_for_run(&store, None, RUN_NOW, true)
+        .expect("capture unbounded frontier");
+    let backdated_at = "2029-12-31T23:59:00Z";
+    insert_chatgpt_turn(
+        &store,
+        "late-unbounded-session",
+        "visible-after-unbounded-frontier",
+        "generic late source with a timestamp before simulated now",
+        backdated_at,
+        None,
+    );
+    store
+        .insert_conclusion(&Conclusion {
+            id: "conclusion-after-unbounded-frontier".into(),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            target: "user".into(),
+            content: "Conclusion: late unbounded frontier source".into(),
+            source_id: None,
+            created_at: backdated_at.into(),
+            metadata: json!({}),
+        })
+        .expect("backdated conclusion");
+    store
+        .insert_checkpoint(&Checkpoint {
+            id: "checkpoint-after-unbounded-frontier".into(),
+            session_id: Some("late-unbounded-session".into()),
+            profile_id: PROFILE.into(),
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            summary: "generic late unbounded frontier checkpoint".into(),
+            changed_files: vec![],
+            decisions: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            tests_run: vec![],
+            tests_not_run: vec![],
+            branch: None,
+            commit: None,
+            created_at: backdated_at.into(),
+        })
+        .expect("backdated checkpoint");
+    let (source, _) = store
+        .upsert_source(
+            PROFILE,
+            "workspace",
+            "fixture",
+            Some("unbounded-late-source"),
+            "unbounded-late-hash",
+            &json!({}),
+        )
+        .expect("backdated memory source");
+    let memory_record_id = insert_memory_record(
+        &store,
+        "Preference: late active record after unbounded frontier",
+        json!({"origin": "fixture"}),
+    );
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_sources SET ingested_at = ?1 WHERE id = ?2",
+                rusqlite::params![backdated_at, source.id],
+            )?;
+            tx.execute(
+                "UPDATE memory_records SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![backdated_at, memory_record_id],
+            )?;
+            Ok(())
+        })
+        .expect("set synthetic backdated timestamps");
+
+    let first_scan = run_scheduler_cursor(&store, &unbounded, RUN_NOW);
+    assert!(
+        evidence_ids(&first_scan).is_empty(),
+        "the late row must remain outside the captured unbounded frontier"
+    );
+    let completed_unbounded = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&unbounded),
+        &first_scan.evidence_window,
+        RUN_NOW,
+        false,
+    )
+    .expect("complete unbounded scan")
+    .expect("completed unbounded cursor");
+
+    let next_band = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_unbounded),
+        "2030-01-01T00:00:01Z",
+        false,
+    )
+    .expect("open fixed band after unbounded scan");
+    let next_scan = run_scheduler_cursor(&store, &next_band, "2030-01-01T00:00:01Z");
+    let next_ids = evidence_ids(&next_scan);
+    for id in [
+        "visible-after-unbounded-frontier",
+        "conclusion-after-unbounded-frontier",
+        "checkpoint-after-unbounded-frontier",
+        source.id.as_str(),
+        memory_record_id.as_str(),
+    ] {
+        assert!(
+            next_ids.contains(id),
+            "the first fixed band after unbounded completion must include every post-frontier stream, even with backdated timestamps; missing={id}, selected={next_ids:?}"
+        );
+    }
+}
+
+#[test]
+fn scheduler_observes_exact_hash_consolidation_reactivation_after_rowid_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    let content = "Preference: preserve exact-hash scheduler eligibility";
+    let archived_id = insert_memory_record(&store, content, json!({"origin": "fixture"}));
+    store
+        .archive_records(
+            PROFILE,
+            Some("workspace"),
+            std::slice::from_ref(&archived_id),
+        )
+        .expect("archive synthetic exact-hash record");
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, "2000-01-01T00:00:00Z", true)
+            .expect("capture initial active-memory frontier");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, "2000-01-01T00:00:00Z");
+    assert!(!evidence_ids(&initial_run).contains(&archived_id));
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        "2000-01-01T00:00:00Z",
+        false,
+    )
+    .expect("complete initial scan")
+    .expect("completed initial cursor");
+
+    assert_eq!(
+        apply_synthetic_consolidation(&store, "reactivate-exact-hash-batch", content, &[],),
+        vec![archived_id.clone()]
+    );
+    let next_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        RUN_NOW,
+        false,
+    )
+    .expect("capture post-reactivation mutation frontier");
+    let next_run = run_scheduler_cursor(&store, &next_cursor, RUN_NOW);
+    assert!(
+        evidence_ids(&next_run).contains(&archived_id),
+        "an exact-hash reactivation must be selected after its old rowid was scanned"
+    );
+    let reactivated_sequence = store
+        .transaction(|tx| {
+            tx.query_row(
+                "SELECT active_memory_mutation_sequence FROM memory_records WHERE id = ?1",
+                rusqlite::params![archived_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .expect("read reactivated mutation sequence");
+    assert!(
+        reactivated_sequence > 0,
+        "reactivation must allocate a mutation sequence"
+    );
+}
+
+#[test]
+fn scheduler_rechecks_eligible_existing_record_updates_after_rowid_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    let upsert_content = "Preference: merge a later synthetic source";
+    let upsert_id = insert_memory_record(&store, upsert_content, json!({"origin": "fixture"}));
+    let superseded_id = insert_memory_record(
+        &store,
+        "Preference: retain supersession context after the frontier",
+        json!({"origin": "fixture"}),
+    );
+    let replacement_id = insert_memory_record(
+        &store,
+        "Preference: replacement context after the frontier",
+        json!({"origin": "fixture"}),
+    );
+    let invalidated_id = insert_memory_record(
+        &store,
+        "Preference: retain invalidation context after the frontier",
+        json!({"origin": "fixture"}),
+    );
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, "2000-01-01T00:00:00Z", true)
+            .expect("capture initial existing-record frontier");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, "2000-01-01T00:00:00Z");
+    let initial_ids = evidence_ids(&initial_run);
+    assert!(initial_ids.contains(&upsert_id));
+    assert!(initial_ids.contains(&superseded_id));
+    assert!(initial_ids.contains(&replacement_id));
+    assert!(initial_ids.contains(&invalidated_id));
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        "2000-01-01T00:00:00Z",
+        false,
+    )
+    .expect("complete initial existing-record scan")
+    .expect("completed existing-record cursor");
+
+    store
+        .upsert_record(&new_memory_record(
+            upsert_content,
+            json!({"origin": "fixture"}),
+            vec!["synthetic-late-source".into()],
+        ))
+        .expect("merge source into existing active record");
+    store
+        .supersede_record(
+            PROFILE,
+            "workspace",
+            &superseded_id,
+            &replacement_id,
+            "synthetic scheduler regression",
+            RUN_NOW,
+        )
+        .expect("update existing supersession records");
+    store
+        .invalidate_record(
+            PROFILE,
+            "workspace",
+            &invalidated_id,
+            "synthetic scheduler regression",
+            RUN_NOW,
+        )
+        .expect("update existing invalidation record");
+
+    let next_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        RUN_NOW,
+        false,
+    )
+    .expect("capture updates to existing rows");
+    let next_run = run_scheduler_cursor(&store, &next_cursor, RUN_NOW);
+    let updated_ids = evidence_ids(&next_run);
+    for id in [upsert_id, superseded_id, replacement_id, invalidated_id] {
+        assert!(
+            updated_ids.contains(&id),
+            "existing eligible record update was skipped after the rowid frontier: {id}; selected={updated_ids:?}"
+        );
+    }
+}
+
+#[test]
+fn scheduler_observes_consolidation_undo_reactivation_after_rowid_frontier() {
+    let store = Store::open(":memory:").expect("store");
+    store
+        .ensure_workspace(PROFILE, "workspace")
+        .expect("workspace");
+    let superseded_id = insert_memory_record(
+        &store,
+        "Preference: original claim restored by consolidation undo",
+        json!({"origin": "fixture"}),
+    );
+    let batch_id = "undo-reactivation-batch";
+    let replacement_ids = apply_synthetic_consolidation(
+        &store,
+        batch_id,
+        "Preference: governed replacement for the original claim",
+        std::slice::from_ref(&superseded_id),
+    );
+    assert_eq!(replacement_ids.len(), 1);
+    assert!(
+        store
+            .get_record(&superseded_id)
+            .expect("read target")
+            .unwrap()
+            .archived
+    );
+
+    let initial_cursor =
+        codex_memoryd::dream::scheduler_cursor_for_run(&store, None, "2000-01-01T00:00:00Z", true)
+            .expect("capture frontier before consolidation undo");
+    let initial_run = run_scheduler_cursor(&store, &initial_cursor, "2000-01-01T00:00:00Z");
+    assert!(!evidence_ids(&initial_run).contains(&superseded_id));
+    let completed_initial = codex_memoryd::dream::scheduler_watermark_after(
+        &store,
+        Some(&initial_cursor),
+        &initial_run.evidence_window,
+        "2000-01-01T00:00:00Z",
+        false,
+    )
+    .expect("complete pre-undo scan")
+    .expect("completed pre-undo cursor");
+
+    assert_eq!(
+        store
+            .undo_consolidation_proposal(batch_id)
+            .expect("undo synthetic consolidation"),
+        replacement_ids
+    );
+    assert!(
+        !store
+            .get_record(&superseded_id)
+            .expect("read restored target")
+            .unwrap()
+            .archived
+    );
+    let next_cursor = codex_memoryd::dream::scheduler_cursor_for_run(
+        &store,
+        Some(&completed_initial),
+        RUN_NOW,
+        false,
+    )
+    .expect("capture consolidation undo mutation");
+    let next_run = run_scheduler_cursor(&store, &next_cursor, RUN_NOW);
+    assert!(
+        evidence_ids(&next_run).contains(&superseded_id),
+        "undo must re-emit a restored existing row after its old rowid was scanned"
+    );
 }
 
 #[test]

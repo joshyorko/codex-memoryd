@@ -1076,6 +1076,7 @@ pub fn scheduler_cursor_for_run(
                 .unwrap_or(now);
             cursor.upper_unbounded = false;
             cursor.upper_bound = Some(next_start.to_string());
+            cursor.include_post_frontier_rowids = true;
             let frontiers = scheduler_rowid_frontier(store)?;
             begin_active_memory_mutation_scan(
                 &mut cursor,
