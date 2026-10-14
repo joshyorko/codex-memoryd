@@ -170,13 +170,13 @@ impl RuntimeOptions {
         let runtime_env_url = runtime_env_value(&runtime_env, "CODEX_MEMORYD_URL")
             .or_else(|| runtime_env_value(&runtime_env, "CODEX_MEMORYD_BASE_URL"));
 
-        let bind_candidate = bind_override.clone().or_else(|| {
-            if endpoint_address_overridden {
-                None
-            } else {
-                process_bind.clone().or_else(|| runtime_env_bind.clone())
-            }
-        });
+        // Keep an inherited bind available while resolving a partial host or
+        // port override. It supplies the unspecified component; the final
+        // bind is rebuilt below when either address component was overridden.
+        let bind_candidate = bind_override
+            .clone()
+            .or_else(|| process_bind.clone())
+            .or_else(|| runtime_env_bind.clone());
         let parsed_bind = bind_candidate.as_deref().and_then(parse_bind_host_port);
 
         let host = host_override
@@ -197,7 +197,11 @@ impl RuntimeOptions {
             })
             .or_else(|| parsed_bind.as_ref().map(|(_, port)| *port))
             .unwrap_or(8787);
-        let bind = bind_candidate.unwrap_or_else(|| format!("{host}:{port}"));
+        let bind = if endpoint_address_overridden && bind_override.is_none() {
+            format!("{host}:{port}")
+        } else {
+            bind_candidate.unwrap_or_else(|| format!("{host}:{port}"))
+        };
         let db = db_override
             .or_else(|| env_path("CODEX_MEMORYD_DB"))
             .or_else(|| runtime_env_path(&runtime_env, "CODEX_MEMORYD_DB"))

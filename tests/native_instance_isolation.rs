@@ -600,6 +600,14 @@ fn reserve_loopback_ports(count: usize) -> (Vec<u16>, Vec<TcpListener>) {
     (ports, listeners)
 }
 
+fn documented_port_check_commands() -> Vec<&'static str> {
+    const RUNBOOK: &str = include_str!("../docs/dakota-native-codex-instance.md");
+    RUNBOOK
+        .lines()
+        .filter(|line| line.starts_with("python3 -c ") && line.contains("sys.argv[1]"))
+        .collect()
+}
+
 fn returned_by_id<'a>(responses: &'a [Value], id: u64) -> &'a Value {
     responses
         .iter()
@@ -1098,4 +1106,81 @@ md down > "$MEMORYD_CODEX_HOME/down.json"
             && row.source_kind == "sync_local"
             && row.policy_state == "accepted"
     }));
+}
+
+#[test]
+fn documented_port_checks_use_selected_port_for_initialization_and_recovery() {
+    let commands = documented_port_check_commands();
+    assert_eq!(
+        commands.len(),
+        2,
+        "expected initial and recovery port probes"
+    );
+    assert!(commands
+        .iter()
+        .all(|command| command.contains("$MEMORYD_CODEX_PORT")));
+
+    for command in commands {
+        let (ports, reservations) = reserve_loopback_ports(1);
+        let port = ports[0];
+        let script = format!("MEMORYD_CODEX_PORT={port}\n{command}");
+        let occupied = Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .expect("run port probe while port is occupied");
+        assert!(
+            !occupied.status.success(),
+            "port probe should reject an occupied selected port {port}"
+        );
+
+        drop(reservations);
+        let available = Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .expect("run port probe after port is released");
+        assert!(
+            available.status.success(),
+            "port probe should accept available selected port {port}: {}",
+            String::from_utf8_lossy(&available.stderr)
+        );
+        assert!(String::from_utf8_lossy(&available.stdout).contains(&port.to_string()));
+    }
+}
+
+#[test]
+fn init_partial_endpoint_overrides_preserve_inherited_bind_component() {
+    let sandbox = TempDir::new().expect("temporary endpoint resolution sandbox");
+    let port_home = sandbox.path().join("port-override");
+    let port_override = command_for_home(&port_home)
+        .env("CODEX_MEMORYD_BIND", "127.0.0.2:9123")
+        .args(["init", "--port", "9124"])
+        .output()
+        .expect("initialize with inherited bind and port override");
+    success_json(port_override, "init with inherited bind and port override");
+    let port_paths = success_json(
+        command_for_home(&port_home)
+            .args(["paths", "--format", "json"])
+            .output()
+            .expect("inspect port-override paths"),
+        "paths after port override",
+    );
+    assert_eq!(port_paths["bind"]["value"], "127.0.0.2:9124");
+    assert_eq!(port_paths["url"]["value"], "http://127.0.0.2:9124");
+
+    let host_home = sandbox.path().join("host-override");
+    let host_override = command_for_home(&host_home)
+        .env("CODEX_MEMORYD_BIND", "127.0.0.2:9123")
+        .args(["init", "--host", "127.0.0.3"])
+        .output()
+        .expect("initialize with inherited bind and host override");
+    success_json(host_override, "init with inherited bind and host override");
+    let host_paths = success_json(
+        command_for_home(&host_home)
+            .args(["paths", "--format", "json"])
+            .output()
+            .expect("inspect host-override paths"),
+        "paths after host override",
+    );
+    assert_eq!(host_paths["bind"]["value"], "127.0.0.3:9123");
+    assert_eq!(host_paths["url"]["value"], "http://127.0.0.3:9123");
 }

@@ -39,7 +39,7 @@ listener.
 
 ```bash
 MEMORYD_CODEX_PORT=8990
-python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 8990)); s.close(); print("127.0.0.1:8990 is available at check time")'
+python3 -c 'import socket, sys; port = int(sys.argv[1]); s=socket.socket(); s.bind(("127.0.0.1", port)); s.close(); print(f"127.0.0.1:{port} is available at check time")' "$MEMORYD_CODEX_PORT"
 ```
 
 ## Initialize and inspect resolved paths
@@ -157,7 +157,7 @@ the resolved path before proceeding.
 
 ```bash
 MEMORYD_CODEX_PORT=8991
-python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 8991)); s.close(); print("127.0.0.1:8991 is available at check time")'
+python3 -c 'import socket, sys; port = int(sys.argv[1]); s=socket.socket(); s.bind(("127.0.0.1", port)); s.close(); print(f"127.0.0.1:{port} is available at check time")' "$MEMORYD_CODEX_PORT"
 md init --host 127.0.0.1 --port "$MEMORYD_CODEX_PORT" \
   --bind "127.0.0.1:$MEMORYD_CODEX_PORT"
 md paths --format json | jq '{home: .entries.runtime_home.path, database: .entries.database.path, bind: .bind.value}'
