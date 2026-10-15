@@ -1,5 +1,8 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::config::Config;
-use codex_memoryd::protocol::{ConclusionsRequest, ConsolidationUndoRequest};
+use codex_memoryd::protocol::ConsolidationUndoRequest;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::Store;
 
@@ -16,17 +19,13 @@ fn automatic_response_returns_batch_id_usable_for_undo() {
     config.dream_scheduler.min_session_age_seconds = 0;
     config.dream_scheduler.min_turn_count = 0;
     let service = Service::new(store, config);
-    service
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("ws".into()),
-            repo: None,
-            target: Some("user".into()),
-            conclusions: Some(vec!["Decision: use concise summaries".into()]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .expect("source conclusion");
+    primary_checkpoint::capture(
+        &service,
+        "personal",
+        "ws",
+        None,
+        "Decision: use concise summaries",
+    );
 
     let scheduled = service
         .scheduled_dream(Some("2030-01-01T00:00:00Z".into()))

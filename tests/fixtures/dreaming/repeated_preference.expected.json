@@ -6,7 +6,7 @@
         "action": "promote",
         "record_type": "command",
         "promotion_reason": "repeated_user_steering",
-        "evidence_count": 4,
+        "evidence_count": 3,
         "must_contain": ["cargo test", "helper scripts"],
         "must_not_contain": []
       }

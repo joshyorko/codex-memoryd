@@ -1,6 +1,9 @@
+#[path = "support/primary_checkpoint.rs"]
+mod primary_checkpoint;
+
 use codex_memoryd::config::Config;
 use codex_memoryd::domain::RepoIdentity;
-use codex_memoryd::protocol::{ConclusionsRequest, RecallRequest};
+use codex_memoryd::protocol::RecallRequest;
 use codex_memoryd::service::Service;
 use codex_memoryd::store::{RecordQuery, Store};
 
@@ -29,21 +32,14 @@ fn repo(repo_id: &str) -> RepoIdentity {
 fn scheduled_adoption_preserves_repository_scope() {
     let store = Store::open(":memory:").expect("store");
     let service = Service::new(store.clone(), config());
-    let source = service
-        .conclusions(ConclusionsRequest {
-            profile: Some("personal".into()),
-            workspace: Some("scope".into()),
-            repo: Some(repo("repo-a")),
-            target: Some("user".into()),
-            conclusions: Some(vec![
-                "Decision: repository alpha uses the crimson deployment.".into(),
-            ]),
-            metadata: None,
-            record_type: Some("decision".into()),
-        })
-        .expect("repo-scoped source");
-
-    let source_id = source.record_ids.first().expect("source record").clone();
+    let source = primary_checkpoint::capture(
+        &service,
+        "personal",
+        "scope",
+        Some(repo("repo-a")),
+        "Decision: repository alpha uses the crimson deployment.",
+    );
+    let source_id = source.id;
     assert_eq!(
         store
             .get_record(&source_id)
@@ -116,17 +112,7 @@ fn scheduled_adoption_rejects_mixed_repository_batch() {
             "Decision: repository beta uses the amber deployment.",
         ),
     ] {
-        service
-            .conclusions(ConclusionsRequest {
-                profile: Some("personal".into()),
-                workspace: Some("scope".into()),
-                repo: Some(repo(repo_id)),
-                target: Some("user".into()),
-                conclusions: Some(vec![content.into()]),
-                metadata: None,
-                record_type: Some("decision".into()),
-            })
-            .expect("repo-scoped source");
+        primary_checkpoint::capture(&service, "personal", "scope", Some(repo(repo_id)), content);
     }
 
     let error = service

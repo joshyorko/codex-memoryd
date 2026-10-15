@@ -12,9 +12,10 @@ use crate::domain::{Portability, RecordType, Scope, Sensitivity, SubjectKind};
 use crate::error::Result;
 use crate::ids;
 use crate::protocol::{
-    AdapterExportRequest, ConclusionsRequest, DreamRequest, EpisodeCreateRequest, ExportQuery,
-    MemoryPatchApplyRequest, MemoryPatchRollbackRequest, ProceduresApplyRequest,
-    ProceduresPreviewRequest, ProceduresRecallRequest, RecallRequest, SubjectCreateRequest,
+    AdapterExportRequest, CheckpointRequest, ConclusionsRequest, DreamRequest,
+    EpisodeCreateRequest, ExportQuery, MemoryPatchApplyRequest, MemoryPatchRollbackRequest,
+    ProceduresApplyRequest, ProceduresPreviewRequest, ProceduresRecallRequest, RecallRequest,
+    SubjectCreateRequest,
 };
 use crate::service::Service;
 use crate::store::{NewRecord, Store, UpsertOutcome};
@@ -635,17 +636,21 @@ fn seed_fixture_records(service: &Service) -> Result<()> {
         vec!["eval:cross-profile".to_string()],
         json!({"fixture_family": "cross_profile_bleed"}),
     )?;
-    insert_record(
-        service,
-        PROFILE,
-        WORKSPACE,
-        RecordType::Decision,
-        PATCH_SEED_CONTENT,
-        Sensitivity::Personal,
-        Portability::ProfileOnly,
-        vec!["eval:patch-seed".to_string()],
-        json!({"origin": "conclusion", "target": "user", "fixture_family": "patch_rollback"}),
-    )?;
+    service.checkpoint(CheckpointRequest {
+        profile: Some(PROFILE.into()),
+        workspace: Some(WORKSPACE.into()),
+        repo: None,
+        session: None,
+        summary: Some(PATCH_SEED_CONTENT.into()),
+        changed_files: vec![],
+        decisions: vec![],
+        blockers: vec![],
+        next_steps: vec![],
+        tests_run: vec![],
+        tests_not_run: vec![],
+        branch: None,
+        commit: None,
+    })?;
     Ok(())
 }
 
