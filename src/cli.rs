@@ -416,6 +416,15 @@ pub enum McpCommand {
         /// Opt in to write-capable MCP tools. The default stdio surface is read-only.
         #[arg(long, conflicts_with = "read_only")]
         write_tools: bool,
+        /// Attach to an existing loopback HTTP daemon without opening local storage.
+        #[arg(long, conflicts_with = "write_tools")]
+        daemon: bool,
+        /// Fixed daemon profile; tool arguments cannot select another profile.
+        #[arg(long, requires = "daemon")]
+        profile: Option<String>,
+        /// Fixed daemon workspace; tool arguments cannot select another workspace.
+        #[arg(long, requires = "daemon")]
+        workspace: Option<String>,
     },
     /// Manage the owned Codex MCP config block.
     Codex {
@@ -1063,7 +1072,15 @@ fn is_database_free_command(command: &Command) -> bool {
 
 fn validate_cli_preflight(cli: &Cli) -> Result<()> {
     let database_free_inspect = is_database_free_command(&cli.command);
-    if cli.runtime.is_none() && !database_free_inspect {
+    // Explicit daemon attachment does not use managed runtime configuration.
+    let explicit_daemon_attachment = cli.url.is_some()
+        && matches!(
+            &cli.command,
+            Command::Mcp {
+                command: McpCommand::Stdio { daemon: true, .. }
+            }
+        );
+    if cli.runtime.is_none() && !database_free_inspect && !explicit_daemon_attachment {
         validate_runtime_environment()?;
     }
 
@@ -2425,7 +2442,34 @@ fn dispatch(cli: Cli) -> Result<()> {
             McpCommand::Stdio {
                 read_only: _,
                 write_tools,
+                daemon,
+                profile,
+                workspace,
             } => {
+                if *daemon {
+                    if cli.local
+                        || cli.db.is_some()
+                        || cli.config.is_some()
+                        || cli.runtime.is_some()
+                    {
+                        return Err(error::Error::invalid_request(
+                            "daemon MCP conflicts with --local, --db, --config, and --runtime",
+                        ));
+                    }
+                    let endpoint = cli.url.as_deref().ok_or_else(|| {
+                        error::Error::invalid_request("daemon MCP requires an explicit --url")
+                    })?;
+                    let profile = profile.as_deref().ok_or_else(|| {
+                        error::Error::invalid_request("daemon MCP requires --profile")
+                    })?;
+                    let workspace = workspace.as_deref().ok_or_else(|| {
+                        error::Error::invalid_request("daemon MCP requires --workspace")
+                    })?;
+                    let client = codex_memoryd::daemon_client::DaemonClient::new(
+                        endpoint, profile, workspace,
+                    )?;
+                    return mcp::run_stdio_daemon(client);
+                }
                 let service = cli.open_service(None)?;
                 mcp::run_stdio(service, *write_tools)?;
                 Ok(())

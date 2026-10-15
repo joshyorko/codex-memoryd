@@ -16,14 +16,14 @@ use crate::error::Error;
 // ---------------------------------------------------------------------------
 
 /// Provider identity attached to responses where useful.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderTag {
     pub name: String,
     pub version: String,
 }
 
 /// The structured error body inside an envelope.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
@@ -40,7 +40,7 @@ impl From<&Error> for ErrorBody {
 
 /// The universal response envelope (SPEC §5.5). `data` is present on success,
 /// `error` on failure; `warnings` may accompany either.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T: Serialize> {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,14 +74,14 @@ impl<T: Serialize> Envelope<T> {
 // Status (SPEC §6.1)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
     pub kind: String,
     pub path: String,
     pub writable: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalImportStatus {
     /// `unknown` | `not_found` | `unsynced` | `synced` | `error`
     pub status: String,
@@ -90,14 +90,14 @@ pub struct LocalImportStatus {
     pub unsynced_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdjacentOwnershipStatus {
     pub owner: String,
     pub memoryd_endpoint: String,
     pub conflict_with_memoryd: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdjacentRuntimeStatus {
     pub status: String,
     pub configured: bool,
@@ -107,7 +107,7 @@ pub struct AdjacentRuntimeStatus {
     pub ownership: AdjacentOwnershipStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub provider_name: String,
     pub provider_version: String,
@@ -128,7 +128,7 @@ pub struct StatusResponse {
     pub degraded_reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamRunStatus {
     pub run_id: String,
     pub profile: String,
@@ -158,7 +158,7 @@ pub struct ScheduledDreamStatus {
     pub degraded: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamWorkerLimits {
     pub interval_seconds: u64,
     pub idle_window_seconds: i64,
@@ -177,7 +177,7 @@ pub struct DreamWorkerLimits {
     pub daily_cost_ceiling_micros: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamWorkerStatus {
     pub enabled: bool,
     pub mode: String,
@@ -344,7 +344,7 @@ pub struct RecallRequest {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallFact {
     pub id: String,
     #[serde(rename = "type")]
@@ -359,14 +359,14 @@ pub struct RecallFact {
     pub policy: RecallFactPolicy,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallFreshness {
     pub stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_days: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallProvenance {
     pub profile_id: String,
     pub workspace_id: String,
@@ -399,7 +399,7 @@ pub struct RecallProvenance {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallFactPolicy {
     pub rank: usize,
     pub freshness: RecallFreshness,
@@ -409,7 +409,7 @@ pub struct RecallFactPolicy {
     pub ranking_signals: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallAdmission {
     pub decision: String,
     pub reason: String,
@@ -417,7 +417,7 @@ pub struct RecallAdmission {
     pub gates: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallWithheld {
     pub reason: String,
     pub count: usize,
@@ -425,7 +425,7 @@ pub struct RecallWithheld {
     pub gates: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallPolicy {
     pub authority: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -434,7 +434,7 @@ pub struct RecallPolicy {
     pub ranking_signals: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallPack {
     pub mode: String,
     pub template: String,
@@ -447,7 +447,7 @@ pub struct RecallPack {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallCheckpoint {
     pub id: String,
     pub summary: String,
@@ -457,14 +457,14 @@ pub struct RecallCheckpoint {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Citation {
     pub memory_id: String,
     pub source_id: Option<String>,
     pub source_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallResponse {
     pub summary: Option<String>,
     pub facts: Vec<RecallFact>,
@@ -503,7 +503,7 @@ pub struct SearchRequest {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
     pub id: String,
     #[serde(rename = "type")]
@@ -518,7 +518,7 @@ pub struct SearchMatch {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub matches: Vec<SearchMatch>,
     pub next_cursor: Option<String>,
