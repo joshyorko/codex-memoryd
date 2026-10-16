@@ -86,6 +86,7 @@ export interface BackendFactoryContext {
 export interface MemoryBackend {
   readonly id: MemoryBackendId;
   start(context: BackendFactoryContext): void | Promise<void>;
+  dispose?(): void | Promise<void>;
   buildDeveloperInstructions(
     agentDir: string,
     settings: SettingsLike,

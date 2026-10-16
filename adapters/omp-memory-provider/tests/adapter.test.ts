@@ -24,6 +24,98 @@ function envelope(data: unknown): Response {
   });
 }
 
+function lifecycleServer() {
+  const received = Promise.withResolvers<void>();
+  const requests: { path: string; body: unknown }[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      const body: unknown = request.method === "POST" ? await request.json() : undefined;
+      requests.push({ path, body });
+      if (path === "/v1/status") return envelope({ status: "local_only", storage: { writable: true }, features: { recall: true, search: true } });
+      if (typeof body === "object" && body !== null && "query" in body && typeof body.query === "string" && body.query.trim() === "pending") {
+        received.resolve();
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { controller.enqueue(new TextEncoder().encode("{")); },
+        }), { headers: { "content-type": "application/json" } });
+      }
+      return envelope({ authority: "recall_not_authority", facts: [{ id: "synthetic", content: "Synthetic lifecycle context" }], checkpoints: [] });
+    },
+  });
+  return { server, received: received.promise, requests, config: { ...config, baseUrl: `http://127.0.0.1:${server.port}`, recallTimeoutMs: 2_000 } };
+}
+
+describe("native reset and disposal", () => {
+  for (const sessioned of [true, false]) {
+    test(`clear ${sessioned ? "session" : "all"} retains initialized recall and scope`, async () => {
+      const fixture = lifecycleServer();
+      try {
+        const session = { sessionId: "native-session" };
+        const backend = createMemoryDBackend(fixture.config);
+        await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+        const staged = await backend.beforeAgentStartPrompt?.(session, "first");
+        await backend.clear(".", ".", sessioned ? session : undefined);
+        expect(staged?.commit()).toBe(false);
+        await expect(backend.status?.({ agentDir: ".", cwd: "." })).resolves.toMatchObject({ active: true });
+        const next = await backend.beforeAgentStartPrompt?.(session, "after clear");
+        expect(next?.context).toContain("Synthetic lifecycle context");
+        expect(next?.commit()).toBe(true);
+        const recalls = fixture.requests.filter(request => request.path === "/v1/recall");
+        expect(recalls).toHaveLength(2);
+        expect(recalls[1]?.body).toMatchObject({ profile: "personal", workspace: "josh-personal", session: { id: "native-session" } });
+        expect(fixture.requests.every(request => request.path === "/v1/status" || request.path === "/v1/recall")).toBe(true);
+      } finally { fixture.server.stop(true); }
+    });
+  }
+
+  for (const operation of ["prompt", "compaction"] as const) {
+    test(`dispose cancels pending ${operation} body reads and leaves replacement usable`, async () => {
+      const fixture = lifecycleServer();
+      try {
+        const session = { sessionId: "native-session" };
+        const context = { session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 };
+        const backend = createMemoryDBackend(fixture.config);
+        await backend.start(context);
+        const staged = await backend.beforeAgentStartPrompt?.(session, "staged");
+        const pending = operation === "prompt"
+          ? backend.beforeAgentStartPrompt?.(session, "pending")
+          : backend.preCompactionContext?.([{ content: "pending" }], {}, session);
+        await fixture.received;
+        expect(typeof backend.dispose).toBe("function");
+        await backend.dispose?.();
+        await backend.dispose?.();
+        expect(staged?.commit()).toBe(false);
+        const result = await Promise.race([pending, Bun.sleep(150).then(() => "read did not cancel")]);
+        expect(result).toBeUndefined();
+        await backend.start(context);
+        await expect(backend.beforeAgentStartPrompt?.(session, "disposed")).resolves.toBeUndefined();
+        await expect(backend.status?.({ agentDir: ".", cwd: ".", session })).resolves.toMatchObject({ active: false });
+        const replacement = createMemoryDBackend(fixture.config);
+        await replacement.start(context);
+        const recalled = await replacement.beforeAgentStartPrompt?.(session, "replacement");
+        expect(recalled?.commit()).toBe(true);
+        expect(recalled?.context).toContain("Synthetic lifecycle context");
+      } finally { fixture.server.stop(true); }
+    });
+  }
+
+  test("clear cancels its pending recall before the transport deadline", async () => {
+    const fixture = lifecycleServer();
+    try {
+      const session = { sessionId: "native-session" };
+      const backend = createMemoryDBackend(fixture.config);
+      await backend.start({ session, settings: {}, agentDir: ".", cwd: ".", taskDepth: 0 });
+      const pending = backend.beforeAgentStartPrompt?.(session, "pending");
+      await fixture.received;
+      await backend.clear(".", ".", session);
+      expect(await Promise.race([pending, Bun.sleep(150).then(() => "read did not cancel")])).toBeUndefined();
+      expect((await backend.beforeAgentStartPrompt?.(session, "next"))?.commit()).toBe(true);
+    } finally { fixture.server.stop(true); }
+  });
+});
+
 describe("configuration and registration", () => {
   test("requires explicit scope and accepts loopback only", () => {
     expect(() => loadConfig({ profile: "", workspace: "work" })).toThrow(MemoryDConfigError);
