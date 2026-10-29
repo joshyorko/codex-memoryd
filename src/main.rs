@@ -32,6 +32,12 @@ mod tests {
 }
 
 fn main() {
+    // A managed child must clear its launch marker before parsing, logging,
+    // or any later code can start subprocesses that might inherit it.
+    if let Err(error) = codex_memoryd::native_runtime::acknowledge_native_startup() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
 
     // Resolve log level from --log / env / default.

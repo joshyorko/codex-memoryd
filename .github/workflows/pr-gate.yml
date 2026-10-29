@@ -10,6 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  macos-native-safety:
+    name: macOS native lifecycle safety
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+
+      - name: Verify native lifecycle fails closed
+        run: cargo test --locked --test native_unsupported_safety
+
   release-gate:
     name: v0.1 release gate
     runs-on: ubuntu-latest

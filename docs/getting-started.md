@@ -19,6 +19,44 @@ The persistent database is `~/.codex-memoryd/memory.db`. `up`, `status`, and
 `down` manage the loopback-only native daemon; the default bind is
 `127.0.0.1:8787`.
 
+### Native process identity and recovery
+
+On Linux, the managed lifecycle requires a kernel with `pidfd_open` and
+`pidfd_send_signal`, a readable `/proc`, and permission to use those operations.
+The numeric PID file remains available for inspection, and a private
+`<pid-file>.identity` file records the launch identity. A per-runtime lock
+serializes lifecycle commands. The runtime state directory and its parents
+must not be writable by untrusted users. `down` holds a pidfd while checking
+identity and sends SIGTERM through that handle; it never signals a bare PID.
+The managed daemon must acknowledge that it removed the launch marker from the
+environment inherited by subprocesses, and the acknowledgment must come from
+the captured process itself. To avoid starting an untracked descendant,
+`CODEX_MEMORYD_BIN` must resolve to the same executable file as the running
+manager (a symlink or hard link is acceptable). Wrappers, different builds, and
+older binaries cannot be managed this way; invoke the desired updated binary
+directly as the manager.
+Do not copy these files between runtime homes or use them as a security boundary
+against another process with the same user privileges.
+
+Legacy PID files contain no trustworthy identity. If their PID is still live,
+the managed status reports `unverified`, and `up`, `down`, and `restart` refuse
+to act on it. Malformed, inaccessible, or inconsistent state is also treated
+as unverified. An exited or demonstrably different process is treated as stale.
+An explicit `--url` status remains an HTTP endpoint query.
+
+To recover, first identify and stop any actual older daemon through the process
+supervisor or terminal that originally started it. Do not send a signal using
+the contents of the PID file or infer ownership from a process name. Once no
+daemon is using that runtime and its configured endpoint, remove the PID file
+and its adjacent `.identity` file, then run `codex-memoryd up`. The persistent
+database must not be removed. If ownership cannot be determined safely, leave
+the state in place and use the original supervisor or an operator to resolve it.
+
+On macOS and other non-Linux platforms, this version fails closed for managed
+native `up`, `down`, and `restart` because a race-free process handle is not
+available through this implementation. Foreground `codex-memoryd serve` can be
+managed by the operator's service supervisor; container mode is unaffected.
+
 To connect Codex to the read-only MCP server:
 
 ```zsh

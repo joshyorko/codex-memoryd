@@ -1,5 +1,7 @@
 //! Productized local runtime management for the native binary mode.
 
+mod native_process;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -460,14 +462,11 @@ pub fn status(opts: &RuntimeOptions) -> RuntimeStatusReport {
     if opts.runtime == RuntimeKind::Container {
         return status_container(opts);
     }
+    let (process, pid) = native_process_state(opts);
     RuntimeStatusReport {
         runtime: runtime_name(opts.runtime).to_string(),
-        process: if running_pid(&opts.pid_file).is_some() {
-            "running".to_string()
-        } else {
-            "stopped".to_string()
-        },
-        pid: running_pid(&opts.pid_file),
+        process: process.to_string(),
+        pid,
         url: opts.url.clone(),
         bind: opts.bind.clone(),
         db: opts.db.display().to_string(),
@@ -477,6 +476,27 @@ pub fn status(opts: &RuntimeOptions) -> RuntimeStatusReport {
         } else {
             "unreachable".to_string()
         },
+    }
+}
+
+pub fn native_process_unverified(opts: &RuntimeOptions) -> bool {
+    native_process_state(opts).0 == "unverified"
+}
+
+/// Clear the launch identity before the managed server starts subprocesses.
+pub fn acknowledge_native_startup() -> Result<()> {
+    native_process::acknowledge_startup().map_err(Error::from)
+}
+
+fn native_process_state(opts: &RuntimeOptions) -> (&'static str, Option<u32>) {
+    match native_process::Paths::new(&opts.pid_file) {
+        Ok(paths) => match native_process::inspect(&paths) {
+            native_process::Inspection::Running(process) => ("running", Some(process.pid())),
+            native_process::Inspection::Stopped => ("stopped", None),
+            native_process::Inspection::Unverified(_) => ("unverified", None),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("stopped", None),
+        Err(_) => ("unverified", None),
     }
 }
 
@@ -579,16 +599,45 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         .map_err(Error::from)?;
     fs::create_dir_all(opts.db.parent().unwrap_or_else(|| Path::new("."))).map_err(Error::from)?;
     opts.db = resolve_database_path(&opts.db)?;
+    fs::create_dir_all(
+        opts.pid_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(Error::from)?;
+    let paths = native_process::Paths::new(&opts.pid_file).map_err(Error::from)?;
+    let _lock = native_process::lock(&paths).map_err(Error::from)?;
+    let already_running = match native_process::inspect(&paths) {
+        native_process::Inspection::Running(_) => true,
+        native_process::Inspection::Stopped => false,
+        native_process::Inspection::Unverified(reason) => {
+            return Err(unverified_pid_error(&opts.pid_file, &reason))
+        }
+    };
 
-    if running_pid(&opts.pid_file).is_none() {
+    if !already_running {
+        native_process::preflight().map_err(|err| {
+            Error::storage(format!("safe native lifecycle is unavailable: {err}"))
+        })?;
+        let (_executable_handle, executable_path) = native_process::verified_binary(&opts.binary)
+            .map_err(|err| {
+            Error::storage(format!(
+                "cannot safely start {}: {err}",
+                opts.binary.display()
+            ))
+        })?;
         ensure_bind_available(&opts)?;
+        native_process::clear(&paths).map_err(Error::from)?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&opts.log_file)
             .map_err(Error::from)?;
         let log_err = log.try_clone().map_err(Error::from)?;
-        let mut command = Command::new(&opts.binary);
+        let marker = uuid::Uuid::new_v4().to_string();
+        let (startup_ack, child_stdin) = native_process::startup_channel().map_err(Error::from)?;
+        let mut command = Command::new(executable_path);
         command
             .arg("serve")
             .env("CODEX_MEMORYD_DB", &opts.db)
@@ -596,7 +645,10 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             .env("CODEX_MEMORYD_PROFILE", &opts.profile)
             .env("CODEX_MEMORYD_WORKSPACE", &opts.workspace)
             .env("CODEX_MEMORYD_LOG", &opts.log_level)
-            .stdin(Stdio::null())
+            .env(native_process::MARKER_ENV, &marker)
+            .env(native_process::STATE_PATH_ENV, paths.pid_path())
+            .env(native_process::ACK_ENV, "1")
+            .stdin(child_stdin)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
         #[cfg(unix)]
@@ -604,7 +656,23 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         let child = command
             .spawn()
             .map_err(|e| Error::storage(format!("start {}: {e}", opts.binary.display())))?;
-        fs::write(&opts.pid_file, child.id().to_string()).map_err(Error::from)?;
+        let (process, identity) =
+            native_process::capture(&paths, child.id(), &marker).map_err(|err| {
+                Error::storage(format!(
+                    "started child pid {} could not be verified; no signal was sent. Inspect it and {} before retrying: {err}",
+                    child.id(), opts.log_file.display()
+                ))
+            })?;
+        if let Err(err) = native_process::wait_for_startup_ack(startup_ack, &marker, &process) {
+            let cleanup = process.terminate_and_wait();
+            return Err(Error::storage(format!("daemon did not establish safe process ownership: {err}; child cleanup: {cleanup:?}")));
+        }
+        if let Err(err) = native_process::write(&paths, child.id(), &identity) {
+            let cleanup = process.terminate_and_wait();
+            return Err(Error::storage(format!(
+                "could not persist process identity: {err}; child cleanup: {cleanup:?}"
+            )));
+        }
     }
 
     wait_for_ready(&opts, &opts.db.to_string_lossy())?;
@@ -942,22 +1010,30 @@ fn resolve_database_path_from(database: &Path, cwd: &Path) -> Result<PathBuf> {
 }
 
 fn down_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
-    let Some(pid) = running_pid(&opts.pid_file) else {
-        let _ = fs::remove_file(&opts.pid_file);
-        return Ok(status(opts));
+    let paths = match native_process::Paths::new(&opts.pid_file) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(status(opts)),
+        Err(err) => return Err(Error::from(err)),
     };
-    terminate_process(pid)
-        .map_err(|err| Error::storage(format!("failed to stop pid {pid}: {err}")))?;
-    for _ in 0..40 {
-        if running_pid(&opts.pid_file).is_none() {
-            let _ = fs::remove_file(&opts.pid_file);
-            return Ok(status(opts));
+    let _lock = native_process::lock(&paths).map_err(Error::from)?;
+    match native_process::inspect(&paths) {
+        native_process::Inspection::Stopped => {}
+        native_process::Inspection::Unverified(reason) => {
+            return Err(unverified_pid_error(&opts.pid_file, &reason))
         }
-        std::thread::sleep(Duration::from_millis(100));
+        native_process::Inspection::Running(process) => {
+            let pid = process.pid();
+            process.terminate_and_wait().map_err(|err| {
+                Error::storage(format!("failed to stop verified pid {pid}: {err}"))
+            })?;
+        }
     }
-    Err(Error::storage(format!(
-        "codex-memoryd did not stop cleanly pid={pid}"
-    )))
+    native_process::clear(&paths).map_err(Error::from)?;
+    Ok(status(opts))
+}
+
+fn unverified_pid_error(path: &Path, reason: &str) -> Error {
+    Error::storage(format!("cannot verify native process in {} ({reason}); no signal was sent. Inspect the runtime and follow the safe recovery procedure in docs/getting-started.md", path.display()))
 }
 
 fn down_container(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
@@ -1133,66 +1209,6 @@ fn status_container(opts: &RuntimeOptions) -> RuntimeStatusReport {
         ),
         health: health.to_string(),
     }
-}
-
-fn running_pid(pid_file: &Path) -> Option<u32> {
-    let raw = fs::read_to_string(pid_file).ok()?;
-    let pid = raw.trim().parse::<u32>().ok()?;
-    process_exists(pid).then_some(pid)
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    let Some(pid) = valid_pid(pid) else {
-        return false;
-    };
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(unix)]
-fn valid_pid(pid: u32) -> Option<libc::pid_t> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
-    (pid > 0).then_some(pid)
-}
-
-#[cfg(not(unix))]
-fn process_exists(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn terminate_process(pid: u32) -> std::io::Result<()> {
-    let pid = valid_pid(pid).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid process id")
-    })?;
-    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_process(pid: u32) -> std::io::Result<()> {
-    Command::new("kill")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("kill command failed"))
-            }
-        })
 }
 
 pub fn container_runtime(opts: &RuntimeOptions) -> Result<String> {
