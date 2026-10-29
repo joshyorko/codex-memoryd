@@ -215,9 +215,68 @@ jobs:
               --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
           done
 
+  stage-release:
+    name: Stage and verify the draft release before registry writes
+    needs: [source, assemble, attest-native]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      attestations: read
+    outputs:
+      release_id: ${{ steps.stage.outputs.release_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+      - name: Refuse any existing release and verify the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          # Contents:write can see drafts; the earlier read-only check cannot
+          # reliably establish that no draft exists.
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | length == 0'
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+      - name: Stage a draft and verify all uploaded assets
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "codex-memoryd $RELEASE_TAG" \
+            --notes "Native archives and versioned GHCR image built from the approved source."
+          gh release upload "$RELEASE_TAG" dist/*
+          mkdir downloaded
+          gh release download "$RELEASE_TAG" --dir downloaded
+          test "$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)" = "$(find downloaded -maxdepth 1 -type f -printf '%f\n' | sort)"
+          for file in dist/*; do cmp "$file" "downloaded/$(basename "$file")"; done
+          python3 scripts/release_publish.py verify-bundle --out downloaded --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          for artifact in downloaded/*; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$APPROVED_COMMIT" --source-ref "$GITHUB_REF" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
+              --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
+          done
+          release="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected one draft release") end')"
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == true and .immutable != true' <<<"$release"
+          release_id="$(jq -er '.id' <<<"$release")"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
   push-platform:
     name: Verify and push untagged OCI ${{ matrix.arch }} by digest
-    needs: [source, assemble, attest-native]
+    needs: [source, assemble, stage-release]
     strategy:
       fail-fast: false
       matrix:
@@ -361,7 +420,7 @@ jobs:
 
   publish-release:
     name: Publish and verify immutable GitHub release
-    needs: [source, assemble, attest-native, publish-image]
+    needs: [source, assemble, stage-release, publish-image]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -376,23 +435,20 @@ jobs:
         with:
           name: verified-release-bundle-${{ github.run_attempt }}
           path: dist
-      - name: Recheck tag and absence before staging
+      - name: Recheck staged draft and all assets before publication
+        env:
+          STAGED_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | length == 0'
+          release="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected one draft release") end')"
+          jq -e --arg tag "$RELEASE_TAG" --arg id "$STAGED_RELEASE_ID" \
+            '.tag_name == $tag and .draft == true and .immutable != true and (.id | tostring) == $id' <<<"$release"
           python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
             --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
-      - name: Stage a draft and compare all downloaded assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release create "$RELEASE_TAG" --draft --verify-tag --title "codex-memoryd $RELEASE_TAG" \
-            --notes "Native archives and versioned GHCR image built from the approved source."
-          gh release upload "$RELEASE_TAG" dist/*
           mkdir downloaded
           gh release download "$RELEASE_TAG" --dir downloaded
           test "$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)" = "$(find downloaded -maxdepth 1 -type f -printf '%f\n' | sort)"
@@ -415,12 +471,16 @@ jobs:
           gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
       - name: Publish the verified draft and verify immutable release assets
+        env:
+          STAGED_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
-          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
-          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == true and .immutable != true' <<<"$release"
+          release="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected one draft release") end')"
+          jq -e --arg tag "$RELEASE_TAG" --arg id "$STAGED_RELEASE_ID" \
+            '.tag_name == $tag and .draft == true and .immutable != true and (.id | tostring) == $id' <<<"$release"
           release_id="$(jq -er '.id' <<<"$release")"
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true |
             jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .immutable == true'

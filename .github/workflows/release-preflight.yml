@@ -191,6 +191,15 @@ jobs:
           python3 scripts/inspect_oci_layers.py summarize --archive "$RUNNER_TEMP/candidate-image.tar" \
             --manifest "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")" \
             > "$RUNNER_TEMP/oci/layers.json"
+          # The future publisher uses the image exporter. Compare its digest
+          # locally, without pushing or naming an image in a registry.
+          docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/image-export.json" \
+            --output 'type=image,name=example.invalid/disposable,push=false,oci-mediatypes=true,rewrite-timestamp=true' .
+          test "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image-export.json")" = "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")"
           rm "$RUNNER_TEMP/candidate-image.tar"
           # Load the same candidate into this disposable runner without a tag
           # or registry push, then exercise the foreground container service.

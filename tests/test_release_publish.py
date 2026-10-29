@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,28 @@ class WorkflowSafetyTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/publish-release.yml").read_text()
         self.assertEqual(self.events(text), ["workflow_dispatch"])
         self.assertIn("create-storage-record: false", text)
+
+    def test_publisher_stages_draft_before_writing_image(self):
+        text = (ROOT / ".github/workflows/publish-release.yml").read_text()
+        self.assertRegex(text, r"(?m)^  push-platform:\n    name:.*\n    needs: \[source, assemble, stage-release\]")
+        self.assertNotIn('gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"', text)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required by the publisher workflow")
+    def test_draft_lookup_rejects_wrong_or_ambiguous_releases(self):
+        text = (ROOT / ".github/workflows/publish-release.yml").read_text()
+        selector = re.search(r"'(add \| map\(select\(\.tag_name == \$tag\)\) \| if length == 1[^']+)'", text).group(1)
+        guard = re.search(r"'(\.tag_name == \$tag and \.draft == true and \.immutable != true and \(\.id \| tostring\) == \$id)'", text).group(1)
+        draft = {"tag_name": "v0.1.1", "draft": True, "immutable": False, "id": 123}
+        def jq(program, value, release_id="123"):
+            return subprocess.run(["jq", "-e", "--arg", "tag", "v0.1.1", "--arg", "id", release_id, program],
+                                  input=json.dumps(value), text=True, capture_output=True)
+        selected = jq(selector, [[draft]])
+        self.assertEqual(selected.returncode, 0)
+        self.assertEqual(jq(guard, json.loads(selected.stdout)).returncode, 0)
+        self.assertNotEqual(jq(guard, draft, "999").returncode, 0)
+        self.assertNotEqual(jq(guard, {**draft, "draft": False}).returncode, 0)
+        self.assertNotEqual(jq(selector, [[]]).returncode, 0)
+        self.assertNotEqual(jq(selector, [[draft, draft]]).returncode, 0)
 
     def test_pr_preflight_remains_read_only(self):
         text = (ROOT / ".github/workflows/release-preflight.yml").read_text()
