@@ -6,10 +6,12 @@ on:
       - .github/workflows/release-preflight.yml
       - .github/workflows/publish-release.yml
       - scripts/release_evidence.py
+      - scripts/inspect_native_mismatch.py
       - scripts/release_publish.py
       - scripts/inspect_oci_layers.py
       - scripts/smoke_release_candidate.py
       - tests/test_release_evidence.py
+      - tests/test_native_mismatch.py
       - tests/test_release_publish.py
       - tests/test_oci_layers.py
       - Cargo.toml
@@ -71,6 +73,7 @@ jobs:
           rustup default 1.88.0
           rustup target add "$TARGET"
           python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
+          python3 -B -m unittest discover -s tests -p test_native_mismatch.py -v
           python3 -B -m unittest discover -s tests -p test_release_publish.py -v
           python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
       - name: Build the locked candidate
@@ -133,6 +136,7 @@ jobs:
           name: candidate-${{ matrix.target }}-second-${{ github.run_attempt }}
           path: second
       - name: Verify source and compare candidates
+        id: compare
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -143,6 +147,9 @@ jobs:
           python3 scripts/release_evidence.py compare \
             --first first --second second --commit "$GITHUB_SHA" --version "$candidate_version" \
             --target "$TARGET" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Diagnose differing native candidates
+        if: ${{ failure() && steps.compare.outcome == 'failure' }}
+        run: python3 scripts/inspect_native_mismatch.py --first first --second second
 
   container:
     name: Unpublished OCI ${{ matrix.platform }} / ${{ matrix.slot }}
