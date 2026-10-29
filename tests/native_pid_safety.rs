@@ -188,6 +188,33 @@ fn helper_uses_managed_lifecycle_for_its_own_disposable_runtime() {
 }
 
 #[test]
+fn older_binary_without_identity_handshake_cannot_publish_state() {
+    let fixture = LegacyPidFixture::new();
+    fs::remove_file(fixture.home.path().join("codex-memoryd.pid")).unwrap();
+    let old_binary = fixture.home.path().join("old-memoryd");
+    fs::write(&old_binary, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+    fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-memoryd"))
+        .env_clear()
+        .env("HOME", fixture.home.path())
+        .env("CODEX_MEMORYD_HOME", fixture.home.path())
+        .env("CODEX_MEMORYD_PORT", fixture.port.to_string())
+        .env("CODEX_MEMORYD_BIND", format!("127.0.0.1:{}", fixture.port))
+        .env("CODEX_MEMORYD_BIN", old_binary)
+        .args(["--runtime", "native", "up"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("child cleanup: Ok"));
+    assert!(!fixture.home.path().join("codex-memoryd.pid").exists());
+    assert!(!fixture
+        .home
+        .path()
+        .join("codex-memoryd.pid.identity")
+        .exists());
+}
+
+#[test]
 fn malformed_state_fails_closed() {
     let mut fixture = LegacyPidFixture::new();
     for raw in ["0", "-1", "4294967296", "not-a-pid", ""] {

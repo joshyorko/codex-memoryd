@@ -1159,10 +1159,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Serve { bind } => {
-            // The launch marker remains visible in this process's original
-            // Linux environment, but must not be inherited by subprocesses.
-            std::env::remove_var("CODEX_MEMORYD_MANAGED_PROCESS_ID");
-            std::env::remove_var("CODEX_MEMORYD_MANAGED_PID_PATH");
+            native_runtime::acknowledge_native_startup()?;
             let service = cli.open_service(bind.clone())?;
             let bind_addr = service.config.bind.clone();
             let runtime = tokio::runtime::Runtime::new()

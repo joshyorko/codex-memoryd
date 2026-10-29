@@ -6,18 +6,20 @@
 
 pub(crate) const MARKER_ENV: &str = "CODEX_MEMORYD_MANAGED_PROCESS_ID";
 pub(crate) const STATE_PATH_ENV: &str = "CODEX_MEMORYD_MANAGED_PID_PATH";
+pub(crate) const ACK_ENV: &str = "CODEX_MEMORYD_MANAGED_STARTUP_ACK";
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{MARKER_ENV, STATE_PATH_ENV};
+    use super::{ACK_ENV, MARKER_ENV, STATE_PATH_ENV};
     use serde::{Deserialize, Serialize};
     use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -292,6 +294,90 @@ mod platform {
         Ok(())
     }
 
+    pub(crate) fn startup_channel() -> io::Result<(File, Stdio)> {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        let writer = unsafe { File::from_raw_fd(fds[1]) };
+        Ok((reader, Stdio::from(writer)))
+    }
+
+    pub(crate) fn wait_for_startup_ack(mut reader: File, marker: &str) -> io::Result<()> {
+        let mut pollfd = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon did not acknowledge its launch identity",
+                ));
+            }
+            let rc = unsafe {
+                libc::poll(
+                    &mut pollfd,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc == 0 {
+                continue;
+            }
+            let mut reply = [0_u8; 64];
+            let count = reader.read(&mut reply)?;
+            if &reply[..count] == marker.as_bytes() {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon did not acknowledge its launch identity",
+            ));
+        }
+    }
+
+    pub(crate) fn acknowledge_startup() -> io::Result<()> {
+        let marker = std::env::var(MARKER_ENV).ok();
+        let channel = std::env::var_os(ACK_ENV).is_some();
+        std::env::remove_var(MARKER_ENV);
+        std::env::remove_var(STATE_PATH_ENV);
+        std::env::remove_var(ACK_ENV);
+        if !channel {
+            return Ok(());
+        }
+        let marker = marker.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing managed launch identity",
+            )
+        })?;
+        // The manager passes a write-only anonymous pipe as stdin. Acknowledge
+        // only after removing the identity from the environment inherited by
+        // subprocesses, then restore the normal /dev/null stdin.
+        let mut pipe = unsafe { File::from_raw_fd(0) };
+        let result = pipe.write_all(marker.as_bytes());
+        drop(pipe);
+        let null = File::open("/dev/null")?;
+        if null.as_raw_fd() == 0 {
+            let _ = null.into_raw_fd();
+        } else if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        result
+    }
+
     pub(crate) fn inspect(paths: &Paths) -> Inspection {
         match inspect_inner(paths) {
             Ok(state) => state,
@@ -517,8 +603,11 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
+    use super::{ACK_ENV, MARKER_ENV, STATE_PATH_ENV};
+    use std::fs::File;
     use std::io;
     use std::path::Path;
+    use std::process::Stdio;
     pub(crate) struct ManagedProcess;
     pub(crate) enum Inspection {
         Stopped,
@@ -555,6 +644,18 @@ mod platform {
     pub(crate) fn preflight() -> io::Result<()> {
         Err(unsupported())
     }
+    pub(crate) fn startup_channel() -> io::Result<(File, Stdio)> {
+        Err(unsupported())
+    }
+    pub(crate) fn wait_for_startup_ack(_: File, _: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub(crate) fn acknowledge_startup() -> io::Result<()> {
+        std::env::remove_var(MARKER_ENV);
+        std::env::remove_var(STATE_PATH_ENV);
+        std::env::remove_var(ACK_ENV);
+        Ok(())
+    }
     pub(crate) fn inspect(_: &Paths) -> Inspection {
         Inspection::Unverified(unsupported().to_string())
     }
@@ -569,4 +670,7 @@ mod platform {
     }
 }
 
-pub(crate) use platform::{capture, clear, inspect, lock, preflight, write, Inspection, Paths};
+pub(crate) use platform::{
+    acknowledge_startup, capture, clear, inspect, lock, preflight, startup_channel,
+    wait_for_startup_ack, write, Inspection, Paths,
+};

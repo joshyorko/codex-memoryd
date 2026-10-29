@@ -483,6 +483,11 @@ pub fn native_process_unverified(opts: &RuntimeOptions) -> bool {
     native_process_state(opts).0 == "unverified"
 }
 
+/// Clear the launch identity before the managed server starts subprocesses.
+pub fn acknowledge_native_startup() -> Result<()> {
+    native_process::acknowledge_startup().map_err(Error::from)
+}
+
 fn native_process_state(opts: &RuntimeOptions) -> (&'static str, Option<u32>) {
     match native_process::Paths::new(&opts.pid_file) {
         Ok(paths) => match native_process::inspect(&paths) {
@@ -624,6 +629,7 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             .map_err(Error::from)?;
         let log_err = log.try_clone().map_err(Error::from)?;
         let marker = uuid::Uuid::new_v4().to_string();
+        let (startup_ack, child_stdin) = native_process::startup_channel().map_err(Error::from)?;
         let mut command = Command::new(&opts.binary);
         command
             .arg("serve")
@@ -634,7 +640,8 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
             .env("CODEX_MEMORYD_LOG", &opts.log_level)
             .env(native_process::MARKER_ENV, &marker)
             .env(native_process::STATE_PATH_ENV, paths.pid_path())
-            .stdin(Stdio::null())
+            .env(native_process::ACK_ENV, "1")
+            .stdin(child_stdin)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
         #[cfg(unix)]
@@ -648,6 +655,10 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
                     "started child could not be verified; inspect it before retrying: {err}"
                 ))
             })?;
+        if let Err(err) = native_process::wait_for_startup_ack(startup_ack, &marker) {
+            let cleanup = process.terminate_and_wait();
+            return Err(Error::storage(format!("daemon did not establish safe process ownership: {err}; child cleanup: {cleanup:?}")));
+        }
         if let Err(err) = native_process::write(&paths, child.id(), &identity) {
             let cleanup = process.terminate_and_wait();
             return Err(Error::storage(format!(

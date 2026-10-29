@@ -28,6 +28,9 @@ The numeric PID file remains available for inspection, and a private
 serializes lifecycle commands. The runtime state directory and its parents
 must not be writable by untrusted users. `down` holds a pidfd while checking
 identity and sends SIGTERM through that handle; it never signals a bare PID.
+The managed daemon must acknowledge that it removed the launch marker from the
+environment inherited by subprocesses. Older or incompatible binaries selected
+via `CODEX_MEMORYD_BIN` cannot be managed by this version and must be upgraded.
 Do not copy these files between runtime homes or use them as a security boundary
 against another process with the same user privileges.
 
