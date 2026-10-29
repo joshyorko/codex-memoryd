@@ -5,8 +5,10 @@ on:
     paths:
       - .github/workflows/release-preflight.yml
       - scripts/release_evidence.py
+      - scripts/inspect_oci_layers.py
       - scripts/smoke_release_candidate.py
       - tests/test_release_evidence.py
+      - tests/test_oci_layers.py
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
@@ -59,7 +61,8 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup default 1.88.0
           rustup target add "$TARGET"
-          python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
+          python3 -B -m unittest discover -s tests -p 'test_*evidence.py' -v
+          python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
       - name: Build the locked candidate
         run: cargo build --locked --release --target "$TARGET" --bin codex-memoryd
       - name: Exercise Linux identity regressions and candidate lifecycle
@@ -84,7 +87,7 @@ jobs:
       - name: Retain temporary candidate evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: candidate-${{ matrix.target }}-${{ matrix.slot }}
+          name: candidate-${{ matrix.target }}-${{ matrix.slot }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/candidate
           if-no-files-found: error
           retention-days: 7
@@ -102,11 +105,11 @@ jobs:
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: candidate-${{ matrix.target }}-first
+          name: candidate-${{ matrix.target }}-first-${{ github.run_attempt }}
           path: first
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: candidate-${{ matrix.target }}-second
+          name: candidate-${{ matrix.target }}-second-${{ github.run_attempt }}
           path: second
       - name: Verify source and compare candidates
         shell: bash
@@ -156,9 +159,16 @@ jobs:
           source_epoch="$(git show -s --format=%ct HEAD)"
           mkdir "$RUNNER_TEMP/oci"
           docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/oci/build.json" \
-            --output type=oci,dest=/dev/null,rewrite-timestamp=true .
+            --output "type=oci,dest=$RUNNER_TEMP/candidate-image.tar,rewrite-timestamp=true" .
           jq -e '(."containerimage.digest" | test("^sha256:[0-9a-f]{64}$")) and (."buildx.build.provenance" | type == "object" and length > 0)' "$RUNNER_TEMP/oci/build.json"
+          python3 scripts/inspect_oci_layers.py summarize --archive "$RUNNER_TEMP/candidate-image.tar" \
+            --manifest "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")" \
+            > "$RUNNER_TEMP/oci/layers.json"
+          rm "$RUNNER_TEMP/candidate-image.tar"
           jq -n --arg commit "$GITHUB_SHA" --arg version "$candidate_version" --arg platform "$PLATFORM" \
             --arg slot "$SLOT" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg lock "$(sha256sum Cargo.lock | cut -d' ' -f1)" --arg buildx "$(docker buildx version)" \
@@ -167,7 +177,7 @@ jobs:
             > "$RUNNER_TEMP/oci/source.json"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: oci-${{ matrix.architecture }}-${{ matrix.slot }}
+          name: oci-${{ matrix.architecture }}-${{ matrix.slot }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/oci
           if-no-files-found: error
           retention-days: 7
@@ -177,6 +187,7 @@ jobs:
     needs: container
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         architecture: [amd64, arm64]
     steps:
@@ -185,11 +196,11 @@ jobs:
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: oci-${{ matrix.architecture }}-first
+          name: oci-${{ matrix.architecture }}-first-${{ github.run_attempt }}
           path: first
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: oci-${{ matrix.architecture }}-second
+          name: oci-${{ matrix.architecture }}-second-${{ github.run_attempt }}
           path: second
       - name: Verify source and compare OCI content digests
         shell: bash
@@ -208,5 +219,6 @@ jobs:
           for build in first/build.json second/build.json; do
             jq -e '(."containerimage.digest" | test("^sha256:[0-9a-f]{64}$")) and (."buildx.build.provenance" | type == "object" and length > 0)' "$build"
           done
+          python3 scripts/inspect_oci_layers.py diff first/layers.json second/layers.json
           test "$(jq -r '."containerimage.digest"' first/build.json)" = "$(jq -r '."containerimage.digest"' second/build.json)"
           echo "Two unpublished OCI content digests match for linux/$ARCH."

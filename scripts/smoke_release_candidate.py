@@ -105,7 +105,12 @@ def main():
                 finally:
                     if daemon.poll() is None:
                         daemon.terminate()
-                    daemon.wait(timeout=5)
+                    try:
+                        daemon.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        daemon.kill()
+                        daemon.wait(timeout=5)
+                        raise
             if not database.is_file() or database.stat().st_size == 0:
                 raise RuntimeError("foreground database was not created")
         if not (runtime / "memory.db").is_file():

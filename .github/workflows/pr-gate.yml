@@ -54,14 +54,15 @@ jobs:
           set -euo pipefail
           bin="$PWD/target/release/codex-memoryd"
           "$bin" --help >/dev/null
-          "$bin" --version | grep -F '0.1.0'
+          candidate_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          test "$("$bin" --version)" = "codex-memoryd $candidate_version"
 
-          home="$(mktemp -d)"
-          runtime="$home/runtime"
-          mkdir -p "$home/home" "$runtime"
-          export HOME="$home/home"
+          fixture_root="$(mktemp -d)"
+          runtime="$fixture_root/runtime"
+          mkdir -p "$fixture_root/home" "$runtime"
+          export HOME="$fixture_root/home"
           export CODEX_MEMORYD_HOME="$runtime"
-          trap '"$bin" down >/dev/null 2>&1 || true; rm -rf "$home"' EXIT
+          trap '"$bin" down >/dev/null 2>&1 || true; rm -rf "$fixture_root"' EXIT
 
           "$bin" init --host 127.0.0.1 --port 18787
           "$bin" up
