@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output};
@@ -83,6 +84,40 @@ fn legacy_unrelated_live_pid_is_not_reported_as_managed() {
     assert!(output.status.success(), "{:?}", output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_ne!(status["process"], "running");
+    assert!(status["pid"].is_null());
+}
+
+#[test]
+fn responsive_endpoint_does_not_hide_unverified_pid() {
+    let fixture = LegacyPidFixture::new();
+    let listener = TcpListener::bind(("127.0.0.1", fixture.port)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let output = fixture.run("status");
+    server.join().unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["process"], "unverified");
     assert!(status["pid"].is_null());
 }
 

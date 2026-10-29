@@ -462,15 +462,7 @@ pub fn status(opts: &RuntimeOptions) -> RuntimeStatusReport {
     if opts.runtime == RuntimeKind::Container {
         return status_container(opts);
     }
-    let (process, pid) = match native_process::Paths::new(&opts.pid_file) {
-        Ok(paths) => match native_process::inspect(&paths) {
-            native_process::Inspection::Running(process) => ("running", Some(process.pid())),
-            native_process::Inspection::Stopped => ("stopped", None),
-            native_process::Inspection::Unverified(_) => ("unverified", None),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("stopped", None),
-        Err(_) => ("unverified", None),
-    };
+    let (process, pid) = native_process_state(opts);
     RuntimeStatusReport {
         runtime: runtime_name(opts.runtime).to_string(),
         process: process.to_string(),
@@ -484,6 +476,22 @@ pub fn status(opts: &RuntimeOptions) -> RuntimeStatusReport {
         } else {
             "unreachable".to_string()
         },
+    }
+}
+
+pub fn native_process_unverified(opts: &RuntimeOptions) -> bool {
+    native_process_state(opts).0 == "unverified"
+}
+
+fn native_process_state(opts: &RuntimeOptions) -> (&'static str, Option<u32>) {
+    match native_process::Paths::new(&opts.pid_file) {
+        Ok(paths) => match native_process::inspect(&paths) {
+            native_process::Inspection::Running(process) => ("running", Some(process.pid())),
+            native_process::Inspection::Stopped => ("stopped", None),
+            native_process::Inspection::Unverified(_) => ("unverified", None),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("stopped", None),
+        Err(_) => ("unverified", None),
     }
 }
 
