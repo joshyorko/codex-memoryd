@@ -63,6 +63,7 @@ def record(args):
                 info.mode = 0o755
                 info.mtime = info.uid = info.gid = 0
                 bundle.addfile(info, io.BytesIO(binary))
+    archive_bytes = archive.read_bytes()
     evidence = {
         "schema": 1,
         "kind": "unsigned-nonrelease-candidate",
@@ -75,8 +76,9 @@ def record(args):
         "zlib_runtime": zlib.ZLIB_RUNTIME_VERSION,
         "binary_sha256": digest(binary),
         "binary_size": len(binary),
-        "archive_sha256": digest(archive.read_bytes()),
-        "archive_size": archive.stat().st_size,
+        "tar_sha256": digest(gzip.decompress(archive_bytes)),
+        "archive_sha256": digest(archive_bytes),
+        "archive_size": len(archive_bytes),
     }
     (args.out / EVIDENCE).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
 
@@ -94,6 +96,8 @@ def verify_candidate(directory, expected, slot):
     archive = (directory / ARCHIVE).read_bytes()
     if evidence.get("archive_sha256") != digest(archive) or evidence.get("archive_size") != len(archive):
         raise ValueError("candidate archive mismatch")
+    if evidence.get("tar_sha256") != digest(gzip.decompress(archive)):
+        raise ValueError("candidate tar mismatch")
     with tarfile.open(directory / ARCHIVE, mode="r:gz") as bundle:
         members = bundle.getmembers()
         if len(members) != 1:
@@ -118,8 +122,8 @@ def compare(args):
     expected = identity(args)
     first = verify_candidate(args.first, expected, "first")
     second = verify_candidate(args.second, expected, "second")
-    for key in ("rustc", "cargo", "python_version", "zlib_build", "zlib_runtime",
-                "binary_sha256", "binary_size", "archive_sha256", "archive_size"):
+    for key in ("rustc", "cargo", "binary_sha256", "binary_size", "tar_sha256",
+                "archive_sha256", "archive_size", "python_version", "zlib_build", "zlib_runtime"):
         if first[key] != second[key]:
             raise ValueError(f"independent build {key} mismatch")
     print(json.dumps({"result": "match", "target": args.target, "commit": args.commit,

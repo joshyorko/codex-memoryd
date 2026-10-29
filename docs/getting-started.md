@@ -5,8 +5,10 @@ primary install path; native mode is the default and does not require Docker,
 Podman, Compose, Rust, or a repository checkout.
 
 The lifecycle safety behavior below describes the PID-safe source after #275.
-The previously published v0.1.0 does not contain that protection; check the
-installed version and follow the legacy recovery procedure before upgrading.
+The previously published v0.1.0 does not contain that protection. Homebrew
+also distributes master-derived builds, so verify the installed formula's
+source commit and provenance; do not infer protection from `--version` alone.
+Follow the legacy recovery procedure before upgrading.
 
 ## Install with Homebrew
 

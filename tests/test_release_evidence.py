@@ -72,6 +72,17 @@ class ReleaseEvidenceTests(unittest.TestCase):
         result = self.compare(first, second)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_tampered_uncompressed_tar_digest_is_rejected(self):
+        first = self.record("first", "first")
+        second = self.record("second", "second")
+        path = second / "evidence.json"
+        evidence = json.loads(path.read_text())
+        evidence["tar_sha256"] = "f" * 64
+        path.write_text(json.dumps(evidence))
+        result = self.compare(first, second)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tar", result.stderr.lower())
+
     def test_tampered_identity_is_rejected_even_if_both_match(self):
         first = self.record("first", "first")
         second = self.record("second", "second")
