@@ -67,18 +67,6 @@ jobs:
           for flag in --source-digest --source-ref --signer-workflow --signer-digest --deny-self-hosted-runners; do
             grep -Fq -- "$flag" <<<"$help"
           done
-      - name: Require immutable releases to be enabled
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_IMMUTABILITY_AUDIT_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # This endpoint requires repository Administration:read. A dedicated
-          # read-only token is required; the ordinary workflow token cannot
-          # request that permission. Missing/insufficient access fails closed.
-          test -n "$GH_TOKEN"
-          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
       - name: Refuse an existing GitHub release or GHCR version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -276,7 +264,7 @@ jobs:
 
   push-platform:
     name: Verify and push untagged OCI ${{ matrix.arch }} by digest
-    needs: [source, assemble, stage-release]
+    needs: [source, assemble, stage-release, publish-release]
     strategy:
       fail-fast: false
       matrix:
@@ -445,10 +433,11 @@ jobs:
           done
           curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" | jq -e '.ok == true'
           test -s "$fixture_dir/memory.db"
+          echo "OCI index: $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
   publish-release:
     name: Publish and verify immutable GitHub release
-    needs: [source, assemble, stage-release, publish-image]
+    needs: [source, assemble, stage-release]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -490,14 +479,6 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
               --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
           done
-      - name: Recheck immutable-release policy immediately before publication
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_IMMUTABILITY_AUDIT_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN"
-          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
       - name: Publish the verified draft and verify immutable release assets
         env:
           STAGED_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
@@ -513,6 +494,12 @@ jobs:
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true |
             jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .immutable == true'
           gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
-          for artifact in dist/*; do gh release verify-asset "$RELEASE_TAG" "$artifact" --repo "$GITHUB_REPOSITORY"; done
+          mkdir published
+          gh release download "$RELEASE_TAG" --dir published --repo "$GITHUB_REPOSITORY"
+          test "$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)" = "$(find published -maxdepth 1 -type f -printf '%f\n' | sort)"
+          for artifact in dist/*; do
+            downloaded="published/$(basename "$artifact")"
+            cmp "$artifact" "$downloaded"
+            gh release verify-asset "$RELEASE_TAG" "$downloaded" --repo "$GITHUB_REPOSITORY"
+          done
           echo "Release: $RELEASE_TAG at $APPROVED_COMMIT" >> "$GITHUB_STEP_SUMMARY"
-          echo "OCI index: $IMAGE@${{ needs.publish-image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

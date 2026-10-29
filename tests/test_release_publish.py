@@ -97,9 +97,17 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertEqual(self.events(text), ["workflow_dispatch"])
         self.assertIn("create-storage-record: false", text)
 
-    def test_publisher_stages_draft_before_writing_image(self):
+    def test_image_publication_waits_for_verified_immutable_release(self):
         text = (ROOT / ".github/workflows/publish-release.yml").read_text()
-        self.assertRegex(text, r"(?m)^  push-platform:\n    name:.*\n    needs: \[source, assemble, stage-release\]")
+        jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", text))
+        def ancestors(name):
+            needed = re.search(r"(?m)^    needs: \[([^\]]+)\]", jobs[name])
+            direct = [] if needed is None else [value.strip() for value in needed.group(1).split(",")]
+            return set(direct).union(*(ancestors(job) for job in direct))
+        self.assertIn("publish-release", ancestors("push-platform"))
+        self.assertIn("publish-release", ancestors("publish-image"))
+        self.assertNotIn("push-platform", ancestors("publish-release"))
+        self.assertNotIn("RELEASE_IMMUTABILITY_AUDIT_TOKEN", text)
         self.assertNotIn('gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"', text)
 
     @unittest.skipUnless(shutil.which("jq"), "jq is required by the publisher workflow")
@@ -126,6 +134,84 @@ class WorkflowSafetyTests(unittest.TestCase):
                            "gh release create", "push=true", "push: true", "type=registry"):
             with self.subTest(prohibited=prohibited):
                 self.assertNotIn(prohibited, text)
+
+
+@unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "publisher requires jq and bash")
+class PublishedReleaseTests(unittest.TestCase):
+    """Run the actual final release step against a disposable Git repository."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.root), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init")
+        git("config", "user.name", "release test")
+        git("config", "user.email", "release-test@example.invalid")
+        git("commit", "--allow-empty", "-m", "fixture")
+        self.commit = git("rev-parse", "HEAD")
+        git("tag", "v0.1.1")
+        git("remote", "add", "origin", str(self.root))
+        (self.root / "scripts").mkdir()
+        for name in ("release_publish.py", "release_evidence.py"):
+            shutil.copyfile(ROOT / "scripts" / name, self.root / "scripts" / name)
+        (self.root / "dist").mkdir()
+        (self.root / "dist" / "fixture.tar.gz").write_bytes(b"verified candidate")
+        self.events = self.root / "events"
+        self.events.write_text("")
+        gh = self.root / "gh"
+        gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import json, os, pathlib, sys
+            args = sys.argv[1:]
+            events = pathlib.Path(os.environ["EVENTS"])
+            with events.open("a") as out:
+                out.write(" ".join(args) + "\\n")
+            release = {"tag_name": "v0.1.1", "draft": True, "prerelease": False,
+                       "immutable": False, "id": 123}
+            if args[:2] == ["api", "--paginate"]:
+                print(json.dumps([[release]]))
+            elif args[:3] == ["api", "--method", "PATCH"]:
+                release.update(draft=False, immutable=os.environ["IMMUTABLE"] == "true")
+                print(json.dumps(release))
+            elif args[:2] == ["release", "download"]:
+                output = pathlib.Path(args[args.index("--dir") + 1])
+                data = b"substituted" if os.environ["TAMPER"] == "true" else b"verified candidate"
+                (output / "fixture.tar.gz").write_bytes(data)
+            elif args[:2] in (["release", "verify"], ["release", "verify-asset"]):
+                pass
+            else:
+                sys.exit(2)
+            '''))
+        gh.chmod(0o755)
+        workflow = (ROOT / ".github/workflows/publish-release.yml").read_text()
+        part = workflow.split("      - name: Publish the verified draft and verify immutable release assets\n", 1)[1]
+        self.shell = textwrap.dedent(part.split("        run: |\n", 1)[1])
+
+    def run_step(self, immutable="true", tamper="false"):
+        env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", EVENTS=str(self.events),
+                   GH_TOKEN="disposable", RELEASE_TAG="v0.1.1", APPROVED_COMMIT=self.commit,
+                   GITHUB_REPOSITORY="fixture/memoryd", STAGED_RELEASE_ID="123",
+                   GITHUB_STEP_SUMMARY=str(self.root / "summary"), IMMUTABLE=immutable, TAMPER=tamper)
+        return subprocess.run(["bash", "-c", self.shell], cwd=self.root, env=env,
+                              text=True, capture_output=True)
+
+    def test_mutable_publication_fails_before_release_verification(self):
+        result = self.run_step(immutable="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("api --method PATCH", self.events.read_text())
+        self.assertNotIn("release verify", self.events.read_text())
+
+    def test_published_assets_are_downloaded_and_verified(self):
+        result = self.run_step()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("release download v0.1.1", self.events.read_text())
+        self.assertIn("release verify-asset v0.1.1 published/fixture.tar.gz", self.events.read_text())
+
+    def test_changed_published_asset_is_rejected(self):
+        result = self.run_step(tamper="true")
+        self.assertNotEqual(result.returncode, 0)
 
 
 @unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "publisher requires jq and bash")
