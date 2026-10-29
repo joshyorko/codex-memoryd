@@ -391,13 +391,13 @@ jobs:
           amd="$(jq -er '.oci_platform_digests["linux/amd64"]' dist/provenance.json)"
           arm="$(jq -er '.oci_platform_digests["linux/arm64"]' dist/provenance.json)"
           docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" "$IMAGE@$amd" "$IMAGE@$arm"
-          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --raw | \
+          digest="$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw | \
             jq -e --arg amd "$amd" --arg arm "$arm" '
               (.manifests | type == "array" and length == 2) and
               ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $amd)] | length == 1) and
               ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $arm)] | length == 1)'
-          digest="$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
         with:

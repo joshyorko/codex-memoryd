@@ -21,7 +21,7 @@ path = "src/lib.rs"
 axum = { version = "0.7", features = ["json", "tokio", "http1", "query"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +126,115 @@ class WorkflowSafetyTests(unittest.TestCase):
                            "gh release create", "push=true", "push: true", "type=registry"):
             with self.subTest(prohibited=prohibited):
                 self.assertNotIn(prohibited, text)
+
+
+@unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "publisher requires jq and bash")
+class OciIndexSubjectTests(unittest.TestCase):
+    """Exercise the workflow shell with a disposable, moving registry tag."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.good = "sha256:" + "a" * 64
+        self.bad = "sha256:" + "b" * 64
+        self.amd = "sha256:" + "1" * 64
+        self.arm = "sha256:" + "2" * 64
+        self.state = self.root / "registry.json"
+        self.output = self.root / "github-output"
+        self.output.write_text("")
+        self.state.write_text(json.dumps({"tag": self.good, "move_after_tag_read": False}))
+        docker = self.root / "docker"
+        docker.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import json, os, pathlib, sys
+            state_file = pathlib.Path(os.environ["FAKE_REGISTRY"])
+            state = json.loads(state_file.read_text())
+            args = sys.argv[1:]
+            if args[:3] == ["buildx", "imagetools", "create"]:
+                sys.exit(0)
+            if args[:3] != ["buildx", "imagetools", "inspect"]:
+                sys.exit(2)
+            ref = args[3]
+            tag = os.environ["IMAGE"] + ":" + os.environ["RELEASE_TAG"]
+            if ref == tag:
+                digest = state["tag"]
+                if state["move_after_tag_read"]:
+                    state["tag"] = os.environ["BAD_INDEX"]
+                    state["move_after_tag_read"] = False
+                    state_file.write_text(json.dumps(state))
+            elif ref.startswith(os.environ["IMAGE"] + "@"):
+                digest = ref.split("@", 1)[1]
+            else:
+                sys.exit(2)
+            if "--raw" in args:
+                amd = os.environ["AMD_DIGEST"] if digest == os.environ["GOOD_INDEX"] else os.environ["BAD_INDEX"]
+                print(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": [{"platform": {"os": "linux", "architecture": "amd64"}, "digest": amd},
+                                  {"platform": {"os": "linux", "architecture": "arm64"}, "digest": os.environ["ARM_DIGEST"]}]}))
+            elif "--format" in args:
+                print(json.dumps({"digest": digest}))
+            else:
+                sys.exit(2)
+            '''))
+        docker.chmod(0o755)
+        gh = self.root / "gh"
+        gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import os, sys
+            expected = "oci://" + os.environ["IMAGE"] + "@" + os.environ["GOOD_INDEX"]
+            sys.exit(0 if sys.argv[1:3] == ["attestation", "verify"] and sys.argv[3] == expected else 2)
+            '''))
+        gh.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}",
+                        IMAGE="example.invalid/memoryd", RELEASE_TAG="v0.1.1",
+                        FAKE_REGISTRY=str(self.state), GITHUB_OUTPUT=str(self.output),
+                        GOOD_INDEX=self.good, BAD_INDEX=self.bad,
+                        AMD_DIGEST=self.amd, ARM_DIGEST=self.arm,
+                        amd=self.amd, arm=self.arm, GITHUB_REPOSITORY="example/memoryd",
+                        APPROVED_COMMIT=COMMIT, GITHUB_REF="refs/tags/v0.1.1")
+        self.workflow = (ROOT / ".github/workflows/publish-release.yml").read_text()
+
+    def run_workflow_part(self, start, end, command_start):
+        part = self.workflow.split(start, 1)[1].split(end, 1)[0]
+        shell = textwrap.dedent(part.split("        run: |\n", 1)[1])
+        shell = "set -euo pipefail\n" + shell[shell.index(command_start):]
+        return subprocess.run(["bash", "-c", shell], env=self.env, text=True, capture_output=True)
+
+    def select_index(self):
+        return self.run_workflow_part(
+            "      - name: Create a versioned index only from verified platform digests\n",
+            "      - uses: actions/attest@", "docker buildx imagetools create")
+
+    def check_version_tag(self):
+        self.env["DIGEST"] = self.good
+        return self.run_workflow_part(
+            "      - name: Verify OCI attestation and unchanged version digest\n",
+            "      - name: Verify public image availability and isolated foreground service\n",
+            "gh attestation verify")
+
+    def test_unchanged_tag_selects_and_rechecks_the_verified_index(self):
+        result = self.select_index()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"digest={self.good}\n")
+        self.assertEqual(self.check_version_tag().returncode, 0)
+
+    def test_tag_movement_between_reads_cannot_select_unverified_index(self):
+        self.state.write_text(json.dumps({"tag": self.good, "move_after_tag_read": True}))
+        result = self.select_index()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"digest={self.good}\n")
+        self.assertNotEqual(self.check_version_tag().returncode, 0)
+
+    def test_tag_movement_after_selection_fails_the_version_recheck(self):
+        result = self.select_index()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"digest={self.good}\n")
+        self.state.write_text(json.dumps({"tag": self.bad, "move_after_tag_read": False}))
+        self.assertNotEqual(self.check_version_tag().returncode, 0)
+
+    def test_unverified_index_selected_before_validation_is_rejected(self):
+        self.state.write_text(json.dumps({"tag": self.bad, "move_after_tag_read": False}))
+        self.assertNotEqual(self.select_index().returncode, 0)
+        self.assertEqual(self.output.read_text(), "")
 
 
 class CandidateGuardTests(unittest.TestCase):
