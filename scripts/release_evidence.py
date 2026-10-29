@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 import tarfile
+import zlib
 
 
 TARGETS = (
@@ -69,6 +70,9 @@ def record(args):
         "slot": args.slot,
         "rustc": args.rustc,
         "cargo": args.cargo,
+        "python_version": sys.version,
+        "zlib_build": zlib.ZLIB_VERSION,
+        "zlib_runtime": zlib.ZLIB_RUNTIME_VERSION,
         "binary_sha256": digest(binary),
         "binary_size": len(binary),
         "archive_sha256": digest(archive.read_bytes()),
@@ -104,10 +108,9 @@ def verify_candidate(directory, expected, slot):
         binary = bundle.extractfile(member).read()
     if evidence.get("binary_sha256") != digest(binary) or evidence.get("binary_size") != len(binary):
         raise ValueError("candidate binary mismatch")
-    if not isinstance(evidence.get("rustc"), str) or not evidence["rustc"].strip():
-        raise ValueError("missing rustc evidence")
-    if not isinstance(evidence.get("cargo"), str) or not evidence["cargo"].strip():
-        raise ValueError("missing cargo evidence")
+    for key in ("rustc", "cargo", "python_version", "zlib_build", "zlib_runtime"):
+        if not isinstance(evidence.get(key), str) or not evidence[key].strip():
+            raise ValueError(f"missing {key} evidence")
     return evidence
 
 
@@ -115,7 +118,8 @@ def compare(args):
     expected = identity(args)
     first = verify_candidate(args.first, expected, "first")
     second = verify_candidate(args.second, expected, "second")
-    for key in ("rustc", "cargo", "binary_sha256", "binary_size", "archive_sha256", "archive_size"):
+    for key in ("rustc", "cargo", "python_version", "zlib_build", "zlib_runtime",
+                "binary_sha256", "binary_size", "archive_sha256", "archive_size"):
         if first[key] != second[key]:
             raise ValueError(f"independent build {key} mismatch")
     print(json.dumps({"result": "match", "target": args.target, "commit": args.commit,

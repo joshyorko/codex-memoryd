@@ -61,7 +61,7 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup default 1.88.0
           rustup target add "$TARGET"
-          python3 -B -m unittest discover -s tests -p 'test_*evidence.py' -v
+          python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
           python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
       - name: Build the locked candidate
         run: cargo build --locked --release --target "$TARGET" --bin codex-memoryd
@@ -84,6 +84,12 @@ jobs:
             --out "$RUNNER_TEMP/candidate" --commit "$GITHUB_SHA" --version "$CANDIDATE_VERSION" \
             --target "$TARGET" --slot "$SLOT" --rustc "$(rustc --version --verbose)" \
             --cargo "$(cargo --version)" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          python3 - "$RUNNER_TEMP/candidate/evidence.json" <<'PY'
+          import json, sys
+          evidence = json.load(open(sys.argv[1]))
+          for key in ("python_version", "zlib_build", "zlib_runtime", "binary_size", "archive_size"):
+              print(f"{key}: {evidence[key]}")
+          PY
       - name: Retain temporary candidate evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -97,6 +103,7 @@ jobs:
     needs: native
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
     steps:
@@ -169,6 +176,35 @@ jobs:
             --manifest "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")" \
             > "$RUNNER_TEMP/oci/layers.json"
           rm "$RUNNER_TEMP/candidate-image.tar"
+          # Load the same candidate into this disposable runner without a tag
+          # or registry push, then exercise the foreground container service.
+          docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false --sbom=false --output type=docker,rewrite-timestamp=true \
+            --iidfile "$RUNNER_TEMP/candidate-image-id" .
+          candidate_image="$(cat "$RUNNER_TEMP/candidate-image-id")"
+          test "$candidate_image" = "$(jq -r '."containerimage.config.digest"' "$RUNNER_TEMP/oci/build.json")"
+          fixture_dir="$(mktemp -d)"
+          chmod 0777 "$fixture_dir"
+          container_id=""
+          cleanup() {
+            if [ -n "$container_id" ]; then docker rm -f "$container_id" >/dev/null 2>&1 || true; fi
+            rm -rf "$fixture_dir"
+          }
+          trap cleanup EXIT
+          container_id="$(docker run --detach --publish 127.0.0.1::8787 \
+            --volume "$fixture_dir:/data" --env CODEX_MEMORYD_DB=/data/memory.db \
+            --env CODEX_MEMORYD_BIND=0.0.0.0:8787 "$candidate_image")"
+          fixture_port="$(docker port "$container_id" 8787/tcp | awk -F: '{print $NF}')"
+          [[ "$fixture_port" =~ ^[0-9]+$ ]]
+          for _ in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" | jq -e '.ok == true'
+          test -s "$fixture_dir/memory.db"
           jq -n --arg commit "$GITHUB_SHA" --arg version "$candidate_version" --arg platform "$PLATFORM" \
             --arg slot "$SLOT" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg lock "$(sha256sum Cargo.lock | cut -d' ' -f1)" --arg buildx "$(docker buildx version)" \

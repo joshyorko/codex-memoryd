@@ -89,6 +89,17 @@ class ReleaseEvidenceTests(unittest.TestCase):
         result = self.compare(first, second)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_mismatched_compression_toolchains_are_rejected(self):
+        first = self.record("first", "first")
+        second = self.record("second", "second")
+        path = second / "evidence.json"
+        evidence = json.loads(path.read_text())
+        evidence["zlib_runtime"] = "different-version"
+        path.write_text(json.dumps(evidence))
+        result = self.compare(first, second)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zlib", result.stderr.lower())
+
     def test_invalid_source_identity_cannot_be_recorded(self):
         result = self.run_tool(
             "record", "--binary", self.binary, "--lockfile", self.lock,
