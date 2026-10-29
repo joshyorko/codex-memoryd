@@ -153,6 +153,8 @@ class PublishedReleaseTests(unittest.TestCase):
         git("commit", "--allow-empty", "-m", "fixture")
         self.commit = git("rev-parse", "HEAD")
         git("tag", "v0.1.1")
+        git("commit", "--allow-empty", "-m", "other fixture")
+        self.other_commit = git("rev-parse", "HEAD")
         git("remote", "add", "origin", str(self.root))
         (self.root / "scripts").mkdir()
         for name in ("release_publish.py", "release_evidence.py"):
@@ -163,7 +165,7 @@ class PublishedReleaseTests(unittest.TestCase):
         self.events.write_text("")
         gh = self.root / "gh"
         gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
-            import json, os, pathlib, sys
+            import json, os, pathlib, subprocess, sys
             args = sys.argv[1:]
             events = pathlib.Path(os.environ["EVENTS"])
             with events.open("a") as out:
@@ -173,6 +175,9 @@ class PublishedReleaseTests(unittest.TestCase):
             if args[:2] == ["api", "--paginate"]:
                 print(json.dumps([[release]]))
             elif args[:3] == ["api", "--method", "PATCH"]:
+                if os.environ["MOVE_TAG"] == "true":
+                    subprocess.run(["git", "tag", "-f", "v0.1.1", os.environ["OTHER_COMMIT"]],
+                                   check=True, stdout=subprocess.DEVNULL)
                 release.update(draft=False, immutable=os.environ["IMMUTABLE"] == "true")
                 print(json.dumps(release))
             elif args[:2] == ["release", "download"]:
@@ -189,11 +194,12 @@ class PublishedReleaseTests(unittest.TestCase):
         part = workflow.split("      - name: Publish the verified draft and verify immutable release assets\n", 1)[1]
         self.shell = textwrap.dedent(part.split("        run: |\n", 1)[1])
 
-    def run_step(self, immutable="true", tamper="false"):
+    def run_step(self, immutable="true", tamper="false", move_tag="false"):
         env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", EVENTS=str(self.events),
                    GH_TOKEN="disposable", RELEASE_TAG="v0.1.1", APPROVED_COMMIT=self.commit,
                    GITHUB_REPOSITORY="fixture/memoryd", STAGED_RELEASE_ID="123",
-                   GITHUB_STEP_SUMMARY=str(self.root / "summary"), IMMUTABLE=immutable, TAMPER=tamper)
+                   GITHUB_STEP_SUMMARY=str(self.root / "summary"), IMMUTABLE=immutable, TAMPER=tamper,
+                   MOVE_TAG=move_tag, OTHER_COMMIT=self.other_commit)
         return subprocess.run(["bash", "-c", self.shell], cwd=self.root, env=env,
                               text=True, capture_output=True)
 
@@ -212,6 +218,13 @@ class PublishedReleaseTests(unittest.TestCase):
     def test_changed_published_asset_is_rejected(self):
         result = self.run_step(tamper="true")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_tag_moved_during_publication_is_rejected(self):
+        result = self.run_step(move_tag="true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("remote tag no longer resolves to the approved commit", result.stderr)
+        self.assertNotIn("release verify", self.events.read_text())
+        self.assertFalse((self.root / "summary").exists())
 
 
 @unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "publisher requires jq and bash")

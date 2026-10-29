@@ -493,6 +493,9 @@ jobs:
           release_id="$(jq -er '.id' <<<"$release")"
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true |
             jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .immutable == true'
+          # Once immutable, the published release freezes its tag. Bind that
+          # frozen tag to the approved commit before accepting its attestation.
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
           gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
           mkdir published
           gh release download "$RELEASE_TAG" --dir published --repo "$GITHUB_REPOSITORY"
