@@ -33,6 +33,7 @@ v0.1 local release gate:
 - git diff --check
 - isolated Linux child-reaper checks
 - release candidate evidence checks
+- isolated dogfood Compose project selection checks
 - cargo test
 - codex-memoryd doctor --format json against a temp DB
 - codex-memoryd eval substrate --compare --format json
@@ -43,6 +44,7 @@ v0.1 local release gate:
 
 Tag-required operator checks (opt in with --include-dogfood when the local dogfood lane is available):
 - scripts/dogfood-compose-heartbeat.sh
+- scripts/dogfood-compose.sh down
 - scripts/codex-memoryd-local-runtime.sh start/status/smoke/restart-survival/stop
 - read-only MCP dogfood canary via the compose heartbeat/runbook
 - write-capable sandbox canary via scripts/dogfood-write-sandbox.sh run
@@ -226,6 +228,7 @@ PY
 : >"$ARTIFACT_DIR/steps.jsonl"
 
 run "child-reaper-tests" python3 -B -m unittest discover -s tests -p test_child_reaper.py -v
+run "dogfood-compose-project-tests" python3 -B -m unittest discover -s tests -p test_dogfood_compose.py -v
 run "release-evidence-tests" python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
 run "native-mismatch-diagnostic-tests" python3 -B -m unittest discover -s tests -p test_native_mismatch.py -v
 run "native-release-build-env-tests" python3 -B -m unittest discover -s tests -p test_release_native_build_env.py -v
@@ -262,7 +265,7 @@ run "release-required-files" validate_required_files
 
 if [ "$INCLUDE_DOGFOOD" = "1" ]; then
   run "dogfood-compose-heartbeat" scripts/dogfood-compose-heartbeat.sh
-  run "dogfood-compose-down-before-native" docker compose down
+  run "dogfood-compose-down-before-native" scripts/dogfood-compose.sh down
   run "native-runtime-start" scripts/codex-memoryd-local-runtime.sh start
   run "native-runtime-status" scripts/codex-memoryd-local-runtime.sh status
   run "native-runtime-smoke" scripts/codex-memoryd-local-runtime.sh smoke

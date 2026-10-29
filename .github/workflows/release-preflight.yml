@@ -11,10 +11,14 @@ on:
       - scripts/release_publish.py
       - scripts/inspect_oci_layers.py
       - scripts/smoke_release_candidate.py
+      - scripts/dogfood-compose.sh
+      - scripts/dogfood-compose-heartbeat.sh
+      - scripts/v0.1-release-gate.sh
       - tests/test_release_evidence.py
       - tests/test_native_mismatch.py
       - tests/test_release_native_build_env.py
       - tests/test_release_publish.py
+      - tests/test_dogfood_compose.py
       - tests/test_oci_layers.py
       - Cargo.toml
       - Cargo.lock
@@ -79,6 +83,24 @@ jobs:
           python3 -B -m unittest discover -s tests -p test_release_native_build_env.py -v
           python3 -B -m unittest discover -s tests -p test_release_publish.py -v
           python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
+      - name: Record native compiler and platform details
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -srm
+          rustc --version --verbose
+          cc --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+            xcrun --find ld
+            xcrun ld -v 2>&1 || true
+          else
+            ld --version
+          fi
       - name: Build the locked candidate
         shell: bash
         run: |

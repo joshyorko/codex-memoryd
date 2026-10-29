@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 SERVICE="codex-memoryd"
-COMPOSE_PROJECT="${DOGFOOD_COMPOSE_PROJECT:-codex-memoryd}"
 HOST_BIND="127.0.0.1:8787"
 BASE_URL="http://127.0.0.1:8787"
 DOGFOOD_PROFILE="${DOGFOOD_PROFILE:-personal}"
@@ -36,7 +35,7 @@ need curl
 need sqlite3
 need python3
 
-COMPOSE=(docker compose --project-name "$COMPOSE_PROJECT")
+COMPOSE=("$ROOT/scripts/dogfood-compose.sh")
 
 mkdir -p "$RUN_DIR" "$ROOT/.dogfood"
 

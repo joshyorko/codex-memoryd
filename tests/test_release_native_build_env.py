@@ -23,7 +23,7 @@ class NativeBuildEnvironmentTests(unittest.TestCase):
                 cwd=root, env=env, capture_output=True, check=True,
             )
             self.assertEqual(result.stdout.decode().split("\x1f"), [
-                f"--remap-path-prefix={root}=/usr/src/codex-memoryd",
+                f"--remap-path-prefix={root.resolve()}=/usr/src/codex-memoryd",
                 f"--remap-path-prefix={cargo}=/usr/src/cargo",
             ])
 
