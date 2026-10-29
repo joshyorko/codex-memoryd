@@ -81,6 +81,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Identify the native lifecycle protocol used by repository helpers.
+    #[command(hide = true)]
+    NativeLifecycleProtocol,
     /// Initialize product runtime config and directories.
     Init {
         /// Initialize repo-local .dogfood layout for development.
@@ -1053,11 +1056,13 @@ fn validate_runtime_environment() -> Result<()> {
 fn is_database_free_command(command: &Command) -> bool {
     matches!(
         command,
-        Command::Bundle {
-            command: BundleCommand::Inspect { .. }
-        } | Command::Import {
-            command: ImportCommand::PccReplay { .. }
-        }
+        Command::NativeLifecycleProtocol
+            | Command::Bundle {
+                command: BundleCommand::Inspect { .. }
+            }
+            | Command::Import {
+                command: ImportCommand::PccReplay { .. }
+            }
     )
 }
 
@@ -1094,6 +1099,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     validate_cli_preflight(&cli)?;
 
     match &cli.command {
+        Command::NativeLifecycleProtocol => {
+            println!("memoryd-pidfd-v1");
+            Ok(())
+        }
         Command::Init {
             dogfood,
             host,

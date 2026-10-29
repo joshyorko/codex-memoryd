@@ -652,7 +652,8 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         let (process, identity) =
             native_process::capture(&paths, child.id(), &marker).map_err(|err| {
                 Error::storage(format!(
-                    "started child could not be verified; inspect it before retrying: {err}"
+                    "started child pid {} could not be verified; no signal was sent. Inspect it and {} before retrying: {err}",
+                    child.id(), opts.log_file.display()
                 ))
             })?;
         if let Err(err) = native_process::wait_for_startup_ack(startup_ack, &marker) {

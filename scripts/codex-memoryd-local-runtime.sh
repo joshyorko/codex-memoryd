@@ -76,11 +76,13 @@ require_safe_bind() {
 }
 
 ensure_binary() {
-  if [ -x "$BIN" ]; then
-    return 0
+  if [ ! -x "$BIN" ]; then
+    need cargo
+    cargo build --manifest-path "$ROOT/Cargo.toml" --bin codex-memoryd
   fi
-  need cargo
-  cargo build --manifest-path "$ROOT/Cargo.toml" --bin codex-memoryd
+  if [ "$("$BIN" native-lifecycle-protocol 2>/dev/null)" != "memoryd-pidfd-v1" ]; then
+    die "configured binary lacks safe native lifecycle support; upgrade CODEX_MEMORYD_BIN"
+  fi
 }
 
 managed_command() {

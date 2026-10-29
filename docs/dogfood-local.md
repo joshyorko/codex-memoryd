@@ -57,7 +57,9 @@ scripts/codex-memoryd-local-runtime.sh stop
 ```
 
 The helper writes runtime state under `.dogfood/`, uses `.dogfood/memory.db`, and
-keeps its own host bind default unless overridden.
+keeps its own host bind default unless overridden. It checks the selected binary
+for the safe lifecycle protocol before calling `start`, `status`, or `stop`;
+upgrade an older `CODEX_MEMORYD_BIN` before using the helper.
 For systemd user-service dogfood, render the unit first and inspect it before
 installing:
 

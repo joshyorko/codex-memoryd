@@ -215,6 +215,35 @@ fn older_binary_without_identity_handshake_cannot_publish_state() {
 }
 
 #[test]
+fn helper_rejects_older_binary_before_calling_its_lifecycle() {
+    let mut fixture = LegacyPidFixture::new();
+    let old = fixture.home.path().join("old-cli");
+    let probe_log = fixture.home.path().join("probe.log");
+    fs::write(&old, "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$PROBE_LOG\"\n").unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/codex-memoryd-local-runtime.sh"
+        ))
+        .arg("stop")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", fixture.home.path())
+        .env("CODEX_MEMORYD_RUNTIME_DIR", fixture.home.path())
+        .env("CODEX_MEMORYD_BIN", &old)
+        .env("PROBE_LOG", &probe_log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(probe_log).unwrap().trim(),
+        "native-lifecycle-protocol"
+    );
+    assert!(fixture.child.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn malformed_state_fails_closed() {
     let mut fixture = LegacyPidFixture::new();
     for raw in ["0", "-1", "4294967296", "not-a-pid", ""] {
