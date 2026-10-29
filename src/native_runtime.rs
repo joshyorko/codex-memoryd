@@ -620,6 +620,13 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         native_process::preflight().map_err(|err| {
             Error::storage(format!("safe native lifecycle is unavailable: {err}"))
         })?;
+        let (_executable_handle, executable_path) = native_process::verified_binary(&opts.binary)
+            .map_err(|err| {
+            Error::storage(format!(
+                "cannot safely start {}: {err}",
+                opts.binary.display()
+            ))
+        })?;
         ensure_bind_available(&opts)?;
         native_process::clear(&paths).map_err(Error::from)?;
         let log = fs::OpenOptions::new()
@@ -630,7 +637,7 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
         let log_err = log.try_clone().map_err(Error::from)?;
         let marker = uuid::Uuid::new_v4().to_string();
         let (startup_ack, child_stdin) = native_process::startup_channel().map_err(Error::from)?;
-        let mut command = Command::new(&opts.binary);
+        let mut command = Command::new(executable_path);
         command
             .arg("serve")
             .env("CODEX_MEMORYD_DB", &opts.db)
@@ -656,7 +663,7 @@ fn up_native(opts: &RuntimeOptions) -> Result<RuntimeStatusReport> {
                     child.id(), opts.log_file.display()
                 ))
             })?;
-        if let Err(err) = native_process::wait_for_startup_ack(startup_ack, &marker) {
+        if let Err(err) = native_process::wait_for_startup_ack(startup_ack, &marker, &process) {
             let cleanup = process.terminate_and_wait();
             return Err(Error::storage(format!("daemon did not establish safe process ownership: {err}; child cleanup: {cleanup:?}")));
         }

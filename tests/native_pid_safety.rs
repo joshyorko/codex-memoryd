@@ -1,11 +1,13 @@
 //! Regression tests use only children spawned by this test and disposable homes.
 #![cfg(target_os = "linux")]
 
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Output};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::process::{Child, Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -33,16 +35,43 @@ impl LegacyPidFixture {
         Self { home, child, port }
     }
 
-    fn run(&self, action: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_codex-memoryd"))
+    fn command(&self, action: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-memoryd"));
+        command
             .env_clear()
             .env("HOME", self.home.path())
             .env("CODEX_MEMORYD_HOME", self.home.path())
             .env("CODEX_MEMORYD_PORT", self.port.to_string())
             .env("CODEX_MEMORYD_BIND", format!("127.0.0.1:{}", self.port))
-            .args(["--runtime", "native", action])
+            .args(["--runtime", "native", action]);
+        command
+    }
+
+    fn run(&self, action: &str) -> Output {
+        self.command(action)
             .output()
             .expect("run isolated native command")
+    }
+
+    fn run_bounded(&self, action: &str) -> Output {
+        let mut child = self
+            .command(action)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated {action} hung on FIFO state");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn run_helper(&self, action: &str) -> Output {
@@ -188,11 +217,16 @@ fn helper_uses_managed_lifecycle_for_its_own_disposable_runtime() {
 }
 
 #[test]
-fn older_binary_without_identity_handshake_cannot_publish_state() {
+fn different_binary_is_rejected_before_it_can_start() {
     let fixture = LegacyPidFixture::new();
     fs::remove_file(fixture.home.path().join("codex-memoryd.pid")).unwrap();
     let old_binary = fixture.home.path().join("old-memoryd");
-    fs::write(&old_binary, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+    let launched = fixture.home.path().join("wrapper-launched");
+    fs::write(
+        &old_binary,
+        "#!/bin/sh\ntouch \"$WRAPPER_LAUNCHED\"\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
     fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o700)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_codex-memoryd"))
         .env_clear()
@@ -201,17 +235,111 @@ fn older_binary_without_identity_handshake_cannot_publish_state() {
         .env("CODEX_MEMORYD_PORT", fixture.port.to_string())
         .env("CODEX_MEMORYD_BIND", format!("127.0.0.1:{}", fixture.port))
         .env("CODEX_MEMORYD_BIN", old_binary)
+        .env("WRAPPER_LAUNCHED", &launched)
         .args(["--runtime", "native", "up"])
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("child cleanup: Ok"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("wrappers and different binaries are not supported"));
+    assert!(
+        !launched.exists(),
+        "unverified wrapper must never be started"
+    );
     assert!(!fixture.home.path().join("codex-memoryd.pid").exists());
     assert!(!fixture
         .home
         .path()
         .join("codex-memoryd.pid.identity")
         .exists());
+}
+
+#[test]
+fn symlink_to_running_manager_supports_normal_lifecycle() {
+    let fixture = LegacyPidFixture::new();
+    fs::remove_file(fixture.home.path().join("codex-memoryd.pid")).unwrap();
+    let link = fixture.home.path().join("manager-symlink");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_codex-memoryd"), &link).unwrap();
+    struct Cleanup<'a>(&'a LegacyPidFixture);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.run("down");
+        }
+    }
+    let _cleanup = Cleanup(&fixture);
+    let output = fixture
+        .command("up")
+        .env("CODEX_MEMORYD_BIN", link)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["process"], "running");
+    assert!(fixture.run("down").status.success());
+}
+
+fn make_fifo(path: &std::path::Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[test]
+fn fifo_pid_file_fails_closed_without_blocking_or_holding_lock() {
+    let mut fixture = LegacyPidFixture::new();
+    let pid = fixture.home.path().join("codex-memoryd.pid");
+    fs::remove_file(&pid).unwrap();
+    make_fifo(&pid);
+    for action in ["status", "down", "up"] {
+        let output = fixture.run_bounded(action);
+        if action == "status" {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["process"], "unverified");
+        } else {
+            assert!(!output.status.success());
+        }
+        assert!(fs::symlink_metadata(&pid).unwrap().file_type().is_fifo());
+        assert!(fixture.child.try_wait().unwrap().is_none());
+    }
+    fs::remove_file(&pid).unwrap();
+    fs::write(&pid, fixture.child.id().to_string()).unwrap();
+    assert!(
+        !fixture.run_bounded("down").status.success(),
+        "lock must remain usable"
+    );
+    assert!(fixture.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn fifo_identity_file_fails_closed_without_blocking_or_holding_lock() {
+    let mut fixture = LegacyPidFixture::new();
+    let pid = fixture.home.path().join("codex-memoryd.pid");
+    let identity = fixture.home.path().join("codex-memoryd.pid.identity");
+    make_fifo(&identity);
+    for action in ["status", "down", "up"] {
+        let output = fixture.run_bounded(action);
+        if action == "status" {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["process"], "unverified");
+        } else {
+            assert!(!output.status.success());
+        }
+        assert!(pid.is_file());
+        assert!(fs::symlink_metadata(&identity)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert!(fixture.child.try_wait().unwrap().is_none());
+    }
+    fs::remove_file(&identity).unwrap();
+    assert!(
+        !fixture.run_bounded("down").status.success(),
+        "lock must remain usable"
+    );
+    assert!(fixture.child.try_wait().unwrap().is_none());
 }
 
 #[test]

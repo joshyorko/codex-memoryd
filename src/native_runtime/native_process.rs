@@ -108,7 +108,9 @@ mod platform {
     fn open_state(path: &Path, private: bool) -> io::Result<File> {
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            // Open before inspecting the descriptor; nonblocking prevents a
+            // FIFO from hanging the lifecycle during that validation.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
         let metadata = file.metadata()?;
         let forbidden = if private { 0o077 } else { 0o022 };
@@ -144,7 +146,7 @@ mod platform {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&paths.lock)?;
         let metadata = file.metadata()?;
         if !metadata.is_file()
@@ -294,17 +296,63 @@ mod platform {
         Ok(())
     }
 
+    /// Launch the same executable image as the manager, pinned by a file
+    /// descriptor. A wrapper or a different executable could start an
+    /// untracked descendant before acknowledging, so reject it before spawn.
+    pub(crate) fn verified_binary(path: &Path) -> io::Result<(File, PathBuf)> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)?;
+        let candidate = file.metadata()?;
+        let manager = fs::metadata("/proc/self/exe")?;
+        if !candidate.is_file()
+            || candidate.dev() != manager.dev()
+            || candidate.ino() != manager.ino()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "CODEX_MEMORYD_BIN must resolve to the running manager executable; wrappers and different binaries are not supported"));
+        }
+        let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        Ok((file, pinned_path))
+    }
+
     pub(crate) fn startup_channel() -> io::Result<(File, Stdio)> {
         let mut fds = [-1; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } != 0
+        {
             return Err(io::Error::last_os_error());
         }
         let reader = unsafe { File::from_raw_fd(fds[0]) };
         let writer = unsafe { File::from_raw_fd(fds[1]) };
+        let enabled: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                reader.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         Ok((reader, Stdio::from(writer)))
     }
 
-    pub(crate) fn wait_for_startup_ack(mut reader: File, marker: &str) -> io::Result<()> {
+    pub(crate) fn wait_for_startup_ack(
+        reader: File,
+        marker: &str,
+        process: &ManagedProcess,
+    ) -> io::Result<()> {
         let mut pollfd = libc::pollfd {
             fd: reader.as_raw_fd(),
             events: libc::POLLIN,
@@ -337,8 +385,62 @@ mod platform {
                 continue;
             }
             let mut reply = [0_u8; 64];
-            let count = reader.read(&mut reply)?;
-            if &reply[..count] == marker.as_bytes() {
+            // Ancillary data must be aligned for cmsghdr/ucred. The kernel
+            // supplies SCM_CREDENTIALS for the actual sender, including when
+            // a socket descriptor was inherited by a descendant.
+            let mut control = [0_usize; 8];
+            let mut iov = libc::iovec {
+                iov_base: reply.as_mut_ptr().cast(),
+                iov_len: reply.len(),
+            };
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = std::mem::size_of_val(&control);
+            let count = unsafe { libc::recvmsg(reader.as_raw_fd(), &mut message, 0) };
+            if count < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated daemon acknowledgment",
+                ));
+            }
+            let mut credential = None;
+            let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+            while !header.is_null() {
+                let hdr = unsafe { &*header };
+                if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_CREDENTIALS {
+                    if credential.is_some()
+                        || hdr.cmsg_len
+                            != unsafe {
+                                libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as u32) as usize
+                            }
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid daemon acknowledgment credentials",
+                        ));
+                    }
+                    credential = Some(unsafe {
+                        std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>())
+                    });
+                }
+                header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+            }
+            let sender = credential.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "daemon acknowledgment lacks sender credentials",
+                )
+            })?;
+            if sender.pid != process.pid as libc::pid_t {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("daemon acknowledgment came from different pid {}; an untracked descendant may still be running", sender.pid)));
+            }
+            if &reply[..count as usize] == marker.as_bytes() && !process.exited(Duration::ZERO)? {
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -363,7 +465,7 @@ mod platform {
                 "missing managed launch identity",
             )
         })?;
-        // The manager passes a write-only anonymous pipe as stdin. Acknowledge
+        // The manager passes an anonymous credential-bearing socket as stdin. Acknowledge
         // only after removing the identity from the environment inherited by
         // subprocesses, then restore the normal /dev/null stdin.
         let mut pipe = unsafe { File::from_raw_fd(0) };
@@ -598,6 +700,40 @@ mod platform {
             handle.terminate_and_wait().unwrap();
             assert!(replacement.0.try_wait().unwrap().is_none());
         }
+
+        #[test]
+        fn descendant_cannot_acknowledge_for_the_captured_process() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(&dir.path().join("service.pid")).unwrap();
+            let marker = uuid::Uuid::new_v4().to_string();
+            let (reader, writer) = startup_channel().unwrap();
+            // The background subshell inherits the acknowledgment socket and
+            // sends the same marker, while its parent becomes a sleep process.
+            let mut parent = Disposable(Command::new("/bin/sh")
+                .args(["-c", "exec 3>&0; (printf '%s' \"$CODEX_MEMORYD_MANAGED_PROCESS_ID\" >&3) & exec /bin/sleep 60"])
+                .env(MARKER_ENV, &marker)
+                .env(STATE_PATH_ENV, paths.pid_path())
+                .stdin(writer)
+                .spawn().unwrap());
+            let (handle, _) = capture(&paths, parent.0.id(), &marker).unwrap();
+            let error = wait_for_startup_ack(reader, &marker, &handle)
+                .expect_err("descendant must not certify its parent");
+            assert!(error.to_string().contains("different pid"), "{error}");
+            assert!(parent.0.try_wait().unwrap().is_none());
+        }
+
+        #[test]
+        fn executable_remains_pinned_after_configured_symlink_changes() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("configured-bin");
+            std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+            let (_handle, pinned) = verified_binary(&link).unwrap();
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+            let target = fs::metadata(pinned).unwrap();
+            let manager = fs::metadata("/proc/self/exe").unwrap();
+            assert_eq!((target.dev(), target.ino()), (manager.dev(), manager.ino()));
+        }
     }
 }
 
@@ -606,7 +742,7 @@ mod platform {
     use super::{ACK_ENV, MARKER_ENV, STATE_PATH_ENV};
     use std::fs::File;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
     pub(crate) struct ManagedProcess;
     pub(crate) enum Inspection {
@@ -644,10 +780,13 @@ mod platform {
     pub(crate) fn preflight() -> io::Result<()> {
         Err(unsupported())
     }
+    pub(crate) fn verified_binary(_: &Path) -> io::Result<(File, PathBuf)> {
+        Err(unsupported())
+    }
     pub(crate) fn startup_channel() -> io::Result<(File, Stdio)> {
         Err(unsupported())
     }
-    pub(crate) fn wait_for_startup_ack(_: File, _: &str) -> io::Result<()> {
+    pub(crate) fn wait_for_startup_ack(_: File, _: &str, _: &ManagedProcess) -> io::Result<()> {
         Err(unsupported())
     }
     pub(crate) fn acknowledge_startup() -> io::Result<()> {
@@ -672,5 +811,5 @@ mod platform {
 
 pub(crate) use platform::{
     acknowledge_startup, capture, clear, inspect, lock, preflight, startup_channel,
-    wait_for_startup_ack, write, Inspection, Paths,
+    verified_binary, wait_for_startup_ack, write, Inspection, Paths,
 };

@@ -1168,7 +1168,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Serve { bind } => {
-            native_runtime::acknowledge_native_startup()?;
             let service = cli.open_service(bind.clone())?;
             let bind_addr = service.config.bind.clone();
             let runtime = tokio::runtime::Runtime::new()

@@ -78,6 +78,13 @@ processes still need to be reaped. Inspect `/proc/<pid>/status` and PID 1 before
 classifying a fixture failure as a startup regression. Do not waive shutdown
 assertions or change production lifecycle behavior to make the environment pass.
 
+The Linux native lifecycle authenticates startup through kernel sender
+credentials and a pidfd. Keep launch-marker removal and acknowledgment at the
+start of `main`, before code that might spawn subprocesses, and keep executable
+selection pinned to the running manager image. The focused regressions are
+`cargo test --lib native_runtime::native_process::platform::tests` and
+`cargo test --test native_pid_safety`; use the child-reaper launcher above.
+
 The agent that starts a release gate must keep ownership until it has the
 command's exit receipt. Shared log files do not transfer ownership of an
 agent-local execution session; do not hand off a still-running gate as verified.
