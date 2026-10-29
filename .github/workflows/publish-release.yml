@@ -417,6 +417,34 @@ jobs:
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
             --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
           test "$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')" = "$DIGEST"
+      - name: Verify public image availability and isolated foreground service
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          pulled="$(docker pull --platform linux/amd64 "$IMAGE@$DIGEST")"
+          grep -Fq "Digest: $DIGEST" <<<"$pulled"
+          fixture_dir="$(mktemp -d)"
+          chmod 0777 "$fixture_dir"
+          container_id=""
+          cleanup() {
+            if [ -n "$container_id" ]; then docker rm -f "$container_id" >/dev/null 2>&1 || true; fi
+            rm -rf "$fixture_dir"
+          }
+          trap cleanup EXIT
+          container_id="$(docker run --detach --publish 127.0.0.1::8787 \
+            --volume "$fixture_dir:/data" --env CODEX_MEMORYD_DB=/data/memory.db \
+            --env CODEX_MEMORYD_BIND=0.0.0.0:8787 "$IMAGE@$DIGEST")"
+          fixture_port="$(docker port "$container_id" 8787/tcp | awk -F: '{print $NF}')"
+          [[ "$fixture_port" =~ ^[0-9]+$ ]]
+          for _ in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" | jq -e '.ok == true'
+          test -s "$fixture_dir/memory.db"
 
   publish-release:
     name: Publish and verify immutable GitHub release
