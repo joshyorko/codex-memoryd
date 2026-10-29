@@ -277,3 +277,43 @@ jobs:
           python3 scripts/inspect_oci_layers.py diff first/layers.json second/layers.json
           test "$(jq -r '."containerimage.digest"' first/build.json)" = "$(jq -r '."containerimage.digest"' second/build.json)"
           echo "Two unpublished OCI content digests match for linux/$ARCH."
+
+  verify-publisher-input:
+    name: Validate all candidates through publisher guards
+    needs: [compare-native, compare-container]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: candidate-*-${{ github.run_attempt }}
+          path: native-input
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: oci-*-${{ github.run_attempt }}
+          path: oci-input
+      - name: Check all same-run candidate inputs without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          mkdir candidates
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            for slot in first second; do
+              mv "native-input/candidate-$target-$slot-$GITHUB_RUN_ATTEMPT" "candidates/native-$target-$slot"
+            done
+          done
+          for arch in amd64 arm64; do
+            for slot in first second; do
+              mv "oci-input/oci-$arch-$slot-$GITHUB_RUN_ATTEMPT" "candidates/oci-$arch-$slot"
+            done
+          done
+          python3 scripts/release_publish.py verify-candidates --candidates candidates \
+            --commit "$GITHUB_SHA" --version "$version" --lockfile Cargo.lock \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"

@@ -58,8 +58,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release verify --help | grep -Fq 'gh release verify '
-          gh release verify-asset --help | grep -Fq 'gh release verify-asset '
+          release_help="$(gh release verify --help)"
+          asset_help="$(gh release verify-asset --help)"
+          grep -Fq 'gh release verify ' <<<"$release_help"
+          grep -Fq 'gh release verify-asset ' <<<"$asset_help"
           help="$(gh attestation verify --help)"
           for flag in --source-digest --source-ref --signer-workflow --signer-digest --deny-self-hosted-runners; do
             grep -Fq -- "$flag" <<<"$help"

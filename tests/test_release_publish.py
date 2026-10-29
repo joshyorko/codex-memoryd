@@ -142,6 +142,8 @@ class CandidateGuardTests(unittest.TestCase):
                                   run_id=RUN, run_attempt=ATTEMPT, ref="refs/tags/v0.1.1")
 
     def test_assembles_only_matching_exact_run_candidates(self):
+        publish.verify_candidates(self.args())
+        self.assertFalse(self.args().out.exists())
         publish.assemble(self.args())
         dist = self.root / "dist"
         release = json.loads((dist / "provenance.json").read_text())

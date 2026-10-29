@@ -102,9 +102,7 @@ def verify_oci_pair(root, arch, args, lock_hash):
         "buildx": sources[0]["buildx"], "buildkit": sources[0]["buildkit"]}
 
 
-def assemble(args):
-    if args.ref != f"refs/tags/v{args.version}":
-        raise ValueError("release evidence ref and version mismatch")
+def verify_candidates(args):
     # identity validates SHA, version, run, and attempt; each target has its
     # own record and only the matching first/second pair can be selected.
     verified = []
@@ -124,6 +122,13 @@ def assemble(args):
     lock_hash = hashlib.sha256(args.lockfile.read_bytes()).hexdigest()
     oci = {f"linux/{arch}": verify_oci_pair(args.candidates, arch, args, lock_hash)
            for arch in ARCHES}
+    return verified, oci, lock_hash
+
+
+def assemble(args):
+    if args.ref != f"refs/tags/v{args.version}":
+        raise ValueError("release evidence ref and version mismatch")
+    verified, oci, lock_hash = verify_candidates(args)
     args.out.mkdir(parents=True, exist_ok=False)
     records = []
     for target, archive, data in verified:
@@ -203,12 +208,16 @@ def main():
     remote.add_argument("--commit", required=True)
     bundle = commands.add_parser("assemble")
     check = commands.add_parser("verify-bundle")
-    for command in (bundle, check):
-        for name in ("commit", "version", "run-id", "run-attempt", "ref"):
+    candidates = commands.add_parser("verify-candidates")
+    for command in (bundle, check, candidates):
+        for name in ("commit", "version", "run-id", "run-attempt"):
             command.add_argument("--" + name, required=True)
-        for name in ("out", "lockfile"):
-            command.add_argument("--" + name, type=Path, required=True)
-    bundle.add_argument("--candidates", type=Path, required=True)
+        command.add_argument("--lockfile", type=Path, required=True)
+    for command in (bundle, check):
+        command.add_argument("--ref", required=True)
+        command.add_argument("--out", type=Path, required=True)
+    for command in (bundle, candidates):
+        command.add_argument("--candidates", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "validate-source":
@@ -222,6 +231,9 @@ def main():
             validate_remote_tag(result.stdout, args.tag, args.commit)
         elif args.command == "assemble":
             assemble(args)
+        elif args.command == "verify-candidates":
+            verify_candidates(args)
+            print("All same-run native and OCI candidate evidence matched.")
         else:
             verify_bundle(args)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
