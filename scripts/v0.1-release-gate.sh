@@ -228,6 +228,7 @@ PY
 run "child-reaper-tests" python3 -B -m unittest discover -s tests -p test_child_reaper.py -v
 run "release-evidence-tests" python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
 run "native-mismatch-diagnostic-tests" python3 -B -m unittest discover -s tests -p test_native_mismatch.py -v
+run "native-release-build-env-tests" python3 -B -m unittest discover -s tests -p test_release_native_build_env.py -v
 run "release-publisher-tests" python3 -B -m unittest discover -s tests -p test_release_publish.py -v
 run "oci-layer-evidence-tests" python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
 run "cargo-fmt" cargo fmt --all --check

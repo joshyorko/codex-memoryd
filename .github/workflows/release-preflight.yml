@@ -6,12 +6,14 @@ on:
       - .github/workflows/release-preflight.yml
       - .github/workflows/publish-release.yml
       - scripts/release_evidence.py
+      - scripts/release-native-build-env.sh
       - scripts/inspect_native_mismatch.py
       - scripts/release_publish.py
       - scripts/inspect_oci_layers.py
       - scripts/smoke_release_candidate.py
       - tests/test_release_evidence.py
       - tests/test_native_mismatch.py
+      - tests/test_release_native_build_env.py
       - tests/test_release_publish.py
       - tests/test_oci_layers.py
       - Cargo.toml
@@ -74,10 +76,14 @@ jobs:
           rustup target add "$TARGET"
           python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
           python3 -B -m unittest discover -s tests -p test_native_mismatch.py -v
+          python3 -B -m unittest discover -s tests -p test_release_native_build_env.py -v
           python3 -B -m unittest discover -s tests -p test_release_publish.py -v
           python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
       - name: Build the locked candidate
-        run: cargo build --locked --release --target "$TARGET" --bin codex-memoryd
+        shell: bash
+        run: |
+          source scripts/release-native-build-env.sh
+          cargo build --locked --release --target "$TARGET" --bin codex-memoryd
       - name: Exercise Linux identity regressions and candidate lifecycle
         if: runner.os == 'Linux'
         run: |
