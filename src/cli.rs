@@ -1159,6 +1159,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Serve { bind } => {
+            // The launch marker remains visible in this process's original
+            // Linux environment, but must not be inherited by subprocesses.
+            std::env::remove_var("CODEX_MEMORYD_MANAGED_PROCESS_ID");
+            std::env::remove_var("CODEX_MEMORYD_MANAGED_PID_PATH");
             let service = cli.open_service(bind.clone())?;
             let bind_addr = service.config.bind.clone();
             let runtime = tokio::runtime::Runtime::new()
@@ -1192,14 +1196,19 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ) {
                     let report = native_runtime::status(runtime);
                     print_json(&report)?;
-                } else if let Ok(body) = native_runtime::http_get(&format!(
-                    "{}/v1/status",
-                    runtime.url.trim_end_matches('/')
-                )) {
-                    print!("{body}");
                 } else {
                     let report = native_runtime::status(runtime);
-                    print_json(&report)?;
+                    if report.process == "unverified" {
+                        // A responsive endpoint does not prove PID ownership.
+                        print_json(&report)?;
+                    } else if let Ok(body) = native_runtime::http_get(&format!(
+                        "{}/v1/status",
+                        runtime.url.trim_end_matches('/')
+                    )) {
+                        print!("{body}");
+                    } else {
+                        print_json(&report)?;
+                    }
                 }
             }
             Ok(())

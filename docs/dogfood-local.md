@@ -89,31 +89,10 @@ placeholder. For self-hosted HTTPS, store the credential in the client runtime's
 secret manager or environment; do not write it into repo docs or checked-in
 config.
 
-The manual equivalent is still useful when debugging the exact process command:
-
-```bash
-cargo build --bin codex-memoryd
-mkdir -p .dogfood/logs .dogfood/exports
-
-setsid -f env \
-  CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" \
-  CODEX_MEMORYD_BIND="127.0.0.1:8989" \
-  CODEX_MEMORYD_PROFILE="personal" \
-  CODEX_MEMORYD_WORKSPACE="josh-personal" \
-  CODEX_MEMORYD_LOG="info" \
-  target/debug/codex-memoryd serve >> .dogfood/logs/codex-memoryd.log 2>&1
-
-pgrep -n -f 'target/debug/codex-memoryd serve' > .dogfood/codex-memoryd.pid
-pgrep -af 'target/debug/codex-memoryd serve'
-curl -fsS http://127.0.0.1:8989/healthz
-curl -fsS http://127.0.0.1:8989/v1/status | jq
-```
-
-Stop it with:
-
-```bash
-kill "$(cat .dogfood/codex-memoryd.pid)"
-```
+For repo-local debugging, use the helper above instead of constructing a PID
+file with `pgrep` or signaling a PID read from disk. The helper delegates
+lifecycle operations to the identity-checked native manager. For legacy or
+unverifiable state, follow the [safe recovery procedure](getting-started.md#native-process-identity-and-recovery).
 
 ## Compose Runtime Heartbeat
 
@@ -278,9 +257,8 @@ target/debug/codex-memoryd export \
 Restart survival check:
 
 ```bash
-kill "$(cat .dogfood/codex-memoryd.pid)"
-setsid -f env CODEX_MEMORYD_DB="$PWD/.dogfood/memory.db" CODEX_MEMORYD_BIND="127.0.0.1:8989" target/debug/codex-memoryd serve >> .dogfood/logs/codex-memoryd.log 2>&1
-pgrep -n -f 'target/debug/codex-memoryd serve' > .dogfood/codex-memoryd.pid
+scripts/codex-memoryd-local-runtime.sh stop
+scripts/codex-memoryd-local-runtime.sh start
 curl -fsS http://127.0.0.1:8989/v1/status | jq
 target/debug/codex-memoryd recall --profile personal --workspace josh-personal --query "What is the safe dogfood mode?" --max-tokens 800 | jq
 ```

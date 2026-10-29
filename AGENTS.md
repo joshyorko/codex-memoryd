@@ -72,12 +72,11 @@ On restricted procfs mounts, the launcher falls back to scanning
 cannot be read due to permissions are skipped; the focused test
 `test_proc_status_fallback_skips_unreadable_status_entries` covers that case.
 
-A non-reaping PID 1 can leave an exited daemon as a zombie. Linux `kill(pid, 0)`
-still reports that PID as present, so `src/native_runtime.rs::process_alive`
-cannot establish clean shutdown in that environment. Inspect `/proc/<pid>/status`
-and PID 1 before classifying such a fixture failure as a startup regression.
-Do not waive the shutdown assertion or change production lifecycle behavior to
-make the test environment pass.
+A non-reaping PID 1 can leave an exited daemon as a zombie. The native lifecycle
+uses a pidfd to detect exit without treating a zombie as running, but fixture
+processes still need to be reaped. Inspect `/proc/<pid>/status` and PID 1 before
+classifying a fixture failure as a startup regression. Do not waive shutdown
+assertions or change production lifecycle behavior to make the environment pass.
 
 The agent that starts a release gate must keep ownership until it has the
 command's exit receipt. Shared log files do not transfer ownership of an

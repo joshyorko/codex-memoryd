@@ -83,8 +83,13 @@ ensure_binary() {
   cargo build --manifest-path "$ROOT/Cargo.toml" --bin codex-memoryd
 }
 
-pid_is_running() {
-  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" >/dev/null 2>&1
+managed_command() {
+  env CODEX_MEMORYD_HOME="$RUNTIME_DIR" \
+    CODEX_MEMORYD_PID_FILE="$PID_FILE" CODEX_MEMORYD_LOG_FILE="$LOG_FILE" \
+    CODEX_MEMORYD_DB="$DB" CODEX_MEMORYD_BIND="$BIND" \
+    CODEX_MEMORYD_PROFILE="$PROFILE" CODEX_MEMORYD_WORKSPACE="$WORKSPACE" \
+    CODEX_MEMORYD_LOG="$LOG_LEVEL" \
+    "$BIN" --runtime native --url "$BASE_URL" "$@"
 }
 
 wait_for_http() {
@@ -104,52 +109,21 @@ start() {
   require_safe_bind
   ensure_binary
   mkdir -p "$LOG_DIR" "$(dirname "$DB")"
-  if pid_is_running; then
-    echo "codex-memoryd already running pid=$(cat "$PID_FILE") bind=$BIND db=$DB"
-    return 0
-  fi
-
-  env \
-    CODEX_MEMORYD_DB="$DB" \
-    CODEX_MEMORYD_BIND="$BIND" \
-    CODEX_MEMORYD_PROFILE="$PROFILE" \
-    CODEX_MEMORYD_WORKSPACE="$WORKSPACE" \
-    CODEX_MEMORYD_LOG="$LOG_LEVEL" \
-    "$BIN" serve >>"$LOG_FILE" 2>&1 &
-  echo "$!" >"$PID_FILE"
-
+  managed_command up
   wait_for_http "$BASE_URL/healthz" "/healthz"
-  echo "codex-memoryd started pid=$(cat "$PID_FILE") bind=$BIND db=$DB log=$LOG_FILE"
 }
 
 stop() {
-  if ! pid_is_running; then
-    rm -f "$PID_FILE"
-    echo "codex-memoryd not running"
-    return 0
-  fi
-
-  local pid
-  pid="$(cat "$PID_FILE")"
-  kill "$pid"
-  for _ in $(seq 1 20); do
-    if ! kill -0 "$pid" >/dev/null 2>&1; then
-      rm -f "$PID_FILE"
-      echo "codex-memoryd stopped pid=$pid"
-      return 0
-    fi
-    sleep 0.2
-  done
-  die "codex-memoryd did not stop cleanly pid=$pid"
+  ensure_binary
+  managed_command down
 }
 
 status() {
   need curl
-  if pid_is_running; then
-    echo "process=running pid=$(cat "$PID_FILE")"
-  else
-    echo "process=stopped"
-  fi
+  ensure_binary
+  env -u CODEX_MEMORYD_DB CODEX_MEMORYD_HOME="$RUNTIME_DIR" \
+    CODEX_MEMORYD_PID_FILE="$PID_FILE" CODEX_MEMORYD_LOG_FILE="$LOG_FILE" \
+    CODEX_MEMORYD_BIND="$BIND" "$BIN" --runtime native --url "$BASE_URL" status
   echo "bind=$BIND"
   echo "base_url=$BASE_URL"
   echo "db=$DB"
