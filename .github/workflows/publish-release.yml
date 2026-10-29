@@ -1,0 +1,424 @@
+name: Publish an explicitly approved release
+
+# This workflow is deliberately manual. Pushing a branch or a tag never runs it.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact approved stable tag (select the same tag as the workflow ref)
+        required: true
+        type: string
+      commit:
+        description: Full approved source commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: memoryd-release-publisher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  APPROVED_COMMIT: ${{ inputs.commit }}
+  IMAGE: ghcr.io/joshyorko/codex-memoryd
+
+jobs:
+  source:
+    name: Verify exact approved tag and publication prerequisites
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate dispatch, source, remote tag, and master ancestry
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = joshyorko/codex-memoryd
+          package_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          python3 scripts/release_publish.py validate-source \
+            --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --tag "$RELEASE_TAG" \
+            --expected-commit "$APPROVED_COMMIT" --event-commit "$GITHUB_SHA" \
+            --checkout-commit "$(git rev-parse HEAD)" --version "$package_version"
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          git fetch origin +refs/heads/master:refs/remotes/origin/master
+          git merge-base --is-ancestor "$APPROVED_COMMIT" origin/master
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+      - name: Require verification commands before external writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release verify --help | grep -Fq 'gh release verify '
+          gh release verify-asset --help | grep -Fq 'gh release verify-asset '
+          help="$(gh attestation verify --help)"
+          for flag in --source-digest --source-ref --signer-workflow --signer-digest --deny-self-hosted-runners; do
+            grep -Fq -- "$flag" <<<"$help"
+          done
+      - name: Require immutable releases to be enabled
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_IMMUTABILITY_AUDIT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This endpoint requires repository Administration:read. A dedicated
+          # read-only token is required; the ordinary workflow token cannot
+          # request that permission. Missing/insufficient access fails closed.
+          test -n "$GH_TOKEN"
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
+      - name: Refuse an existing GitHub release or GHCR version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | length == 0'
+          gh api --paginate --slurp "users/joshyorko/packages/container/codex-memoryd/versions?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | [.[].metadata.container.tags[]?] | index($tag) == null'
+
+  preflight:
+    name: Rebuild exact tagged source twice without publication
+    needs: source
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-preflight.yml
+
+  full-gate:
+    name: Full synthetic release gate for exact source
+    needs: source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Run the isolated release gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustup component add rustfmt
+          python3 scripts/run-with-child-reaper.py scripts/v0.1-release-gate.sh \
+            --artifact-dir "$RUNNER_TEMP/release-gate"
+          jq -e '.status == "pass" and .operator_dogfood_included == false' \
+            "$RUNNER_TEMP/release-gate/release-gate-summary.json"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: synthetic-release-gate-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-gate/release-gate-summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble only same-run reproducible candidates
+    needs: [source, preflight, full-gate]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: candidate-*-${{ github.run_attempt }}
+          path: native-input
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: oci-*-${{ github.run_attempt }}
+          path: oci-input
+      - name: Verify candidate identities and build the release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
+          mkdir candidates
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            for slot in first second; do
+              mv "native-input/candidate-$target-$slot-$GITHUB_RUN_ATTEMPT" "candidates/native-$target-$slot"
+            done
+          done
+          for arch in amd64 arm64; do
+            for slot in first second; do
+              mv "oci-input/oci-$arch-$slot-$GITHUB_RUN_ATTEMPT" "candidates/oci-$arch-$slot"
+            done
+          done
+          python3 scripts/release_publish.py assemble --candidates candidates --out dist \
+            --commit "$APPROVED_COMMIT" --version "$VERSION" --lockfile Cargo.lock \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "$VERSION" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          (cd dist && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-native:
+    name: Attest and verify native release bundle
+    needs: [source, assemble]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+      - name: Revalidate tag and bundle before signing
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+      - uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-path: dist/*
+      - name: Verify native attestations against exact source and signer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in dist/*; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$APPROVED_COMMIT" --source-ref "$GITHUB_REF" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
+              --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
+          done
+
+  push-platform:
+    name: Verify and push untagged OCI ${{ matrix.arch }} by digest
+    needs: [source, assemble, attest-native]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Rebuild and compare before any registry write
+        env:
+          ARCH: ${{ matrix.arch }}
+          BUILDX_METADATA_PROVENANCE: max
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          platform="linux/$ARCH"
+          expected="$(jq -er --arg p "$platform" '.oci_platform_digests[$p]' dist/provenance.json)"
+          test "$(docker buildx version)" = "$(jq -er --arg p "$platform" '.oci_build_tools[$p].buildx' dist/provenance.json)"
+          test "$(docker buildx inspect --bootstrap | sed -n 's/^BuildKit version:[[:space:]]*//p')" = "$(jq -er --arg p "$platform" '.oci_build_tools[$p].buildkit' dist/provenance.json)"
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          docker buildx build --platform "$platform" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            --label "org.opencontainers.image.revision=$APPROVED_COMMIT" \
+            --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/local.json" \
+            --output "type=oci,dest=$RUNNER_TEMP/candidate-image.tar,rewrite-timestamp=true" .
+          test "$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/local.json")" = "$expected"
+          python3 scripts/inspect_oci_layers.py summarize --archive "$RUNNER_TEMP/candidate-image.tar" --manifest "$expected" >/dev/null
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push only the matched platform digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          BUILDX_METADATA_PROVENANCE: max
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          platform="linux/$ARCH"
+          expected="$(jq -er --arg p "$platform" '.oci_platform_digests[$p]' dist/provenance.json)"
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          docker buildx build --platform "$platform" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            --label "org.opencontainers.image.revision=$APPROVED_COMMIT" \
+            --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/pushed.json" \
+            --output "type=image,name=$IMAGE,push=true,push-by-digest=true,oci-mediatypes=true,rewrite-timestamp=true" .
+          test "$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/pushed.json")" = "$expected"
+          test "$(docker buildx imagetools inspect "$IMAGE@$expected" --format '{{json .Manifest}}' | jq -er '.digest')" = "$expected"
+
+  publish-image:
+    name: Publish and attest verified versioned OCI index
+    needs: [source, assemble, push-platform]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Create a versioned index only from verified platform digests
+        id: index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          gh api --paginate --slurp "users/joshyorko/packages/container/codex-memoryd/versions?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | [.[].metadata.container.tags[]?] | index($tag) == null'
+          amd="$(jq -er '.oci_platform_digests["linux/amd64"]' dist/provenance.json)"
+          arm="$(jq -er '.oci_platform_digests["linux/arm64"]' dist/provenance.json)"
+          docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" "$IMAGE@$amd" "$IMAGE@$arm"
+          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --raw | \
+            jq -e --arg amd "$amd" --arg arm "$arm" '
+              (.manifests | type == "array" and length == 2) and
+              ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $amd)] | length == 1) and
+              ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $arm)] | length == 1)'
+          digest="$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+      - name: Verify OCI attestation and unchanged version digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY" \
+            --source-digest "$APPROVED_COMMIT" --source-ref "$GITHUB_REF" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
+            --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
+          test "$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')" = "$DIGEST"
+
+  publish-release:
+    name: Publish and verify immutable GitHub release
+    needs: [source, assemble, attest-native, publish-image]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: verified-release-bundle-${{ github.run_attempt }}
+          path: dist
+      - name: Recheck tag and absence before staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -e --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | length == 0'
+          python3 scripts/release_publish.py verify-bundle --out dist --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+      - name: Stage a draft and compare all downloaded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "codex-memoryd $RELEASE_TAG" \
+            --notes "Native archives and versioned GHCR image built from the approved source."
+          gh release upload "$RELEASE_TAG" dist/*
+          mkdir downloaded
+          gh release download "$RELEASE_TAG" --dir downloaded
+          test "$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)" = "$(find downloaded -maxdepth 1 -type f -printf '%f\n' | sort)"
+          for file in dist/*; do cmp "$file" "downloaded/$(basename "$file")"; done
+          python3 scripts/release_publish.py verify-bundle --out downloaded --commit "$APPROVED_COMMIT" \
+            --version "${RELEASE_TAG#v}" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --ref "$GITHUB_REF"
+          for artifact in downloaded/*; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$APPROVED_COMMIT" --source-ref "$GITHUB_REF" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" \
+              --signer-digest "$APPROVED_COMMIT" --deny-self-hosted-runners
+          done
+      - name: Recheck immutable-release policy immediately before publication
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_IMMUTABILITY_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
+      - name: Publish the verified draft and verify immutable release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == true and .immutable != true' <<<"$release"
+          release_id="$(jq -er '.id' <<<"$release")"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true |
+            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .immutable == true'
+          gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+          for artifact in dist/*; do gh release verify-asset "$RELEASE_TAG" "$artifact" --repo "$GITHUB_REPOSITORY"; done
+          echo "Release: $RELEASE_TAG at $APPROVED_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "OCI index: $IMAGE@${{ needs.publish-image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
