@@ -53,6 +53,7 @@ jobs:
           python3 scripts/release_publish.py verify-remote-tag --tag "$RELEASE_TAG" --commit "$APPROVED_COMMIT"
           git fetch origin +refs/heads/master:refs/remotes/origin/master
           git merge-base --is-ancestor "$APPROVED_COMMIT" origin/master
+          git merge-base --is-ancestor fea268928b197b09ca602a73e8f26bf867fd2e9e "$APPROVED_COMMIT"
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
       - name: Require verification commands before external writes
         shell: bash
@@ -76,7 +77,8 @@ jobs:
           # read-only token is required; the ordinary workflow token cannot
           # request that permission. Missing/insufficient access fails closed.
           test -n "$GH_TOKEN"
-          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
       - name: Refuse an existing GitHub release or GHCR version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -343,6 +345,7 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
+          create-storage-record: false
       - name: Verify OCI attestation and unchanged version digest
         env:
           GH_TOKEN: ${{ github.token }}
@@ -409,7 +412,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
       - name: Publish the verified draft and verify immutable release assets
         shell: bash
         run: |

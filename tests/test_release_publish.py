@@ -92,11 +92,12 @@ class WorkflowSafetyTests(unittest.TestCase):
     def test_publisher_cannot_be_triggered_by_push_or_pull_request(self):
         text = (ROOT / ".github/workflows/publish-release.yml").read_text()
         self.assertEqual(self.events(text), ["workflow_dispatch"])
+        self.assertIn("create-storage-record: false", text)
 
     def test_pr_preflight_remains_read_only(self):
         text = (ROOT / ".github/workflows/release-preflight.yml").read_text()
         self.assertEqual(set(self.events(text)), {"pull_request", "workflow_dispatch", "workflow_call"})
-        for prohibited in ("packages: write", "attestations: write", "id-token: write",
+        for prohibited in ("contents: write", "packages: write", "attestations: write", "id-token: write",
                            "gh release create", "push=true", "push: true", "type=registry"):
             with self.subTest(prohibited=prohibited):
                 self.assertNotIn(prohibited, text)
