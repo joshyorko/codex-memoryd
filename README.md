@@ -10,14 +10,24 @@ For the shortest install-to-first-recall path, see [`docs/getting-started.md`](.
 
 ## v0.1.0 distribution
 
-Install the native daemon from the immutable Homebrew tap:
+Install the daemon from the Homebrew tap:
 
 ```bash
 brew install joshyorko/tools/codex-memoryd
 codex-memoryd init
+```
+
+On Linux, use the managed native lifecycle:
+
+```bash
 codex-memoryd up
 codex-memoryd status
 ```
+
+In the PID-safe source, macOS managed native `up`, `down`, and `restart` fail
+closed. Run `codex-memoryd serve` in the foreground under a trusted supervisor,
+or use container mode. The previously published v0.1.0 does not contain this
+protection; see the recovery guidance before upgrading a legacy daemon.
 
 Native mode is the default and remains loopback-only. The persistent database
 is `~/.codex-memoryd/memory.db`; upgrading or uninstalling the formula does

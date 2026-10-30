@@ -4,19 +4,33 @@
 primary install path; native mode is the default and does not require Docker,
 Podman, Compose, Rust, or a repository checkout.
 
+The lifecycle safety behavior below describes the PID-safe source after #275.
+The previously published v0.1.0 does not contain that protection. Homebrew
+also distributes master-derived builds, so verify the installed formula's
+source commit and provenance; do not infer protection from `--version` alone.
+Follow the legacy recovery procedure before upgrading.
+
 ## Install with Homebrew
 
 ```zsh
 brew install joshyorko/tools/codex-memoryd
 codex-memoryd --version
 codex-memoryd init
+```
+
+On Linux, manage the native daemon with:
+
+```zsh
 codex-memoryd up
 codex-memoryd status
 codex-memoryd down
 ```
 
-The persistent database is `~/.codex-memoryd/memory.db`. `up`, `status`, and
-`down` manage the loopback-only native daemon; the default bind is
+On macOS, use `codex-memoryd serve` under a trusted service supervisor or use
+container mode; managed native `up`, `down`, and `restart` fail closed.
+
+The persistent database is `~/.codex-memoryd/memory.db`. On Linux, `up`,
+`status`, and `down` manage the loopback-only native daemon; the default bind is
 `127.0.0.1:8787`.
 
 ### Native process identity and recovery
@@ -45,12 +59,14 @@ as unverified. An exited or demonstrably different process is treated as stale.
 An explicit `--url` status remains an HTTP endpoint query.
 
 To recover, first identify and stop any actual older daemon through the process
-supervisor or terminal that originally started it. Do not send a signal using
+supervisor or terminal that originally started it. Do not use the vulnerable
+v0.1.0 native `down` or `restart` commands for this migration. Do not send a signal using
 the contents of the PID file or infer ownership from a process name. Once no
 daemon is using that runtime and its configured endpoint, remove the PID file
-and its adjacent `.identity` file, then run `codex-memoryd up`. The persistent
-database must not be removed. If ownership cannot be determined safely, leave
-the state in place and use the original supervisor or an operator to resolve it.
+and its adjacent `.identity` file. On Linux, run the updated `codex-memoryd up`;
+on macOS, use foreground `serve` or container mode. The persistent database
+must not be removed. If ownership cannot be determined safely, leave the state
+in place and use the original supervisor or an operator to resolve it.
 
 On macOS and other non-Linux platforms, this version fails closed for managed
 native `up`, `down`, and `restart` because a race-free process handle is not

@@ -1,6 +1,6 @@
 [package]
 name = "codex-memoryd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Codex-native portable memory provider daemon (recall, ingest, dedupe, safety, export)"
@@ -21,7 +21,7 @@ path = "src/lib.rs"
 axum = { version = "0.7", features = ["json", "tokio", "http1", "query"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

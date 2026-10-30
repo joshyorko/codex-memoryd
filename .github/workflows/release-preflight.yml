@@ -1,0 +1,364 @@
+name: Release candidate preflight (no publication)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-preflight.yml
+      - .github/workflows/publish-release.yml
+      - scripts/release_evidence.py
+      - scripts/release-native-build-env.sh
+      - scripts/inspect_native_mismatch.py
+      - scripts/release_publish.py
+      - scripts/inspect_oci_layers.py
+      - scripts/smoke_release_candidate.py
+      - scripts/dogfood-compose.sh
+      - scripts/dogfood-compose-heartbeat.sh
+      - scripts/v0.1-release-gate.sh
+      - tests/test_release_evidence.py
+      - tests/test_native_mismatch.py
+      - tests/test_release_native_build_env.py
+      - tests/test_release_publish.py
+      - tests/test_dogfood_compose.py
+      - tests/test_oci_layers.py
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - docs/release/release-preparation.md
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Candidate ${{ matrix.target }} / ${{ matrix.slot }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
+        slot: [first, second]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+      SLOT: ${{ matrix.slot }}
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Check out the candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Pin the packaging interpreter
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - name: Resolve the candidate version and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          candidate_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          [[ "$candidate_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo "CANDIDATE_VERSION=$candidate_version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Install pinned Rust and run evidence tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustup target add "$TARGET"
+          python3 -B -m unittest discover -s tests -p test_release_evidence.py -v
+          python3 -B -m unittest discover -s tests -p test_native_mismatch.py -v
+          python3 -B -m unittest discover -s tests -p test_release_native_build_env.py -v
+          python3 -B -m unittest discover -s tests -p test_release_publish.py -v
+          python3 -B -m unittest discover -s tests -p test_oci_layers.py -v
+      - name: Record native compiler and platform details
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -srm
+          rustc --version --verbose
+          cc --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+            xcrun --find ld
+            xcrun ld -v 2>&1 || true
+          else
+            ld --version
+          fi
+      - name: Build the locked candidate
+        shell: bash
+        run: |
+          source scripts/release-native-build-env.sh
+          cargo build --locked --release --target "$TARGET" --bin codex-memoryd
+      - name: Exercise Linux identity regressions and candidate lifecycle
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/run-with-child-reaper.py cargo test --locked --test native_pid_safety
+          python3 scripts/run-with-child-reaper.py python3 scripts/smoke_release_candidate.py "target/$TARGET/release/codex-memoryd" --version "$CANDIDATE_VERSION"
+      - name: Exercise macOS fail-closed regressions and foreground service
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --locked --test native_unsupported_safety
+          python3 scripts/smoke_release_candidate.py "target/$TARGET/release/codex-memoryd" --version "$CANDIDATE_VERSION"
+      - name: Record unsigned candidate evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_evidence.py record \
+            --binary "target/$TARGET/release/codex-memoryd" --lockfile Cargo.lock \
+            --out "$RUNNER_TEMP/candidate" --commit "$GITHUB_SHA" --version "$CANDIDATE_VERSION" \
+            --target "$TARGET" --slot "$SLOT" --rustc "$(rustc --version --verbose)" \
+            --cargo "$(cargo --version)" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          python3 - "$RUNNER_TEMP/candidate/evidence.json" <<'PY'
+          import json, sys
+          evidence = json.load(open(sys.argv[1]))
+          for key in ("python_version", "zlib_build", "zlib_runtime", "binary_size", "archive_size",
+                      "binary_sha256", "tar_sha256", "archive_sha256"):
+              print(f"{key}: {evidence[key]}")
+          PY
+      - name: Retain temporary candidate evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: candidate-${{ matrix.target }}-${{ matrix.slot }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  compare-native:
+    name: Compare independent ${{ matrix.target }} builds
+    needs: native
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: candidate-${{ matrix.target }}-first-${{ github.run_attempt }}
+          path: first
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: candidate-${{ matrix.target }}-second-${{ github.run_attempt }}
+          path: second
+      - name: Verify source and compare candidates
+        id: compare
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          candidate_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          python3 scripts/release_evidence.py compare \
+            --first first --second second --commit "$GITHUB_SHA" --version "$candidate_version" \
+            --target "$TARGET" --lockfile Cargo.lock --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Diagnose differing native candidates
+        if: ${{ failure() && steps.compare.outcome == 'failure' }}
+        run: python3 scripts/inspect_native_mismatch.py --first first --second second
+
+  container:
+    name: Unpublished OCI ${{ matrix.platform }} / ${{ matrix.slot }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        slot: [first, second]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+            architecture: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build an unpublished OCI candidate with metadata
+        shell: bash
+        env:
+          BUILDX_METADATA_PROVENANCE: max
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          candidate_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          [[ "$candidate_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          mkdir "$RUNNER_TEMP/oci"
+          docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/oci/build.json" \
+            --output "type=oci,dest=$RUNNER_TEMP/candidate-image.tar,rewrite-timestamp=true" .
+          jq -e '(."containerimage.digest" | test("^sha256:[0-9a-f]{64}$")) and (."buildx.build.provenance" | type == "object" and length > 0)' "$RUNNER_TEMP/oci/build.json"
+          python3 scripts/inspect_oci_layers.py summarize --archive "$RUNNER_TEMP/candidate-image.tar" \
+            --manifest "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")" \
+            > "$RUNNER_TEMP/oci/layers.json"
+          # The future publisher uses the image exporter. Compare its digest
+          # locally, without pushing or naming an image in a registry.
+          docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false --sbom=false --metadata-file "$RUNNER_TEMP/image-export.json" \
+            --output 'type=image,name=example.invalid/disposable,push=false,oci-mediatypes=true,rewrite-timestamp=true' .
+          test "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image-export.json")" = "$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/oci/build.json")"
+          rm "$RUNNER_TEMP/candidate-image.tar"
+          # Load the same candidate into this disposable runner without a tag
+          # or registry push, then exercise the foreground container service.
+          docker buildx build --platform "$PLATFORM" --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=v$candidate_version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false --sbom=false --output type=docker,rewrite-timestamp=true \
+            --iidfile "$RUNNER_TEMP/candidate-image-id" .
+          candidate_image="$(cat "$RUNNER_TEMP/candidate-image-id")"
+          test "$candidate_image" = "$(jq -r '."containerimage.config.digest"' "$RUNNER_TEMP/oci/build.json")"
+          fixture_dir="$(mktemp -d)"
+          chmod 0777 "$fixture_dir"
+          container_id=""
+          cleanup() {
+            if [ -n "$container_id" ]; then docker rm -f "$container_id" >/dev/null 2>&1 || true; fi
+            rm -rf "$fixture_dir"
+          }
+          trap cleanup EXIT
+          container_id="$(docker run --detach --publish 127.0.0.1::8787 \
+            --volume "$fixture_dir:/data" --env CODEX_MEMORYD_DB=/data/memory.db \
+            --env CODEX_MEMORYD_BIND=0.0.0.0:8787 "$candidate_image")"
+          fixture_port="$(docker port "$container_id" 8787/tcp | awk -F: '{print $NF}')"
+          [[ "$fixture_port" =~ ^[0-9]+$ ]]
+          for _ in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent "http://127.0.0.1:$fixture_port/healthz" | jq -e '.ok == true'
+          test -s "$fixture_dir/memory.db"
+          jq -n --arg commit "$GITHUB_SHA" --arg version "$candidate_version" --arg platform "$PLATFORM" \
+            --arg slot "$SLOT" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg lock "$(sha256sum Cargo.lock | cut -d' ' -f1)" --arg buildx "$(docker buildx version)" \
+            --arg buildkit "$(docker buildx inspect --bootstrap | sed -n 's/^BuildKit version:[[:space:]]*//p')" \
+            '{commit:$commit, version:$version, platform:$platform, slot:$slot, run:$run, attempt:$attempt, lock:$lock, buildx:$buildx, buildkit:$buildkit, kind:"unsigned-nonrelease-candidate"}' \
+            > "$RUNNER_TEMP/oci/source.json"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: oci-${{ matrix.architecture }}-${{ matrix.slot }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oci
+          if-no-files-found: error
+          retention-days: 7
+
+  compare-container:
+    name: Compare unpublished OCI ${{ matrix.architecture }} builds
+    needs: container
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: oci-${{ matrix.architecture }}-first-${{ github.run_attempt }}
+          path: first
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: oci-${{ matrix.architecture }}-second-${{ github.run_attempt }}
+          path: second
+      - name: Verify source and compare OCI content digests
+        shell: bash
+        env:
+          ARCH: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          candidate_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          lock_hash="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          jq -ne --slurpfile a first/source.json --slurpfile b second/source.json \
+            --arg commit "$GITHUB_SHA" --arg version "$candidate_version" --arg platform "linux/$ARCH" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg lock "$lock_hash" \
+            '($a[0] | .commit == $commit and .version == $version and .platform == $platform and .slot == "first" and .run == $run and .attempt == $attempt and .lock == $lock and .kind == "unsigned-nonrelease-candidate") and
+             ($b[0] | .commit == $commit and .version == $version and .platform == $platform and .slot == "second" and .run == $run and .attempt == $attempt and .lock == $lock and .kind == "unsigned-nonrelease-candidate") and ($a[0].buildx == $b[0].buildx) and ($a[0].buildkit != "") and ($a[0].buildkit == $b[0].buildkit)'
+          for build in first/build.json second/build.json; do
+            jq -e '(."containerimage.digest" | test("^sha256:[0-9a-f]{64}$")) and (."buildx.build.provenance" | type == "object" and length > 0)' "$build"
+          done
+          python3 scripts/inspect_oci_layers.py diff first/layers.json second/layers.json
+          test "$(jq -r '."containerimage.digest"' first/build.json)" = "$(jq -r '."containerimage.digest"' second/build.json)"
+          echo "Two unpublished OCI content digests match for linux/$ARCH."
+
+  verify-publisher-input:
+    name: Validate all candidates through publisher guards
+    needs: [compare-native, compare-container]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: candidate-*-${{ github.run_attempt }}
+          path: native-input
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: oci-*-${{ github.run_attempt }}
+          path: oci-input
+      - name: Check all same-run candidate inputs without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          mkdir candidates
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            for slot in first second; do
+              mv "native-input/candidate-$target-$slot-$GITHUB_RUN_ATTEMPT" "candidates/native-$target-$slot"
+            done
+          done
+          for arch in amd64 arm64; do
+            for slot in first second; do
+              mv "oci-input/oci-$arch-$slot-$GITHUB_RUN_ATTEMPT" "candidates/oci-$arch-$slot"
+            done
+          done
+          python3 scripts/release_publish.py verify-candidates --candidates candidates \
+            --commit "$GITHUB_SHA" --version "$version" --lockfile Cargo.lock \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"

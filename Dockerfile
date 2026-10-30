@@ -35,7 +35,9 @@ FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2
 # curl is used by the container HEALTHCHECK; ca-certificates for safety.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /var/cache/ldconfig/aux-cache /var/log/apt/history.log \
+       /var/log/apt/term.log /var/log/dpkg.log
 
 # Run as a non-root user.
 RUN useradd --system --create-home --uid 10001 memoryd
